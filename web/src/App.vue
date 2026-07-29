@@ -1,37 +1,30 @@
 <script setup lang="ts">
+import { useRoute } from 'vue-router'
+
+const route = useRoute()
+const titles: Record<string, string> = {
+  'stock-pools': '股票池', 'portfolios': '组合策略',
+  'backtest': '回测管理', 'live': '实盘交易', 'system': '系统配置',
+}
 </script>
 
 <template>
-  <div class="layout">
-    <nav class="sidebar">
-      <h2>创懿量化</h2>
-      <ul>
-        <li><router-link to="/stock-pools">股票池</router-link></li>
-        <li><router-link to="/portfolios">组合策略</router-link></li>
-        <li><router-link to="/backtest">回测管理</router-link></li>
-        <li><router-link to="/live">实盘交易</router-link></li>
-        <li><router-link to="/system">系统配置</router-link></li>
-      </ul>
-    </nav>
-    <main class="content">
-      <router-view />
-    </main>
+  <div class="app-layout">
+    <aside class="sidebar">
+      <div class="sidebar-header"><h1>创懿量化</h1></div>
+      <nav class="sidebar-nav">
+        <router-link to="/stock-pools" class="nav-item" active-class="active">📋 股票池</router-link>
+        <router-link to="/portfolios" class="nav-item" active-class="active">📦 组合策略</router-link>
+        <router-link to="/backtest" class="nav-item" active-class="active">📊 回测管理</router-link>
+        <router-link to="/live" class="nav-item" active-class="active">⚡ 实盘交易</router-link>
+        <router-link to="/system" class="nav-item" active-class="active">⚙️ 系统配置</router-link>
+      </nav>
+    </aside>
+    <div class="main-container">
+      <header class="topbar">
+        <span class="topbar-title">{{ titles[route.name as string] || '创懿量化' }}</span>
+      </header>
+      <main class="content"><router-view /></main>
+    </div>
   </div>
 </template>
-
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: system-ui, sans-serif; }
-.layout { display: flex; height: 100vh; }
-.sidebar { width: 200px; background: #f5f5f5; padding: 1rem; border-right: 1px solid #ddd; }
-.sidebar h2 { font-size: 1.1rem; margin-bottom: 1rem; }
-.sidebar ul { list-style: none; }
-.sidebar li { margin-bottom: 0.5rem; }
-.sidebar a { text-decoration: none; color: #333; padding: 0.3rem 0.5rem; display: block; border-radius: 4px; }
-.sidebar a:hover { background: #e0e0e0; }
-.content { flex: 1; padding: 2rem; overflow-y: auto; }
-.page h2 { margin-bottom: 1rem; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #eee; }
-th { font-weight: 600; color: #666; }
-</style>

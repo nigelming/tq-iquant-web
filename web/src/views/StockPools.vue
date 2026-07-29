@@ -10,16 +10,17 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="page">
-    <h2>股票池</h2>
+  <div class="card table-wrap">
     <table>
       <thead><tr><th>ID</th><th>名称</th><th>同步时间</th></tr></thead>
       <tbody>
         <tr v-for="p in pools" :key="p.id">
-          <td>{{ p.id }}</td><td>{{ p.name }}</td><td>{{ p.synced_at }}</td>
+          <td style="color:#888">#{{ p.id }}</td>
+          <td>{{ p.name }}</td>
+          <td style="color:#888;font-size:13px">{{ p.synced_at || '-' }}</td>
         </tr>
-        <tr v-if="pools.length === 0"><td colspan="3">暂无数据</td></tr>
       </tbody>
     </table>
+    <div v-if="pools.length === 0" class="empty-state"><p>暂无股票池</p></div>
   </div>
 </template>
