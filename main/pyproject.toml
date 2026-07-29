@@ -12,6 +12,7 @@ dependencies = [
     "nats-py>=2.15.0",
     "polars>=1.43.1",
     "pydantic>=2.13.4",
+    "pytdx>=1.72",
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.51",

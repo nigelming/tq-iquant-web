@@ -30,3 +30,7 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Runtime
+logs/
+*.log
