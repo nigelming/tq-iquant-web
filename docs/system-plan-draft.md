@@ -795,7 +795,13 @@ engine/
 │   └── SignalEngine         # 信号优先级（风控>公式）、CLOSE 全清、REDUCE 走减仓比例
 │
 ├── execution_engine.py      # 执行引擎
-│   └── ExecutionEngine      # 下单、按比例缩减、不足1手放弃、资金不足放弃
+│   └── ExecutionEngine      # 共用：按比例缩减、不足1手放弃、资金不足放弃
+│       ├── OrderDispatcher  # 接口：下单
+│       ├── SimulatedDispatcher  # 回测：模拟成交，按 next_bar.open 填价
+│       └── NatsDispatcher   # 实盘：通过 NATS 发往 iQuant 网关
+│   └── T1Checker            # 接口：T+1 检查
+│       ├── SimulatedT1Checker   # 回测：内部模拟检查
+│       └── LiveT1Checker    # 实盘：查 iQuant 实际可用股数
 │
 ├── evaluator.py             # 回测评估
 │   └── Evaluator            # 读取 daily_snapshots → 计算 18 个指标 → 输出 BacktestEvaluation
@@ -830,6 +836,126 @@ backtest_evaluations  ──输出──→  Evaluator.evaluate(snapshots)
 live_sessions + live_session_portfolios ──创建──→  LiveEngine（含多个 Portfolio）
 live_orders           ──输出──→  LiveEngine（订单状态跟踪）
 live_trades           ──输出──→  LiveEngine（成交记录写入，恢复时重算虚拟持仓）
+```
+
+#### 5.5.4 回测/实盘执行适配层
+
+ExecutionEngine 是回测和实盘共用的核心执行逻辑（按比例缩减、资金审批、1 手检查），差异部分通过策略模式抽取为接口：
+
+```
+  BarEvent → SignalEngine → RiskManager → ExecutionEngine
+                                                │
+                                    ┌───────────┴───────────┐
+                                    │                       │
+                            OrderDispatcher            T1Checker
+                                    │                       │
+                    ┌───────────────┼───┐           ┌───────┴───────┐
+                    │               │   │           │               │
+            Simulated         Nats     (预留其他)   Simulated    LiveT1Checker
+            Dispatcher     Dispatcher              T1Checker      (查 iQuant)
+            (回测模拟成交)  (实盘NATS下单)
+
+```
+
+##### OrderDispatcher 接口
+
+```python
+# execution_engine.py
+class OrderDispatcher(ABC):
+    @abstractmethod
+    def place_order(self, order: OrderEvent, portfolio_id: int) -> TradeEvent:
+        """下单，返回成交结果"""
+
+class SimulatedDispatcher(OrderDispatcher):
+    """回测使用：按 next_bar.open 模拟成交，不涉及外部系统"""
+    def place_order(self, order, portfolio_id) -> TradeEvent:
+        price = self._get_open_price(order.stock_code, order.bar_time)
+        return TradeEvent(
+            price=price,
+            quantity=order.quantity,
+            amount=price * order.quantity,
+            commission=calc_commission(order, price),
+            stamp_duty=calc_stamp_duty(order, price),
+        )
+
+class NatsDispatcher(OrderDispatcher):
+    """实盘使用：通过 NATS 发往 iQuant 网关"""
+    def place_order(self, order, portfolio_id) -> TradeEvent:
+        # 异步下单，等待成交回报
+        nats_client.request("iquant.iguant.order.place", {
+            "stock_code": order.stock_code,
+            "trade_type": order.trade_type,
+            "quantity": order.quantity,
+            "order_type": "market",
+            "portfolio_id": portfolio_id,  # 标记所属组合策略
+        })
+        # 成交回报由网关异步推送，更新 live_orders/live_trades
+```
+
+##### T1Checker 接口
+
+```python
+class T1Checker(ABC):
+    @abstractmethod
+    def get_available_shares(self, stock_code: str, portfolio_id: int) -> int:
+        """获取当日可卖出股数（实盘查 iQuant，回测直接返回持仓量）"""
+
+class SimulatedT1Checker(T1Checker):
+    def get_available_shares(self, stock_code, portfolio_id) -> int:
+        # 昨天及之前买入的即可卖出，无真实 T+1 限制之外的其他约束
+        return position.quantity  # 持仓量即可卖出
+
+class LiveT1Checker(T1Checker):
+    def get_available_shares(self, stock_code, portfolio_id) -> int:
+        # 通过 NATS 查 iQuant 实际可用股数
+        resp = nats_client.request("iquant.iguant.position.query", ...)
+        return resp.get("available_shares", 0)
+```
+
+##### 共有逻辑（ExecutionEngine 主体）
+
+```python
+class ExecutionEngine:
+    def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker):
+        self._dispatcher = dispatcher
+        self._t1_checker = t1_checker
+
+    def execute(self, order: OrderEvent, account: Account,
+                position: Position, portfolio_id: int) -> Optional[TradeEvent]:
+        """共用：审批 → 缩减 → 1手检查 → 委托"""
+        # 1. 资金审批（策略上限 + 组合现金）
+        approved, qty = account.approve_order(order, position.market_value)
+        if not approved or qty < 100:  # 不足 1 手
+            account.record_insufficient_funds()  # 记录资金不足次数
+            return None
+        # 2. T+1 检查
+        available = self._t1_checker.get_available_shares(order.stock_code, portfolio_id)
+        if order.trade_type == "SELL":
+            qty = min(qty, available)
+            if qty < 100: return None
+        # 3. 下单
+        order.quantity = qty
+        trade = self._dispatcher.place_order(order, portfolio_id)
+        # 4. 更新账户和持仓
+        account.apply_trade(trade)
+        if position: position.apply_trade(trade)
+        return trade
+```
+
+##### 创建方式
+
+```python
+# BacktestEngine 创建时
+executor = ExecutionEngine(
+    dispatcher=SimulatedDispatcher(),
+    t1_checker=SimulatedT1Checker(),
+)
+
+# LiveEngine 创建时
+executor = ExecutionEngine(
+    dispatcher=NatsDispatcher(nats_client),
+    t1_checker=LiveT1Checker(nats_client),
+)
 ```
 
 ### 5.6 REST API 设计

@@ -89,6 +89,17 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 - **多组合策略实盘**：一个 live session 可含多个组合策略，共享 iQuant 账户下单，各组合策略独立维护虚拟持仓（Per Portfolio）和虚拟现金（基于成本，非市值）。Core 重启时从 `live_trades` 按 `portfolio_strategy_id` 聚合重算虚拟持仓和虚拟现金
 - **回测仅支持单组合策略**：每次回测针对一个 `portfolio_strategy_id`，多组合策略交互行为仅在实盘体现
 
+## 模块复用
+
+引擎层约 97% 的代码回测/实盘共用（风控、信号排序、资金审批、持仓更新）。差异通过策略模式隔离：
+
+| 接口 | 回测实现 | 实盘实现 |
+|------|----------|----------|
+| `OrderDispatcher` | `SimulatedDispatcher` 按 next_bar.open 模拟成交 | `NatsDispatcher` 通过 NATS 向 iQuant 下单 |
+| `T1Checker` | `SimulatedT1Checker` 直接返回持仓量 | `LiveT1Checker` 查 iQuant 实际可用股数 |
+
+执行引擎 `ExecutionEngine` 持有这两个接口，不感知具体实现。
+
 ## 关键路径与配置文件
 
 | 路径 | 说明 |

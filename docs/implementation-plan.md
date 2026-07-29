@@ -535,10 +535,33 @@ class SignalEngine:
     def process(self, formula_signals: List[SignalEvent],
                 risk_events: List[RiskEvent]) -> List[OrderEvent]
 
-# execution_engine.py
+# execution_engine.py — 回测/实盘共用，差异通过策略模式隔离
+class OrderDispatcher(ABC):
+    """下单接口：回测模拟成交，实盘通过 NATS"""
+    @abstractmethod
+    def place_order(self, order: OrderEvent, portfolio_id: int) -> TradeEvent
+
+class SimulatedDispatcher(OrderDispatcher):
+    """回测：按 next_bar.open 模拟成交"""
+
+class NatsDispatcher(OrderDispatcher):
+    """实盘：通过 NATS 发往 iQuant 网关"""
+
+class T1Checker(ABC):
+    """T+1 接口：回测直接返回持仓，实盘查 iQuant"""
+    @abstractmethod
+    def get_available_shares(self, stock_code: str, portfolio_id: int) -> int
+
+class SimulatedT1Checker(T1Checker):
+    """回测：持仓量即可卖出"""
+
+class LiveT1Checker(T1Checker):
+    """实盘：查 iQuant 实际可用股数"""
+
 class ExecutionEngine:
+    def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker)
     def execute(self, order: OrderEvent, account: Account,
-                position: Optional[Position]) -> Optional[TradeEvent]
+                position: Optional[Position], portfolio_id: int) -> Optional[TradeEvent]
     def reduce_by_ratio(self, position: Position, ratio: Decimal) -> OrderEvent
 ```
 
