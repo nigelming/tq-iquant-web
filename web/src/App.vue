@@ -9,6 +9,8 @@
         <li><router-link to="/stock-pools">股票池</router-link></li>
         <li><router-link to="/portfolios">组合策略</router-link></li>
         <li><router-link to="/backtest">回测管理</router-link></li>
+        <li><router-link to="/live">实盘交易</router-link></li>
+        <li><router-link to="/system">系统配置</router-link></li>
       </ul>
     </nav>
     <main class="content">

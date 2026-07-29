@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.7"
-dependencies = ["nats-py", "pyyaml", "tq-iquant-shared"]
+dependencies = [
+ "nats-py<2.7",
+ "pyyaml",
+ "tq-iquant-shared",
+]
 [tool.uv.sources]
 tq-iquant-shared = { path = "../shared" }
