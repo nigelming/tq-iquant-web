@@ -80,7 +80,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
 - **复权方式**：统一前复权
-- **TQ 数据传递**：polars DataFrame 进程内传递（不走 NATS）
+- **TQ 数据传递**：polars DataFrame 进程内传递（不走 NATS），通过 tqcenter SDK 直连运行中通达信
 - **NATS 仅用于 Core↔iQuant 通信**，5 个 subject（下单/查订单/撤单/持仓查询/状态）
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
 - **资金模型**：策略资金占比是持仓上限（非预分），多策略上限之和可超过 100%

@@ -76,9 +76,10 @@
     │   │       ├── __init__.py
     │   │       └── client.py
     │   │   ├── tq/                      # 通达信 TQ 模块（同进程，直接调用）
-    │   │   │   ├── __init__.py
-    │   │   │   ├── data.py              # 历史数据获取、bar 实时订阅
-    │   │   │   └── formula.py           # 公式计算、信号输出
+│   │   │   ├── __init__.py
+│   │   │   ├── utils.py              # tqcenter 连接管理（initialize/close/全局锁）
+│   │   │   ├── data.py               # 数据获取（get_market_data/股票池/板块）
+│   │   │   └── formula.py            # 公式计算（formula_process_mul_zb/xg）
     │   │   └── tests/                   # 后端测试（pytest）
     │   │       ├── conftest.py            # fixtures（测试数据库等）
     │   │       ├── unit/                  # 单元测试（engine 各模块）
@@ -118,15 +119,14 @@
     └── README.md
 
 ## 2.通达信TQ模块
-### 2.1 定位：嵌入核心后端的 Python 模块，与 Core 同进程运行，由 Core 直接函数调用（不走 NATS）。负责所有与通达信的数据交互和公式计算
-### 2.2 功能：
-    1、获取通达信内的自定义股票池的列表，每个股票池中股票清单
-    2、获取股票的历史数据（多股票×多周期，返回 polars DataFrame）
-    3、通过tq提供的公式计算，获取输出的信号
-    4、实盘中订阅股票的1分钟、5分钟 bar的数据
-    5、将1分钟、5分钟 数据 按通达信的规范，实盘中追加到通达信1分钟和5分钟的数据上
-    6、实盘开启前对通达信1分钟、5分钟、日线进行备份，同时支持恢复
-    7、根据请求中携带的 mode（回测/实盘）校验对应的通达信是否已启动，未启动则拒绝操作
+### 2.1 定位：嵌入核心后端的 Python 模块，与 Core 同进程运行，由 Core 直接函数调用（不走 NATS）。通过通达信 tqcenter SDK（`PYPlugins/sys/tqcenter.py`）与运行中的通达信进程通信，获取数据、计算公式、订阅实时行情。
+### 2.2 技术实现：
+    1、tqcenter 连接：`sys.path` 注入 `PYPlugins/sys` + `PYPlugins/user`，导入 `tqcenter.tq`，调用 `tq.initialize(__file__)` 连接到通达信进程
+    2、数据获取（`tq.get_market_data`）：支持多股票×多周期历史K线（1m/5m/1d/1w等），返回 DataFrame，自动前复权
+    3、股票池/板块（`tq.get_sector_list` / `tq.get_stock_list_in_sector`）：读取通达信自定义板块
+    4、公式计算（`tq.formula_process_mul_zb` / `tq.formula_process_mul_xg`）：批量指标计算和条件选股
+    5、交易接口（`tq.stock_account` / `tq.order_stock` / `tq.query_stock_positions`）：实盘下单、持仓查询
+    6、实时行情订阅（`tq.subscribe_hq`）：注册回调函数，股票有更新时自动推送
 ### 2.3 业务规则：
     1、统一用带有后缀的股票代码，如000001.SZ 符合通达信的规范
     2、复权方式统一用前复权
