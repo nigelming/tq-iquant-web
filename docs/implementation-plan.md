@@ -186,17 +186,11 @@ main/core/models/
 └── live_trade.py             # LiveTrade
 ```
 
-**TDD 顺序**：每张表先写 ORM 定义，然后写 schema 验证测试：
-```python
-# tests/unit/models/test_user.py
-def test_user_create():
-    user = User(username="admin", password_hash="...", role="admin")
-    assert user.username == "admin"
-```
+**TDD 顺序**：每张表先写 ORM 定义，然后写 schema 验证测试。
 
 **步骤**：
 1. 写 `base.py` — SQLAlchemy DeclarativeBase
-2. 按依赖顺序写 model：User → Session → StockPool → StockPoolStock → Formula → FormulaSignal → PortfolioStrategy → Strategy → BacktestRecord → BacktestTrade → BacktestDailySnapshot → BacktestEvaluation → LiveSession → LiveSessionPortfolio → LiveOrder → LiveTrade
+2. 按依赖顺序写 model：StockPool → StockPoolStock → Formula → FormulaSignal → PortfolioStrategy → Strategy → BacktestRecord → BacktestTrade → BacktestDailySnapshot → BacktestEvaluation → LiveSession → LiveSessionPortfolio → LiveOrder → LiveTrade
 3. 写每个 model 的字段定义和关系
 4. 验证：`uv run python -c "from core.models import *"` 正常
 

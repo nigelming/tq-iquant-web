@@ -688,7 +688,6 @@ HAVING net_quantity > 0
 
 #### 表关系
 ```
-users ──< sessions
 stock_pools ──< stock_pool_stocks
 formulas ──< formula_signals
 portfolio_strategies ──< strategies ──< backtest_trades
@@ -704,7 +703,6 @@ strategies.master_strategy_id ──> strategies（自引用）
 #### 索引设计
 ```
 -- 高频查询索引
-sessions (session_token)                      -- 每次请求查 session
 stock_pool_stocks (pool_id, stock_code)       -- 按池查股票，唯一约束防重复
 backtest_trades (backtest_record_id, bar_time) -- 按回测查交易明细
 backtest_daily_snapshots (backtest_record_id, target_type, target_id, snap_date) -- 按策略查快照
@@ -746,8 +744,6 @@ ORM（SQLAlchemy）负责数据库的存取，Engine 负责运行时计算。Eng
 ##### models/（ORM 层，14 个类，与数据库表一一对应）
 ```
 models/
-├── user.py                  # User
-├── session.py               # Session
 ├── stock_pool.py            # StockPool
 ├── stock_pool_stock.py      # StockPoolStock
 ├── formula.py               # Formula
@@ -1106,7 +1102,7 @@ nats:
 |-----|------|
 | `WS /api/live/sessions/{id}/stream` | 实盘 session 实时事件流 |
 
-**连接认证**：通过 query 参数 `?token={session_token}` 传递 Session token，服务端校验有效性。
+**连接认证**：无鉴权，直接连接。
 
 **推送消息类型**（所有事件均带 `portfolio_id` 字段）：
 ```json
@@ -1125,9 +1121,6 @@ nats:
 #### 5.6.11 接口汇总
 
 ```
-POST   /api/auth/login
-POST   /api/auth/logout
-GET    /api/auth/me
 GET    /api/status
 GET    /api/stock-pools
 GET    /api/stock-pools/tdx
@@ -1257,59 +1250,58 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 | 7 | nats_client | Core 侧 natsio 客户端封装 |
 | 8 | 前端框架 | 路由、功能树框架、页面占位 |
 | 9 | 测试框架 | 配置 pytest + vitest，编写 conftest.py（测试数据库 fixtures，用独立 PostgreSQL 测试库或内存 SQLite） |
-| 10 | 认证 stub | 登录/登出/获取当前用户 API + Session 中间件 + 前端登录页（后续阶段的 API 测试依赖认证） |
 
 ### 第三阶段：TQ 数据模块（依赖第二阶段，与 Core 同进程）
 | # | 任务 | 内容 |
 |---|------|------|
-| 11 | TQ 数据模块 | 股票池获取、历史数据、bar 实时订阅、公式计算（进程内直接调用，无 NATS） |
-| 12 | 公式管理 | 先写 API 集成测试 → formulas API + 前端页面 |
+| 10 | TQ 数据模块 | 股票池获取、历史数据、bar 实时订阅、公式计算（进程内直接调用，无 NATS） |
+| 11 | 公式管理 | 先写 API 集成测试 → formulas API + 前端页面 |
 
 ### 第四阶段：核心引擎（依赖第三阶段，每项 TDD：先写单元测试再写实现）
 | # | 任务 | 内容 |
 |---|------|------|
-| 13 | 事件系统 | event.py + event_bus.py + 单元测试 |
-| 14 | 数据+账户 | data_feed.py（调用 TQ 模块） + account.py + position.py + 单元测试 |
-| 15 | 信号+风控 | signal_engine.py + risk_manager.py + 单元测试 |
-| 16 | 执行引擎 | execution_engine.py + 单元测试 |
-| 17 | 组合+策略 | portfolio.py + strategy_context.py + 单元测试 |
-| 18 | 回测引擎 | backtest_engine.py（逐bar迭代→每交易日结束生成 daily_snapshot）+ 集成测试（小数据集端到端验证） |
+| 12 | 事件系统 | event.py + event_bus.py + 单元测试 |
+| 13 | 数据+账户 | data_feed.py（调用 TQ 模块） + account.py + position.py + 单元测试 |
+| 14 | 信号+风控 | signal_engine.py + risk_manager.py + 单元测试 |
+| 15 | 执行引擎 | execution_engine.py + 单元测试 |
+| 16 | 组合+策略 | portfolio.py + strategy_context.py + 单元测试 |
+| 17 | 回测引擎 | backtest_engine.py（逐bar迭代→每交易日结束生成 daily_snapshot）+ 集成测试（小数据集端到端验证） |
 
 ### 第五阶段：回测（依赖第四阶段）
 | # | 任务 | 内容 |
 |---|------|------|
-| 19 | 评估模块 | evaluator.py（读取 daily_snapshots → 计算 18 个指标）+ 单元测试（用固定快照序列验证指标计算） |
-| 20 | 股票池管理 | 先写测试 → 股票池 API + 前端页面 |
-| 21 | 策略管理 | 先写测试 → 组合策略+策略 API + 前端页面 |
-| 22 | 回测管理 | 先写测试 → 启动/查询/交易明细/每日快照/评估结果 API + 前端页面 |
+| 18 | 评估模块 | evaluator.py（读取 daily_snapshots → 计算 18 个指标）+ 单元测试（用固定快照序列验证指标计算） |
+| 19 | 股票池管理 | 先写测试 → 股票池 API + 前端页面 |
+| 20 | 策略管理 | 先写测试 → 组合策略+策略 API + 前端页面 |
+| 21 | 回测管理 | 先写测试 → 启动/查询/交易明细/每日快照/评估结果 API + 前端页面 |
 
 ### 第六阶段：实盘（依赖第五阶段）
 | # | 任务 | 内容 |
 |---|------|------|
-| 23 | 实盘引擎 | live_engine.py（TQ 回调接收 bar）+ 单元测试 |
-| 24 | iQuant 网关 | 下单、订单查询、撤单、持仓查询、状态（NATS 通信）+ Mock 测试 |
-| 25 | 实盘管理 | 先写测试 → 创建/启动/停止/订单/成交查询 API + WebSocket 推送 + 前端页面 |
+| 22 | 实盘引擎 | live_engine.py（TQ 回调接收 bar）+ 单元测试 |
+| 23 | iQuant 网关 | 下单、订单查询、撤单、持仓查询、状态（NATS 通信）+ Mock 测试 |
+| 24 | 实盘管理 | 先写测试 → 创建/启动/停止/订单/成交查询 API + WebSocket 推送 + 前端页面 |
 
 ### 第七阶段：系统收尾
 | # | 任务 | 内容 |
 |---|------|------|
-| 26 | 系统配置 | 先写测试 → 配置文件读写 API（config.yaml）+ 页面 |
-| 27 | 首页仪表盘 | 运行状态展示 + 组件测试 |
-| 28 | 日志监控 | 日志、监控、告警机制 |
+| 25 | 系统配置 | 先写测试 → 配置文件读写 API（config.yaml）+ 页面 |
+| 26 | 首页仪表盘 | 运行状态展示 + 组件测试 |
+| 27 | 日志监控 | 日志、监控、告警机制 |
 
 ### 依赖关系图
 ```
 一: [1][2][3][4]→[5]
       │
-二: [6][7][8][9]→[10]
+二: [6][7][8][9]
       │
-三: [11]→[12]
+三: [10]→[11]
       │
-四: [13]→[14]→[15]→[16]→[17]→[18]
+四: [12]→[13]→[14]→[15]→[16]→[17]
       │
-五: [19]→[20][21]→[22]
+五: [18]→[19][20]→[21]
       │
-六: [23]→[24]→[25]
+六: [22]→[23]→[24]
       │
-七: [26][27][28]
+七: [25][26][27]
 ```
