@@ -283,61 +283,59 @@ def test_client(db_session):
 
 ### 3.1 TQ 模块初始化
 
+通过通达信 tqcenter SDK（`PYPlugins/sys/tqcenter.py`）与运行中的通达信进程通信，无需 mock，无需 pytdx。
+
 ```
 main/core/tq/
 ├── __init__.py
-├── data.py                   # 历史数据、bar 实时订阅
-├── formula.py                # 公式计算
-├── backup.py                 # TDX 数据备份/恢复
-└── utils.py                  # 配置加载、mode 校验
+├── utils.py                  # tqcenter 连接管理 + 全局锁
+├── data.py                   # 股票池、历史数据、实时订阅
+└── formula.py                # 公式计算（zb/xg）
 ```
 
 ```python
 # utils.py — 核心接口
-class TQClient:
-    def __init__(self, config: TQConfig):
-        self._lock = threading.Lock()  # 全局锁，TDX C 扩展非线程安全
+def init_tq(tdx_path: str) -> None:
+    """sys.path 注入 PYPlugins/sys + PYPlugins/user → import tqcenter.tq
+       → tq.initialize(__file__) 连接到通达信进程"""
 
-    def ensure_mode(self, mode: str) -> bool:
-        """校验通达信进程是否已启动"""
+def close_tq() -> None:
+    """tq.close() 断开连接"""
 
-    def get_stock_pools(self) -> List[dict]:
-        """获取通达信股票池列表"""
+def get_tdx_lock() -> threading.Lock:
+    """全局锁，TDX C 扩展非线程安全"""
 
-    def get_pool_stocks(self, pool_name: str) -> List[dict]:
-        """获取股票池中的股票清单"""
+def get_tq() -> module:
+    """获取 tqcenter.tq 模块实例"""
 
-    def get_history(self, stocks: List[str], periods: List[str],
-                    start: str, end: str) -> Dict[str, polars.DataFrame]:
-        """多股票×多周期历史K线"""
+# data.py — 数据获取
+class TQData:
+    def get_stock_pools(self) -> List[dict]:       # tq.get_sector_list
+    def get_pool_stocks(self, pool_name) -> List[dict]:  # tq.get_stock_list_in_sector
+    def get_all_stocks(self, market="5") -> List[str]:   # 5=全A股
+    def get_history(self, stocks, periods, start="", end="",
+                    dividend_type="front", count=100) -> Dict:  # tq.get_market_data
+    def subscribe_bars(self, stocks, periods, callback):        # tq.subscribe_hq
 
-    def subscribe_bars(self, stocks: List[str], periods: List[str],
-                       callback: Callable) -> None:
-        """订阅 1m/5m bar"""
-
-    def compute_formula(self, formula_text: str, stocks: List[str],
-                        period: str) -> Dict[str, polars.DataFrame]:
-        """公式计算，返回信号"""
-
-    def backup_tdx(self, mode: str) -> bool:
-        """备份 1m/5m/日线数据"""
-
-    def restore_tdx(self, mode: str) -> bool:
-        """恢复 TDX 数据"""
+# formula.py — 公式计算
+class TQFormula:
+    def compute(self, formula_name, formula_arg, stocks,
+                period="1d", count=10) -> dict:      # tq.formula_process_mul_zb
+    def compute_xg(self, formula_name, formula_arg, stocks,
+                   period="1d") -> dict:             # tq.formula_process_mul_xg
 ```
 
-**TDD**：
+**验证**：
 ```python
-# tests/unit/tq/test_tq.py（Mock 通达信）
-def test_get_history_mocked():
-    tq = TQClient(config)
-    # Mock 底层 TDX 调用
-    result = tq.get_history(["000001.SZ"], ["1d"], "2024-01-01", "2024-12-31")
-    assert "000001.SZ" in result
-    assert isinstance(result["000001.SZ"], polars.DataFrame)
+# 直接连接运行中通达信验证
+from core.tq import init_tq, TQData, TQFormula
+init_tq(r"D:\new_tdx64")
+tqdata = TQData()
+stocks = tqdata.get_all_stocks()          # 5543 只 A 股
+df = tqdata.get_history(["000001.SZ"], ["1d"], count=5)
 ```
 
-**验收标准**：所有 TQ 接口有 mock 测试覆盖，`ensure_mode` 验证逻辑完整。
+**验收标准**：通达信开启状态下能获取到真实数据。
 
 ### 3.2 公式管理 API + 前端
 
@@ -443,7 +441,7 @@ def test_signal_priority():
 
 ```
 main/core/engine/
-├── data_feed.py              # DataFeed — 调用 TQ 获取数据
+├── data_feed.py              # DataFeed — 调用 TQData/TQFormula 获取 K 线和公式信号
 ├── account.py                # Account — 资金管理
 └── position.py               # Position — 持仓
 ```
@@ -754,7 +752,7 @@ main/core/engine/
 class LiveEngine:
     session_id: int
     portfolios: List[Portfolio]          # 多个组合策略
-    tq_client: TQClient                  # TDX 订阅
+    tq_data: TQData                       # TDX 数据（通过 tqcenter）
     nats_client: NatsClient              # iQuant 通信
     sse_manager: SSEManager               # SSE 实时推送
 
@@ -908,13 +906,13 @@ LOGGING_CONFIG = {
 ## 开发进展跟踪
 
 ```
-第一阶段：基础设施   ▒░░░░░░░░░░░░░░░░░  0%  [#1-#5]
-第二阶段：数据层     ░░░░░░░░░░░░░░░░░░  0%  [#6-#10]
-第三阶段：TQ 模块    ░░░░░░░░░░░░░░░░░░  0%  [#11-#12]
-第四阶段：核心引擎   ░░░░░░░░░░░░░░░░░░  0%  [#13-#18]
-第五阶段：回测       ░░░░░░░░░░░░░░░░░░  0%  [#19-#22]
-第六阶段：实盘       ░░░░░░░░░░░░░░░░░░  0%  [#23-#25]
-第七阶段：收尾       ░░░░░░░░░░░░░░░░░░  0%  [#26-#28]
+第一阶段：基础设施   ████████████████████  100%  [#1-#5]
+第二阶段：数据层     ████████████████████  100%  [#6-#9]
+第三阶段：TQ 模块    ████████████████████  100%  [#10-#11]
+第四阶段：核心引擎   ████████████████████  100%  [#12-#17]
+第五阶段：回测       ████████████████████  100%  [#18-#21]
+第六阶段：实盘       ████████████████████  100%  [#22-#24]
+第七阶段：收尾       ████████████████████  100%  [#25-#27]
 ```
 
-每条任务完成后标记进度。回测端到端链路打通后（#18）进入可验证状态。
+每条任务完成后标记进度。回测端到端链路打通后（#17）进入可验证状态。
