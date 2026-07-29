@@ -170,8 +170,6 @@ def test_validate_stock_code():
 main/core/models/
 ├── __init__.py               # 导入所有模型
 ├── base.py                   # DeclarativeBase
-├── user.py                   # User
-├── session.py                # Session
 ├── stock_pool.py             # StockPool
 ├── stock_pool_stock.py       # StockPoolStock
 ├── formula.py                # Formula
@@ -286,54 +284,6 @@ def test_client(db_session):
 2. 写第一个测试：`tests/unit/test_first.py` — assert True
 3. 验证：`uv run pytest tests/` 通过
 
-### 2.6 认证 stub
-
-```
-main/core/api/auth.py
-main/core/services/auth_service.py
-web/src/views/Login.vue
-web/src/stores/auth.ts
-```
-
-**API**：
-```
-POST /api/auth/login    { "username": "...", "password": "..." } → session cookie
-POST /api/auth/logout
-GET  /api/auth/me       → { "id": 1, "username": "admin", "role": "admin" }
-```
-
-**Session 中间件**（基础路径校验）：
-```python
-# middleware
-@app.middleware("http")
-async def session_middleware(request, call_next):
-    # 排除 /api/auth/login, /health
-    # 从 cookie 取 session_token → 查 DB → 校验有效期 → 续期
-    # 过期返回 401
-```
-
-**TDD**：
-```python
-# tests/integration/api/test_auth.py
-def test_login_success(test_client):
-    resp = test_client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
-    assert resp.status_code == 200
-    assert resp.json()["code"] == 0
-
-def test_auth_required(test_client):
-    resp = test_client.get("/api/portfolios")
-    assert resp.status_code == 401
-```
-
-**步骤**：
-1. 写 auth API 集成测试
-2. 实现 User model + Session model
-3. 实现 auth_service（密码 bcrypt 哈希）
-4. 实现 session 中间件
-5. 实现前端登录页 + Pinia store
-6. 验证：前后端登录流程完整
-
----
 
 ## 第三阶段：TQ 数据模块
 
@@ -899,21 +849,7 @@ ws.onmessage = (event) => {
 
 ## 第七阶段：系统收尾
 
-### 7.1 用户管理
-
-```
-GET    /api/users              # 管理员
-POST   /api/users
-PUT    /api/users/{id}
-DELETE /api/users/{id}
-```
-
-**步骤**：
-1. API 测试（角色权限验证）
-2. UserService
-3. 前端用户管理页面
-
-### 7.2 系统配置
+### 7.1 系统配置
 
 ```
 GET    /api/system/configs
@@ -925,7 +861,7 @@ PUT    /api/system/configs
 2. API 实现（密码字段过滤/回写空）
 3. 前端系统配置页面
 
-### 7.3 首页仪表盘
+### 7.2 首页仪表盘
 
 ```
 GET    /api/status
@@ -935,7 +871,7 @@ GET    /api/status
 1. 状态聚合（Core 运行状态 + TQ 状态 + iQuant 网关状态 + NATS 状态）
 2. 前端仪表盘页面
 
-### 7.4 日志/监控/告警（骨架）
+### 7.3 日志/监控/告警（骨架）
 
 ```python
 # main/core/logging_config.py
@@ -965,7 +901,7 @@ LOGGING_CONFIG = {
 第四阶段：核心引擎   ░░░░░░░░░░░░░░░░░░  0%  [#13-#18]
 第五阶段：回测       ░░░░░░░░░░░░░░░░░░  0%  [#19-#22]
 第六阶段：实盘       ░░░░░░░░░░░░░░░░░░  0%  [#23-#25]
-第七阶段：收尾       ░░░░░░░░░░░░░░░░░░  0%  [#26-#29]
+第七阶段：收尾       ░░░░░░░░░░░░░░░░░░  0%  [#26-#28]
 ```
 
 每条任务完成后标记进度。回测端到端链路打通后（#18）进入可验证状态。

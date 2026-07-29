@@ -4,6 +4,8 @@
 
 **Greenfield** — 仅存在设计文档 `docs/system-plan-draft.md`，无实际代码。所有实现均需从零开始。
 
+**单用户系统**：系统初始化自动创建 admin 用户（密码 admin123），首次登录强制修改密码。无角色体系，登录后全部功能可用。无用户鉴权，所有接口无需登录。
+
 ## 仓库
 
 `github.com/nigelming/tq-iquant-web`
@@ -50,12 +52,12 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 ## API 规范
 
 - 基础路径：`/api`
-- 认证：Session（cookie 自动携带）
+- 无鉴权，API 直接可访问
 - 统一返回格式：`{ "code": 0, "message": "ok", "data": { ... } }`（code=0 成功，非 0 错误）
-- 51 个 HTTP 接口 + 1 个 WebSocket，11 组（详见设计文档 5.6 节）
+- 44 个 HTTP 接口 + 1 个 WebSocket，11 组（详见设计文档 5.6 节）
 - 实盘实时推送通过 WebSocket（`WS /api/live/sessions/{id}/stream`），非轮询
 
-## 数据库（PostgreSQL + SQLAlchemy ORM，16 张表）
+## 数据库（PostgreSQL + SQLAlchemy ORM，14 张表）
 
 详见设计文档 5.4 节。关键点：
 - 使用 PostgreSQL，通过 MVCC 解决回测子进程并发写入冲突

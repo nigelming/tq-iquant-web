@@ -27,9 +27,7 @@
     │   │   ├── main.py                # FastAPI 入口
     │   │   ├── api/                   # REST 路由
     │   │   │   ├── __init__.py
-    │   │   │   ├── auth.py            # 登录认证
-    │   │   │   ├── users.py           # 用户管理
-    │   │   │   ├── stock_pools.py     # 股票池
+│   │   │   ├── stock_pools.py     # 股票池
     │   │   │   ├── formulas.py        # 公式管理
     │   │   │   ├── strategies.py      # 组合策略+策略
     │   │   │   ├── backtest.py        # 回测
@@ -37,9 +35,7 @@
     │   │   │   └── system.py          # 系统配置
     │   │   ├── models/                # SQLAlchemy ORM 模型（16个）
     │   │   │   ├── __init__.py
-    │   │   │   ├── user.py
-    │   │   │   ├── session.py
-    │   │   │   ├── stock_pool.py
+│   │   │   ├── stock_pool.py
     │   │   │   ├── stock_pool_stock.py
     │   │   │   ├── formula.py
     │   │   │   ├── formula_signal.py
@@ -55,9 +51,7 @@
 │   │   │   └── live_trade.py
     │   │   ├── services/              # 业务逻辑层
     │   │   │   ├── __init__.py
-    │   │   │   ├── auth_service.py    # 认证+Session
-    │   │   │   ├── user_service.py
-    │   │   │   ├── stock_pool_service.py
+│   │   │   ├── stock_pool_service.py
     │   │   │   ├── formula_service.py
     │   │   │   ├── strategy_service.py
     │   │   │   ├── backtest_service.py
@@ -440,32 +434,12 @@ GROUP BY portfolio_strategy_id, stock_code
 HAVING net_quantity > 0
 ```
 
-### 5.4 数据库表设计（使用 PostgreSQL + SQLAlchemy ORM，16 张表）
+### 5.4 数据库表设计（使用 PostgreSQL + SQLAlchemy ORM，14 张表）
 
 > 使用 PostgreSQL 替代 SQLite，利用 MVCC 解决回测子进程并发写入 + 主进程读取的冲突问题
 
-#### 一、系统
-##### 1. users
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER PK | |
-| username | VARCHAR(50) UNIQUE | |
-| password_hash | VARCHAR(255) | |
-| role | VARCHAR(20) | admin / researcher / trader |
-| created_at | DATETIME | |
-| updated_at | DATETIME | |
-
-##### 2. sessions
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER PK | |
-| user_id | INTEGER FK → users | |
-| session_token | VARCHAR(255) UNIQUE | |
-| expires_at | DATETIME | |
-| created_at | DATETIME | |
-
-#### 二、通达信
-##### 3. stock_pools
+#### 一、通达信
+##### 1. stock_pools
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -473,7 +447,7 @@ HAVING net_quantity > 0
 | synced_at | DATETIME | 最近同步时间 |
 | created_at | DATETIME | |
 
-##### 4. stock_pool_stocks
+##### 2. stock_pool_stocks
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -484,7 +458,7 @@ HAVING net_quantity > 0
 > **唯一约束**：`UNIQUE(pool_id, stock_code)`，防止同步时产生重复记录。同步策略为**全量替换**（先删除该池下所有股票，再批量写入）。
 
 #### 三、公式
-##### 5. formulas
+##### 3. formulas
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -493,7 +467,7 @@ HAVING net_quantity > 0
 | created_at | DATETIME | |
 | updated_at | DATETIME | |
 
-##### 6. formula_signals
+##### 4. formula_signals
 公式运行后输出多个信号，每行定义其中一个信号的映射规则
 
 > **触发规则**：公式输出 1 或 -1（纯标记，不表示买卖方向），`trigger_value` 与之匹配则触发。不同公式作者的输出习惯不同（有人用 1=触发，有人用 -1=触发），`trigger_value` 用来兼容各自的习惯。具体操作类型（OPEN/ADD/REDUCE/CLOSE）由 `signal_type` 决定，与公式输出值无关。
@@ -507,7 +481,7 @@ HAVING net_quantity > 0
 | trigger_value | INTEGER | 触发值：1 或 -1，公式输出值等于此值时触发 |
 
 #### 四、策略
-##### 7. portfolio_strategies
+##### 5. portfolio_strategies
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | id | INTEGER PK | | |
@@ -528,7 +502,7 @@ HAVING net_quantity > 0
 | created_at | DATETIME | | |
 | updated_at | DATETIME | | |
 
-##### 8. strategies
+##### 6. strategies
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | id | INTEGER PK | | |
@@ -552,7 +526,7 @@ HAVING net_quantity > 0
 | updated_at | DATETIME | | |
 
 #### 五、回测
-##### 9. backtest_records
+##### 7. backtest_records
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -567,7 +541,7 @@ HAVING net_quantity > 0
 | created_at | DATETIME | |
 | completed_at | DATETIME | |
 
-##### 10. backtest_trades
+##### 8. backtest_trades
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -586,7 +560,7 @@ HAVING net_quantity > 0
 | bar_time | DATETIME | 该 bar 的时间 |
 | created_at | DATETIME | |
 
-##### 11. backtest_daily_snapshots
+##### 9. backtest_daily_snapshots
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -605,7 +579,7 @@ HAVING net_quantity > 0
 
 > 每日快照是评估指标的原始数据来源。回测每个交易日结束时生成一条快照，18 个评估指标由 Evaluator 基于快照序列计算得出。
 
-##### 12. backtest_evaluations
+##### 10. backtest_evaluations
 > 以下 18 个指标均由 Evaluator 从 backtest_daily_snapshots 计算得出，每条记录对应一个回测的 portfolio 或单个 strategy 的评估结果。
 
 | 字段 | 类型 | 说明 |
@@ -635,7 +609,7 @@ HAVING net_quantity > 0
 | created_at | DATETIME | |
 
 #### 六、实盘
-##### 13. live_sessions
+##### 11. live_sessions
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PK | |
@@ -651,7 +625,7 @@ HAVING net_quantity > 0
 
 > **Core 重启恢复**：Core 启动时扫描所有 `status=running` 的 session，自动重建 TQ 订阅（1m/5m bar）和 NATS 连接。恢复失败（如通达信未启动）的 session 自动标记为 `stopped`。多天运行的 session 恢复细节详见「实盘恢复机制」（5.3.3 之后）。
 
-##### 14. live_session_portfolios
+##### 12. live_session_portfolios
 
 一个 session 与多个 portfolio_strategy 的关联表，每行记录一个组合策略在 session 中的状态。虚拟现金不持久化存储，Core 恢复时从 `live_trades` 重算。
 
@@ -667,7 +641,7 @@ HAVING net_quantity > 0
 
 > **唯一约束**：`UNIQUE(session_id, portfolio_strategy_id)`，防止同一 session 重复添加同一组合策略。
 
-##### 15. live_orders
+##### 13. live_orders
 > 实盘订单跟踪表。记录每次下单的状态流转，支持部分成交、拒绝、超时等场景。
 
 | 字段 | 类型 | 说明 |
@@ -692,7 +666,7 @@ HAVING net_quantity > 0
 | created_at | DATETIME | |
 | updated_at | DATETIME | |
 
-##### 16. live_trades
+##### 14. live_trades
 > 实盘成交记录表。每笔实际成交（含部分成交）生成一条记录，用于实盘交易审计和盈亏分析。
 
 | 字段 | 类型 | 说明 |
@@ -769,7 +743,7 @@ ORM（SQLAlchemy）负责数据库的存取，Engine 负责运行时计算。Eng
 
 #### 5.5.2 类清单
 
-##### models/（ORM 层，16 个类，与数据库表一一对应）
+##### models/（ORM 层，14 个类，与数据库表一一对应）
 ```
 models/
 ├── user.py                  # User
@@ -872,7 +846,7 @@ live_trades           ──输出──→  LiveEngine（成交记录写入，�
 ```json
 { "code": 0, "data": { "items": [...], "total": 150, "page": 1, "page_size": 20 } }
 ```
-未传分页参数时返回全量数据（仅限数据量小的接口：股票池列表、组合策略列表、公式列表、用户列表等）。交易明细、快照等大数据量接口必须传分页参数。
+未传分页参数时返回全量数据（仅限数据量小的接口：股票池列表、组合策略列表、公式列表等）。交易明细、快照等大数据量接口必须传分页参数。
 - 返回格式：
 ```json
 { "code": 0, "message": "ok", "data": { ... } }
@@ -882,27 +856,12 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 | code | HTTP | message | 说明 |
 |------|------|---------|------|
 | 0 | 200 | ok | 成功 |
-| 401 | 401 | 未登录，请先登录 | session 过期或无效 |
-| 403 | 403 | 权限不足 | 当前用户角色无权操作 |
 | 404 | 404 | 资源不存在 | 请求的资源未找到 |
 | 409 | 409 | 已有回测正在运行，请等待完成 | 回测并发冲突 |
 | 422 | 422 | 请求参数校验失败 | 参数格式或值不合法 |
 | 500 | 500 | 服务器内部错误 | 未预期的异常 |
 
-#### 5.6.2 认证
-| 方法 | URL | 说明 |
-|------|-----|------|
-| POST | `/api/auth/login` | 登录 |
-| POST | `/api/auth/logout` | 登出 |
-| GET | `/api/auth/me` | 获取当前登录用户信息 |
-
-**POST /api/auth/login**
-```
-请求: { "username": "admin", "password": "admin123" }
-返回: { "code": 0, "data": { "id": 1, "username": "admin", "role": "admin" } }
-```
-
-#### 5.6.3 首页 - 运行状态
+#### 5.6.2 首页 - 运行状态
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/status` | 获取系统运行状态 |
@@ -915,7 +874,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 }}
 ```
 
-#### 5.6.4 股票池
+#### 5.6.3 股票池
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/stock-pools` | 获取股票池列表 |
@@ -938,7 +897,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ]}
 ```
 
-#### 5.6.5 公式管理
+#### 5.6.4 公式管理
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/formulas` | 公式列表 |
@@ -983,7 +942,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 }}
 ```
 
-#### 5.6.6 组合策略
+#### 5.6.5 组合策略
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/portfolios` | 组合策略列表 |
@@ -998,7 +957,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 返回: { "code": 0, "data": { "id": 1 } }
 ```
 
-#### 5.6.7 策略
+#### 5.6.6 策略
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/portfolios/{pid}/strategies` | 策略列表 |
@@ -1012,7 +971,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 返回: { "code": 0, "data": { "id": 1 } }
 ```
 
-#### 5.6.8 回测管理
+#### 5.6.7 回测管理
 | 方法 | URL | 说明 |
 |------|-----|------|
 | POST | `/api/backtest` | 启动回测（非阻塞，子进程执行） |
@@ -1056,7 +1015,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 }}
 ```
 
-#### 5.6.9 实盘交易
+#### 5.6.8 实盘交易
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/live/sessions` | 实盘列表 |
@@ -1106,21 +1065,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ]}
 ```
 
-#### 5.6.10 用户管理（管理员）
-| 方法 | URL | 说明 |
-|------|-----|------|
-| GET | `/api/users` | 用户列表 |
-| POST | `/api/users` | 新增用户 |
-| PUT | `/api/users/{id}` | 编辑用户 |
-| DELETE | `/api/users/{id}` | 删除用户 |
-
-**POST /api/users**
-```
-请求: { "username": "researcher1", "password": "123456", "role": "researcher" }
-返回: { "code": 0, "data": { "id": 2 } }
-```
-
-#### 5.6.11 系统配置（管理员，文件存储）
+#### 5.6.9 系统配置（文件存储）
 系统配置存储在项目根目录 `config.yaml`，不存数据库。
 
 | 方法 | URL | 说明 |
@@ -1154,7 +1099,7 @@ nats:
 返回: { "code": 0 }
 ```
 
-#### 5.6.12 实盘实时推送（WebSocket）
+#### 5.6.10 实盘实时推送（WebSocket）
 > 实盘交易需要实时推送持仓变化、成交回报、信号触发等事件，HTTP 轮询无法满足实时性要求。
 
 | URL | 说明 |
@@ -1177,7 +1122,7 @@ nats:
 - 服务端每 30 秒发送心跳 ping，客户端需回复 pong，60 秒未响应则断开
 - 连接断开后客户端自动重连（指数退避）
 
-#### 5.6.13 接口汇总
+#### 5.6.11 接口汇总
 
 ```
 POST   /api/auth/login
@@ -1226,10 +1171,6 @@ DELETE /api/live/sessions/{id}
 GET    /api/live/sessions/{id}/orders?portfolio_id=1
 GET    /api/live/sessions/{id}/trades?portfolio_id=1
 WS     /api/live/sessions/{id}/stream
-GET    /api/users
-POST   /api/users
-PUT    /api/users/{id}
-DELETE /api/users/{id}
 GET    /api/system/configs
 PUT    /api/system/configs
 ```
@@ -1280,17 +1221,9 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 5. iQuant → Core（NATS）: 返回成交结果
 ```
 
-## 7.用户管理
-### 7.1 系统有三个权限：管理员、研究员、交易员
-### 7.2 管理员：权限是最高权限（全部菜单可用），研究员：实盘交易、系统管理不可用，交易员：系统管理不可用
-### 7.3 系统初始化管理为admin，密码 admin123。首次登录强制修改密码，修改前仅可访问用户管理页面
-### 7.4 前端认证：使用 Session 方式，由 FastAPI 管理，PostgreSQL 存储 session 数据
+## 7.认证
 
-Session 策略：
-- 有效期：24 小时（从最近一次操作算起）
-- 滑动过期：每次请求自动续期，连续 24 小时无操作则过期
-- 过期后 API 返回 `{ "code": 401, "message": "未登录" }`，前端跳转登录页，不清除其他页面本地状态
-- 服务端定时任务每小时清理已过期的 session 记录
+无用户认证。系统为单机单用户设计，无登录页，无 Session，无角色权限。前端直接展示功能界面，后端所有接口无需鉴权。
 
 ## 8.系统统一规则
 ### 8.1 系统中的股票代码统一都用带后缀的 如000001.SZ
@@ -1298,12 +1231,12 @@ Session 策略：
 
 ## 9.须明确的事项
 ### 9.1 【已明确】策略资金模型规则→详见 5.3.2 业务边界第 8-9 条
-### 9.2 【已明确】数据库表设计（16 张表）→详见 5.4
+### 9.2 【已明确】数据库表设计（14 张表）→详见 5.4
 ### 9.3 【已明确】自研框架类设计→详见 5.5
 ### 9.4 【已明确】natsio 消息格式与 Subject 设计→详见第 6 章
 ### 9.5 【已明确】实盘执行时机→下一个 bar 的 open，详见 5.3.2 业务边界第 3 条
 ### 9.6 【已明确】策略周期数据来源→通达信接口自动合成，详见 5.3.2 策略参数第 2 条
-### 9.7 【已明确】REST API 协议设计→详见 5.6（11 组，51 个 HTTP 接口 + 1 个 WebSocket）
+### 9.7 【已明确】REST API 协议设计→详见 5.6（11 组，44 个 HTTP 接口 + 1 个 WebSocket，无鉴权）
 ### 9.8 待明确：日志、监控、告警机制设计
 
 ## 10.开发顺序
@@ -1320,7 +1253,7 @@ Session 策略：
 ### 第二阶段：数据层（依赖第一阶段）
 | # | 任务 | 内容 |
 |---|------|------|
-| 6 | 数据库 | 16 张表 SQLAlchemy ORM 定义 + Alembic 迁移初始化 |
+| 6 | 数据库 | 14 张表 SQLAlchemy ORM 定义 + Alembic 迁移初始化 |
 | 7 | nats_client | Core 侧 natsio 客户端封装 |
 | 8 | 前端框架 | 路由、功能树框架、页面占位 |
 | 9 | 测试框架 | 配置 pytest + vitest，编写 conftest.py（测试数据库 fixtures，用独立 PostgreSQL 测试库或内存 SQLite） |
@@ -1360,10 +1293,9 @@ Session 策略：
 ### 第七阶段：系统收尾
 | # | 任务 | 内容 |
 |---|------|------|
-| 26 | 用户管理 | 先写测试 → 用户增删改查 + 角色权限 API + 页面 |
-| 27 | 系统配置 | 先写测试 → 配置文件读写 API（config.yaml）+ 页面 |
-| 28 | 首页仪表盘 | 运行状态展示 + 组件测试 |
-| 29 | 日志监控 | 日志、监控、告警机制 |
+| 26 | 系统配置 | 先写测试 → 配置文件读写 API（config.yaml）+ 页面 |
+| 27 | 首页仪表盘 | 运行状态展示 + 组件测试 |
+| 28 | 日志监控 | 日志、监控、告警机制 |
 
 ### 依赖关系图
 ```
@@ -1379,5 +1311,5 @@ Session 策略：
       │
 六: [23]→[24]→[25]
       │
-七: [26][27][28][29]
+七: [26][27][28]
 ```
