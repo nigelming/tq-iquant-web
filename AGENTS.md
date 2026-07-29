@@ -11,12 +11,20 @@
 ## 核心架构（4 模块）
 
 ```
-Core (main, Python 3.13) ──NATS──→ iQuant Gateway (live, Python 3.6.8)
+Core (main, Python 3.13) ──NATS──→ iQuant Gateway (live, Python 3.7)
   └─ 同进程嵌入 TQ 模块（通达信，直接函数调用，不走 NATS）
-Web 前端 (Vue 3 + Vite) ←HTTP→ Core (FastAPI)
+Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 ```
 
-**关键约束**：两个独立的 uv 虚拟环境。`main/` 用 Python 3.13，`live/` 用 Python 3.6.8。
+**关键约束**：两个独立的 uv 虚拟环境。`main/` 用 Python 3.13，`live/` 用 Python 3.7。
+
+> **Python 版本说明**：国信 iQuant 自带 Python 3.6.8，但 xquant(xtquant) 也支持 Python 3.7。live 环境用 3.7 是因为 NATS 客户端(nats-py)最低要求 3.7，且 3.6 已 EOL。
+
+> **shared 包兼容性**：`shared/` 包被 main(3.13) 和 live(3.7) 共同引用，代码必须兼容 Python 3.7（不可用 walrus `:=`、match、pydantic v2 等）。数据结构用 dataclasses 或 pydantic v1。
+
+> **时区**：所有时间按 Asia/Shanghai 处理，bar 时间判断基于上海时间。
+
+> **数据库迁移**：使用 Alembic 管理 schema 变更，禁止手动改表结构。
 
 ## 开发命令
 
@@ -44,14 +52,19 @@ Web 前端 (Vue 3 + Vite) ←HTTP→ Core (FastAPI)
 - 基础路径：`/api`
 - 认证：Session（cookie 自动携带）
 - 统一返回格式：`{ "code": 0, "message": "ok", "data": { ... } }`（code=0 成功，非 0 错误）
-- 43 个接口，11 组（详见设计文档 5.6 节）
+- 51 个 HTTP 接口 + 1 个 WebSocket，11 组（详见设计文档 5.6 节）
+- 实盘实时推送通过 WebSocket（`WS /api/live/sessions/{id}/stream`），非轮询
 
-## 数据库（SQLAlchemy ORM，13 张表）
+## 数据库（PostgreSQL + SQLAlchemy ORM，16 张表）
 
 详见设计文档 5.4 节。关键点：
-- `config.yaml`（项目根目录）存储系统路径配置，**不存数据库**
+- 使用 PostgreSQL，通过 MVCC 解决回测子进程并发写入冲突
+- `config.yaml`（项目根目录）存储系统路径配置，**不存数据库密码**（密码从环境变量 `TQ_DB_PASSWORD` 读取）
 - 每日快照 `backtest_daily_snapshots` 是评估指标的原始数据来源
 - `backtest_evaluations` 18 个指标由 Evaluator 从快照序列计算
+- `backtest_records.params_snapshot` 冻结回测时的策略参数，确保结果可复现
+- 实盘交易记录：`live_orders`（订单状态跟踪）+ `live_trades`（成交记录）
+- 多组合策略实盘：`live_session_portfolios` 关联表，一个 session 可含多个组合策略，共享 iQuant 账户，各组合策略独立维护虚拟持仓和虚拟现金
 
 ## 并发模型
 
@@ -64,13 +77,15 @@ Web 前端 (Vue 3 + Vite) ←HTTP→ Core (FastAPI)
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
 - **复权方式**：统一前复权
 - **TQ 数据传递**：polars DataFrame 进程内传递（不走 NATS）
-- **NATS 仅用于 Core↔iQuant 通信**，3 个 subject（下单/持仓查询/状态）
+- **NATS 仅用于 Core↔iQuant 通信**，5 个 subject（下单/查订单/撤单/持仓查询/状态）
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
 - **资金模型**：策略资金占比是持仓上限（非预分），多策略上限之和可超过 100%
 - **T+1 约束**：回测强制 T+1，实盘实时查可用股票
-- **熔断规则**：max_drawdown 触发 → 次日恢复；daily_loss_limit 触发 → 当日暂停，次日恢复。熔断期间不清仓，仅暂停新开仓
-- **主从策略**：从策略只能在主策略持有股票时买入
+- **熔断规则**：max_drawdown 触发 → 次日恢复（累计触发 3 次后转手动恢复）；daily_loss_limit 触发 → 当日暂停，次日恢复。熔断期间不清仓，仅暂停新开仓
+- **主从策略**：从策略只能在主策略持有任意股票时买入；主策略清仓后从策略不可新开仓但存量可自行卖出
 - **一个 5m bar 可能同时触发多个周期**（如 10:30 同时触发 5m+30m+60m 公式）
+- **多组合策略实盘**：一个 live session 可含多个组合策略，共享 iQuant 账户下单，各组合策略独立维护虚拟持仓（Per Portfolio）和虚拟现金（基于成本，非市值）。Core 重启时从 `live_trades` 按 `portfolio_strategy_id` 聚合重算虚拟持仓和虚拟现金
+- **回测仅支持单组合策略**：每次回测针对一个 `portfolio_strategy_id`，多组合策略交互行为仅在实盘体现
 
 ## 关键路径与配置文件
 
@@ -79,13 +94,13 @@ Web 前端 (Vue 3 + Vite) ←HTTP→ Core (FastAPI)
 | `main/core/main.py` | FastAPI 入口 |
 | `main/core/engine/` | 自研回测/交易框架（事件驱动，polars 核心） |
 | `main/core/tq/` | 通达信 TQ 模块（嵌入 Core 同进程） |
-| `live/iguant_gateway/` | 国信 iQuant 网关（Python 3.6.8） |
+| `live/iguant_gateway/` | 国信 iQuant 网关（Python 3.7） |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、iQuant 路径等） |
 
 ## 测试注意事项
 
-- 后端测试需要 `conftest.py` 提供测试数据库 fixtures（独立的 SQLite）
+- 后端测试需要 `conftest.py` 提供测试数据库 fixtures（使用独立 PostgreSQL 测试库或内存 SQLite）
 - 前端测试在 `web/src/__tests__/` 目录
 - 引擎模块的单元测试应使用 Mock 数据，无需连接通达信
 - 集成测试需小数据集端到端验证
