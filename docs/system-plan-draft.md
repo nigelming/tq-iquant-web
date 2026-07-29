@@ -16,7 +16,7 @@
 
 > **数据库迁移**：使用 Alembic 管理 SQLAlchemy ORM 的 schema 变更。每次表结构修改需生成 migration 脚本，通过 `alembic upgrade head` 应用。禁止手动修改数据库表结构。
 ### 1.5web前端：使用Vue 3 + Vite + Pinia（状态管理），开发期 dev server 代理 API，生产期由 FastAPI 直接托管静态文件
-### 1.6核心后端：使用fastapi，数据库使用PostgreSQL
+### 1.6核心后端：使用fastapi，开发期数据库使用SQLite（`main/dev.db`），生产期切换到PostgreSQL
 ### 1.7 开发模式：TDD（测试驱动开发），先写测试，再写实现。pytest（后端）+ vitest（前端）
 ### 1.8 项目目录结构：
     tq-iquant-web/
@@ -435,7 +435,7 @@ HAVING net_quantity > 0
 
 ### 5.4 数据库表设计（使用 PostgreSQL + SQLAlchemy ORM，14 张表）
 
-> 使用 PostgreSQL 替代 SQLite，利用 MVCC 解决回测子进程并发写入 + 主进程读取的冲突问题
+> 开发期使用 SQLite（`main/dev.db`），Alembic 配置已预设。生产期切换到 PostgreSQL，利用 MVCC 解决回测子进程并发写入 + 主进程读取的冲突问题。切换只需修改 `alembic.ini` 中的 `sqlalchemy.url`。
 
 #### 一、通达信
 ##### 1. stock_pools

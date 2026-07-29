@@ -57,10 +57,12 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 - 44 个 HTTP 接口 + 1 个 WebSocket，9 组（详见设计文档 5.6 节）
 - 实盘实时推送通过 SSE（`GET /api/live/sessions/{id}/stream`），非轮询
 
-## 数据库（PostgreSQL + SQLAlchemy ORM，14 张表）
+## 数据库（SQLite 开发 / PostgreSQL 生产）
 
 详见设计文档 5.4 节。关键点：
-- 使用 PostgreSQL，通过 MVCC 解决回测子进程并发写入冲突
+- **开发期**：SQLite（`main/dev.db`），零配置
+- **生产期**：PostgreSQL，通过 MVCC 解决回测子进程并发写入冲突
+- 切换方式：修改 `alembic.ini` 的 `sqlalchemy.url`
 - `config.yaml`（项目根目录）存储系统路径配置，**不存数据库密码**（密码从环境变量 `TQ_DB_PASSWORD` 读取）
 - 每日快照 `backtest_daily_snapshots` 是评估指标的原始数据来源
 - `backtest_evaluations` 18 个指标由 Evaluator 从快照序列计算
