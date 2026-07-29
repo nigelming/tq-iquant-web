@@ -33,7 +33,7 @@
     │   │   │   ├── backtest.py        # 回测
     │   │   │   ├── live.py            # 实盘交易
     │   │   │   └── system.py          # 系统配置
-    │   │   ├── models/                # SQLAlchemy ORM 模型（16个）
+    │   │   ├── models/                # SQLAlchemy ORM 模型（14个）
     │   │   │   ├── __init__.py
 │   │   │   ├── stock_pool.py
     │   │   │   ├── stock_pool_stock.py
@@ -196,8 +196,7 @@ iQuant 网关进程独立于 Core 运行，不随 Core 重启而退出：
     3、组合策略：定义组合策略实例，组合策略实例添加对应策略实例，组合策略实例包括：组合策略的风控、初始资金、对应股票池、交易成本等，策略实例包括：策略的风控、策略使用的公式
     4、回测管理：确定回测开始结束时间、组合策略回测、回测记录查看、回测结果指标展示
     5、实盘交易：新建实盘、包括模拟和实盘两种模式
-    6、系统管理：包括用户管理和系统配置
-        用户管理：添加、删除、编辑用户
+    6、系统管理：系统配置
         系统配置：回测通达信目录设置、实盘通达信目录设置、iquant目录设置（存储在 config.yaml，非数据库）
 
 ## 5.核心后端
@@ -806,7 +805,7 @@ engine/
 │
 └── live_engine.py           # 实盘引擎
     └── LiveEngine           # 管理多个 Portfolio 实例；TQ 回调接收 bar → 按 portfolio 分发信号 → 事件分发 → 执行
-                              # NATS 对接 iQuant 网关下单；订单状态跟踪（live_orders）；成交记录（live_trades）；WebSocket 推送
+                              # NATS 对接 iQuant 网关下单；订单状态跟踪（live_orders）；成交记录（live_trades）；SSE 推送
 ```
 
 #### 5.5.3 数据库表与运行时对象对应关系
@@ -837,7 +836,7 @@ live_trades           ──输出──→  LiveEngine（成交记录写入，�
 
 #### 5.6.1 通用规范
 - 基础路径：`/api`
-- 认证：Session，登录后 cookie 自动携带
+- 无鉴权，所有接口直接可访问（单用户系统）
 - 分页：所有列表接口支持 `page`（页码，从 1 开始）和 `page_size`（每页条数，默认 20，最大 100）查询参数。返回格式：
 ```json
 { "code": 0, "data": { "items": [...], "total": 150, "page": 1, "page_size": 20 } }
@@ -1094,29 +1093,43 @@ nats:
 请求: { "tdx_backtest_path": "D:\\tdx\\data", "tdx_live_path": "D:\\tdx\\data2", "iquant_path": "D:\\iquant", "max_concurrent_backtest": 1, "database": { "host": "localhost", "port": 5432, "database": "tq_iquant", "user": "postgres" }, "nats": { "url": "nats://localhost:4222" } }
 返回: { "code": 0 }
 ```
+#### 5.6.10 实盘实时推送（SSE）
 
-#### 5.6.10 实盘实时推送（WebSocket）
-> 实盘交易需要实时推送持仓变化、成交回报、信号触发等事件，HTTP 轮询无法满足实时性要求。
+> 实盘交易需要实时推送持仓变化、成交回报、信号触发等事件，HTTP 轮询无法满足实时性要求。使用 Server-Sent Events（SSE）实现服务端到前端的单向推送。
 
 | URL | 说明 |
 |-----|------|
-| `WS /api/live/sessions/{id}/stream` | 实盘 session 实时事件流 |
+| `GET /api/live/sessions/{id}/stream` | 实盘 session 实时事件流 |
 
 **连接认证**：无鉴权，直接连接。
 
-**推送消息类型**（所有事件均带 `portfolio_id` 字段）：
+**事件类型**（所有事件均带 `portfolio_id` 字段）：
 ```json
-{ "type": "signal", "data": { "portfolio_id": 1, "strategy_id": 1, "stock_code": "000001.SZ", "signal_name": "买入", "signal_type": "OPEN", "bar_time": "2024-01-02T10:30:00" } }
-{ "type": "order", "data": { "portfolio_id": 1, "order_id": 1, "status": "filled", "filled_quantity": 1000, "filled_price": 10.50 } }
-{ "type": "trade", "data": { "portfolio_id": 1, "trade_id": 1, "stock_code": "000001.SZ", "trade_type": "BUY", "price": 10.50, "quantity": 1000, "amount": 10500 } }
-{ "type": "position", "data": { "portfolio_id": 1, "stock_code": "000001.SZ", "quantity": 1000, "avg_cost": 10.50, "market_value": 10500, "pnl": 0 } }
-{ "type": "risk", "data": { "portfolio_id": 1, "rule": "max_drawdown", "triggered": true, "message": "最大回撤熔断触发" } }
+// 信号触发
+event: signal
+data: { "portfolio_id": 1, "strategy_id": 1, "stock_code": "000001.SZ", "signal_name": "买入", "signal_type": "OPEN", "bar_time": "2024-01-02T10:30:00" }
+
+// 订单状态
+event: order
+data: { "portfolio_id": 1, "order_id": 1, "status": "filled", "filled_quantity": 1000, "filled_price": 10.50 }
+
+// 成交回报
+event: trade
+data: { "portfolio_id": 1, "trade_id": 1, "stock_code": "000001.SZ", "trade_type": "BUY", "price": 10.50, "quantity": 1000, "amount": 10500 }
+
+// 持仓变化
+event: position
+data: { "portfolio_id": 1, "stock_code": "000001.SZ", "quantity": 1000, "avg_cost": 10.50, "market_value": 10500, "pnl": 0 }
+
+// 风控触发
+event: risk
+data: { "portfolio_id": 1, "rule": "max_drawdown", "triggered": true, "message": "最大回撤熔断触发" }
 ```
 
 **约束**：
-- 每个 WebSocket 连接绑定一个 live session
-- 服务端每 30 秒发送心跳 ping，客户端需回复 pong，60 秒未响应则断开
-- 连接断开后客户端自动重连（指数退避）
+- 每个 SSE 连接绑定一个 live session
+- 服务端每 30 秒发送 `event: ping` 心跳，浏览器自动保持连接
+- 连接断开后浏览器 `EventSource` 自动重连（原生行为，无需重连逻辑）
 
 #### 5.6.11 接口汇总
 
@@ -1163,7 +1176,7 @@ PUT    /api/live/sessions/{id}
 DELETE /api/live/sessions/{id}
 GET    /api/live/sessions/{id}/orders?portfolio_id=1
 GET    /api/live/sessions/{id}/trades?portfolio_id=1
-WS     /api/live/sessions/{id}/stream
+GET    /api/live/sessions/{id}/stream     # SSE
 GET    /api/system/configs
 PUT    /api/system/configs
 ```
@@ -1229,7 +1242,7 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 ### 9.4 【已明确】natsio 消息格式与 Subject 设计→详见第 6 章
 ### 9.5 【已明确】实盘执行时机→下一个 bar 的 open，详见 5.3.2 业务边界第 3 条
 ### 9.6 【已明确】策略周期数据来源→通达信接口自动合成，详见 5.3.2 策略参数第 2 条
-### 9.7 【已明确】REST API 协议设计→详见 5.6（11 组，44 个 HTTP 接口 + 1 个 WebSocket，无鉴权）
+### 9.7 【已明确】REST API 协议设计→详见 5.6（9 组，44 个 HTTP 接口 + 1 个 SSE）
 ### 9.8 待明确：日志、监控、告警机制设计
 
 ## 10.开发顺序
@@ -1280,7 +1293,7 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 |---|------|------|
 | 22 | 实盘引擎 | live_engine.py（TQ 回调接收 bar）+ 单元测试 |
 | 23 | iQuant 网关 | 下单、订单查询、撤单、持仓查询、状态（NATS 通信）+ Mock 测试 |
-| 24 | 实盘管理 | 先写测试 → 创建/启动/停止/订单/成交查询 API + WebSocket 推送 + 前端页面 |
+| 24 | 实盘管理 | 先写测试 → 创建/启动/停止/订单/成交查询 API + SSE 推送 + 前端页面 |
 
 ### 第七阶段：系统收尾
 | # | 任务 | 内容 |

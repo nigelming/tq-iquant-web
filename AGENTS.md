@@ -54,8 +54,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 - 基础路径：`/api`
 - 无鉴权，API 直接可访问
 - 统一返回格式：`{ "code": 0, "message": "ok", "data": { ... } }`（code=0 成功，非 0 错误）
-- 44 个 HTTP 接口 + 1 个 WebSocket，11 组（详见设计文档 5.6 节）
-- 实盘实时推送通过 WebSocket（`WS /api/live/sessions/{id}/stream`），非轮询
+- 44 个 HTTP 接口 + 1 个 WebSocket，9 组（详见设计文档 5.6 节）
+- 实盘实时推送通过 SSE（`GET /api/live/sessions/{id}/stream`），非轮询
 
 ## 数据库（PostgreSQL + SQLAlchemy ORM，14 张表）
 

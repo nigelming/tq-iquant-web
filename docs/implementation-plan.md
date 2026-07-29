@@ -164,7 +164,7 @@ def test_validate_stock_code():
 4. `stock_utils.py` — 工具函数
 5. 测试：`main/` 和 `live/` 都能 `import tq_iquant_shared`
 
-### 2.2 数据库模型（16 张 ORM 表）
+### 2.2 数据库模型（14 张 ORM 表）
 
 ```
 main/core/models/
@@ -733,7 +733,7 @@ class LiveEngine:
     portfolios: List[Portfolio]          # 多个组合策略
     tq_client: TQClient                  # TDX 订阅
     nats_client: NatsClient              # iQuant 通信
-    ws_manager: WebSocketManager         # 实时推送
+    sse_manager: SSEManager               # SSE 实时推送
 
     async def start(self) -> None
         """加载配置 → 重建虚拟持仓 → 恢复未完成订单 → 订阅 bar"""
@@ -802,7 +802,7 @@ async def handle_place_order(msg):
 - xtquant API 封装（下单/撤单/查询）
 - 网关无状态，所有订单状态由 Core 管理
 
-### 6.3 实盘管理 API + 前端 + WebSocket
+### 6.3 实盘管理 API + 前端 + SSE
 
 ```
 POST   /api/live/sessions                # { "name": "...", "mode": "simulation", "portfolio_ids": [1,2] }
@@ -814,29 +814,25 @@ PUT    /api/live/sessions/{id}
 DELETE /api/live/sessions/{id}
 GET    /api/live/sessions/{id}/orders?portfolio_id=1
 GET    /api/live/sessions/{id}/trades?portfolio_id=1
-WS     /api/live/sessions/{id}/stream?token=...
+WS     /api/live/sessions/{id}/stream
 ```
 
-**WebSocket 前端**：
+**SSE 前端**：
 ```typescript
 // web/src/stores/live.ts
-const ws = new WebSocket(`ws://localhost:8000/api/live/sessions/${id}/stream?token=${token}`)
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data)
-  switch (msg.type) {
-    case 'signal':    // 信号触发
-    case 'order':     // 订单状态
-    case 'trade':     // 成交
-    case 'position':  // 持仓变化
-    case 'risk':      // 风控触发
-  }
-}
+const sse = new EventSource(`/api/live/sessions/${id}/stream`)
+sse.addEventListener('signal',   (e) => { /* 信号触发 */ })
+sse.addEventListener('order',    (e) => { /* 订单状态 */ })
+sse.addEventListener('trade',    (e) => { /* 成交 */ })
+sse.addEventListener('position', (e) => { /* 持仓变化 */ })
+sse.addEventListener('risk',     (e) => { /* 风控触发 */ })
+sse.addEventListener('ping',     (e) => { /* 心跳，无需处理 */ })
 ```
 
 **TDD 顺序**：
 1. live session API 集成测试（含多组合策略场景）
 2. LiveService（Engine 生命周期管理 + NAS 下单）
-3. WebSocket 推送
+3. SSE 推送
 4. 前端实盘管理页面
 
 ---
