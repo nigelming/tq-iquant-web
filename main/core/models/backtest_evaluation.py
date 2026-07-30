@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Numeric, DateTime
+from sqlalchemy import Column, Integer, String, ForeignKey, Numeric, DateTime, Index
 from sqlalchemy.sql import func
 
 from .base import Base
@@ -8,7 +8,7 @@ class BacktestEvaluation(Base):
     __tablename__ = "backtest_evaluations"
 
     id = Column(Integer, primary_key=True)
-    backtest_record_id = Column(Integer, ForeignKey("backtest_records.id"), nullable=False)
+    backtest_record_id = Column(Integer, ForeignKey("backtest_records.id", ondelete="CASCADE"), nullable=False)
     target_type = Column(String(10), nullable=False)
     target_id = Column(Integer, nullable=False)
     total_return = Column(Numeric(10, 4), nullable=True)
@@ -30,3 +30,12 @@ class BacktestEvaluation(Base):
     ulcer_index = Column(Numeric(10, 4), nullable=True)
     return_stability = Column(Numeric(10, 4), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_backtest_evaluations_rec_target",
+            "backtest_record_id",
+            "target_type",
+            "target_id",
+        ),
+    )

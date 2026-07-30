@@ -8,9 +8,9 @@ class Strategy(Base):
     __tablename__ = "strategies"
 
     id = Column(Integer, primary_key=True)
-    portfolio_id = Column(Integer, ForeignKey("portfolio_strategies.id"), nullable=False)
+    portfolio_id = Column(Integer, ForeignKey("portfolio_strategies.id", ondelete="CASCADE"), nullable=False)
     name = Column(String(100), nullable=False)
-    formula_id = Column(Integer, ForeignKey("formulas.id"), nullable=False)
+    formula_id = Column(Integer, ForeignKey("formulas.id", ondelete="RESTRICT"), nullable=False)
     period = Column(String(5), nullable=False)
     role = Column(String(15), nullable=False)
     master_strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=True)

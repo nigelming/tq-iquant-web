@@ -8,7 +8,7 @@ class BacktestRecord(Base):
     __tablename__ = "backtest_records"
 
     id = Column(Integer, primary_key=True)
-    portfolio_strategy_id = Column(Integer, ForeignKey("portfolio_strategies.id"), nullable=False)
+    portfolio_strategy_id = Column(Integer, ForeignKey("portfolio_strategies.id", ondelete="RESTRICT"), nullable=False)
     name = Column(String(100), nullable=False)
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)

@@ -9,7 +9,7 @@ class PortfolioStrategy(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
-    stock_pool_id = Column(Integer, ForeignKey("stock_pools.id"), nullable=False)
+    stock_pool_id = Column(Integer, ForeignKey("stock_pools.id", ondelete="RESTRICT"), nullable=False)
     benchmark_index = Column(String(20), default="000300.SH")
     initial_capital = Column(Numeric(15, 2), default=500000)
     max_drawdown = Column(Numeric(5, 4), default=0.2000)
