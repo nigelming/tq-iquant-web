@@ -4,10 +4,7 @@ iquant_path: D:\iquant
 max_concurrent_backtest: 1
 
 database:
-  host: localhost
-  port: 5432
-  database: tq_iquant
-  user: postgres
+  sqlite_path: dev.db
 
 nats:
   url: nats://localhost:4222

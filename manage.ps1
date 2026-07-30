@@ -27,7 +27,6 @@ switch ($Action) {
         $bp = Get-BackendPid
         if (-not $bp) {
             Write-Host "Starting backend on port $backend_port ..." -ForegroundColor Cyan
-            $env:TQ_DB_PASSWORD = ""
             $log = Join-Path $backend_dir "server.log"
             Start-Process -NoNewWindow -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardOutput $log
             Start-Sleep 3
