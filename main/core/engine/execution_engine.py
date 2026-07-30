@@ -1,10 +1,12 @@
 from abc import ABC, abstractmethod
+from datetime import date
 from decimal import Decimal
 from typing import Optional
 
 from .event import OrderEvent, TradeEvent
 from .account import Account
 from .position import Position
+from tq_iquant_shared.constants import TradeType, SignalType
 
 
 class OrderDispatcher(ABC):
@@ -15,7 +17,7 @@ class OrderDispatcher(ABC):
 
 class T1Checker(ABC):
     @abstractmethod
-    def get_available_shares(self, stock_code: str, portfolio_id: int) -> int:
+    def get_available_shares(self, position: Position, query_date: date) -> int:
         ...
 
 
@@ -38,12 +40,14 @@ class SimulatedDispatcher(OrderDispatcher):
             commission=Decimal("5") if price * order.quantity < 20000 else price * order.quantity * Decimal("0.00025"),
             stamp_duty=price * order.quantity * Decimal("0.0005") if order.trade_type.value == "SELL" else Decimal("0"),
             trade_time=order.bar_time,
+            signal_type=order.signal_type,
         )
 
 
 class SimulatedT1Checker(T1Checker):
-    def get_available_shares(self, stock_code: str, portfolio_id: int) -> int:
-        return 999999
+    def get_available_shares(self, position: Position, query_date: date) -> int:
+        # T+1：query_date 之前买入的份额可卖，当日买入不可卖
+        return position.available_shares_on(query_date)
 
 
 class ExecutionEngine:
@@ -66,8 +70,10 @@ class ExecutionEngine:
                 return None
             order.quantity = qty
         else:
+            if position is None or order.bar_time is None:
+                return None
             available = self._t1_checker.get_available_shares(
-                order.stock_code, order.portfolio_id
+                position, order.bar_time.date()
             )
             qty = min(order.quantity, available)
             if qty < 100:
@@ -78,10 +84,10 @@ class ExecutionEngine:
         if not trade:
             return None
 
-        if order.trade_type.value == "BUY":
-            account.deduct_cash(trade.amount + trade.commission + trade.stamp_duty)
-        else:
-            account.add_cash(trade.amount - trade.commission - trade.stamp_duty)
+        # 统一用 apply_trade 更新账户和持仓
+        account.apply_trade(trade)
+        if position is not None:
+            position.apply_trade(trade)
 
         return trade
 
@@ -91,4 +97,13 @@ class ExecutionEngine:
         qty = int(position.quantity * ratio / 100) * 100
         if qty < 100:
             return None
-        return None
+        return OrderEvent(
+            strategy_id=0,
+            portfolio_id=0,
+            stock_code=position.stock_code,
+            trade_type=TradeType.SELL,
+            signal_type=SignalType.REDUCE,
+            quantity=qty,
+            price=None,
+            bar_time=None,
+        )

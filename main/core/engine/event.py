@@ -53,3 +53,4 @@ class TradeEvent:
     commission: Decimal
     stamp_duty: Decimal
     trade_time: datetime
+    signal_type: Optional[SignalType] = None
