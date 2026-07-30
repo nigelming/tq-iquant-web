@@ -5,6 +5,64 @@
 
 ---
 
+## 实现状态（截至 2026-07-30）
+
+> 本节由 Claude Code 在从 opencode 迁移开发后补充，记录**真实完成度**。
+> 文末进度表曾由 opencode 标注为全 100%，但实际多数模块为脚手架/桩代码，已据实修正。
+
+**图例**：✅ 已实现　⚠️ 部分实现/有缺陷　❌ 未实现/桩代码
+
+### 总体
+
+opencode 已完成项目脚手架搭建：4 模块结构、14 张 ORM 表、7 个 API 路由注册、NATS 客户端、前端 5 视图、引擎层类骨架。但**核心业务逻辑多为空桩**（回测引擎空循环、实盘引擎全 `pass`、多数 API 返回 `{"code":0,"data":[]}`、iQuant 网关全 mock）。
+
+### P0 配置链修复（2026-07-30 已完成）
+
+原 `main/core/db.py` 硬编码 `sqlite:///./dev.db`、`main/alembic/env.py` 走 `alembic.ini` 硬编码 url，与 `config.yaml` 脱节。已统一为：db.py 与 alembic/env.py 均从 `core.config.load_config()` 读 `database.sqlite_path`；config.yaml 精简为仅 SQLite 配置（删 PG 的 host/port/user/password，未来切 PG 再加回）；config.py 引入 `_deep_merge` 修复嵌套配置默认值丢失。连带清理 `.env.template`、`manage.ps1` 的 `TQ_DB_PASSWORD`。详见 `docs/status-audit.md`（如已生成）。
+
+### 分阶段真实状态
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| 1.1 main 环境 | ✅ | FastAPI app + /health |
+| 1.2 live 环境 | ✅ | 骨架 + mock 网关 |
+| 1.3 前端项目 | ⚠️ | Vite+Vue+路由齐；Pinia 已装未启用，无 stores；无 SSE |
+| 1.4 数据库 | ✅ | 现阶段固定 SQLite（P0 修复后配置链通）；docker-compose.yml 保留备用 |
+| 1.5 NATS 连通测试 | ❌ | `test_nats_connectivity.py` 不存在 |
+| 2.1 shared 包 | ✅ | constants/nats_schemas/stock_utils 齐 |
+| 2.2 14 张 ORM 表 | ⚠️ | 14 表全齐；但 `live_session_portfolios` 缺 `circuit_breaker_count/created_at/updated_at` |
+| 2.3 Alembic | ⚠️ | init + 迁移在；env.py 已接 config（P0 修复）；**级联删除仅 1 处、索引全缺** |
+| 2.4 NATS 客户端 | ⚠️ | main 侧 NatsClient 在；live 侧无独立 nats_client 目录（网关内联） |
+| 2.5 测试框架 | ⚠️ | conftest 在但 `dependency_overrides["get_db"]` 用字符串 key 是 bug；测试实际在 `core/tests/` 非计划写的 `tests/` |
+| 3.1 TQ 模块 | ⚠️ | 接口骨架齐；`utils.py` 硬编码 `D:\new_tdx64` 路径；未实测连通通达信 |
+| 3.2 公式 API+前端 | ❌ | API 仅 list 桩，缺 9 个；无前端公式页 |
+| 4.1 事件系统 | ✅ | 5 类 event 齐；EventBus 风控优先已实现 |
+| 4.2 数据源+账户+持仓 | ⚠️ | account/position 已实现；**`data_feed.py` 不存在** |
+| 4.3 策略运行时+风控 | ⚠️ | risk_manager 已实现；strategy_context.get_signal 返回 `[]`；SignalEngine 框架；ExecutionEngine 部分 + `reduce_by_ratio` 末尾 `return None` bug |
+| 4.4 组合策略运行时 | ⚠️ | Portfolio 骨架在；`on_bar` 是 `pass` |
+| 4.5 回测引擎 | ❌ | `BacktestEngine.run` 空循环桩，无逐 bar 推进 |
+| 5.1 评估模块 | ⚠️ | Evaluator 实算约 12/18 指标；win_rate/profit_factor 等 6 个硬编码 0（入参缺 trades） |
+| 5.2 股票池 API+前端 | ⚠️ | API 3/5；前端仅列表展示，无新增/同步操作 |
+| 5.3 策略 API+前端 | ❌ | API 1/4（list 桩）；缺 strategies 路由 |
+| 5.4 回测 API+前端 | ❌ | API 1/6；**缺 `POST /api/backtest` 启动 + 409 并发冲突** |
+| 6.1 实盘引擎 | ❌ | LiveEngine 4 方法全 `pass`；recover 未实现 |
+| 6.2 iQuant 网关 | ⚠️ | 骨架在但全 mock；无 trade/nats_client 子目录 |
+| 6.3 实盘 API+前端+SSE | ⚠️ | session CRUD 7/11；SSE 仅 ping 心跳；缺 portfolio 级 start/stop、orders、trades |
+| 7.1 系统配置 | ✅ | GET/PUT configs + 前端页 |
+| 7.2 首页仪表盘 | ⚠️ | `/api/status` 在但 iguant_gateway 固定 false；前端无仪表盘页 |
+| 7.3 日志/监控/告警 | ⚠️ | logging_config 在；监控/告警骨架缺 |
+
+### 待办优先级（下一步）
+
+1. **P0**：补 `live_session_portfolios` 缺字段 + 新迁移（熔断恢复数据基础）
+2. **P0**：补级联删除 + 设计要求的 9 组索引
+3. **P1**：实现 `BacktestEngine.run` 真实逐 bar 逻辑 + `POST /api/backtest`
+4. **P1**：补 `data_feed.py`、修 `execution_engine.reduce_by_ratio` bug、补 `StrategyContext.get_signal`
+5. **P2**：Evaluator 缺失 6 指标、`LiveEngine.recover`、services 层、前端写操作 + SSE 双端
+6. **P3**：修 TQ utils 硬编码路径、conftest override key bug、文档表数量/进度表
+
+---
+
 ## 第一阶段：基础设施（无依赖，可并行）
 
 ### 1.1 main 环境
@@ -77,6 +135,8 @@ tq-iquant-web/web/
 **验收标准**：`npm run dev` 启动，`npx vitest run` 通过。
 
 ### 1.4 PostgreSQL
+
+> **现状（2026-07-30）**：现阶段**固定使用 SQLite**，不启 PostgreSQL。`docker-compose.yml` 保留备用（未来切 PG 时现成配置），但开发期不依赖。`TQ_DB_PASSWORD` 环境变量已从 `.env.template`/`manage.ps1` 移除。
 
 ```yaml
 # docker-compose.yml（项目根目录）
@@ -196,11 +256,14 @@ main/core/models/
 
 ### 2.3 Alembic 初始化
 
+> **现状（2026-07-30）**：init 迁移已生成（`97323b81fdcc_init_14_tables.py`，14 张表）。`alembic/env.py` 已接入 `core.config.load_config()` 读 `database.sqlite_path`，`alembic.ini` 的 `sqlalchemy.url` 已置空（P0 配置链修复）。
+> **遗留**：设计要求的级联删除规则仅落地 1 处（live_session_portfolios→live_sessions CASCADE），索引设计（9 组）完全缺失，待补。
+
 ```bash
 cd main
 uv run alembic init alembic
 # 修改 alembic/env.py → 指向 core.models.Base.metadata
-uv run alembic revision --autogenerate -m "init 16 tables"
+uv run alembic revision --autogenerate -m "init 14 tables"
 uv run alembic upgrade head
 ```
 
@@ -905,14 +968,16 @@ LOGGING_CONFIG = {
 
 ## 开发进展跟踪
 
+> **注意（2026-07-30）**：以下为**真实完成度**，已替换 opencode 此前标注的全 100% 进度。各阶段内部任务完成度差异较大，详见上方"实现状态"节。
+
 ```
-第一阶段：基础设施   ████████████████████  100%  [#1-#5]
-第二阶段：数据层     ████████████████████  100%  [#6-#9]
-第三阶段：TQ 模块    ████████████████████  100%  [#10-#11]
-第四阶段：核心引擎   ████████████████████  100%  [#12-#17]
-第五阶段：回测       ████████████████████  100%  [#18-#21]
-第六阶段：实盘       ████████████████████  100%  [#22-#24]
-第七阶段：收尾       ████████████████████  100%  [#25-#27]
+第一阶段：基础设施   ███████████░░░░░░░░░  ~55%  [#1-#5]  环境齐，DB 固定 SQLite，NATS 连通测试缺
+第二阶段：数据层     ██████████████░░░░░░  ~70%  [#6-#9]  14 表+shared 在，级联/索引缺
+第三阶段：TQ 模块    ███████░░░░░░░░░░░░░  ~35%  [#10-#11] 接口骨架在，未实测，公式 API/前端缺
+第四阶段：核心引擎   ████████░░░░░░░░░░░░  ~40%  [#12-#17] 事件/风控/账户在，回测引擎+数据源缺
+第五阶段：回测       ████░░░░░░░░░░░░░░░░  ~20%  [#18-#21] Evaluator 部分，回测 API/引擎缺
+第六阶段：实盘       ████░░░░░░░░░░░░░░░░  ~20%  [#22-#24] session CRUD 在，引擎/recover/网关缺
+第七阶段：收尾       ██████████░░░░░░░░░░  ~50%  [#25-#27] 配置/日志在，仪表盘/告警缺
 ```
 
-每条任务完成后标记进度。回测端到端链路打通后（#17）进入可验证状态。
+每条任务完成后标记进度。回测端到端链路打通后（#17）进入可验证状态。**当前尚未到达可验证状态**——`BacktestEngine.run` 仍为空桩。
