@@ -1,4 +1,5 @@
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import create_engine
 
@@ -18,12 +19,19 @@ from core.models import Base
 
 target_metadata = Base.metadata
 
+# 锚定到 main/ 目录（本文件位于 main/alembic/env.py），与 core.db 同源，
+# 让 sqlite_path 无论从哪个 cwd 启动都解析到同一绝对路径。
+_MAIN_DIR = Path(__file__).resolve().parent.parent
+
 
 def _db_url() -> str:
     """从 config.yaml 读取数据库连接串，与 core.db 同源。"""
     cfg = load_config()
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
-    return f"sqlite:///./{sqlite_path}"
+    db_file = Path(sqlite_path)
+    if not db_file.is_absolute():
+        db_file = _MAIN_DIR / sqlite_path
+    return f"sqlite:///{db_file.as_posix()}"
 
 
 def run_migrations_offline() -> None:
