@@ -18,7 +18,7 @@ opencode 已完成项目脚手架搭建：4 模块结构、14 张 ORM 表、7 �
 
 ### P0 配置链修复（2026-07-30 已完成）
 
-原 `main/core/db.py` 硬编码 `sqlite:///./dev.db`、`main/alembic/env.py` 走 `alembic.ini` 硬编码 url，与 `config.yaml` 脱节。已统一为：db.py 与 alembic/env.py 均从 `core.config.load_config()` 读 `database.sqlite_path`；config.yaml 精简为仅 SQLite 配置（删 PG 的 host/port/user/password，未来切 PG 再加回）；config.py 引入 `_deep_merge` 修复嵌套配置默认值丢失。连带清理 `.env.template`、`manage.ps1` 的 `TQ_DB_PASSWORD`。详见 `docs/status-audit.md`（如已生成）。
+原 `main/core/db.py` 硬编码 `sqlite:///./dev.db`、`main/alembic/env.py` 走 `alembic.ini` 硬编码 url，与 `config.yaml` 脱节。已统一为：db.py 与 alembic/env.py 均从 `core.config.load_config()` 读 `database.sqlite_path`；config.yaml 精简为仅 SQLite 配置（删 PG 的 host/port/user/password，未来切 PG 再加回）；config.py 引入 `_deep_merge` 修复嵌套配置默认值丢失。连带清理 `.env.template`、`manage.ps1` 的 `TQ_DB_PASSWORD`。数据库文件现位于 `main/data/dev.db`（`config.yaml` 的 `database.sqlite_path: data/dev.db`，相对 `main/` 解析），已加入 `.gitignore`。详见 `docs/status-audit.md`（如已生成）。
 
 ### 分阶段真实状态
 

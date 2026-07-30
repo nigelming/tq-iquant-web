@@ -1,5 +1,5 @@
 # 生产环境用 PostgreSQL + NATS
-# 开发期用 SQLite（main/dev.db），NATS 不需要时可注释
+# 开发期用 SQLite（main/data/dev.db），NATS 不需要时可注释
 services:
   postgres:
     image: postgres:16

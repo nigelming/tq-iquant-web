@@ -22,7 +22,7 @@ target_metadata = Base.metadata
 def _db_url() -> str:
     """从 config.yaml 读取数据库连接串，与 core.db 同源。"""
     cfg = load_config()
-    sqlite_path = cfg.get("database", {}).get("sqlite_path", "dev.db")
+    sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     return f"sqlite:///./{sqlite_path}"
 
 

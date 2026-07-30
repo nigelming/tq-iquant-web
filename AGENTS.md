@@ -60,7 +60,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 ## 数据库（SQLite 开发 / PostgreSQL 生产）
 
 详见设计文档 5.4 节。关键点：
-- **开发期**：SQLite（`main/dev.db`），零配置
+- **开发期**：SQLite（`main/data/dev.db`），零配置
 - **生产期**：PostgreSQL，通过 MVCC 解决回测子进程并发写入冲突
 - 切换方式：修改 `alembic.ini` 的 `sqlalchemy.url`
 - `config.yaml`（项目根目录）存储系统路径配置，**不存数据库密码**（密码从环境变量 `TQ_DB_PASSWORD` 读取）

@@ -18,7 +18,7 @@ def _defaults() -> dict:
         "iquant_path": "",
         "max_concurrent_backtest": 1,
         "database": {
-            "sqlite_path": "dev.db",
+            "sqlite_path": "data/dev.db",
         },
         "nats": {
             "url": "nats://localhost:4222",

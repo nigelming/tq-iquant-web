@@ -34,3 +34,9 @@ Thumbs.db
 # Runtime
 logs/
 *.log
+
+# SQLite databases (local runtime data)
+main/data/*.db
+main/data/*.db-journal
+main/data/*.sqlite
+main/data/*.sqlite3

@@ -70,7 +70,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - iQuant 网关 [live/iguant_gateway/main.py](live/iguant_gateway/main.py) 全为 mock 处理器
 - TQ 模块（[main/core/tq/](main/core/tq/)）文件已建，需对接通达信
 
-**已知待修复**：[main/core/db.py](main/core/db.py) 当前硬编码 `sqlite:///./dev.db`，未读取 `config.yaml`/`TQ_DB_PASSWORD`，与 [config.py](main/core/config.py) 的配置系统脱节。切换 PostgreSQL 时需打通此处（设计要求改 `alembic.ini` 的 `sqlalchemy.url`）。
+**配置链（已修复）**：[main/core/db.py](main/core/db.py) 与 [main/alembic/env.py](main/alembic/env.py) 均从 [core.config.load_config()](main/core/config.py) 读 `database.sqlite_path`（默认 `data/dev.db`，相对 `main/` 解析为 `main/data/dev.db`），与 `config.yaml` 一致。db.py 逐连接开启 `PRAGMA foreign_keys=ON` 让 ondelete 生效。切换 PostgreSQL 时改 `config.yaml` 的 `database` 段并补 `TQ_DB_PASSWORD` 环境变量。
 
 ## 关键约定（非显而易见，易遗漏）
 
