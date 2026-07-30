@@ -1,0 +1,342 @@
+"""build_klines / build_signal_cache / build_open_prices 数据对接层测试。
+
+这些函数桥接 TQ 原始格式与回测引擎内部格式。TQ 调用本身依赖通达信进程，
+不可单测；故将逻辑拆为纯转换函数（_convert_market_data / _convert_formula_output）
++ 编排函数（build_*，monkeypatch TQ 调用）。纯函数用合成输入直接单测。
+"""
+from datetime import datetime, date
+from decimal import Decimal
+
+import polars as pl
+import pytest
+
+import core.api.backtest as bt_api
+
+
+# ---------------------------------------------------------------------------
+# _convert_market_data：TQ 原始行情 → 引擎 klines
+# TQ 原始格式：dict[str, pandas.DataFrame]，键 "Open"/"High"/"Low"/"Close"/"Volume"/"Amount"，
+#   index=时间戳，columns=股票代码（一次调用 = 多股票单周期）。
+# 引擎格式：{stock_code: {period: pl.DataFrame}}，列 datetime + Open/High/Low/Close/Volume/Amount。
+# ---------------------------------------------------------------------------
+def _tq_raw_market_data():
+    """构造 TQ 原始日线行情（多股票单周期），用 polars 模拟 pandas DataFrame。
+    TQ 返回的是 pandas，但转换函数只依赖 .index / [col].loc[t, code] 接口，
+    polars 不支持该接口，故测试用真实 pandas 构造。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
+    codes = ["000001.SZ", "600519.SH"]
+    return {
+        "Open": pd.DataFrame(
+            {"000001.SZ": [10.0, 10.2, 9.0], "600519.SH": [1600.0, 1610.0, 1595.0]},
+            index=ts,
+        ),
+        "High": pd.DataFrame(
+            {"000001.SZ": [10.3, 10.5, 9.2], "600519.SH": [1610.0, 1620.0, 1605.0]},
+            index=ts,
+        ),
+        "Low": pd.DataFrame(
+            {"000001.SZ": [9.9, 8.9, 8.8], "600519.SH": [1590.0, 1600.0, 1590.0]},
+            index=ts,
+        ),
+        "Close": pd.DataFrame(
+            {"000001.SZ": [10.2, 9.0, 9.1], "600519.SH": [1605.0, 1615.0, 1600.0]},
+            index=ts,
+        ),
+        "Volume": pd.DataFrame(
+            {"000001.SZ": [1000, 1000, 1000], "600519.SH": [200, 210, 180]},
+            index=ts,
+        ),
+        "Amount": pd.DataFrame(
+            {"000001.SZ": [10200.0, 9000.0, 9100.0], "600519.SH": [321000.0, 339150.0, 288000.0]},
+            index=ts,
+        ),
+    }
+
+
+def test_convert_market_data_basic():
+    """单周期多股票转换：得到 {stock: {period: polars}}，列齐全，时间升序。"""
+    raw = _tq_raw_market_data()
+    klines = bt_api._convert_market_data(raw, ["000001.SZ", "600519.SH"], ["1d"])
+
+    assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
+    for code in klines:
+        assert "1d" in klines[code]
+        df = klines[code]["1d"]
+        assert isinstance(df, pl.DataFrame)
+        # 列齐全（datetime + 6 行情列）
+        for col in ("datetime", "Open", "High", "Low", "Close", "Volume", "Amount"):
+            assert col in df.columns
+        assert df.height == 3
+        # 时间升序
+        times = df["datetime"].to_list()
+        assert times == sorted(times)
+
+
+def test_convert_market_data_decimal_preserved():
+    """价格列应保留为 Decimal（引擎依赖 Decimal 做金额计算，float 会引入误差）。"""
+    raw = _tq_raw_market_data()
+    klines = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = klines["000001.SZ"]["1d"]
+    # 第一行 open 应为 Decimal("10")，而非 float 10.0
+    assert isinstance(df["Open"][0], Decimal)
+    assert df["Open"][0] == Decimal("10")
+    assert df["Close"][2] == Decimal("9.1")
+
+
+def test_convert_market_data_missing_stock_skipped():
+    """请求的股票在 TQ 返回中缺失 → 该股票不出现在结果中（不报错）。"""
+    raw = _tq_raw_market_data()
+    # 请求一只不存在的股票
+    klines = bt_api._convert_market_data(raw, ["000001.SZ", "999999.XX"], ["1d"])
+    assert "000001.SZ" in klines
+    assert "999999.XX" not in klines
+
+
+def test_convert_market_data_multi_period():
+    """多周期：每个 period 独立一份 DataFrame（TQ 一次调用 = 单周期，故 raw 按 period 分组）。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw_1d = _tq_raw_market_data()
+    # 构造一个 5m 周期的 raw（TQ 实际返回完整 6 字段，这里同步构造）
+    raw_5m = {
+        "Open": pd.DataFrame({"000001.SZ": [10.5, 9.5]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.6, 9.6]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [10.4, 9.4]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.5, 9.5]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [500, 600]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [5250.0, 5700.0]}, index=ts),
+    }
+    # 多周期 raw 结构：{period: raw_dict}
+    raw_by_period = {"1d": raw_1d, "5m": raw_5m}
+    klines = bt_api._convert_market_data_multi(raw_by_period, ["000001.SZ"])
+
+    assert "1d" in klines["000001.SZ"]
+    assert "5m" in klines["000001.SZ"]
+    assert klines["000001.SZ"]["1d"].height == 3
+    assert klines["000001.SZ"]["5m"].height == 2
+
+
+# ---------------------------------------------------------------------------
+# build_open_prices：klines → {stock: {bar_time: Decimal open}}
+# ---------------------------------------------------------------------------
+def test_build_open_prices_from_klines():
+    """open 价表直接从 klines 的 Open 列提取，key 为 datetime。"""
+    df = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)],
+        "Open": [Decimal("10"), Decimal("10.2"), Decimal("9.0")],
+        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("9.2")],
+        "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("8.8")],
+        "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("9.1")],
+        "Volume": [1000, 1000, 1000],
+    })
+    klines = {"000001.SZ": {"1d": df}}
+    prices = bt_api.build_open_prices(None, klines)
+
+    assert "000001.SZ" in prices
+    stock_prices = prices["000001.SZ"]
+    assert stock_prices[datetime(2026, 7, 29)] == Decimal("10")
+    assert stock_prices[datetime(2026, 7, 30)] == Decimal("10.2")
+    assert stock_prices[datetime(2026, 7, 31)] == Decimal("9.0")
+    # 值为 Decimal
+    for v in stock_prices.values():
+        assert isinstance(v, Decimal)
+
+
+def test_build_open_prices_empty_klines():
+    """空 klines → 空 open_prices。"""
+    assert bt_api.build_open_prices(None, {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# _convert_formula_output：TQ 公式输出 → signal_cache 条目
+# TQ 公式输出（formula_process_mul_zb）：{stock_code: {var_name: [{"Date":"YYYYMMDD","Value":float}, ...]}}
+#   顶层可能有 "ErrorId"。日期串 "YYYYMMDD" 需转 datetime 对齐 klines 时间轴。
+# signal_cache value: [{name: str, value: int}]（trigger_value 是 int 比较）
+# ---------------------------------------------------------------------------
+def test_convert_formula_output_date_format():
+    """日期格式输出：{code: {var: [{Date, Value}, ...]}} → 按 datetime 索引的 cache 条目。"""
+    raw = {
+        "ErrorId": "0",
+        "000001.SZ": {
+            "open_sig": [
+                {"Date": "20260729", "Value": 1},
+                {"Date": "20260730", "Value": -1},
+                {"Date": "20260731", "Value": 1},
+            ],
+        },
+    }
+    entries = bt_api._convert_formula_output(raw, 1, ["000001.SZ"])
+
+    # 条目：{(strategy_id, stock_code, bar_time): [{"name", "value"}]}
+    assert (1, "000001.SZ", datetime(2026, 7, 29)) in entries
+    assert (1, "000001.SZ", datetime(2026, 7, 30)) in entries
+    assert (1, "000001.SZ", datetime(2026, 7, 31)) in entries
+    assert entries[(1, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "open_sig", "value": 1}]
+    assert entries[(1, "000001.SZ", datetime(2026, 7, 31))] == [{"name": "open_sig", "value": 1}]
+
+
+def test_convert_formula_output_multi_var():
+    """多输出变量：同股票同 bar 多变量合并到一个 list。"""
+    raw = {
+        "000001.SZ": {
+            "open_sig": [{"Date": "20260729", "Value": 1}],
+            "close_sig": [{"Date": "20260729", "Value": 1}],
+        },
+    }
+    entries = bt_api._convert_formula_output(raw, 1, ["000001.SZ"])
+    val = entries[(1, "000001.SZ", datetime(2026, 7, 29))]
+    assert {"name": "open_sig", "value": 1} in val
+    assert {"name": "close_sig", "value": 1} in val
+    assert len(val) == 2
+
+
+def test_convert_formula_output_skips_metadata_keys():
+    """跳过 Date/ErrorId/Time 等非变量键。"""
+    raw = {
+        "ErrorId": "0",
+        "000001.SZ": {
+            "Date": [{"Date": "20260729", "Value": "20260729"}],
+            "open_sig": [{"Date": "20260729", "Value": 1}],
+        },
+    }
+    entries = bt_api._convert_formula_output(raw, 1, ["000001.SZ"])
+    # 只应有 open_sig，不含 Date
+    val = entries[(1, "000001.SZ", datetime(2026, 7, 29))]
+    assert [o["name"] for o in val] == ["open_sig"]
+
+
+def test_convert_formula_output_empty_raw():
+    """空输出 → 空条目。"""
+    assert bt_api._convert_formula_output(None, 1, ["000001.SZ"]) == {}
+    assert bt_api._convert_formula_output({}, 1, ["000001.SZ"]) == {}
+
+
+def test_convert_formula_output_error_id_nonzero():
+    """ErrorId 非 0/19 → 视为公式出错，返回空（不抛异常）。"""
+    raw = {"ErrorId": "99", "Error": "formula not found", "000001.SZ": {}}
+    assert bt_api._convert_formula_output(raw, 1, ["000001.SZ"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# 编排层：build_klines / build_signal_cache 的 DB 读取 + TQ 调用接线
+# monkeypatch TQ 调用，用真实内存 DB 验证：股票池读取、周期去重、公式名读取
+# ---------------------------------------------------------------------------
+def _seed_db(db):
+    """建依赖链：StockPool + 股票 → Formula + FormulaSignal → PortfolioStrategy + Strategy。"""
+    from decimal import Decimal
+    from core.models import (
+        StockPool, StockPoolStock, Formula, FormulaSignal,
+        PortfolioStrategy, Strategy,
+    )
+    pool = StockPool(name="test_pool")
+    db.add(pool); db.flush()
+    db.add(StockPoolStock(pool_id=pool.id, stock_code="000001.SZ"))
+    db.add(StockPoolStock(pool_id=pool.id, stock_code="600519.SH"))
+    db.flush()
+    formula = Formula(name="OPEN_FORMULA", content="REF(CLOSE,1)")
+    db.add(formula); db.flush()
+    db.add(FormulaSignal(
+        formula_id=formula.id, signal_name="open_sig",
+        signal_type="OPEN", trigger_value=1,
+    ))
+    db.flush()
+    ps = PortfolioStrategy(
+        name="ps", stock_pool_id=pool.id,
+        initial_capital=Decimal("100000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(ps); db.flush()
+    strat = Strategy(
+        portfolio_id=ps.id, name="s1", formula_id=formula.id,
+        period="1d", role="master",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    db.add(strat); db.commit()
+    return ps, strat, formula
+
+
+def test_build_klines_orchestration(db_session, monkeypatch):
+    """build_klines 读股票池 + 策略周期，调 get_history_raw，转 polars。"""
+    import pandas as pd
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.2], "600519.SH": [1600.0, 1610.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 10.5], "600519.SH": [1610.0, 1620.0]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.9], "600519.SH": [1590.0, 1600.0]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, 9.0], "600519.SH": [1605.0, 1615.0]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 1000], "600519.SH": [200, 210]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0], "600519.SH": [321000.0, 339150.0]}, index=ts),
+    }
+    captured = {}
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        captured["stocks"] = stocks
+        captured["periods"] = periods
+        captured["start"] = start
+        captured["end"] = end
+        return {"1d": raw}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+
+    klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
+
+    # 接线校验：股票池 2 只股票、周期 1d、日期 YYYYMMDD
+    assert captured["stocks"] == ["000001.SZ", "600519.SH"]
+    assert captured["periods"] == ["1d"]
+    assert captured["start"] == "20260729"
+    assert captured["end"] == "20260731"
+    # 输出校验：两股票 polars DataFrame 含 datetime
+    assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
+    assert "datetime" in klines["000001.SZ"]["1d"].columns
+    assert klines["000001.SZ"]["1d"].height == 2
+
+
+def test_build_signal_cache_orchestration(db_session, monkeypatch):
+    """build_signal_cache 读 Strategy+Formula，调 compute，转 cache。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    klines = {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+        "Open": [Decimal("10"), Decimal("10.2")],
+        "High": [Decimal("10.3"), Decimal("10.5")],
+        "Low": [Decimal("9.9"), Decimal("8.9")],
+        "Close": [Decimal("10.2"), Decimal("9.0")],
+        "Volume": [1000, 1000],
+    })}}
+
+    captured = {}
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                      start_time="", end_time="", return_count=-1, return_date=True):
+        captured["formula_name"] = formula_name
+        captured["stocks"] = stocks
+        captured["period"] = period
+        captured["start_time"] = start_time
+        captured["end_time"] = end_time
+        captured["return_date"] = return_date
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},
+                    {"Date": "20260730", "Value": -1},
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 接线校验：读到了 Formula.name=OPEN_FORMULA，period=1d，时间范围从 klines 提取
+    assert captured["formula_name"] == "OPEN_FORMULA"
+    assert captured["period"] == "1d"
+    assert captured["stocks"] == ["000001.SZ"]
+    assert captured["start_time"] == "20260729"
+    assert captured["end_time"] == "20260730"
+    assert captured["return_date"] is True
+    # cache key = (strategy_id, stock, bar_time)，strategy_id = strat.id
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29)) in cache
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "open_sig", "value": 1}]
+

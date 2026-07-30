@@ -98,8 +98,8 @@ def test_post_backtest_end_to_end(client, monkeypatch):
 
     stock = "000001.SZ"
     # monkeypatch 数据获取层：返回 mock klines / signal_cache / open_prices
-    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end: _mock_klines())
-    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines: {
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -153,8 +153,8 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end: _mock_klines())
-    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines: {
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from core.db import get_db
 from core.models import (
-    PortfolioStrategy, Strategy, FormulaSignal,
+    PortfolioStrategy, Strategy, Formula, FormulaSignal, StockPoolStock,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
 )
 from core.engine.portfolio import Portfolio
@@ -17,6 +17,8 @@ from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import StrategyRiskManager, PortfolioRiskManager
 from core.engine.backtest_engine import BacktestEngine
 from tq_iquant_shared.constants import SignalType
+from core.tq.data import TQData
+from core.tq.formula import TQFormula
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -29,21 +31,281 @@ class BacktestRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 数据获取层（TQ 对接留后续切片，当前为桩；测试 monkeypatch 注入 mock 数据）
+# 数据获取层 — TQ 对接
+# 拆为「TQ 调用（依赖通达信进程，不可单测）」+「纯转换（可单测）」两层。
 # ---------------------------------------------------------------------------
-def build_klines(ps: PortfolioStrategy, start: date, end: date) -> dict:
-    """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}。"""
-    return {}
+# TQ 行情字段（首字母大写）→ 引擎 polars 列
+_OHLCV_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Amount")
 
 
-def build_signal_cache(ps: PortfolioStrategy, klines: dict) -> dict:
-    """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。"""
-    return {}
+def _convert_market_data(
+    raw: dict, stocks: list, periods: list
+) -> dict:
+    """单周期 TQ 原始行情 → 引擎 klines（单周期入口）。
+
+    raw: {field: pandas.DataFrame}，field ∈ Open/High/Low/Close/Volume/Amount，
+         DataFrame.index=时间戳，columns=股票代码。
+    返回: {stock_code: {period: pl.DataFrame}}（列 datetime + 6 行情列，Decimal 价）。
+    缺失股票静默跳过。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    # 以 Close 的 index 为时间轴基准
+    close_df = raw.get("Close")
+    if close_df is None:
+        return {}
+    timestamps = list(close_df.index)
+    result: dict = {}
+    for code in stocks:
+        per_period: dict = {}
+        for period in periods:
+            df = _build_polars_kline(raw, code, timestamps)
+            if df is not None:
+                per_period[period] = df
+        if per_period:
+            result[code] = per_period
+    return result
+
+
+def _build_polars_kline(raw: dict, code: str, timestamps: list):
+    """从 TQ raw 抽取单股票 polars DataFrame；该股票无数据返回 None。"""
+    col_data: dict = {"datetime": []}
+    has_any = False
+    for field in _OHLCV_FIELDS:
+        col_data[field] = []
+    for ts in timestamps:
+        row_ok = True
+        for field in _OHLCV_FIELDS:
+            df = raw.get(field)
+            if df is None or code not in getattr(df, "columns", []):
+                row_ok = False
+                break
+        if not row_ok:
+            continue
+        has_any = True
+        col_data["datetime"].append(ts)
+        for field in _OHLCV_FIELDS:
+            val = raw[field].loc[ts, code]
+            # 价格/金额列转 Decimal，成交量列保留原值
+            if field in ("Open", "High", "Low", "Close", "Amount"):
+                col_data[field].append(_to_decimal(val))
+            else:
+                col_data[field].append(val)
+    if not has_any:
+        return None
+    return pl.DataFrame(col_data)
+
+
+def _to_decimal(val) -> Decimal:
+    """数值转 Decimal，容忍 float/int/str/Decimal。"""
+    if isinstance(val, Decimal):
+        return val
+    if isinstance(val, (int, float)):
+        return Decimal(str(val))
+    if isinstance(val, str):
+        return Decimal(val)
+    return Decimal(str(val))
+
+
+def _convert_market_data_multi(raw_by_period: dict, stocks: list) -> dict:
+    """多周期 TQ 原始行情 → 引擎 klines。
+
+    raw_by_period: {period: {field: pandas.DataFrame}}（每个周期一次 TQ 调用）。
+    返回: {stock_code: {period: pl.DataFrame}}。
+    """
+    result: dict = {}
+    for period, raw in raw_by_period.items():
+        single = _convert_market_data(raw, stocks, [period])
+        for code, per_period in single.items():
+            if code not in result:
+                result[code] = {}
+            result[code].update(per_period)
+    return result
+
+
+def build_klines(ps: PortfolioStrategy, start: date, end: date, db: Session = None) -> dict:
+    """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}。
+
+    股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
+    需要 db 查股票池；若未传 db，返回空（无法定位股票）。
+    流程：get_history_raw（原始 TQ 行情）→ _convert_market_data_multi（转引擎 polars）。
+    """
+    stocks = _pool_stocks(ps, db)
+    if not stocks:
+        return {}
+    periods = _strategy_periods(ps, db)
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    tq = TQData()
+    raw_by_period = tq.get_history_raw(
+        stocks=stocks, periods=periods,
+        start=start_str, end=end_str, dividend_type="front", count=-1,
+    )
+    return _convert_market_data_multi(raw_by_period, stocks)
 
 
 def build_open_prices(ps: PortfolioStrategy, klines: dict) -> dict:
-    """构造 open 价表：{stock_code: {bar_time: Decimal}}。"""
-    return {}
+    """从 klines 提取 open 价表：{stock_code: {bar_time: Decimal}}。
+
+    供 SimulatedDispatcher 在下一 bar open 成交。取每只股票首个周期的 Open 列。
+    """
+    prices: dict = {}
+    for code, periods in klines.items():
+        if not periods:
+            continue
+        # 取任一周期（日线回测只有一个周期）
+        df = next(iter(periods.values()))
+        if "datetime" not in df.columns or "Open" not in df.columns:
+            continue
+        stock_prices: dict = {}
+        times = df["datetime"].to_list()
+        opens = df["Open"].to_list()
+        for t, o in zip(times, opens):
+            stock_prices[t] = o if isinstance(o, Decimal) else _to_decimal(o)
+        prices[code] = stock_prices
+    return prices
+
+
+# --- 公式信号 ---
+# TQ 公式输出中需跳过的非变量键
+_FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
+
+
+def _convert_formula_output(
+    raw: dict, strategy_id: int, stocks: list
+) -> dict:
+    """TQ 公式输出（formula_process_mul_zb）→ signal_cache 条目。
+
+    raw: {stock_code: {var_name: [{"Date":"YYYYMMDD","Value":float}, ...]}}，
+         顶层可能有 ErrorId。日期串需转 datetime 对齐 klines 时间轴。
+    返回: {(strategy_id, stock_code, bar_time): [{"name": str, "value": int}]}。
+    ErrorId 非 0/19 → 视为出错，返回空。
+    """
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    err = raw.get("ErrorId")
+    if err is not None and str(err) not in ("0", "19"):
+        return {}
+    entries: dict = {}
+    for code in stocks:
+        stock_data = raw.get(code)
+        if not isinstance(stock_data, dict):
+            continue
+        # 按 bar_time 聚合该股票所有变量
+        by_time: dict = {}
+        for var_name, val_list in stock_data.items():
+            if var_name in _FORMULA_META_KEYS:
+                continue
+            if not isinstance(val_list, list):
+                continue
+            for entry in val_list:
+                if not isinstance(entry, dict):
+                    continue
+                d = entry.get("Date")
+                v = entry.get("Value")
+                if not d or v is None:
+                    continue
+                bar_time = _parse_date_str(d)
+                if bar_time is None:
+                    continue
+                key = (strategy_id, code, bar_time)
+                by_time.setdefault(key, []).append({"name": var_name, "value": _to_int(v)})
+        entries.update(by_time)
+    return entries
+
+
+def _parse_date_str(d: str):
+    """YYYYMMDD 或 YYYY-MM-DD → datetime。无法解析返回 None。"""
+    s = str(d).strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _to_int(val) -> int:
+    """公式输出值转 int（trigger_value 是 int 比较）。"""
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, (int, float)):
+        return int(val)
+    try:
+        return int(Decimal(str(val)))
+    except (ValueError, ArithmeticError):
+        return 0
+
+
+def build_signal_cache(ps: PortfolioStrategy, klines: dict, db: Session = None) -> dict:
+    """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
+
+    对每个策略：读 Formula（公式名）+ FormulaSignal（信号配置），
+    调 TQFormula.compute 跑公式，转 signal_cache。cache-first，TQ 兜底。
+    """
+    if db is None:
+        return {}
+    stocks = list(klines.keys())
+    if not stocks:
+        return {}
+    strategies = _portfolio_strategies(ps, db)
+    tq_formula = TQFormula()
+    cache: dict = {}
+    for strat in strategies:
+        formula = db.get(Formula, strat.formula_id)
+        if formula is None:
+            continue
+        period = strat.period
+        start_str, end_str = _kline_time_range(klines)
+        raw = tq_formula.compute(
+            formula_name=formula.name, formula_arg="",
+            stocks=stocks, period=period,
+            count=-1, dividend_type=1,
+            start_time=start_str, end_time=end_str,
+        )
+        entries = _convert_formula_output(raw, strat.id, stocks)
+        cache.update(entries)
+    return cache
+
+
+# --- 辅助：从 DB 读组装所需数据 ---
+def _pool_stocks(ps: PortfolioStrategy, db: Session) -> list:
+    """股票池股票代码列表。db 为 None 时返回空。"""
+    if db is None:
+        return []
+    rows = db.query(StockPoolStock).filter_by(pool_id=ps.stock_pool_id).all()
+    return [r.stock_code for r in rows]
+
+
+def _strategy_periods(ps: PortfolioStrategy, db: Session) -> list:
+    """所有策略的 period 去重（保持顺序）。"""
+    if db is None:
+        return ["1d"]
+    strats = _portfolio_strategies(ps, db)
+    seen: list = []
+    for s in strats:
+        if s.period not in seen:
+            seen.append(s.period)
+    return seen or ["1d"]
+
+
+def _portfolio_strategies(ps: PortfolioStrategy, db: Session) -> list:
+    if db is None:
+        return []
+    return db.query(Strategy).filter_by(portfolio_id=ps.id).all()
+
+
+def _kline_time_range(klines: dict):
+    """从 klines 取最早/最晚时间，返回 (start_str, end_str) YYYYMMDD。"""
+    times = []
+    for periods in klines.values():
+        for df in periods.values():
+            if "datetime" in df.columns:
+                times.extend(df["datetime"].to_list())
+    if not times:
+        return "", ""
+    t_min, t_max = min(times), max(times)
+    return t_min.strftime("%Y%m%d"), t_max.strftime("%Y%m%d")
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +451,8 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
 
     try:
         portfolio = _assemble_portfolio(ps, strategies, db)
-        klines = build_klines(ps, req.start_date, req.end_date)
-        signal_cache = build_signal_cache(ps, klines)
+        klines = build_klines(ps, req.start_date, req.end_date, db)
+        signal_cache = build_signal_cache(ps, klines, db)
         open_prices = build_open_prices(ps, klines)
 
         def on_progress(p: int):

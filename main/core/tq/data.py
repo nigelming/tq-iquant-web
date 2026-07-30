@@ -20,6 +20,19 @@ class TQData:
         with get_tdx_lock():
             return self._load_history(stocks, periods, start, end, dividend_type, count)
 
+    def get_history_raw(
+        self, stocks: List[str], periods: List[str],
+        start: str = "", end: str = "",
+        dividend_type: str = "front", count: int = 100,
+    ) -> Dict[str, dict]:
+        """取原始 TQ 行情（未经转换），按周期分组：{period: {field: pandas.DataFrame}}。
+
+        field ∈ Open/High/Low/Close/Volume/Amount，DataFrame.index=时间戳，columns=股票代码。
+        一次调用 = 单周期多股票。转换由调用方（_convert_market_data）负责，便于单测。
+        """
+        with get_tdx_lock():
+            return self._load_history_raw(stocks, periods, start, end, dividend_type, count)
+
     def subscribe_bars(
         self, stocks: List[str], periods: List[str],
         callback: Callable,
@@ -58,10 +71,14 @@ class TQData:
         result = {}
         for period in periods:
             df = tq.get_market_data(
+                field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
                 stock_list=stocks,
-                count=count,
                 period=period,
+                start_time=start,
+                end_time=end,
+                count=count,
                 dividend_type=dividend_type,
+                fill_data=True,
             )
             if df is not None:
                 for code in stocks:
@@ -76,6 +93,28 @@ class TQData:
                             result[code][period] = pl.DataFrame(series)
                     except Exception:
                         pass
+        return result
+
+    def _load_history_raw(
+        self, stocks, periods, start="", end="",
+        dividend_type="front", count=100,
+    ) -> Dict[str, dict]:
+        """原始 TQ 行情按周期分组：{period: raw_dict}。raw_dict 即 tq.get_market_data 返回值。"""
+        tq = get_tq()
+        result: Dict[str, dict] = {}
+        for period in periods:
+            df = tq.get_market_data(
+                field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+                stock_list=stocks,
+                period=period,
+                start_time=start,
+                end_time=end,
+                count=count,
+                dividend_type=dividend_type,
+                fill_data=True,
+            )
+            if df is not None:
+                result[period] = df
         return result
 
     def _subscribe(self, stocks, periods, callback):
