@@ -176,6 +176,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     // 金额不转
     expect(arg.min_commission).toBe(5)
     expect(arg.initial_capital).toBe(500000)
+    // select 字段保持字符串/原值，不被 Number() 转成 NaN
+    expect(arg.trading_session).toBe('full')
+    expect(arg.stock_pool_id).toBe(0)
   })
 
   it('填组合表 + 提交 → 调 createPortfolio，strategies 为空数组', async () => {
@@ -192,6 +195,22 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const arg = (createPortfolio as any).mock.calls[0][0]
     expect(arg.name).toBe('NEW_PS')
     expect(arg.strategies).toEqual([])
+  })
+
+  it('提交失败（422）→ alert 错误且弹窗保持打开，不静默卡死', async () => {
+    ;(createPortfolio as any).mockRejectedValue({ response: { data: { message: '股票池不存在' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 新建组合
+    await w.find('input[data-field="name"]').setValue('X')
+    await w.find('.modal-actions button.btn-primary').trigger('click')  // 确定
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(w.text()).toContain('新建组合')  // 弹窗仍打开
+    vi.unstubAllGlobals()
   })
 
   it('点某行[编辑] → 回填（比例转百分比显示）并提交调 updatePortfolio（比例转回小数）', async () => {

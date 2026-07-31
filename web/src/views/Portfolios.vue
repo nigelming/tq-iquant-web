@@ -132,7 +132,9 @@ function toPercent(v: any, isRatio: boolean): any {
   return Number(v) * 100
 }
 function fromPercent(v: any, fld: { type: string; key: string }): any {
-  if (fld.type === 'text') return v  // 文本字段原值
+  // select 字段（trading_session/period/role/stock_pool_id 等）原值透传，
+  // 不做 Number() —— 字符串值如 'full' 会被转成 NaN 致后端 422。
+  if (fld.type !== 'number' && fld.type !== 'percent') return v
   if (v === null || v === undefined || v === '') return v
   const num = Number(v)
   return STRATEGY_RATIO_FIELDS.has(fld.key) || PORTFOLIO_RATIO_FIELDS.has(fld.key) ? num / 100 : num
@@ -232,12 +234,26 @@ async function openEditPortfolio(p: any) {
   showPortfolioForm.value = true
 }
 
+// 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
+function errMsg(e: any): string {
+  const d = e?.response?.data
+  if (d?.message) return d.message
+  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (typeof d?.detail === 'string') return d.detail
+  return e?.message || '请求失败'
+}
+
 async function submitPortfolio() {
   const payload = buildPortfolioPayload()
-  if (editingPortfolioId.value === null) {
-    await createPortfolio(payload)
-  } else {
-    await updatePortfolio(editingPortfolioId.value, payload)
+  try {
+    if (editingPortfolioId.value === null) {
+      await createPortfolio(payload)
+    } else {
+      await updatePortfolio(editingPortfolioId.value, payload)
+    }
+  } catch (e) {
+    alert(`保存失败：${errMsg(e)}`)
+    return  // 弹窗保持打开，供用户修正
   }
   showPortfolioForm.value = false
   loadPortfolios()
@@ -283,10 +299,15 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
 async function submitStrategy() {
   const pid = strategyPortfolioId.value!
   const payload = buildStrategyPayload()
-  if (editingStrategyId.value === null) {
-    await createStrategy(pid, payload)
-  } else {
-    await updateStrategy(pid, editingStrategyId.value, payload)
+  try {
+    if (editingStrategyId.value === null) {
+      await createStrategy(pid, payload)
+    } else {
+      await updateStrategy(pid, editingStrategyId.value, payload)
+    }
+  } catch (e) {
+    alert(`保存失败：${errMsg(e)}`)
+    return  // 弹窗保持打开，供用户修正
   }
   showStrategyForm.value = false
   strategyCache.value[pid] = await getStrategies(pid)
