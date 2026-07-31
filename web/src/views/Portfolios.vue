@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   getPortfolios, getPortfolioDetail, createPortfolio, updatePortfolio, deletePortfolio,
   getStockPools, getFormulas,
@@ -12,17 +12,20 @@ const portfolios = ref<any[]>([])
 const stockPools = ref<any[]>([])
 const formulas = ref<any[]>([])
 
-// ===== 第一层：组合列表 =====
+// 展开的组合 id 集合 + 各组合子策略缓存
+const expanded = ref<Set<number>>(new Set())
+const strategyCache = ref<Record<number, StrategyDetail[]>>({})
+
+// ===== 组合表单 =====
 const showPortfolioForm = ref(false)
 const editingPortfolioId = ref<number | null>(null)
-const portfolioForm = ref<PortfolioRequest>(emptyPortfolioForm())
+const portfolioForm = ref<Record<string, any>>(emptyPortfolioForm())
 
-// ===== 第二层：子策略列表 =====
-const currentPortfolio = ref<any | null>(null)  // null=在第一层
-const strategies = ref<StrategyDetail[]>([])
+// ===== 子策略表单 =====
 const showStrategyForm = ref(false)
+const strategyPortfolioId = ref<number | null>(null)  // 当前编辑的子策略所属组合
 const editingStrategyId = ref<number | null>(null)
-const strategyForm = ref<StrategyRequest>(emptyStrategyForm())
+const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
 const PERIODS = ['1m', '5m', '30m', '60m', '1d', '1w']
@@ -37,7 +40,69 @@ const TRADING_SESSIONS = [
   { value: 'pm', label: '仅下午' },
 ]
 
-function emptyStrategyForm(): StrategyRequest {
+// 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
+const PORTFOLIO_RATIO_FIELDS = new Set([
+  'max_drawdown', 'daily_loss_limit',
+  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'slippage',
+])
+const STRATEGY_RATIO_FIELDS = new Set([
+  'capital_ratio', 'single_open_ratio',
+  'stop_loss_ratio', 'take_profit_ratio', 'trailing_stop_ratio',
+  'add_position_threshold', 'add_position_ratio', 'reduce_position_ratio',
+])
+
+// 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
+const PORTFOLIO_GROUPS = [
+  { title: '基本信息', fields: [
+    { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
+    { key: 'stock_pool_id', label: '股票池', span: 2, type: 'select', options: 'pools' },
+    { key: 'benchmark_index', label: '基准指数', span: 2, type: 'text', placeholder: '000300.SH' },
+    { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
+  ]},
+  { title: '风控参数', fields: [
+    { key: 'max_drawdown', label: '最大回撤', span: 2, type: 'percent', placeholder: '20' },
+    { key: 'daily_loss_limit', label: '日亏损限', span: 2, type: 'percent', placeholder: '5' },
+    { key: 'max_holdings', label: '最大持仓数', span: 2, type: 'number', placeholder: '10' },
+  ]},
+  { title: '交易成本', fields: [
+    { key: 'min_commission', label: '最低佣金（元）', span: 2, type: 'number', placeholder: '5' },
+    { key: 'buy_commission_rate', label: '买佣金率', span: 2, type: 'percent', placeholder: '0.025' },
+    { key: 'sell_commission_rate', label: '卖佣金率', span: 2, type: 'percent', placeholder: '0.025' },
+    { key: 'stamp_duty_rate', label: '印花税率', span: 2, type: 'percent', placeholder: '0.05' },
+    { key: 'slippage', label: '滑点', span: 2, type: 'percent', placeholder: '0' },
+  ]},
+  { title: '交易时段', fields: [
+    { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
+  ]},
+]
+
+const STRATEGY_GROUPS = [
+  { title: '基本信息', fields: [
+    { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '子策略名称' },
+    { key: 'formula_id', label: '公式', span: 2, type: 'select', options: 'formulas' },
+    { key: 'period', label: '周期', span: 2, type: 'select', options: 'periods' },
+    { key: 'role', label: '角色', span: 2, type: 'select', options: 'roles' },
+    { key: 'master_strategy_id', label: '主策略', span: 2, type: 'select', options: 'masters', showIf: 'slave' },
+  ]},
+  { title: '资金参数', fields: [
+    { key: 'capital_ratio', label: '资金占比', span: 2, type: 'percent', placeholder: '60' },
+    { key: 'max_positions', label: '最大持仓数', span: 2, type: 'number', placeholder: '5' },
+    { key: 'single_open_ratio', label: '单仓占比', span: 2, type: 'percent', placeholder: '10' },
+  ]},
+  { title: '风控参数', fields: [
+    { key: 'stop_loss_ratio', label: '止损', span: 2, type: 'percent', placeholder: '5' },
+    { key: 'take_profit_ratio', label: '止盈', span: 2, type: 'percent', placeholder: '15' },
+    { key: 'trailing_stop_ratio', label: '移动止损', span: 2, type: 'percent', placeholder: '3' },
+  ]},
+  { title: '加仓参数', fields: [
+    { key: 'add_position_threshold', label: '加仓阈值', span: 2, type: 'percent', placeholder: '5' },
+    { key: 'max_add_count', label: '加仓次数', span: 2, type: 'number', placeholder: '2' },
+    { key: 'add_position_ratio', label: '加仓比例', span: 2, type: 'percent', placeholder: '10' },
+    { key: 'reduce_position_ratio', label: '减仓比例', span: 2, type: 'percent', placeholder: '30' },
+  ]},
+]
+
+function emptyStrategyForm(): Record<string, any> {
   return {
     name: '', formula_id: 0, period: '1d', role: 'independent',
     master_strategy_id: null, capital_ratio: 0.6, max_positions: 5,
@@ -48,7 +113,7 @@ function emptyStrategyForm(): StrategyRequest {
   }
 }
 
-function emptyPortfolioForm(): PortfolioRequest {
+function emptyPortfolioForm(): Record<string, any> {
   return {
     name: '', stock_pool_id: 0, benchmark_index: '000300.SH',
     initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
@@ -58,6 +123,19 @@ function emptyPortfolioForm(): PortfolioRequest {
     trading_session: 'full', status: 'active',
     strategies: [],
   }
+}
+
+// ===== 百分比 ↔ 小数转换 =====
+// 仅对 ratio 字段做 ×100 / ÷100；其他字段原值透传。文本字段保持字符串。
+function toPercent(v: any, isRatio: boolean): any {
+  if (!isRatio || v === null || v === undefined || v === '') return v
+  return Number(v) * 100
+}
+function fromPercent(v: any, fld: { type: string; key: string }): any {
+  if (fld.type === 'text') return v  // 文本字段原值
+  if (v === null || v === undefined || v === '') return v
+  const num = Number(v)
+  return STRATEGY_RATIO_FIELDS.has(fld.key) || PORTFOLIO_RATIO_FIELDS.has(fld.key) ? num / 100 : num
 }
 
 // ===== 加载 =====
@@ -72,8 +150,15 @@ async function loadPortfolios() {
   formulas.value = fs as any[]
 }
 
-async function loadStrategies(pid: number) {
-  strategies.value = await getStrategies(pid)
+async function toggleExpand(p: any) {
+  if (expanded.value.has(p.id)) {
+    expanded.value.delete(p.id)
+  } else {
+    expanded.value.add(p.id)
+    if (!strategyCache.value[p.id]) {
+      strategyCache.value[p.id] = await getStrategies(p.id)
+    }
+  }
 }
 
 function poolName(id: number) {
@@ -85,14 +170,42 @@ function formulaName(id: number) {
 }
 
 // 同组合下 role=master 的子策略（供 slave 选主策略）
-const masterOptions = computed(() =>
-  strategies.value.filter(s => s.role === 'master')
-)
+function masterOptions(pid: number) {
+  return (strategyCache.value[pid] || []).filter(s => s.role === 'master')
+}
 
-// ===== 第一层：组合 CRUD =====
+// 提交组合表单：比例字段从百分比转回小数
+function buildPortfolioPayload(): PortfolioRequest {
+  const f = portfolioForm.value
+  const out: any = { strategies: [] }
+  for (const g of PORTFOLIO_GROUPS) for (const fld of g.fields) {
+    out[fld.key] = fromPercent(f[fld.key], fld)
+  }
+  out.status = f.status
+  return out as PortfolioRequest
+}
+
+// 提交子策略表单：比例字段从百分比转回小数
+function buildStrategyPayload(): StrategyRequest {
+  const f = strategyForm.value
+  const out: any = {}
+  for (const g of STRATEGY_GROUPS) for (const fld of g.fields) {
+    if (fld.showIf && f.role !== fld.showIf) continue
+    out[fld.key] = fromPercent(f[fld.key], fld)
+  }
+  // showIf 跳过 master_strategy_id 时，独立/主策略置 null
+  if (f.role !== 'slave') out.master_strategy_id = null
+  return out as StrategyRequest
+}
+
+// ===== 组合 CRUD =====
 function openCreatePortfolio() {
   editingPortfolioId.value = null
   portfolioForm.value = emptyPortfolioForm()
+  // 把比例默认值转成百分比显示
+  for (const k of PORTFOLIO_RATIO_FIELDS) {
+    portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
+  }
   showPortfolioForm.value = true
 }
 
@@ -112,14 +225,19 @@ async function openEditPortfolio(p: any) {
     trading_session: detail.trading_session, status: detail.status,
     strategies: [],
   }
+  // 比例字段转百分比显示
+  for (const k of PORTFOLIO_RATIO_FIELDS) {
+    portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
+  }
   showPortfolioForm.value = true
 }
 
 async function submitPortfolio() {
+  const payload = buildPortfolioPayload()
   if (editingPortfolioId.value === null) {
-    await createPortfolio(portfolioForm.value)
+    await createPortfolio(payload)
   } else {
-    await updatePortfolio(editingPortfolioId.value, portfolioForm.value)
+    await updatePortfolio(editingPortfolioId.value, payload)
   }
   showPortfolioForm.value = false
   loadPortfolios()
@@ -128,28 +246,24 @@ async function submitPortfolio() {
 async function removePortfolio(id: number) {
   if (!confirm('确认删除该组合策略？子策略将一并删除。')) return
   await deletePortfolio(id)
+  expanded.value.delete(id)
+  delete strategyCache.value[id]
   loadPortfolios()
 }
 
-// ===== 切换到第二层 =====
-async function openStrategies(p: any) {
-  currentPortfolio.value = p
-  await loadStrategies(p.id)
-}
-
-function backToPortfolios() {
-  currentPortfolio.value = null
-  strategies.value = []
-}
-
-// ===== 第二层：子策略 CRUD =====
-function openCreateStrategy() {
+// ===== 子策略 CRUD =====
+function openCreateStrategy(pid: number) {
+  strategyPortfolioId.value = pid
   editingStrategyId.value = null
   strategyForm.value = emptyStrategyForm()
+  for (const k of STRATEGY_RATIO_FIELDS) {
+    strategyForm.value[k] = toPercent(strategyForm.value[k], true)
+  }
   showStrategyForm.value = true
 }
 
-function openEditStrategy(s: StrategyDetail) {
+function openEditStrategy(pid: number, s: StrategyDetail) {
+  strategyPortfolioId.value = pid
   editingStrategyId.value = s.id
   strategyForm.value = {
     name: s.name, formula_id: s.formula_id, period: s.period, role: s.role,
@@ -160,32 +274,53 @@ function openEditStrategy(s: StrategyDetail) {
     add_position_threshold: s.add_position_threshold, max_add_count: s.max_add_count,
     add_position_ratio: s.add_position_ratio, reduce_position_ratio: s.reduce_position_ratio,
   }
+  for (const k of STRATEGY_RATIO_FIELDS) {
+    strategyForm.value[k] = toPercent(strategyForm.value[k], true)
+  }
   showStrategyForm.value = true
 }
 
 async function submitStrategy() {
-  const pid = currentPortfolio.value.id
+  const pid = strategyPortfolioId.value!
+  const payload = buildStrategyPayload()
   if (editingStrategyId.value === null) {
-    await createStrategy(pid, strategyForm.value)
+    await createStrategy(pid, payload)
   } else {
-    await updateStrategy(pid, editingStrategyId.value, strategyForm.value)
+    await updateStrategy(pid, editingStrategyId.value, payload)
   }
   showStrategyForm.value = false
-  loadStrategies(pid)
+  strategyCache.value[pid] = await getStrategies(pid)
 }
 
-async function removeStrategy(s: StrategyDetail) {
+async function removeStrategy(pid: number, s: StrategyDetail) {
   if (!confirm(`确认删除子策略「${s.name}」？`)) return
-  await deleteStrategy(currentPortfolio.value.id, s.id)
-  loadStrategies(currentPortfolio.value.id)
+  await deleteStrategy(pid, s.id)
+  strategyCache.value[pid] = await getStrategies(pid)
+}
+
+// 表单字段是否显示（showIf 条件）
+function fieldVisible(fld: any, form: Record<string, any>): boolean {
+  if (!fld.showIf) return true
+  return form.role === fld.showIf
+}
+
+// 下拉选项源
+function optionsOf(src: string | undefined, pid?: number) {
+  if (!src) return []
+  if (src === 'pools') return stockPools.value.map(p => ({ value: p.id, label: `${p.name}（${p.code}）` }))
+  if (src === 'sessions') return TRADING_SESSIONS.map(t => ({ value: t.value, label: `${t.label}（${t.value}）` }))
+  if (src === 'formulas') return formulas.value.map(f => ({ value: f.id, label: f.name }))
+  if (src === 'periods') return PERIODS.map(p => ({ value: p, label: p }))
+  if (src === 'roles') return ROLES.map(r => ({ value: r.value, label: r.label }))
+  if (src === 'masters') return (pid ? masterOptions(pid) : []).map(m => ({ value: m.id, label: m.name }))
+  return []
 }
 
 onMounted(loadPortfolios)
 </script>
 
 <template>
-  <!-- ============ 第一层：组合列表 ============ -->
-  <div v-if="!currentPortfolio">
+  <div>
     <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
       <button @click="openCreatePortfolio" class="btn btn-primary">+ 新建组合</button>
     </div>
@@ -194,65 +329,72 @@ onMounted(loadPortfolios)
       <table>
         <thead><tr><th>ID</th><th>名称</th><th>股票池</th><th>子策略</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
-          <tr v-for="p in portfolios" :key="p.id">
-            <td style="color:#888">#{{ p.id }}</td>
-            <td>{{ p.name }}</td>
-            <td>{{ poolName(p.stock_pool_id) }}</td>
-            <td><span class="badge badge-blue">{{ p.strategies.length }} 个子策略</span></td>
-            <td><span class="badge" :class="p.status === 'active' ? 'badge-green' : 'badge-gray'">{{ p.status === 'active' ? '运行中' : '已归档' }}</span></td>
-            <td>
-              <button @click="openEditPortfolio(p)" class="btn btn-sm btn-primary">编辑</button>
-              <button @click="openStrategies(p)" class="btn btn-sm" style="margin-left:6px">子策略</button>
-              <button @click="removePortfolio(p.id)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
-            </td>
-          </tr>
+          <template v-for="p in portfolios" :key="p.id">
+            <tr>
+              <td style="color:#888">#{{ p.id }}</td>
+              <td>
+                <button class="btn btn-sm toggle-expand" @click="toggleExpand(p)">
+                  {{ expanded.has(p.id) ? '▼' : '▶' }}
+                </button>
+                {{ p.name }}
+              </td>
+              <td>{{ poolName(p.stock_pool_id) }}</td>
+              <td><span class="badge badge-blue">{{ p.strategies.length }} 个子策略</span></td>
+              <td><span class="badge" :class="p.status === 'active' ? 'badge-green' : 'badge-gray'">{{ p.status === 'active' ? '运行中' : '已归档' }}</span></td>
+              <td>
+                <button @click="openEditPortfolio(p)" class="btn btn-sm btn-primary">编辑</button>
+                <button @click="removePortfolio(p.id)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
+              </td>
+            </tr>
+            <!-- 树状子策略子行 -->
+            <tr v-for="s in (expanded.has(p.id) ? (strategyCache[p.id] || []) : [])" :key="`${p.id}-${s.id}`" class="strategy-sub-row">
+              <td></td>
+              <td colspan="5">
+                <div class="sub-strategy-row">
+                  <span class="sub-strategy-name">{{ ROLES.find(r => r.value === s.role)?.label || s.role }} · {{ s.name }}</span>
+                  <span class="sub-strategy-meta">{{ formulaName(s.formula_id) }} · {{ s.period }} · 资金 {{ (s.capital_ratio * 100).toFixed(0) }}%</span>
+                  <span class="sub-strategy-actions">
+                    <button @click="openEditStrategy(p.id, s)" class="btn btn-sm btn-primary">编辑</button>
+                    <button @click="removeStrategy(p.id, s)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
+                  </span>
+                </div>
+              </td>
+            </tr>
+            <!-- 展开区域的[+新建子策略] -->
+            <tr v-if="expanded.has(p.id)" class="strategy-add-row">
+              <td></td>
+              <td colspan="5">
+                <button @click="openCreateStrategy(p.id)" class="btn btn-sm signal-add" style="margin:0">+ 新建子策略</button>
+              </td>
+            </tr>
+          </template>
         </tbody>
       </table>
       <div v-if="portfolios.length === 0" class="empty-state"><p>暂无组合策略</p></div>
     </div>
 
-    <!-- 组合编辑 Modal（两层设计：不含子策略配置） -->
+    <!-- ============ 组合编辑 Modal ============ -->
     <div v-if="showPortfolioForm" class="modal-overlay modal-lg" @click.self="showPortfolioForm = false">
       <div class="modal-content">
         <h3>{{ editingPortfolioId === null ? '新建组合' : '编辑组合' }}</h3>
 
-        <label>名称</label>
-        <input v-model="portfolioForm.name" placeholder="例如：稳健组合（组合策略名称）" />
-
-        <label>股票池</label>
-        <select v-model="portfolioForm.stock_pool_id">
-          <option :value="0" disabled>请选择股票池</option>
-          <option v-for="p in stockPools" :key="p.id" :value="p.id">{{ p.name }}（{{ p.code }}）</option>
-        </select>
-
-        <label>基准指数</label>
-        <input v-model="portfolioForm.benchmark_index" placeholder="000300.SH" />
-
-        <label>初始资金（元）</label>
-        <input v-model.number="portfolioForm.initial_capital" type="number" />
-
-        <label>风控参数</label>
-        <div class="signal-row">
-          <input v-model.number="portfolioForm.max_drawdown" type="number" step="0.01" placeholder="最大回撤" />
-          <input v-model.number="portfolioForm.daily_loss_limit" type="number" step="0.01" placeholder="日亏损限" />
-          <input v-model.number="portfolioForm.max_holdings" type="number" placeholder="最大持仓数" />
+        <div v-for="g in PORTFOLIO_GROUPS" :key="g.title">
+          <label class="group-label">{{ g.title }}</label>
+          <div v-for="fld in g.fields" :key="fld.key" class="field-row">
+            <span class="field-label">{{ fld.label }}</span>
+            <input
+              v-if="fld.type === 'text' || fld.type === 'number' || fld.type === 'percent'"
+              :type="fld.type === 'percent' ? 'number' : fld.type"
+              :data-field="fld.key"
+              v-model="portfolioForm[fld.key]"
+              :placeholder="fld.placeholder"
+            />
+            <select v-else :data-field="fld.key" v-model="portfolioForm[fld.key]">
+              <option v-for="o in optionsOf(fld.options)" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
+          </div>
         </div>
-
-        <label>交易成本</label>
-        <div class="signal-row">
-          <input v-model.number="portfolioForm.min_commission" type="number" step="0.01" placeholder="最低佣金" />
-          <input v-model.number="portfolioForm.buy_commission_rate" type="number" step="0.0001" placeholder="买佣金" />
-          <input v-model.number="portfolioForm.sell_commission_rate" type="number" step="0.0001" placeholder="卖佣金" />
-        </div>
-        <div class="signal-row">
-          <input v-model.number="portfolioForm.stamp_duty_rate" type="number" step="0.0001" placeholder="印花税" />
-          <input v-model.number="portfolioForm.slippage" type="number" step="0.0001" placeholder="滑点" />
-        </div>
-
-        <label>交易时段</label>
-        <select v-model="portfolioForm.trading_session">
-          <option v-for="t in TRADING_SESSIONS" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
-        </select>
 
         <div class="modal-actions">
           <button @click="submitPortfolio" class="btn btn-primary">确认</button>
@@ -260,89 +402,28 @@ onMounted(loadPortfolios)
         </div>
       </div>
     </div>
-  </div>
 
-  <!-- ============ 第二层：子策略列表 ============ -->
-  <div v-else>
-    <div style="margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
-      <div style="display:flex;align-items:center;gap:12px">
-        <button @click="backToPortfolios" class="btn btn-sm">← 返回</button>
-        <h3 style="font-size:16px;font-weight:600;color:var(--text-heading);margin:0">
-          {{ currentPortfolio.name }} — 子策略
-        </h3>
-      </div>
-      <button @click="openCreateStrategy" class="btn btn-primary">+ 新建子策略</button>
-    </div>
-
-    <div class="card table-wrap">
-      <table>
-        <thead><tr><th>ID</th><th>名称</th><th>公式</th><th>周期</th><th>角色</th><th>主策略</th><th>资金占比</th><th>操作</th></tr></thead>
-        <tbody>
-          <tr v-for="s in strategies" :key="s.id">
-            <td style="color:#888">#{{ s.id }}</td>
-            <td>{{ s.name }}</td>
-            <td>{{ formulaName(s.formula_id) }}</td>
-            <td>{{ s.period }}</td>
-            <td><span class="badge badge-blue">{{ ROLES.find(r => r.value === s.role)?.label || s.role }}</span></td>
-            <td>{{ s.role === 'slave' ? (strategies.find(m => m.id === s.master_strategy_id)?.name || `#${s.master_strategy_id}`) : '—' }}</td>
-            <td>{{ (s.capital_ratio * 100).toFixed(0) }}%</td>
-            <td>
-              <button @click="openEditStrategy(s)" class="btn btn-sm btn-primary">编辑</button>
-              <button @click="removeStrategy(s)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-if="strategies.length === 0" class="empty-state"><p>暂无子策略，点右上[+新建子策略]添加</p></div>
-    </div>
-
-    <!-- 单个子策略编辑 Modal -->
+    <!-- ============ 子策略编辑 Modal ============ -->
     <div v-if="showStrategyForm" class="modal-overlay modal-lg" @click.self="showStrategyForm = false">
       <div class="modal-content">
         <h3>{{ editingStrategyId === null ? '新建子策略' : '编辑子策略' }}</h3>
 
-        <label>名称</label>
-        <input v-model="strategyForm.name" placeholder="子策略名称" />
-
-        <div class="signal-row">
-          <select v-model="strategyForm.formula_id">
-            <option :value="0" disabled>选公式</option>
-            <option v-for="f in formulas" :key="f.id" :value="f.id">{{ f.name }}</option>
-          </select>
-          <select v-model="strategyForm.period">
-            <option v-for="p in PERIODS" :key="p" :value="p">{{ p }}</option>
-          </select>
-          <select v-model="strategyForm.role">
-            <option v-for="r in ROLES" :key="r.value" :value="r.value">{{ r.label }}</option>
-          </select>
-        </div>
-
-        <div v-if="strategyForm.role === 'slave'">
-          <label>主策略</label>
-          <select v-model="strategyForm.master_strategy_id">
-            <option :value="null" disabled>选主策略</option>
-            <option v-for="m in masterOptions" :key="m.id" :value="m.id">{{ m.name }}</option>
-          </select>
-        </div>
-
-        <label>资金</label>
-        <div class="signal-row">
-          <input v-model.number="strategyForm.capital_ratio" type="number" step="0.01" placeholder="资金占比" />
-          <input v-model.number="strategyForm.max_positions" type="number" placeholder="最大持仓数" />
-          <input v-model.number="strategyForm.single_open_ratio" type="number" step="0.01" placeholder="单仓占比" />
-        </div>
-        <label>风控</label>
-        <div class="signal-row">
-          <input v-model.number="strategyForm.stop_loss_ratio" type="number" step="0.01" placeholder="止损" />
-          <input v-model.number="strategyForm.take_profit_ratio" type="number" step="0.01" placeholder="止盈" />
-          <input v-model.number="strategyForm.trailing_stop_ratio" type="number" step="0.01" placeholder="移动止损" />
-        </div>
-        <label>加仓</label>
-        <div class="signal-row">
-          <input v-model.number="strategyForm.add_position_threshold" type="number" step="0.01" placeholder="加仓阈值" />
-          <input v-model.number="strategyForm.max_add_count" type="number" placeholder="加仓次数" />
-          <input v-model.number="strategyForm.add_position_ratio" type="number" step="0.01" placeholder="加仓比例" />
-          <input v-model.number="strategyForm.reduce_position_ratio" type="number" step="0.01" placeholder="减仓比例" />
+        <div v-for="g in STRATEGY_GROUPS" :key="g.title">
+          <label class="group-label">{{ g.title }}</label>
+          <div v-for="fld in g.fields" :key="fld.key" v-show="fieldVisible(fld, strategyForm)" class="field-row">
+            <span class="field-label">{{ fld.label }}</span>
+            <input
+              v-if="fld.type === 'text' || fld.type === 'number' || fld.type === 'percent'"
+              :type="fld.type === 'percent' ? 'number' : fld.type"
+              :data-field="fld.key"
+              v-model="strategyForm[fld.key]"
+              :placeholder="fld.placeholder"
+            />
+            <select v-else :data-field="fld.key" v-model="strategyForm[fld.key]">
+              <option v-for="o in optionsOf(fld.options, strategyPortfolioId!)" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
+          </div>
         </div>
 
         <div class="modal-actions">

@@ -56,3 +56,20 @@ tbody tr:last-child td{border-bottom:none}
 .strategy-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .strategy-card-title{font-size:13px;font-weight:600;color:var(--text-heading)}
 .strategy-card label{font-size:12px;color:var(--text-secondary);margin-top:8px}
+
+/* 组合/子策略弹窗：分组 + 每行单字段（名称在左、输入在右） */
+.group-label{display:block;font-size:13px;font-weight:600;color:var(--text-heading);margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+.group-label:first-child{margin-top:0}
+.field-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.field-label{flex:0 0 100px;font-size:13px;color:var(--text-secondary);text-align:right}
+.field-row input,.field-row select{flex:1;margin-bottom:0;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius)}
+.field-suffix{flex:0 0 auto;font-size:13px;color:var(--text-secondary)}
+
+/* 树状子策略子行 */
+.toggle-expand{margin-right:4px;padding:2px 6px;font-size:11px;line-height:1}
+.strategy-sub-row td{background:#fafbfc !important;border-bottom:1px solid #f0f0f0 !important;padding:6px 14px !important}
+.strategy-sub-row:hover td{background:#f5f7fa !important}
+.sub-strategy-row{display:flex;align-items:center;gap:10px;padding-left:8px;border-left:2px solid var(--accent);padding:6px 8px 6px 12px}
+.sub-strategy-name{font-size:13px;font-weight:500;color:var(--text)}
+.sub-strategy-meta{font-size:12px;color:var(--text-secondary)}
+.sub-strategy-actions{margin-left:auto;display:flex;align-items:center}
