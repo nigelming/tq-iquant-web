@@ -26,7 +26,10 @@ const TRADING_SESSIONS = [
 const emptyStrategy = (): StrategyItem => ({
   name: '', formula_id: 0, period: '1d', role: 'independent',
   master_strategy_id: null, capital_ratio: 0.6, max_positions: 5,
+  single_open_ratio: 0.1,
   stop_loss_ratio: 0.05, take_profit_ratio: 0.15, trailing_stop_ratio: 0.03,
+  add_position_threshold: 0.05, max_add_count: 2,
+  add_position_ratio: 0.1, reduce_position_ratio: 0.3,
 })
 
 const emptyForm = (): PortfolioRequest => ({
@@ -71,8 +74,11 @@ async function openEdit(p: any) {
       ? detail.strategies.map((s: any) => ({
           name: s.name, formula_id: s.formula_id, period: s.period, role: s.role,
           master_strategy_id: s.master_strategy_id, capital_ratio: s.capital_ratio,
-          max_positions: s.max_positions, stop_loss_ratio: s.stop_loss_ratio,
-          take_profit_ratio: s.take_profit_ratio, trailing_stop_ratio: s.trailing_stop_ratio,
+          max_positions: s.max_positions, single_open_ratio: s.single_open_ratio,
+          stop_loss_ratio: s.stop_loss_ratio, take_profit_ratio: s.take_profit_ratio,
+          trailing_stop_ratio: s.trailing_stop_ratio,
+          add_position_threshold: s.add_position_threshold, max_add_count: s.max_add_count,
+          add_position_ratio: s.add_position_ratio, reduce_position_ratio: s.reduce_position_ratio,
         }))
       : [emptyStrategy()],
   }
@@ -170,23 +176,51 @@ onMounted(load)
       </select>
 
       <label>子策略配置</label>
-      <div v-for="(s, idx) in form.strategies" :key="idx" class="signal-row">
+      <div v-for="(s, idx) in form.strategies" :key="idx" class="strategy-card">
+        <div class="strategy-card-head">
+          <span class="strategy-card-title">子策略 {{ idx + 1 }}</span>
+          <button @click="removeStrategy(idx)" class="btn btn-sm btn-danger">×</button>
+        </div>
+        <label>名称</label>
         <input v-model="s.name" placeholder="子策略名称" />
-        <select v-model="s.formula_id">
-          <option :value="0" disabled>选公式</option>
-          <option v-for="f in formulas" :key="f.id" :value="f.id">{{ f.name }}</option>
-        </select>
-        <select v-model="s.period">
-          <option v-for="p in PERIODS" :key="p" :value="p">{{ p }}</option>
-        </select>
-        <select v-model="s.role">
-          <option v-for="r in ROLES" :key="r.value" :value="r.value">{{ r.label }}</option>
-        </select>
-        <select v-if="s.role === 'slave'" v-model="s.master_strategy_id">
-          <option :value="null" disabled>选主策略</option>
-          <option v-for="o in masterOptions()" :key="o.idx" :value="o.idx">{{ o.name }}（第{{ o.idx + 1 }}行）</option>
-        </select>
-        <button @click="removeStrategy(idx)" class="btn btn-sm btn-danger">×</button>
+        <div class="signal-row">
+          <select v-model="s.formula_id">
+            <option :value="0" disabled>选公式</option>
+            <option v-for="f in formulas" :key="f.id" :value="f.id">{{ f.name }}</option>
+          </select>
+          <select v-model="s.period">
+            <option v-for="p in PERIODS" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <select v-model="s.role">
+            <option v-for="r in ROLES" :key="r.value" :value="r.value">{{ r.label }}</option>
+          </select>
+        </div>
+        <div v-if="s.role === 'slave'">
+          <label>主策略</label>
+          <select v-model="s.master_strategy_id">
+            <option :value="null" disabled>选主策略</option>
+            <option v-for="o in masterOptions()" :key="o.idx" :value="o.idx">{{ o.name }}（第{{ o.idx + 1 }}个）</option>
+          </select>
+        </div>
+        <label>资金</label>
+        <div class="signal-row">
+          <input v-model.number="s.capital_ratio" type="number" step="0.01" placeholder="资金占比" />
+          <input v-model.number="s.max_positions" type="number" placeholder="最大持仓数" />
+          <input v-model.number="s.single_open_ratio" type="number" step="0.01" placeholder="单仓占比" />
+        </div>
+        <label>风控</label>
+        <div class="signal-row">
+          <input v-model.number="s.stop_loss_ratio" type="number" step="0.01" placeholder="止损" />
+          <input v-model.number="s.take_profit_ratio" type="number" step="0.01" placeholder="止盈" />
+          <input v-model.number="s.trailing_stop_ratio" type="number" step="0.01" placeholder="移动止损" />
+        </div>
+        <label>加仓</label>
+        <div class="signal-row">
+          <input v-model.number="s.add_position_threshold" type="number" step="0.01" placeholder="加仓阈值" />
+          <input v-model.number="s.max_add_count" type="number" placeholder="加仓次数" />
+          <input v-model.number="s.add_position_ratio" type="number" step="0.01" placeholder="加仓比例" />
+          <input v-model.number="s.reduce_position_ratio" type="number" step="0.01" placeholder="减仓比例" />
+        </div>
       </div>
       <button @click="addStrategy" class="btn btn-sm signal-add">+ 添加子策略</button>
 

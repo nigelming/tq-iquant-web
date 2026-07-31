@@ -52,3 +52,7 @@ tbody tr:last-child td{border-bottom:none}
 .empty-state{text-align:center;padding:40px 20px;color:var(--text-secondary)}
 .field{margin-bottom:16px}.field label{display:block;font-size:13px;font-weight:500;color:var(--text-secondary);margin-bottom:4px}
 .field input{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius)}
+.strategy-card{border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:10px;background:#fafafa}
+.strategy-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.strategy-card-title{font-size:13px;font-weight:600;color:var(--text-heading)}
+.strategy-card label{font-size:12px;color:var(--text-secondary);margin-top:8px}

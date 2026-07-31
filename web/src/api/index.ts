@@ -86,9 +86,14 @@ export interface StrategyItem {
   master_strategy_id: number | null  // 0=本批第N个；null=无
   capital_ratio: number
   max_positions: number
+  single_open_ratio: number
   stop_loss_ratio: number
   take_profit_ratio: number
   trailing_stop_ratio: number
+  add_position_threshold: number
+  max_add_count: number
+  add_position_ratio: number
+  reduce_position_ratio: number
 }
 
 export interface PortfolioRequest {

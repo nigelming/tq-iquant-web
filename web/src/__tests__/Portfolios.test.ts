@@ -71,14 +71,30 @@ describe('Portfolios.vue', () => {
     expect(w.text()).toContain('添加子策略')
   })
 
-  it('点[+添加子策略]子策略行 +1', async () => {
+  it('点[+添加子策略]子策略卡片 +1', async () => {
     const w = mount(Portfolios)
     await flushPromises()
     await w.find('button.btn-primary').trigger('click')  // 打开 Modal
 
-    const before = w.findAll('.signal-row').length
+    const before = w.findAll('.strategy-card').length
     await w.find('button.signal-add').trigger('click')
-    expect(w.findAll('.signal-row').length).toBe(before + 1)
+    expect(w.findAll('.strategy-card').length).toBe(before + 1)
+  })
+
+  it('子策略卡片含风控参数（止损/止盈/移动止损）与加仓参数字段', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开 Modal
+
+    // 风控参数 placeholder
+    expect(w.find('input[placeholder*="止损"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="止盈"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="移动止损"]').exists()).toBe(true)
+    // 加仓参数 placeholder
+    expect(w.find('input[placeholder*="加仓阈值"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="加仓次数"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="加仓比例"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="减仓比例"]').exists()).toBe(true)
   })
 
   it('填表 + 提交 → 调 createPortfolio，参数含 name/strategies/stock_pool_id', async () => {
