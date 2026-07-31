@@ -8,9 +8,9 @@ class TQData:
         with get_tdx_lock():
             return self._get_pools()
 
-    def get_pool_stocks(self, pool_name: str) -> List[dict]:
+    def get_pool_stocks(self, pool_code: str) -> List[dict]:
         with get_tdx_lock():
-            return self._get_stocks(pool_name)
+            return self._get_stocks(pool_code)
 
     def get_history(
         self, stocks: List[str], periods: List[str],
@@ -44,24 +44,29 @@ class TQData:
         tq = get_tq()
         return tq.get_stock_list(market) or []
 
-    def get_sectors(self, list_type: int = 1) -> List[dict]:
-        tq = get_tq()
-        return tq.get_sector_list(list_type=list_type) or []
-
-    def get_stocks_in_sector(self, block_code: str) -> List[str]:
-        tq = get_tq()
-        return tq.get_stock_list_in_sector(block_code) or []
-
     # --- TDX 底层调用 ---
     def _get_pools(self) -> List[dict]:
-        tq = get_tq()
-        sectors = tq.get_sector_list(list_type=1) or []
-        return [{"name": s} for s in sectors]
+        """通达信用户自定义板块，归一化为 [{"code","name"}]。
 
-    def _get_stocks(self, pool_name: str) -> List[dict]:
+        SDK get_user_sector() 返回 [{"Code","Name"}]（大写首字母）。
+        v1 曾用 get_sector_list（系统板块，587 个，非用户板块）且把 dict 当 str → 线上炸。
+        """
         tq = get_tq()
-        stocks = tq.get_stock_list_in_sector(pool_name) or []
-        return [{"stock_code": s} for s in stocks]
+        sectors = tq.get_user_sector() or []
+        return [{"code": s["Code"], "name": s["Name"]} for s in sectors]
+
+    def _get_stocks(self, pool_code: str) -> List[dict]:
+        """板块成分股，归一化为 [{"stock_code","stock_name"}]。
+
+        SDK get_stock_list_in_sector(code, block_type=1, list_type=1) 返回
+        [{"Code","Name"}]。必须传板块 Code（如 TQCS），传 Name 返回空。
+        """
+        tq = get_tq()
+        stocks = tq.get_stock_list_in_sector(pool_code, block_type=1, list_type=1) or []
+        return [
+            {"stock_code": s["Code"], "stock_name": s["Name"]}
+            for s in stocks
+        ]
 
     def _load_history(
         self, stocks, periods, start="", end="",

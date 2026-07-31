@@ -46,7 +46,7 @@ def client(tmp_path):
 
 def _seed(db):
     """建最小依赖链：StockPool → Formula → FormulaSignal → PortfolioStrategy → Strategy。"""
-    pool = StockPool(name="test_pool")
+    pool = StockPool(code="TEST", name="test_pool")
     db.add(pool)
     db.flush()
     formula = Formula(name="open_formula", content="REF(CLOSE,1)")

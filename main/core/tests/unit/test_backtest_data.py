@@ -229,7 +229,7 @@ def _seed_db(db):
         StockPool, StockPoolStock, Formula, FormulaSignal,
         PortfolioStrategy, Strategy,
     )
-    pool = StockPool(name="test_pool")
+    pool = StockPool(code="TEST", name="test_pool")
     db.add(pool); db.flush()
     db.add(StockPoolStock(pool_id=pool.id, stock_code="000001.SZ"))
     db.add(StockPoolStock(pool_id=pool.id, stock_code="600519.SH"))
