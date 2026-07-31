@@ -27,6 +27,11 @@ const mockPortfolios = [
   {
     id: 1, name: '稳健组合', stock_pool_id: 1, status: 'active',
     strategies: [{ id: 10, name: '主策略', role: 'master' }],
+    benchmark_index: '000300.SH', initial_capital: 500000,
+    max_drawdown: 0.2, daily_loss_limit: 0.05, max_holdings: 10,
+    trading_session: 'full',
+    min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
+    stamp_duty_rate: 0.0005, slippage: 0,
   },
   {
     id: 2, name: '激进组合', stock_pool_id: 2, status: 'archived',
@@ -117,6 +122,31 @@ describe('Portfolios.vue — 第一层 组合列表', () => {
     expect(arg.strategies).toEqual([])
   })
 
+  it('组合 Modal 含交易成本字段（手续费/印花税/滑点），提交时带默认值', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // +新建组合
+
+    // 交易成本 placeholder：买佣金/卖佣金/最低佣金/印花税/滑点
+    expect(w.find('input[placeholder*="买佣金"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="卖佣金"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="最低佣金"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="印花税"]').exists()).toBe(true)
+    expect(w.find('input[placeholder*="滑点"]').exists()).toBe(true)
+
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    // 交易成本字段已带入提交体（与后端 PortfolioCreate 对齐）
+    expect(arg).toHaveProperty('min_commission')
+    expect(arg).toHaveProperty('buy_commission_rate')
+    expect(arg).toHaveProperty('sell_commission_rate')
+    expect(arg).toHaveProperty('stamp_duty_rate')
+    expect(arg).toHaveProperty('slippage')
+  })
+
   it('点某行[编辑] → 回填并提交调 updatePortfolio', async () => {
     ;(updatePortfolio as any).mockResolvedValue({ id: 1 })
     ;(getPortfolioDetail as any).mockResolvedValue(mockPortfolios[0])
@@ -133,6 +163,11 @@ describe('Portfolios.vue — 第一层 组合列表', () => {
 
     expect(updatePortfolio).toHaveBeenCalledTimes(1)
     expect((updatePortfolio as any).mock.calls[0][0]).toBe(1)  // id
+    // 交易成本字段回填后带入提交体
+    const arg = (updatePortfolio as any).mock.calls[0][1]
+    expect(arg.min_commission).toBe(5)
+    expect(arg.buy_commission_rate).toBe(0.00025)
+    expect(arg.stamp_duty_rate).toBe(0.0005)
   })
 
   it('点某行[删除] → 调 deletePortfolio(id)', async () => {

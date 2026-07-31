@@ -104,6 +104,11 @@ export interface PortfolioRequest {
   max_drawdown: number
   daily_loss_limit: number
   max_holdings: number
+  min_commission: number
+  buy_commission_rate: number
+  sell_commission_rate: number
+  stamp_duty_rate: number
+  slippage: number
   trading_session: string  // full|am|pm
   status: string  // active|archived
   strategies: StrategyItem[]

@@ -52,7 +52,10 @@ function emptyPortfolioForm(): PortfolioRequest {
   return {
     name: '', stock_pool_id: 0, benchmark_index: '000300.SH',
     initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
-    max_holdings: 10, trading_session: 'full', status: 'active',
+    max_holdings: 10,
+    min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
+    stamp_duty_rate: 0.0005, slippage: 0,
+    trading_session: 'full', status: 'active',
     strategies: [],
   }
 }
@@ -101,6 +104,11 @@ async function openEditPortfolio(p: any) {
     benchmark_index: detail.benchmark_index || '000300.SH',
     initial_capital: detail.initial_capital, max_drawdown: detail.max_drawdown,
     daily_loss_limit: detail.daily_loss_limit, max_holdings: detail.max_holdings,
+    min_commission: detail.min_commission ?? 5,
+    buy_commission_rate: detail.buy_commission_rate ?? 0.00025,
+    sell_commission_rate: detail.sell_commission_rate ?? 0.00025,
+    stamp_duty_rate: detail.stamp_duty_rate ?? 0.0005,
+    slippage: detail.slippage ?? 0,
     trading_session: detail.trading_session, status: detail.status,
     strategies: [],
   }
@@ -228,6 +236,17 @@ onMounted(loadPortfolios)
           <input v-model.number="portfolioForm.max_drawdown" type="number" step="0.01" placeholder="最大回撤" />
           <input v-model.number="portfolioForm.daily_loss_limit" type="number" step="0.01" placeholder="日亏损限" />
           <input v-model.number="portfolioForm.max_holdings" type="number" placeholder="最大持仓数" />
+        </div>
+
+        <label>交易成本</label>
+        <div class="signal-row">
+          <input v-model.number="portfolioForm.min_commission" type="number" step="0.01" placeholder="最低佣金" />
+          <input v-model.number="portfolioForm.buy_commission_rate" type="number" step="0.0001" placeholder="买佣金" />
+          <input v-model.number="portfolioForm.sell_commission_rate" type="number" step="0.0001" placeholder="卖佣金" />
+        </div>
+        <div class="signal-row">
+          <input v-model.number="portfolioForm.stamp_duty_rate" type="number" step="0.0001" placeholder="印花税" />
+          <input v-model.number="portfolioForm.slippage" type="number" step="0.0001" placeholder="滑点" />
         </div>
 
         <label>交易时段</label>
