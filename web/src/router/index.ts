@@ -5,6 +5,7 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/stock-pools' },
     { path: '/stock-pools', name: 'stock-pools', component: () => import('../views/StockPools.vue') },
+    { path: '/formulas', name: 'formulas', component: () => import('../views/Formulas.vue') },
     { path: '/portfolios', name: 'portfolios', component: () => import('../views/Portfolios.vue') },
     { path: '/backtest', name: 'backtest', component: () => import('../views/Backtest.vue') },
     { path: '/live', name: 'live', component: () => import('../views/LiveSessions.vue') },

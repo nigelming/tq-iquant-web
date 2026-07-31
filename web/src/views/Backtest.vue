@@ -17,7 +17,7 @@ onMounted(async () => {
         <tr v-for="r in records" :key="r.id">
           <td style="color:#888">#{{ r.id }}</td>
           <td>{{ r.name }}</td>
-          <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ {completed:'已完成',running:'运行中',failed:'失败'}[r.status] || r.status }}</span></td>
+          <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ ({completed:'已完成',running:'运行中',failed:'失败'} as Record<string,string>)[r.status] || r.status }}</span></td>
           <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:#888">-</span></td>
           <td><button class="btn btn-sm">查看</button></td>
         </tr>
