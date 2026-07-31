@@ -397,8 +397,212 @@ def test_delete_portfolio_not_found(client):
 
 
 def test_delete_master_strategy_blocked_by_slave(client):
-    """删除被从策略引用的主策略 → 400。
-    （通过 PUT 全量替换删除 master 时，若残留 slave 引用应被拒。
-    这里测的是独立子策略删除端点——若实现该端点。）"""
-    # 注：若本次不实现独立子策略删除端点，此测试跳过
-    pytest.skip("独立子策略删除端点本次不实现，主从引用检查在 POST/PUT 校验阶段覆盖")
+    """独立删除被从策略引用的主策略 → 400（防孤儿引用）。"""
+    c, Session = client
+    db = Session()
+    pid_pool = _seed_pool(db)
+    fid = _seed_formula(db)
+    p = PortfolioStrategy(
+        name="ps", stock_pool_id=pid_pool, initial_capital=Decimal("100000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(p); db.flush()
+    master = Strategy(portfolio_id=p.id, name="M", formula_id=fid, period="1d", role="master")
+    db.add(master); db.flush()
+    slave = Strategy(portfolio_id=p.id, name="S", formula_id=fid, period="1d",
+                     role="slave", master_strategy_id=master.id)
+    db.add(slave)
+    db.commit()
+    master_id = master.id
+    pid = p.id
+    db.close()
+
+    body = c.delete(f"/api/portfolios/{pid}/strategies/{master_id}").json()
+    assert body["code"] == 400
+    assert "引用" in body["message"] or "从策略" in body["message"]
+
+    # 主策略仍在
+    db = Session()
+    assert db.get(Strategy, master_id) is not None
+    db.close()
+
+
+# ===========================================================================
+# 独立子策略 CRUD — /api/portfolios/{pid}/strategies
+# 两层设计：组合与子策略分开管理。新建/编辑/删除单个子策略。
+# ===========================================================================
+def _strategy_payload(**overrides):
+    """单个子策略请求体。"""
+    base = {
+        "name": "S1", "formula_id": 1, "period": "1d", "role": "independent",
+        "master_strategy_id": None, "capital_ratio": 0.6, "max_positions": 5,
+        "single_open_ratio": 0.1, "stop_loss_ratio": 0.05, "take_profit_ratio": 0.15,
+        "trailing_stop_ratio": 0.03, "add_position_threshold": 0.05, "max_add_count": 2,
+        "add_position_ratio": 0.1, "reduce_position_ratio": 0.3,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_list_strategies(client):
+    """GET /api/portfolios/{pid}/strategies — 列出某组合的子策略。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("S1", "independent", None), ("S2", "independent", None)])
+    db.close()
+
+    body = c.get(f"/api/portfolios/{pid}/strategies").json()
+    assert body["code"] == 0
+    assert len(body["data"]) == 2
+
+
+def test_list_strategies_portfolio_not_found(client):
+    c, Session = client
+    assert c.get("/api/portfolios/9999/strategies").json()["code"] == 404
+
+
+def test_create_strategy(client):
+    """POST — 在某组合下新建单个子策略。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])  # 空子策略
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(name="NEW_S")).json()
+    assert body["code"] == 0
+    assert body["data"]["name"] == "NEW_S"
+    assert body["data"]["portfolio_id"] == pid
+
+    db = Session()
+    assert db.query(Strategy).filter(Strategy.portfolio_id == pid).count() == 1
+    db.close()
+
+
+def test_create_strategy_portfolio_not_found(client):
+    c, Session = client
+    db = Session()
+    _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios/9999/strategies", json=_strategy_payload()).json()
+    assert body["code"] == 404
+
+
+def test_create_strategy_invalid_period(client):
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(period="15m")).json()
+    assert body["code"] == 400
+
+
+def test_create_strategy_formula_not_found(client):
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(formula_id=999)).json()
+    assert body["code"] == 400
+
+
+def test_create_strategy_slave_with_master(client):
+    """独立新建 slave：master_strategy_id 指向已存在的同组合 master id。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    db.close()
+
+    # 取 master id
+    db = Session()
+    master = db.query(Strategy).filter(Strategy.portfolio_id == pid, Strategy.role == "master").first()
+    master_id = master.id
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        name="SLAVE", role="slave", master_strategy_id=master_id,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["master_strategy_id"] == master_id
+
+
+def test_create_strategy_slave_without_master_rejected(client):
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        role="slave", master_strategy_id=None,
+    )).json()
+    assert body["code"] == 400
+
+
+def test_create_strategy_slave_master_wrong_portfolio(client):
+    """slave 的 master 指向另一组合的策略 → 400。"""
+    c, Session = client
+    db = Session()
+    pid1 = _seed_portfolio(db, strategies=[("M", "master", None)])
+    pid2 = _seed_portfolio(db, strategies=[])
+    # 取 pid1 的 master id
+    master_id = db.query(Strategy).filter(Strategy.portfolio_id == pid1).first().id
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid2}/strategies", json=_strategy_payload(
+        role="slave", master_strategy_id=master_id,
+    )).json()
+    assert body["code"] == 400
+
+
+def test_update_strategy(client):
+    """PUT — 编辑单个子策略。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("S1", "independent", None)])
+    sid = db.query(Strategy).filter(Strategy.portfolio_id == pid).first().id
+    db.close()
+
+    body = c.put(f"/api/portfolios/{pid}/strategies/{sid}", json=_strategy_payload(
+        name="RENAMED", capital_ratio=0.8,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["name"] == "RENAMED"
+    assert body["data"]["capital_ratio"] == 0.8
+
+
+def test_update_strategy_not_found(client):
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.put(f"/api/portfolios/{pid}/strategies/9999", json=_strategy_payload()).json()
+    assert body["code"] == 404
+
+
+def test_delete_strategy(client):
+    """DELETE — 删除单个子策略（无引用时成功）。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("S1", "independent", None)])
+    sid = db.query(Strategy).filter(Strategy.portfolio_id == pid).first().id
+    db.close()
+
+    body = c.delete(f"/api/portfolios/{pid}/strategies/{sid}").json()
+    assert body["code"] == 0
+
+    db = Session()
+    assert db.get(Strategy, sid) is None
+    db.close()
+
+
+def test_delete_strategy_not_found(client):
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.delete(f"/api/portfolios/{pid}/strategies/9999").json()
+    assert body["code"] == 404

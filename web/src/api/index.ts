@@ -129,6 +129,64 @@ export async function deletePortfolio(id: number) {
   return res.data.data
 }
 
+export interface StrategyDetail {
+  id: number
+  name: string
+  formula_id: number
+  period: string  // 1m|5m|30m|60m|1d|1w
+  role: string  // independent|master|slave
+  master_strategy_id: number | null  // 已存在的同组合 master id
+  capital_ratio: number
+  max_positions: number
+  single_open_ratio: number
+  stop_loss_ratio: number
+  take_profit_ratio: number
+  trailing_stop_ratio: number
+  add_position_threshold: number
+  max_add_count: number
+  add_position_ratio: number
+  reduce_position_ratio: number
+}
+
+export interface StrategyRequest {
+  name: string
+  formula_id: number
+  period: string  // 1m|5m|30m|60m|1d|1w
+  role: string  // independent|master|slave
+  master_strategy_id: number | null  // 已存在的同组合 master id
+  capital_ratio: number
+  max_positions: number
+  single_open_ratio: number
+  stop_loss_ratio: number
+  take_profit_ratio: number
+  trailing_stop_ratio: number
+  add_position_threshold: number
+  max_add_count: number
+  add_position_ratio: number
+  reduce_position_ratio: number
+}
+
+// 独立子策略 CRUD（两层设计：组合下单独管理子策略）
+export async function getStrategies(pid: number) {
+  const res = await api.get<ApiResponse<StrategyDetail[]>>(`/portfolios/${pid}/strategies`)
+  return res.data.data
+}
+
+export async function createStrategy(pid: number, req: StrategyRequest) {
+  const res = await api.post<ApiResponse<StrategyDetail>>(`/portfolios/${pid}/strategies`, req)
+  return res.data.data
+}
+
+export async function updateStrategy(pid: number, sid: number, req: StrategyRequest) {
+  const res = await api.put<ApiResponse<StrategyDetail>>(`/portfolios/${pid}/strategies/${sid}`, req)
+  return res.data.data
+}
+
+export async function deleteStrategy(pid: number, sid: number) {
+  const res = await api.delete<ApiResponse<any>>(`/portfolios/${pid}/strategies/${sid}`)
+  return res.data.data
+}
+
 export async function getBacktestRecords() {
   const res = await api.get<ApiResponse<any[]>>('/backtest/records')
   return res.data.data

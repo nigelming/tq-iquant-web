@@ -62,6 +62,7 @@ class PortfolioCreate(BaseModel):
 def _serialize_strategy(s: Strategy) -> dict:
     return {
         "id": s.id,
+        "portfolio_id": s.portfolio_id,
         "name": s.name,
         "formula_id": s.formula_id,
         "period": s.period,
@@ -253,4 +254,124 @@ def delete_portfolio(pid: int, db: Session = Depends(get_db)):
     except IntegrityError:
         db.rollback()
         return {"code": 409, "message": "该组合策略被回测记录或实盘 session 引用，无法删除"}
+    return {"code": 0, "data": None}
+
+
+# ===========================================================================
+# 独立子策略 CRUD — /api/portfolios/{pid}/strategies
+# 两层设计：组合与子策略分开管理。此组端点管理单个子策略。
+# slave 的 master_strategy_id 是已存在的同组合 master 的 strategy id（正整数）。
+# ===========================================================================
+class StrategyCreate(BaseModel):
+    name: str
+    formula_id: int
+    period: str
+    role: str
+    master_strategy_id: int | None = None  # 已存在的同组合 master id
+    capital_ratio: float = 0.6
+    max_positions: int = 5
+    single_open_ratio: float = 0.1
+    stop_loss_ratio: float = 0.05
+    take_profit_ratio: float = 0.15
+    trailing_stop_ratio: float = 0.03
+    add_position_threshold: float = 0.05
+    max_add_count: int = 2
+    add_position_ratio: float = 0.1
+    reduce_position_ratio: float = 0.3
+
+
+def _apply_strategy_fields(s: Strategy, req: StrategyCreate) -> None:
+    s.name = req.name
+    s.formula_id = req.formula_id
+    s.period = req.period
+    s.role = req.role
+    s.master_strategy_id = req.master_strategy_id
+    s.capital_ratio = req.capital_ratio
+    s.max_positions = req.max_positions
+    s.single_open_ratio = req.single_open_ratio
+    s.stop_loss_ratio = req.stop_loss_ratio
+    s.take_profit_ratio = req.take_profit_ratio
+    s.trailing_stop_ratio = req.trailing_stop_ratio
+    s.add_position_threshold = req.add_position_threshold
+    s.max_add_count = req.max_add_count
+    s.add_position_ratio = req.add_position_ratio
+    s.reduce_position_ratio = req.reduce_position_ratio
+
+
+def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None:
+    """单个子策略校验。master_strategy_id 必须是同组合下 role=master 的已存在 strategy。"""
+    if req.role not in VALID_ROLES:
+        return f"role 必须为 {sorted(VALID_ROLES)}，收到 {req.role}"
+    if req.period not in VALID_PERIODS:
+        return f"period 必须为 {sorted(VALID_PERIODS)}，收到 {req.period}"
+    if not (0 < req.capital_ratio <= 1):
+        return f"capital_ratio 必须在 (0,1]，收到 {req.capital_ratio}"
+    if not db.query(Formula).filter(Formula.id == req.formula_id).first():
+        return f"公式 id={req.formula_id} 不存在"
+    if req.role == "slave":
+        if req.master_strategy_id is None:
+            return "role=slave 必须指定主策略（master_strategy_id）"
+        # master 必须是同组合下 role=master 的已存在策略
+        master = db.query(Strategy).filter(Strategy.id == req.master_strategy_id).first()
+        if not master:
+            return f"主策略 id={req.master_strategy_id} 不存在"
+        if master.portfolio_id != pid:
+            return "主策略不属于本组合"
+        if master.role != "master":
+            return "主策略角色必须为 master"
+    else:  # master / independent
+        if req.master_strategy_id is not None:
+            return f"role={req.role} 的 master_strategy_id 必须为空"
+    return None
+
+
+@router.get("/{pid}/strategies")
+def list_strategies(pid: int, db: Session = Depends(get_db)):
+    if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
+        return {"code": 404, "message": "组合策略不存在"}
+    items = db.query(Strategy).filter(Strategy.portfolio_id == pid).order_by(Strategy.id).all()
+    return {"code": 0, "data": [_serialize_strategy(s) for s in items]}
+
+
+@router.post("/{pid}/strategies")
+def create_strategy(pid: int, req: StrategyCreate, db: Session = Depends(get_db)):
+    if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
+        return {"code": 404, "message": "组合策略不存在"}
+    err = _validate_strategy(req, db, pid)
+    if err:
+        return {"code": 400, "message": err}
+    s = Strategy(portfolio_id=pid)
+    _apply_strategy_fields(s, req)
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"code": 0, "data": _serialize_strategy(s)}
+
+
+@router.put("/{pid}/strategies/{sid}")
+def update_strategy(pid: int, sid: int, req: StrategyCreate, db: Session = Depends(get_db)):
+    s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
+    if not s:
+        return {"code": 404, "message": "子策略不存在"}
+    err = _validate_strategy(req, db, pid)
+    if err:
+        return {"code": 400, "message": err}
+    _apply_strategy_fields(s, req)
+    db.commit()
+    db.refresh(s)
+    return {"code": 0, "data": _serialize_strategy(s)}
+
+
+@router.delete("/{pid}/strategies/{sid}")
+def delete_strategy(pid: int, sid: int, db: Session = Depends(get_db)):
+    s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
+    if not s:
+        return {"code": 404, "message": "子策略不存在"}
+    # 删 master 前 check 无 slave 引用
+    if s.role == "master":
+        slave_count = db.query(Strategy).filter(Strategy.master_strategy_id == sid).count()
+        if slave_count > 0:
+            return {"code": 400, "message": "该主策略被从策略引用，无法删除"}
+    db.delete(s)
+    db.commit()
     return {"code": 0, "data": None}
