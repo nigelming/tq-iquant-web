@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.db import get_db
@@ -118,6 +119,10 @@ def delete_formula(formula_id: int, db: Session = Depends(get_db)):
     f = db.query(Formula).filter(Formula.id == formula_id).first()
     if not f:
         return {"code": 404, "message": "公式不存在"}
-    db.delete(f)  # FormulaSignal 随 ondelete=CASCADE 删
-    db.commit()
+    try:
+        db.delete(f)  # FormulaSignal 随 ondelete=CASCADE 删
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"code": 409, "message": "该公式被策略引用，无法删除"}
     return {"code": 0, "data": None}

@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from core.main import app
 from core.db import get_db
-from core.models import Base, Formula, FormulaSignal
+from core.models import Base, Formula, FormulaSignal, Strategy, PortfolioStrategy, StockPool
 
 
 @pytest.fixture
@@ -279,3 +279,37 @@ def test_delete_formula_not_found(client):
     resp = c.delete("/api/formulas/9999")
     assert resp.status_code == 200
     assert resp.json()["code"] == 404
+
+
+def test_delete_formula_referenced_by_strategy(client):
+    """DELETE 被策略引用的公式 → code 409（而非 500）。
+    Strategy.formula_id ondelete=RESTRICT，删除应被拒，提示需先解除引用。"""
+    from decimal import Decimal
+    c, Session = client
+    db = Session()
+    # 建依赖链：StockPool → PortfolioStrategy → Formula → Strategy(引用该公式)
+    pool = StockPool(code="TQCS", name="tq自选")
+    db.add(pool); db.flush()
+    fid = _seed_formula(db)
+    ps = PortfolioStrategy(
+        name="ps", stock_pool_id=pool.id, initial_capital=Decimal("100000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(ps); db.flush()
+    db.add(Strategy(
+        portfolio_id=ps.id, name="s1", formula_id=fid,
+        period="1d", role="independent",
+    ))
+    db.commit()
+    db.close()
+
+    resp = c.delete(f"/api/formulas/{fid}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 409
+    assert "引用" in body["message"]
+
+    # 公式仍在（未被删）
+    db = Session()
+    assert db.get(Formula, fid) is not None
+    db.close()

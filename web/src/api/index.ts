@@ -78,6 +78,52 @@ export async function getPortfolios() {
   return res.data.data
 }
 
+export interface StrategyItem {
+  name: string
+  formula_id: number
+  period: string  // 1m|5m|30m|60m|1d|1w
+  role: string  // independent|master|slave
+  master_strategy_id: number | null  // 0=本批第N个；null=无
+  capital_ratio: number
+  max_positions: number
+  stop_loss_ratio: number
+  take_profit_ratio: number
+  trailing_stop_ratio: number
+}
+
+export interface PortfolioRequest {
+  name: string
+  stock_pool_id: number
+  benchmark_index?: string
+  initial_capital: number
+  max_drawdown: number
+  daily_loss_limit: number
+  max_holdings: number
+  trading_session: string  // full|am|pm
+  status: string  // active|archived
+  strategies: StrategyItem[]
+}
+
+export async function getPortfolioDetail(id: number) {
+  const res = await api.get<ApiResponse<any>>(`/portfolios/${id}`)
+  return res.data.data
+}
+
+export async function createPortfolio(req: PortfolioRequest) {
+  const res = await api.post<ApiResponse<any>>('/portfolios', req)
+  return res.data.data
+}
+
+export async function updatePortfolio(id: number, req: PortfolioRequest) {
+  const res = await api.put<ApiResponse<any>>(`/portfolios/${id}`, req)
+  return res.data.data
+}
+
+export async function deletePortfolio(id: number) {
+  const res = await api.delete<ApiResponse<any>>(`/portfolios/${id}`)
+  return res.data.data
+}
+
 export async function getBacktestRecords() {
   const res = await api.get<ApiResponse<any[]>>('/backtest/records')
   return res.data.data
