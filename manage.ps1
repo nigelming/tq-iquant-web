@@ -28,7 +28,10 @@ switch ($Action) {
         if (-not $bp) {
             Write-Host "Starting backend on port $backend_port ..." -ForegroundColor Cyan
             $log = Join-Path $backend_dir "server.log"
-            Start-Process -NoNewWindow -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardOutput $log
+            $err = Join-Path $backend_dir "server.err.log"
+            $stdin = Join-Path $backend_dir "stdin.empty"
+            if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
+            Start-Process -WindowStyle Hidden -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
             Start-Sleep 3
             Write-Host "  backend started (PID: $(Get-BackendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
         } else {
@@ -39,7 +42,10 @@ switch ($Action) {
         if (-not $fp) {
             Write-Host "Starting frontend on port $frontend_port ..." -ForegroundColor Cyan
             $log = Join-Path $frontend_dir "vite.log"
-            Start-Process -NoNewWindow -FilePath "cmd" -ArgumentList "/c npm run dev -- --host 0.0.0.0" -WorkingDirectory $frontend_dir -RedirectStandardOutput $log
+            $err = Join-Path $frontend_dir "vite.err.log"
+            $stdin = Join-Path $frontend_dir "stdin.empty"
+            if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
+            Start-Process -WindowStyle Hidden -FilePath "cmd" -ArgumentList "/c npm run dev -- --host 0.0.0.0" -WorkingDirectory $frontend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
             Start-Sleep 3
             Write-Host "  frontend started (PID: $(Get-FrontendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
         } else {
