@@ -101,8 +101,20 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
     return pl.DataFrame(col_data)
 
 
+def _is_nan(val) -> bool:
+    """识别 NaN/None/空（TQ 停牌/无交易日返回 NaN float 或 None）。"""
+    if val is None:
+        return True
+    if isinstance(val, float) and val != val:  # NaN 唯一不等于自身的特性
+        return True
+    return False
+
+
 def _to_decimal(val) -> Decimal:
-    """数值转 Decimal，容忍 float/int/str/Decimal。"""
+    """数值转 Decimal，容忍 float/int/str/Decimal；NaN/None → Decimal("0")。
+    NaN 会毒化下游金额计算（Decimal('nan') 参与运算全 NaN），故规整为 0。"""
+    if _is_nan(val):
+        return Decimal("0")
     if isinstance(val, Decimal):
         return val
     if isinstance(val, (int, float)):
@@ -110,6 +122,21 @@ def _to_decimal(val) -> Decimal:
     if isinstance(val, str):
         return Decimal(val)
     return Decimal(str(val))
+
+
+def _to_int(val) -> int:
+    """数值转 int（Volume/公式 trigger_value）；NaN/None/无法解析 → 0。
+    注意：int(NaN) 直接抛 ValueError，故先 _is_nan 拦截。"""
+    if _is_nan(val):
+        return 0
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, (int, float)):
+        return int(val)
+    try:
+        return int(Decimal(str(val)))
+    except (ValueError, ArithmeticError):
+        return 0
 
 
 def _convert_market_data_multi(raw_by_period: dict, stocks: list) -> dict:
@@ -228,18 +255,6 @@ def _parse_date_str(d: str):
         except ValueError:
             continue
     return None
-
-
-def _to_int(val) -> int:
-    """公式输出值转 int（trigger_value 是 int 比较）。"""
-    if isinstance(val, bool):
-        return int(val)
-    if isinstance(val, (int, float)):
-        return int(val)
-    try:
-        return int(Decimal(str(val)))
-    except (ValueError, ArithmeticError):
-        return 0
 
 
 def build_signal_cache(ps: PortfolioStrategy, klines: dict, db: Session = None) -> dict:

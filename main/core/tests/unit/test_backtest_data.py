@@ -116,6 +116,34 @@ def test_convert_market_data_volume_as_string():
     assert vols[0] == 1000 and isinstance(vols[0], (int, float, Decimal))
 
 
+def test_convert_market_data_nan_values():
+    """真机 bug：停牌/无交易的日子 TQ 返回 NaN（float）。
+    _to_int(NaN) 直接 int(NaN) 抛 ValueError；_to_decimal(NaN) 产 Decimal('nan') 毒化计算。
+    NaN 应规整为 0（无成交量）/ 价列也应容忍 NaN 不报错。"""
+    import math
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, float("nan")]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, float("nan")]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, float("nan")]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, float("nan")]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, float("nan")]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, float("nan")]}, index=ts),
+    }
+    # 不应抛异常
+    klines = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = klines["000001.SZ"]["1d"]
+    assert df.height == 2
+    # NaN Volume 规整为 0（非 NaN）
+    vols = df["Volume"].to_list()
+    assert vols[1] == 0, f"NaN Volume 应为 0，实得 {vols[1]!r}"
+    # 价列 NaN 不毒化（Decimal nan 会破坏下游金额计算）— 规整为 0
+    opens = df["Open"].to_list()
+    assert not (isinstance(opens[1], Decimal) and opens[1].is_nan()), \
+        f"NaN 价应规整为 0，实得 {opens[1]!r}"
+
+
 def test_convert_market_data_multi_period():
     """多周期：每个 period 独立一份 DataFrame（TQ 一次调用 = 单周期，故 raw 按 period 分组）。"""
     import pandas as pd
