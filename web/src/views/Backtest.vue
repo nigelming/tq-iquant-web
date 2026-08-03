@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord,
@@ -17,6 +18,16 @@ const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date:
 // ===== 详情视图 =====
 const currentRecord = ref<any | null>(null)
 const detail = ref<any | null>(null)
+
+// echarts 实例（净值 + 回撤）
+const equityChartEl = ref<HTMLDivElement | null>(null)
+const drawdownChartEl = ref<HTMLDivElement | null>(null)
+let equityChart: echarts.ECharts | null = null
+let drawdownChart: echarts.ECharts | null = null
+
+// 交易明细分页
+const currentPage = ref(1)
+const pageSize = 20
 
 const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
@@ -54,7 +65,6 @@ async function submit() {
   if (!form.value.portfolio_strategy_id) { alert('请选择组合'); return }
   if (!form.value.name.trim()) { alert('请填写回测名称'); return }
   if (!form.value.start_date || !form.value.end_date) { alert('请选择起止日期'); return }
-  // 前端拦截日期区间错误：start 必须 ≤ end，避免发到后端才报错
   if (form.value.start_date > form.value.end_date) {
     alert(`开始日期不能晚于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
     return
@@ -75,6 +85,10 @@ async function submit() {
 async function openDetail(id: number) {
   detail.value = await getBacktestDetail(id)
   currentRecord.value = detail.value?.record || null
+  currentPage.value = 1
+  // 等 DOM 渲染后初始化图表
+  await nextTick()
+  initCharts()
 }
 
 async function onDelete(id: number) {
@@ -90,9 +104,12 @@ async function onDelete(id: number) {
 function backToList() {
   currentRecord.value = null
   detail.value = null
+  // 销毁图表实例，避免内存泄漏
+  equityChart?.dispose(); equityChart = null
+  drawdownChart?.dispose(); drawdownChart = null
 }
 
-// ===== 评估指标格式 =====
+// ===== 格式化 =====
 function pct(v: any): string {
   if (v === null || v === undefined) return '—'
   return `${(Number(v) * 100).toFixed(2)}%`
@@ -101,61 +118,253 @@ function num(v: any, digits = 4): string {
   if (v === null || v === undefined) return '—'
   return Number(v).toFixed(digits)
 }
+// 按值正负着色
+function valueClass(v: any): string {
+  if (v === null || v === undefined) return ''
+  return Number(v) >= 0 ? 'text-green' : 'text-red'
+}
 
-const metrics = computed(() => {
+// ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
+function buildMetrics(m: any) {
+  if (!m) return []
+  const retVolRatio = m.annual_return != null && m.volatility
+    ? m.annual_return / m.volatility : null
+  return [
+    { label: '总收益', value: pct(m.total_return), cls: valueClass(m.total_return) },
+    { label: '年化收益', value: pct(m.annual_return), cls: valueClass(m.annual_return) },
+    { label: '最大回撤', value: pct(m.max_drawdown), cls: 'text-red' },
+    { label: '年化波动率', value: pct(m.volatility), cls: 'text-orange' },
+    { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue' },
+    { label: '卡玛比率', value: num(m.calmar_ratio, 2), cls: 'text-blue' },
+    { label: '索提诺比率', value: num(m.sortino_ratio, 2), cls: 'text-blue' },
+    { label: 'VaR (95%)', value: pct(m.var_95), cls: 'text-red' },
+    { label: 'CVaR (95%)', value: pct(m.cvar_95), cls: 'text-red' },
+    { label: '收益/波动比', value: num(retVolRatio, 2), cls: 'text-blue' },
+    { label: '平均修复天数', value: num(m.avg_recovery_days, 0), cls: 'text-orange' },
+    { label: '最大修复天数', value: num(m.max_recovery_days, 0), cls: 'text-orange' },
+    { label: '胜率', value: pct(m.win_rate), cls: 'text-blue' },
+    { label: '盈亏比', value: num(m.profit_factor, 2), cls: 'text-blue' },
+    { label: '交易次数', value: String(m.total_trades ?? '—'), cls: '' },
+    { label: '平均持仓天数', value: num(m.avg_holding_days, 1), cls: 'text-blue' },
+    { label: 'Ulcer指数', value: num(m.ulcer_index, 2), cls: 'text-orange' },
+    { label: '收益稳定性', value: num(m.return_stability, 2), cls: 'text-blue' },
+  ]
+}
+
+// 组合整体 18 项指标
+const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
+
+// 策略对比卡片
+const strategyCards = computed(() => {
+  const evals = detail.value?.strategy_evaluations || []
+  return evals.map((s: any) => ({
+    strategy_id: s.strategy_id,
+    strategy_name: s.strategy_name,
+    metrics: buildMetrics(s),
+  }))
+})
+
+// 关键指标摘要（4 卡）
+const summaryCards = computed(() => {
+  const e = detail.value?.evaluations
+  if (!e) return []
+  return [
+    { label: '总收益', value: pct(e.total_return), tone: 'positive' },
+    { label: '年化收益', value: pct(e.annual_return), tone: 'positive' },
+    { label: '最大回撤', value: pct(e.max_drawdown), tone: 'danger' },
+    { label: '夏普比率', value: num(e.sharpe_ratio, 2), tone: 'neutral' },
+  ]
+})
+
+// 整体表现 6 渐变卡
+const overallStats = computed(() => {
   const e = detail.value?.evaluations
   if (!e) return []
   return [
     { label: '总收益', value: pct(e.total_return) },
     { label: '年化收益', value: pct(e.annual_return) },
     { label: '最大回撤', value: pct(e.max_drawdown) },
-    { label: '波动率', value: pct(e.volatility) },
+    { label: '年化波动率', value: pct(e.volatility) },
     { label: '夏普比率', value: num(e.sharpe_ratio, 2) },
-    { label: '索提诺比率', value: num(e.sortino_ratio, 2) },
-    { label: '卡尔玛比率', value: num(e.calmar_ratio, 2) },
-    { label: '胜率', value: pct(e.win_rate) },
-    { label: '盈亏比', value: num(e.profit_factor, 2) },
-    { label: '交易次数', value: String(e.total_trades ?? '—') },
-    { label: '基准收益', value: pct(e.benchmark_return) },
-    { label: '平均持仓天数', value: num(e.avg_holding_days, 1) },
+    { label: '卡玛比率', value: num(e.calmar_ratio, 2) },
   ]
 })
 
-// ===== 净值曲线 SVG（单序列折线，2px，recessive 轴，crosshair tooltip）=====
-const chart = computed(() => {
+// 副标题：交易天数
+const subtitle = computed(() => {
   const snaps = detail.value?.snapshots || []
-  if (snaps.length < 2) return null
-  const W = 760, H = 240, PAD_L = 56, PAD_R = 16, PAD_T = 16, PAD_B = 28
-  const values = snaps.map((s: any) => Number(s.total_value))
-  const dates = snaps.map((s: any) => s.snap_date)
-  const minV = Math.min(...values), maxV = Math.max(...values)
-  const range = maxV - minV || 1
-  const x = (i: number) => PAD_L + (i / (values.length - 1)) * (W - PAD_L - PAD_R)
-  const y = (v: number) => PAD_T + (1 - (v - minV) / range) * (H - PAD_T - PAD_B)
-  const points = values.map((v: number, i: number) => `${x(i)},${y(v)}`).join(' ')
-  const yTicks = [0, 0.33, 0.66, 1].map(f => {
-    const v = minV + range * f
-    return { v, y: y(v), label: Math.round(v).toLocaleString() }
-  })
-  const xTicks = [0, Math.floor((dates.length - 1) / 2), dates.length - 1].map(i => ({
-    x: x(i), label: dates[i],
-  }))
-  return { W, H, PAD_L, PAD_R, PAD_T, PAD_B, points, x, y, values, dates, yTicks, xTicks, minV, maxV }
+  if (snaps.length < 2) return ''
+  const days = snaps.length - 1
+  const years = (days / 252).toFixed(2)
+  return `回测周期: ${days} 个交易日 (${years}年)`
 })
 
-const hoverIdx = ref<number | null>(null)
-function onChartMove(e: MouseEvent) {
-  if (!chart.value) return
-  const rect = (e.currentTarget as SVGElement).querySelector('rect.chart-hit')!.getBoundingClientRect()
-  const rx = (e.clientX - rect.left) / rect.width * chart.value.W
-  const { PAD_L, PAD_R, values } = chart.value
-  const plotW = chart.value.W - PAD_L - PAD_R
-  const ratio = Math.max(0, Math.min(1, (rx - PAD_L) / plotW))
-  hoverIdx.value = Math.round(ratio * (values.length - 1))
-}
-function onChartLeave() { hoverIdx.value = null }
+// ===== 净值 / 回撤曲线数据 =====
+const equityDates = computed(() => (detail.value?.snapshots || []).map((s: any) => s.snap_date))
+const portfolioCurve = computed(() => (detail.value?.snapshots || []).map((s: any) => Number(s.total_value)))
 
-onMounted(load)
+// 基准指数曲线（归一化为累计收益率%，与组合/策略同轴）。
+// benchmark_value 缺失（旧记录/未配置）→ hasBenchmark=false，前端隐藏基准线。
+const benchmarkRaw = computed(() => (detail.value?.snapshots || []).map((s: any) => s.benchmark_value))
+const hasBenchmark = computed(() => benchmarkRaw.value.some((v: any) => v !== null && v !== undefined))
+const benchmarkCurve = computed(() => {
+  const vals = benchmarkRaw.value
+  const base = vals.find((v: any) => v !== null && v !== undefined)
+  return vals.map((v: any) => {
+    if (v === null || v === undefined) return null
+    return base > 0 ? ((v - base) / base) * 100 : 0
+  })
+})
+
+// 回撤由组合净值序列前端算（peak − current）
+const drawdownCurve = computed(() => {
+  const vals = portfolioCurve.value
+  let peak = vals[0] ?? 0
+  return vals.map((v: any) => {
+    if (v > peak) peak = v
+    // 用百分比表示回撤（负值）
+    return peak > 0 ? -((peak - v) / peak) * 100 : 0
+  })
+})
+
+// 策略净值曲线（归一化到百分比收益率，便于与组合同轴比较）
+const strategyCurves = computed(() => {
+  const sSnaps = detail.value?.strategy_snapshots || []
+  return sSnaps.map((s: any) => {
+    const curve = s.curve || []
+    // 用首日为基准算累计收益率%
+    const base = Number(curve[0]?.total_value) || 0
+    return {
+      name: s.strategy_name,
+      data: curve.map((p: any) => base > 0 ? ((Number(p.total_value) - base) / base) * 100 : 0),
+      dates: curve.map((p: any) => p.snap_date),
+    }
+  })
+})
+
+// 组合净值也归一化为累计收益率%，与策略曲线同轴
+const portfolioReturnPct = computed(() => {
+  const vals = portfolioCurve.value
+  const base = vals[0] ?? 0
+  return vals.map((v: any) => base > 0 ? ((v - base) / base) * 100 : 0)
+})
+
+// ===== 交易明细分页 =====
+const totalPages = computed(() => Math.max(1, Math.ceil((detail.value?.trades || []).length / pageSize)))
+const paginatedTrades = computed(() => {
+  const trades = detail.value?.trades || []
+  const start = (currentPage.value - 1) * pageSize
+  return trades.slice(start, start + pageSize)
+})
+
+// ===== echarts 初始化 =====
+function initCharts() {
+  initEquityChart()
+  initDrawdownChart()
+}
+
+function initEquityChart() {
+  if (!equityChartEl.value || portfolioCurve.value.length < 2) return
+  equityChart?.dispose()
+  equityChart = echarts.init(equityChartEl.value)
+
+  const series: any[] = [{
+    name: '组合',
+    type: 'line',
+    data: portfolioReturnPct.value,
+    smooth: true,
+    areaStyle: {
+      color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+        { offset: 0, color: 'rgba(102, 126, 234, 0.3)' },
+        { offset: 1, color: 'rgba(102, 126, 234, 0.05)' },
+      ]),
+    },
+    itemStyle: { color: '#667eea' },
+    markLine: {
+      silent: true,
+      data: [{ yAxis: 0, lineStyle: { color: '#999', type: 'dashed' } }],
+      label: { show: false },
+    },
+  }]
+  // 策略曲线
+  for (const sc of strategyCurves.value) {
+    series.push({
+      name: sc.name, type: 'line', data: sc.data, smooth: true,
+      lineStyle: { width: 1.5 },
+    })
+  }
+  // 基准曲线（灰色虚线，无面积填充）；无基准数据则不画
+  if (hasBenchmark.value) {
+    series.push({
+      name: '基准', type: 'line', data: benchmarkCurve.value, smooth: true,
+      symbol: 'none',
+      lineStyle: { width: 1.5, type: 'dashed', color: '#9ca3af' },
+      itemStyle: { color: '#9ca3af' },
+    })
+  }
+
+  const legendData = ['组合', ...strategyCurves.value.map((s: any) => s.name)]
+  if (hasBenchmark.value) legendData.push('基准')
+
+  equityChart.setOption({
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params: any) => {
+        let r = params[0].axisValue + '<br/>'
+        params.forEach((p: any) => {
+          // 基准在某些日期可能为 null（无数据日）→ 显示 '—'
+          const val = p.value == null ? '—' : `${p.value.toFixed(2)}%`
+          r += `${p.marker}${p.seriesName}: ${val}<br/>`
+        })
+        return r
+      },
+    },
+    legend: { data: legendData, bottom: 0 },
+    grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
+    xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
+    yAxis: { type: 'value', name: '收益率(%)', scale: true,
+      axisLabel: { formatter: '{value}%' },
+      splitLine: { lineStyle: { type: 'dashed' } } },
+    series,
+  })
+}
+
+function initDrawdownChart() {
+  if (!drawdownChartEl.value || drawdownCurve.value.length < 2) return
+  drawdownChart?.dispose()
+  drawdownChart = echarts.init(drawdownChartEl.value)
+  drawdownChart.setOption({
+    tooltip: { trigger: 'axis', formatter: '{b}<br />回撤: {c}%' },
+    grid: { left: '3%', right: '4%', bottom: '3%', top: '10%', containLabel: true },
+    xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
+    yAxis: { type: 'value', name: '回撤(%)', max: 0 },
+    series: [{
+      name: '回撤', type: 'line', data: drawdownCurve.value, smooth: true,
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(239, 68, 68, 0.3)' },
+          { offset: 1, color: 'rgba(239, 68, 68, 0.05)' },
+        ]),
+      },
+      itemStyle: { color: '#ef4444' },
+    }],
+  })
+}
+
+function handleResize() {
+  equityChart?.resize()
+  drawdownChart?.resize()
+}
+
+onMounted(() => {
+  load()
+  window.addEventListener('resize', handleResize)
+})
+onUnmounted(() => {
+  window.removeEventListener('resize', handleResize)
+  equityChart?.dispose()
+  drawdownChart?.dispose()
+})
 </script>
 
 <template>
@@ -219,62 +428,89 @@ onMounted(load)
     </div>
   </div>
 
-  <!-- ============ 详情视图 ============ -->
-  <div v-else>
-    <div style="margin-bottom:16px;display:flex;align-items:center;gap:12px">
-      <button @click="backToList" class="btn btn-sm">← 返回</button>
-      <h3 style="font-size:16px;font-weight:600;color:var(--text-heading);margin:0">
-        {{ currentRecord.name }}
-      </h3>
-      <span style="color:#888;font-size:12px">{{ currentRecord.start_date }} ~ {{ currentRecord.end_date }}</span>
+  <!-- ============ 详情报告视图 ============ -->
+  <div v-else class="report-page">
+    <!-- 报告头 -->
+    <div class="report-header">
+      <button @click="backToList" class="back-link btn btn-sm">← 返回</button>
+      <h1>{{ currentRecord.name }}</h1>
+      <p class="subtitle">{{ currentRecord.start_date }} ~ {{ currentRecord.end_date }} · {{ subtitle }}</p>
     </div>
 
-    <!-- 评估指标卡 -->
-    <div class="metric-grid">
-      <div v-for="m in metrics" :key="m.label" class="metric-card">
-        <span class="metric-label">{{ m.label }}</span>
-        <span class="metric-value">{{ m.value }}</span>
+    <!-- 关键指标摘要 -->
+    <div class="section-title">关键指标摘要</div>
+    <div class="summary-section">
+      <div v-for="c in summaryCards" :key="c.label" class="summary-card" :class="c.tone">
+        <div class="title">{{ c.label }}</div>
+        <div class="value">{{ c.value }}</div>
       </div>
     </div>
+
+    <!-- 整体表现指标 -->
+    <div class="section-title">整体表现指标</div>
+    <div class="stats-grid">
+      <div v-for="s in overallStats" :key="s.label" class="stat-card">
+        <div class="value">{{ s.value }}</div>
+        <div class="label">{{ s.label }}</div>
+      </div>
+    </div>
+
+    <!-- 策略对比分析 -->
+    <template v-if="strategyCards.length > 0">
+      <div class="section-title">策略对比分析</div>
+      <div class="strategy-comparison">
+        <div v-for="sc in strategyCards" :key="sc.strategy_id" class="strategy-card">
+          <h3>{{ sc.strategy_name }}</h3>
+          <div class="risk-metrics">
+            <div v-for="m in sc.metrics" :key="m.label" class="metric-row">
+              <span class="metric-label">{{ m.label }}</span>
+              <span :class="m.cls">{{ m.value }}</span>
+            </div>
+          </div>
+        </div>
+        <!-- 组合整体卡 -->
+        <div class="strategy-card portfolio-card">
+          <h3>组合整体</h3>
+          <div class="risk-metrics">
+            <div v-for="m in portfolioMetrics" :key="m.label" class="metric-row">
+              <span class="metric-label">{{ m.label }}</span>
+              <span :class="m.cls">{{ m.value }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
 
     <!-- 净值曲线 -->
-    <div v-if="chart" class="card chart-wrap">
-      <div class="chart-title">净值曲线</div>
-      <svg class="net-value-chart" :viewBox="`0 0 ${chart.W} ${chart.H}`" @mousemove="onChartMove" @mouseleave="onChartLeave">
-        <g v-for="t in chart.yTicks" :key="t.label">
-          <line :x1="chart.PAD_L" :x2="chart.W - chart.PAD_R" :y1="t.y" :y2="t.y" stroke="#e5e7eb" stroke-width="1" />
-          <text :x="chart.PAD_L - 8" :y="t.y + 4" text-anchor="end" font-size="11" fill="#888">{{ t.label }}</text>
-        </g>
-        <g v-for="(t, i) in chart.xTicks" :key="i">
-          <text :x="t.x" :y="chart.H - 8" text-anchor="middle" font-size="11" fill="#888">{{ t.label }}</text>
-        </g>
-        <polyline :points="chart.points" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
-        <g v-if="hoverIdx !== null">
-          <line :x1="chart.x(hoverIdx)" :x2="chart.x(hoverIdx)" :y1="chart.PAD_T" :y2="chart.H - chart.PAD_B" stroke="#bbb" stroke-width="1" stroke-dasharray="3,3" />
-          <circle :cx="chart.x(hoverIdx)" :cy="chart.y(chart.values[hoverIdx])" r="4" fill="#3b82f6" stroke="#fff" stroke-width="2" />
-        </g>
-        <rect class="chart-hit" :x="chart.PAD_L" :y="chart.PAD_T" :width="chart.W - chart.PAD_L - chart.PAD_R" :height="chart.H - chart.PAD_T - chart.PAD_B" fill="transparent" />
-      </svg>
-      <div v-if="hoverIdx !== null" class="chart-tooltip">
-        <span class="tt-date">{{ chart.dates[hoverIdx] }}</span>
-        <span class="tt-value">¥{{ Number(chart.values[hoverIdx]).toLocaleString() }}</span>
-      </div>
+    <div class="section-title">净值曲线</div>
+    <div class="chart-box">
+      <div ref="equityChartEl" class="chart-container"></div>
     </div>
-    <div v-else class="card empty-state"><p>快照不足，无法绘制曲线</p></div>
+
+    <!-- 回撤曲线 -->
+    <div class="section-title">回撤曲线</div>
+    <div class="chart-box">
+      <div ref="drawdownChartEl" class="chart-container"></div>
+    </div>
 
     <!-- 交易明细 -->
-    <div class="card table-wrap" style="margin-top:16px">
-      <div class="chart-title">交易明细</div>
-      <table>
-        <thead><tr><th>时间</th><th>股票</th><th>信号</th><th>买卖</th><th>价格</th><th>数量</th><th>金额</th><th>佣金</th><th>印花税</th></tr></thead>
+    <div class="section-title">交易明细</div>
+    <div class="table-container">
+      <table class="trade-table">
+        <thead>
+          <tr>
+            <th>时间</th><th>策略</th><th>买卖</th><th>代码</th>
+            <th>数量</th><th>价格</th><th>金额</th><th>佣金</th><th>印花税</th>
+          </tr>
+        </thead>
         <tbody>
-          <tr v-for="t in (detail?.trades || [])" :key="t.id">
+          <tr v-for="t in paginatedTrades" :key="t.id">
             <td style="font-size:12px;color:#888">{{ t.bar_time?.replace('T', ' ') }}</td>
+            <td><span class="strategy-badge">{{ t.strategy_name || `#${t.strategy_id}` }}</span></td>
+            <td :class="t.trade_type === 'BUY' ? 'text-green' : 'text-red'">{{ t.trade_type === 'BUY' ? '买入' : '卖出' }}</td>
             <td>{{ t.stock_code }}</td>
-            <td>{{ t.signal_name }}</td>
-            <td><span class="badge" :class="t.trade_type === 'BUY' ? 'badge-blue' : 'badge-gray'">{{ t.trade_type === 'BUY' ? '买入' : '卖出' }}</span></td>
-            <td>{{ Number(t.price).toFixed(3) }}</td>
             <td>{{ t.quantity }}</td>
+            <td>{{ Number(t.price).toFixed(3) }}</td>
             <td>{{ Number(t.amount).toLocaleString() }}</td>
             <td>{{ Number(t.commission).toFixed(2) }}</td>
             <td>{{ Number(t.stamp_duty).toFixed(2) }}</td>
@@ -282,6 +518,223 @@ onMounted(load)
         </tbody>
       </table>
       <div v-if="(detail?.trades || []).length === 0" class="empty-state"><p>无交易记录</p></div>
+      <div v-if="(detail?.trades || []).length > pageSize" class="pagination">
+        <button :disabled="currentPage === 1" @click="currentPage--" class="page-btn">上一页</button>
+        <span class="page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
+        <button :disabled="currentPage === totalPages" @click="currentPage++" class="page-btn">下一页</button>
+      </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.report-page {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+.report-header {
+  text-align: center;
+  margin-bottom: 24px;
+  position: relative;
+}
+.back-link {
+  position: absolute;
+  left: 0;
+  top: 0;
+  text-decoration: none;
+}
+.report-header h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-heading, #1a1a2e);
+}
+.subtitle {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: #888;
+}
+
+/* 区块标题 */
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-heading, #1a1a2e);
+  margin: 24px 0 14px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #667eea;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.section-title::before {
+  content: '';
+  width: 4px;
+  height: 18px;
+  background: linear-gradient(180deg, #667eea, #764ba2);
+  border-radius: 2px;
+}
+
+/* 关键指标摘要 */
+.summary-section {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.summary-card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 16px;
+  border-left: 4px solid #667eea;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.summary-card .title { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+.summary-card .value { font-size: 22px; font-weight: 700; color: #333; }
+.summary-card.positive { border-left-color: #10b981; }
+.summary-card.danger { border-left-color: #ef4444; }
+
+/* 整体表现 6 渐变卡 */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.stat-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 10px;
+  padding: 18px 12px;
+  color: #fff;
+  text-align: center;
+  transition: transform 0.25s, box-shadow 0.25s;
+}
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);
+}
+.stat-card .value { font-size: 22px; font-weight: 700; }
+.stat-card .label { font-size: 12px; opacity: 0.9; margin-top: 6px; }
+
+/* 策略对比 */
+.strategy-comparison {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.strategy-card {
+  background: #f8f9fa;
+  border-radius: 10px;
+  padding: 16px;
+  border: 1px solid #e9ecef;
+}
+.strategy-card.portfolio-card {
+  border: 2px solid #667eea;
+  background: linear-gradient(135deg, #f8f9fa 0%, #e8f4f8 100%);
+}
+.strategy-card h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: #333;
+}
+.risk-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 10px;
+  background: #fff;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.metric-label { color: #666; }
+.metric-row span:last-child { font-weight: 600; }
+
+.text-green { color: #10b981; font-weight: 600; }
+.text-red { color: #ef4444; font-weight: 600; }
+.text-orange { color: #f59e0b; font-weight: 600; }
+.text-blue { color: #667eea; font-weight: 600; }
+
+/* 图表 */
+.chart-box {
+  background: #f8f9fa;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 8px;
+}
+.chart-container {
+  width: 100%;
+  height: 380px;
+}
+
+/* 交易明细表 */
+.table-container {
+  background: #f8f9fa;
+  border-radius: 10px;
+  padding: 16px;
+  overflow-x: auto;
+}
+.trade-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.trade-table th {
+  padding: 10px 12px;
+  text-align: left;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.trade-table td {
+  padding: 9px 12px;
+  border-bottom: 1px solid #e9ecef;
+  font-size: 12px;
+}
+.trade-table tr:hover { background: #e9ecef; }
+.strategy-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #e0e7ff;
+  color: #4338ca;
+}
+
+/* 分页 */
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+  margin-top: 14px;
+}
+.page-btn {
+  padding: 6px 16px;
+  background: #667eea;
+  color: #fff;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.page-info { font-size: 13px; color: #6b7280; }
+
+/* 响应式 */
+@media (max-width: 1200px) {
+  .stats-grid { grid-template-columns: repeat(3, 1fr); }
+  .summary-section { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 768px) {
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .summary-section { grid-template-columns: 1fr; }
+  .risk-metrics { grid-template-columns: 1fr; }
+}
+</style>

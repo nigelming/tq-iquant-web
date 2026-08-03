@@ -198,6 +198,45 @@ def build_open_prices(ps: PortfolioStrategy, klines: dict) -> dict:
     return prices
 
 
+def build_benchmark_data(
+    ps: PortfolioStrategy, start: date, end: date, db: Session = None
+) -> Dict[date, Decimal]:
+    """拉基准指数收盘价：{snap_date: close_value}。
+
+    基准代码取 ps.benchmark_index（默认 000300.SH）。用 TQ 拉指数日线 Close，
+    按日期（date）建索引，供 BacktestEngine 逐 bar 填入快照 benchmark_value。
+    拉取失败/无数据返回空 dict（前端据此隐藏基准线，Evaluator 退化为 0）。
+    """
+    index_code = getattr(ps, "benchmark_index", None) or "000300.SH"
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    tq = TQData()
+    raw = tq.get_history_raw(
+        stocks=[index_code], periods=["1d"],
+        start=start_str, end=end_str, dividend_type="front", count=-1,
+    )
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    raw_1d = raw.get("1d")
+    if not isinstance(raw_1d, dict):
+        return {}
+    close_df = raw_1d.get("Close")
+    if close_df is None or index_code not in getattr(close_df, "columns", []):
+        return {}
+    result: Dict[date, Decimal] = {}
+    for ts in close_df.index:
+        val = close_df.loc[ts, index_code]
+        if _is_nan(val):
+            continue
+        # ts 可能是 Timestamp/datetime/date，统一取 .date()
+        d = ts.date() if hasattr(ts, "date") else ts
+        if isinstance(d, datetime):
+            d = d.date()
+        result[d] = _to_decimal(val)
+    return result
+
+
+
 # --- 公式信号 ---
 # TQ 公式输出中需跳过的非变量键
 _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
@@ -498,6 +537,45 @@ def _persist_result(
         return_stability=ev.get("return_stability"),
     ))
 
+    # ---- 策略层快照 + 评估 ----
+    strategy_snaps = result.get("strategy_snapshots") or {}
+    strategy_evals = result.get("strategy_evaluations") or {}
+    for sid, snaps in strategy_snaps.items():
+        for snap in snaps:
+            db.add(BacktestDailySnapshot(
+                backtest_record_id=record_id,
+                target_type="strategy",
+                target_id=sid,
+                snap_date=snap["snap_date"],
+                total_value=snap["total_value"],
+                cash=snap.get("cash", Decimal("0")),
+                market_value=snap.get("market_value", Decimal("0")),
+            ))
+    for sid, sev in strategy_evals.items():
+        db.add(BacktestEvaluation(
+            backtest_record_id=record_id,
+            target_type="strategy",
+            target_id=sid,
+            total_return=sev.get("total_return"),
+            annual_return=sev.get("annual_return"),
+            max_drawdown=sev.get("max_drawdown"),
+            volatility=sev.get("volatility"),
+            sharpe_ratio=sev.get("sharpe_ratio"),
+            sortino_ratio=sev.get("sortino_ratio"),
+            calmar_ratio=sev.get("calmar_ratio"),
+            win_rate=sev.get("win_rate"),
+            profit_factor=sev.get("profit_factor"),
+            total_trades=sev.get("total_trades"),
+            benchmark_return=sev.get("benchmark_return"),
+            avg_holding_days=sev.get("avg_holding_days"),
+            var_95=sev.get("var_95"),
+            cvar_95=sev.get("cvar_95"),
+            avg_recovery_days=sev.get("avg_recovery_days"),
+            max_recovery_days=sev.get("max_recovery_days"),
+            ulcer_index=sev.get("ulcer_index"),
+            return_stability=sev.get("return_stability"),
+        ))
+
 
 # ---------------------------------------------------------------------------
 # 序列化
@@ -551,6 +629,13 @@ def _serialize_trade(t: BacktestTrade) -> dict:
     }
 
 
+def _serialize_trade_with_name(t: BacktestTrade, name_map: dict) -> dict:
+    """带策略名的交易序列化（详情页策略列展示）。"""
+    d = _serialize_trade(t)
+    d["strategy_name"] = name_map.get(t.strategy_id, f"策略{t.strategy_id}")
+    return d
+
+
 def _serialize_evaluation(e: BacktestEvaluation) -> dict:
     return {
         "total_return": _f(e.total_return),
@@ -590,7 +675,7 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
         return {"code": 404, "message": "回测记录不存在"}
     snaps = (
         db.query(BacktestDailySnapshot)
-        .filter_by(backtest_record_id=record_id)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
         .order_by(BacktestDailySnapshot.snap_date)
         .all()
     )
@@ -602,16 +687,55 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
     )
     evals = (
         db.query(BacktestEvaluation)
-        .filter_by(backtest_record_id=record_id)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
         .first()
     )
+
+    # ---- 策略层 ----
+    strategy_evals_rows = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id, target_type="strategy")
+        .all()
+    )
+    strategy_snaps_rows = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="strategy")
+        .order_by(BacktestDailySnapshot.target_id, BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    # strategy_id → name 映射（trades/snapshots 都带 strategy_id，前端展示需名字）
+    strat_ids = {t.strategy_id for t in trades} | {r.target_id for r in strategy_evals_rows}
+    strat_name_map = {
+        s.id: s.name for s in db.query(Strategy).filter(Strategy.id.in_(strat_ids)).all()
+    } if strat_ids else {}
+
+    # 按策略聚合快照曲线
+    curves_by_sid: dict = {}
+    for s in strategy_snaps_rows:
+        curves_by_sid.setdefault(s.target_id, []).append({
+            "snap_date": s.snap_date.isoformat() if s.snap_date else None,
+            "total_value": _f(s.total_value),
+        })
+
+    strategy_evaluations = [
+        {"strategy_id": r.target_id, "strategy_name": strat_name_map.get(r.target_id, f"策略{r.target_id}"),
+         **_serialize_evaluation(r)}
+        for r in strategy_evals_rows
+    ]
+    strategy_snapshots = [
+        {"strategy_id": sid, "strategy_name": strat_name_map.get(sid, f"策略{sid}"), "curve": curve}
+        for sid, curve in curves_by_sid.items()
+    ]
+
     return {
         "code": 0,
         "data": {
             "record": _serialize_record(rec),
             "snapshots": [_serialize_snapshot(s) for s in snaps],
-            "trades": [_serialize_trade(t) for t in trades],
+            "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
             "evaluations": _serialize_evaluation(evals) if evals else None,
+            "strategy_evaluations": strategy_evaluations,
+            "strategy_snapshots": strategy_snapshots,
         },
     }
 
@@ -677,6 +801,7 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         klines = build_klines(ps, req.start_date, req.end_date, db)
         signal_cache = build_signal_cache(ps, klines, db)
         open_prices = build_open_prices(ps, klines)
+        benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
 
         # 空行情保护：TQ 在该区间/股票池拉不到任何 K 线 → 标 failed 而非静默 completed。
         # 这正是"启动了但没运行直接完成"的根因（日期填反/未来日/股票池空等）。
@@ -704,6 +829,7 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
             klines=klines,
             signal_cache=signal_cache,
             open_prices=open_prices,
+            benchmark_data=benchmark_data,
             progress_callback=on_progress,
         )
 

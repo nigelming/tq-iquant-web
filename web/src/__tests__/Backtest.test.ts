@@ -9,6 +9,20 @@ vi.mock('../api', () => ({
   deleteBacktestRecord: vi.fn(),
 }))
 
+// echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
+vi.mock('echarts', () => {
+  const stub = {
+    init: vi.fn(() => ({
+      setOption: vi.fn(),
+      resize: vi.fn(),
+      dispose: vi.fn(),
+    })),
+    // 必须是可 new 的普通函数（组件用 new echarts.graphic.LinearGradient(...)）
+    graphic: { LinearGradient: function () { return {} } },
+  }
+  return { default: stub, ...stub }
+})
+
 import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
@@ -32,9 +46,9 @@ const mockPortfolios = [
 const mockDetail = {
   record: { id: 1, name: '回测A', status: 'completed', start_date: '2026-07-01', end_date: '2026-07-31' },
   snapshots: [
-    { snap_date: '2026-07-01', total_value: 100000, cash: 100000, market_value: 0, daily_return: null, cumulative_return: 0 },
-    { snap_date: '2026-07-02', total_value: 101000, cash: 50000, market_value: 51000, daily_return: 0.01, cumulative_return: 0.01 },
-    { snap_date: '2026-07-03', total_value: 99000, cash: 50000, market_value: 49000, daily_return: -0.0198, cumulative_return: -0.01 },
+    { snap_date: '2026-07-01', total_value: 100000, cash: 100000, market_value: 0, daily_return: null, cumulative_return: 0, benchmark_value: 3000 },
+    { snap_date: '2026-07-02', total_value: 101000, cash: 50000, market_value: 51000, daily_return: 0.01, cumulative_return: 0.01, benchmark_value: 3060 },
+    { snap_date: '2026-07-03', total_value: 99000, cash: 50000, market_value: 49000, daily_return: -0.0198, cumulative_return: -0.01, benchmark_value: 3030 },
   ],
   trades: [
     { id: 1, stock_code: '000001.SZ', trade_type: 'BUY', price: 10.0, quantity: 1000, amount: 10000, commission: 5, stamp_duty: 0, bar_time: '2026-07-02T09:30:00', signal_name: 'open_sig', signal_type: 'OPEN' },
@@ -203,8 +217,8 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('总收益')
     expect(w.text()).toContain('最大回撤')
     expect(w.text()).toContain('夏普')
-    // 净值曲线 SVG
-    expect(w.find('svg.net-value-chart').exists()).toBe(true)
+    // 净值曲线 echarts 容器
+    expect(w.find('.chart-container').exists()).toBe(true)
     // 交易明细表（trade_type BUY → 显示"买入"）
     expect(w.text()).toContain('000001.SZ')
     expect(w.text()).toContain('买入')
@@ -237,5 +251,25 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('5.00%')
     // max_drawdown=0.02 → 2.00%
     expect(w.text()).toContain('2.00%')
+  })
+
+  it('净值曲线含基准线（snapshots 带 benchmark_value → echarts setOption legend 含"基准"）', async () => {
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').find(b => b.text().includes('查看'))!
+    await viewBtn.trigger('click')
+    await flushPromises()
+
+    // echarts.init 被调用，返回的实例 setOption 含基准 series
+    expect(init).toHaveBeenCalled()
+    const chartInstance = (init as any).mock.results[0].value
+    expect(chartInstance.setOption).toHaveBeenCalled()
+    const option = chartInstance.setOption.mock.calls[0][0]
+    expect(option.legend.data).toContain('基准')
+    const benchSeries = option.series.find((s: any) => s.name === '基准')
+    expect(benchSeries).toBeTruthy()
+    // 基准归一化：3000→0%，3060→2%，3030→1%
+    expect(benchSeries.data).toHaveLength(3)
   })
 })

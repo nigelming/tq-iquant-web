@@ -198,3 +198,152 @@ def test_run_breaker_triggers_on_drawdown_and_halts_next_bar_buy():
     assert port.risk_manager.circuit_breaker_active is True
     buy_trades = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
     assert len(buy_trades) == 2  # 仅熔断生效前两笔；后续被剥
+
+
+def _portfolio_two_strategies():
+    """两策略组合：s1 capital_ratio=0.6，s2=0.4，各自有公式信号。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.5"), daily_loss_limit=Decimal("0.5"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    for sid, ratio in [(1, Decimal("0.6")), (2, Decimal("0.4"))]:
+        ctx = StrategyContext(
+            strategy_id=sid, period="1d",
+            capital_ratio=ratio, max_positions=5,
+        )
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        ctx.strategy_risk = StrategyRiskManager(
+            stop_loss_ratio=Decimal("0.5"),
+            take_profit_ratio=Decimal("0.5"),
+            trailing_stop_ratio=Decimal("0"),
+        )
+        port.strategies.append(ctx)
+    return port
+
+
+def test_strategy_snapshots_additivity():
+    """两策略快照：每日 Σ(策略总净值) == 组合总净值（现金按 ratio 归一化分摊）。
+    无交易时各策略市值=0，分摊现金之和 = 组合现金，故 Σ策略净值 = 组合现金 = 组合净值。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
+    ])
+    port = _portfolio_two_strategies()
+    # 无信号 → 无交易，全程纯现金
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (2, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
+        (2, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+    }
+
+    engine = BacktestEngine()
+    result = engine.run(port, klines=klines, signal_cache=cache,
+                        open_prices={stock: {}})
+
+    strategy_snaps = result["strategy_snapshots"]
+    # 两个策略各 2 个快照
+    assert set(strategy_snaps.keys()) == {1, 2}
+    assert len(strategy_snaps[1]) == 2 and len(strategy_snaps[2]) == 2
+
+    # 可加性：每日 Σ策略净值 == 组合净值
+    portfolio_snaps = result["snapshots"]
+    for i in range(2):
+        s1 = strategy_snaps[1][i]["total_value"]
+        s2 = strategy_snaps[2][i]["total_value"]
+        p = portfolio_snaps[i]["total_value"]
+        assert s1 + s2 == p  # 纯现金 + 市值0，精确相等
+
+
+def test_strategy_evaluations_present():
+    """有交易的策略 → strategy_evaluations 含该策略的评估（total_return 等非空）。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
+        (datetime(2026, 7, 31), Decimal("9.0"), Decimal("9.2"), Decimal("8.8"), Decimal("9.1"), 1000),
+    ])
+    port = _portfolio_two_strategies()
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+        (2, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
+        (2, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (2, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    }
+    open_prices = {stock: {datetime(2026, 7, 30): Decimal("10.2")}}
+
+    engine = BacktestEngine()
+    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+
+    # s1 有交易（BUY@10.2），其评估应存在
+    sev = result["strategy_evaluations"]
+    assert 1 in sev
+    assert sev[1].get("total_return") is not None
+    # s2 无交易，快照不足或全现金 → 评估存在但指标可能为 None/0
+    assert "total_trades" in sev.get(2, {}) or 2 not in sev
+
+
+def test_benchmark_filled_into_snapshots_and_evaluated():
+    """传 benchmark_data={date: Decimal} → 每个 portfolio 快照带 benchmark_value，
+    且 evaluations.benchmark_return 反映基准涨跌（首末日 close 之比）。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
+        (datetime(2026, 7, 31), Decimal("9.0"), Decimal("9.2"), Decimal("8.8"), Decimal("9.1"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    }
+    # 基准指数：1000 → 1100（+10%）
+    benchmark_data = {
+        datetime(2026, 7, 29).date(): Decimal("1000"),
+        datetime(2026, 7, 30).date(): Decimal("1050"),
+        datetime(2026, 7, 31).date(): Decimal("1100"),
+    }
+
+    engine = BacktestEngine()
+    result = engine.run(
+        port, klines=klines, signal_cache=cache,
+        open_prices={stock: {}}, benchmark_data=benchmark_data,
+    )
+
+    # 每个组合快照都带 benchmark_value
+    snaps = result["snapshots"]
+    assert len(snaps) == 3
+    assert [s["benchmark_value"] for s in snaps] == [
+        Decimal("1000"), Decimal("1050"), Decimal("1100"),
+    ]
+    # benchmark_return = (1100-1000)/1000 = 0.1
+    ev = result["evaluations"]
+    assert ev["benchmark_return"] == Decimal("0.1000")
+
+
+def test_no_benchmark_data_no_curve():
+    """不传 benchmark_data → 快照 benchmark_value 全 None，benchmark_return 退化为 0。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+    }
+
+    engine = BacktestEngine()
+    result = engine.run(
+        port, klines=klines, signal_cache=cache, open_prices={stock: {}}
+    )
+
+    snaps = result["snapshots"]
+    assert all(s["benchmark_value"] is None for s in snaps)
+    assert result["evaluations"]["benchmark_return"] == Decimal("0")
+

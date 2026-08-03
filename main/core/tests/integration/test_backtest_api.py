@@ -137,10 +137,14 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     assert trades[0].trade_type == "BUY"
     assert trades[1].trade_type == "SELL"
 
-    snaps = db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).all()
-    assert len(snaps) == 3  # 3 个交易日
+    snaps = db.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=record_id, target_type="portfolio"
+    ).all()
+    assert len(snaps) == 3  # 3 个交易日（组合层）
 
-    evals = db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).all()
+    evals = db.query(BacktestEvaluation).filter_by(
+        backtest_record_id=record_id, target_type="portfolio"
+    ).all()
     assert len(evals) == 1
     assert evals[0].total_return is not None
     db.close()
@@ -176,7 +180,9 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     db = Session()
     trades = db.query(BacktestTrade).filter_by(backtest_record_id=record_id).all()
     assert len(trades) == 0
-    snaps = db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).all()
+    snaps = db.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=record_id, target_type="portfolio"
+    ).all()
     assert len(snaps) == 3
     db.close()
 
@@ -295,18 +301,20 @@ def test_delete_record_removes_record_and_children(client, monkeypatch):
     _mock_data(monkeypatch)
     record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
 
-    # 删前：子表有数据
+    # 删前：子表有数据（按 target_type 分层计数）
     db = Session()
     assert db.query(BacktestTrade).filter_by(backtest_record_id=record_id).count() == 2
-    assert db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).count() == 3
-    assert db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).count() == 1
+    assert db.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=record_id, target_type="portfolio").count() == 3
+    assert db.query(BacktestEvaluation).filter_by(
+        backtest_record_id=record_id, target_type="portfolio").count() == 1
     db.close()
 
     resp = c.delete(f"/api/backtest/records/{record_id}")
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
 
-    # 删后：record + 三张子表全空
+    # 删后：record + 三张子表全空（含策略层）
     db = Session()
     assert db.get(BacktestRecord, record_id) is None
     assert db.query(BacktestTrade).filter_by(backtest_record_id=record_id).count() == 0
