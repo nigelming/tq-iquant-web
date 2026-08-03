@@ -189,7 +189,7 @@ export async function updateStrategy(pid: number, sid: number, req: StrategyRequ
 
 export async function deleteStrategy(pid: number, sid: number) {
   const res = await api.delete<ApiResponse<any>>(`/portfolios/${pid}/strategies/${sid}`)
-  return res.data.data
+  return res.data
 }
 
 export async function getBacktestRecords() {

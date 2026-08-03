@@ -372,6 +372,16 @@ def delete_strategy(pid: int, sid: int, db: Session = Depends(get_db)):
         slave_count = db.query(Strategy).filter(Strategy.master_strategy_id == sid).count()
         if slave_count > 0:
             return {"code": 400, "message": "该主策略被从策略引用，无法删除"}
-    db.delete(s)
-    db.commit()
+    # 子策略可能被 backtest_trades / live_trades / live_orders 引用（历史交易记录，
+    # strategy_id FK 默认 RESTRICT）。直删触发 IntegrityError → 拦截返回可读错误，
+    # 不破坏历史数据；用户需先删相关回测/实盘记录才能删该子策略。
+    try:
+        db.delete(s)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {
+            "code": 400,
+            "message": "该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。",
+        }
     return {"code": 0, "data": None}

@@ -606,3 +606,39 @@ def test_delete_strategy_not_found(client):
 
     body = c.delete(f"/api/portfolios/{pid}/strategies/9999").json()
     assert body["code"] == 404
+
+
+def test_delete_strategy_referenced_by_backtest_trade(client):
+    """删被回测交易引用的子策略 → 不应 500，应给出可读错误或先清引用。
+
+    backtest_trades.strategy_id 无 ondelete（默认 RESTRICT），直删触发 IntegrityError。
+    修复后端点应捕获并返回 400/409 可读消息，而非 500。"""
+    from core.models import BacktestRecord, BacktestTrade
+    from datetime import datetime
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("S1", "independent", None)])
+    sid = db.query(Strategy).filter(Strategy.portfolio_id == pid).first().id
+    # 建一条回测记录 + 交易引用该策略
+    rec = BacktestRecord(
+        portfolio_strategy_id=pid, name="bt1",
+        start_date=datetime(2026, 7, 1).date(), end_date=datetime(2026, 7, 31).date(),
+        status="completed", progress=100,
+    )
+    db.add(rec); db.flush()
+    db.add(BacktestTrade(
+        backtest_record_id=rec.id, strategy_id=sid,
+        signal_name="open_sig", signal_type="OPEN",
+        stock_code="000001.SZ", trade_type="BUY",
+        price=Decimal("10"), quantity=100, amount=Decimal("1000"),
+        commission=Decimal("5"), stamp_duty=Decimal("0"),
+        bar_time=datetime(2026, 7, 2, 9, 30),
+    ))
+    db.commit()
+    db.close()
+
+    resp = c.delete(f"/api/portfolios/{pid}/strategies/{sid}")
+    # 修复前：500（IntegrityError 未捕获上抛）。修复后：可读 400/409。
+    assert resp.status_code != 500
+    body = resp.json()
+    assert body["code"] != 0  # 不是成功

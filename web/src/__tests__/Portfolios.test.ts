@@ -344,7 +344,7 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
   })
 
   it('点子策略子行[删除] → 调 deleteStrategy(pid, sid)', async () => {
-    ;(deleteStrategy as any).mockResolvedValue(null)
+    ;(deleteStrategy as any).mockResolvedValue({ code: 0, data: null })
     vi.stubGlobal('confirm', () => true)
     const w = mount(Portfolios)
     await flushPromises()
@@ -358,6 +358,24 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     const args = (deleteStrategy as any).mock.calls[0]
     expect(args[0]).toBe(1)   // pid
     expect(args[1]).toBe(10)  // sid
+    vi.unstubAllGlobals()
+  })
+
+  it('删除被引用子策略 → 后端返回 code≠0，前端 alert 提示且不刷新列表', async () => {
+    ;(deleteStrategy as any).mockResolvedValue({ code: 400, message: '该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。' })
+    const alertMock = vi.fn()
+    vi.stubGlobal('confirm', () => true)
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await expandFirst(w)
+
+    const delBtn = w.findAll('.strategy-sub-row button.btn-danger').find(b => b.text() === '删除')!
+    await delBtn.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('被回测或实盘交易记录引用')
     vi.unstubAllGlobals()
   })
 })

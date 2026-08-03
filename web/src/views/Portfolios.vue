@@ -315,7 +315,17 @@ async function submitStrategy() {
 
 async function removeStrategy(pid: number, s: StrategyDetail) {
   if (!confirm(`确认删除子策略「${s.name}」？`)) return
-  await deleteStrategy(pid, s.id)
+  try {
+    const res = await deleteStrategy(pid, s.id)
+    // 后端业务错误（如被回测交易引用）返回 HTTP 200 + code≠0，不触发 axios catch
+    if (res.code !== 0) {
+      alert(`删除失败：${res.message || '未知错误'}`)
+      return
+    }
+  } catch (e) {
+    alert(`删除失败：${errMsg(e)}`)
+    return
+  }
   strategyCache.value[pid] = await getStrategies(pid)
 }
 
