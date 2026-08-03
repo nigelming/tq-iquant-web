@@ -93,6 +93,29 @@ def test_convert_market_data_missing_stock_skipped():
     assert "999999.XX" not in klines
 
 
+def test_convert_market_data_volume_as_string():
+    """真机 bug：TQ 返回的 Volume 可能是 str 而非 int（如 "1000"），
+    polars 构造 DataFrame 时会 panic 'str object cannot be interpreted as integer'。
+    转换层应将 Volume/Amount 数值列统一规整为可数值类型，不依赖调用方传干净数据。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.2]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 10.5]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, 9.0]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": ["1000", "1500"]}, index=ts),  # 字符串！
+        "Amount": pd.DataFrame({"000001.SZ": ["10200", "9000"]}, index=ts),  # 字符串！
+    }
+    # 不应抛异常
+    klines = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = klines["000001.SZ"]["1d"]
+    assert df.height == 2
+    # Volume 列可被引擎当数值用（持仓快照市值计算虽不直接读 Volume，但下游不能是 str）
+    vols = df["Volume"].to_list()
+    assert vols[0] == 1000 and isinstance(vols[0], (int, float, Decimal))
+
+
 def test_convert_market_data_multi_period():
     """多周期：每个 period 独立一份 DataFrame（TQ 一次调用 = 单周期，故 raw 按 period 分组）。"""
     import pandas as pd

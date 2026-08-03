@@ -68,7 +68,11 @@ def _convert_market_data(
 
 
 def _build_polars_kline(raw: dict, code: str, timestamps: list):
-    """从 TQ raw 抽取单股票 polars DataFrame；该股票无数据返回 None。"""
+    """从 TQ raw 抽取单股票 polars DataFrame；该股票无数据返回 None。
+
+    TQ 真机返回的 Volume/Amount 可能是 str（如 "1000"），polars 构造时若混入
+    str 会 panic。故数值列统一规整：价/金额→Decimal，成交量→int。
+    """
     col_data: dict = {"datetime": []}
     has_any = False
     for field in _OHLCV_FIELDS:
@@ -86,11 +90,12 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
         col_data["datetime"].append(ts)
         for field in _OHLCV_FIELDS:
             val = raw[field].loc[ts, code]
-            # 价格/金额列转 Decimal，成交量列保留原值
-            if field in ("Open", "High", "Low", "Close", "Amount"):
-                col_data[field].append(_to_decimal(val))
+            if field == "Volume":
+                # 成交量统一规整为 int（TQ 可能返回 str）
+                col_data[field].append(_to_int(val))
             else:
-                col_data[field].append(val)
+                # 价/金额列转 Decimal
+                col_data[field].append(_to_decimal(val))
     if not has_any:
         return None
     return pl.DataFrame(col_data)
@@ -630,9 +635,14 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         rec.completed_at = datetime.now()
         db.commit()
     except Exception as e:
-        rec.status = "failed"
-        rec.error_message = str(e)
-        db.commit()
+        # 异常时把 record 标 failed 并落库。session 可能因异常处于脏状态，
+        # 先 rollback 再改字段重提交，确保状态写进去（否则前端会看到永久 running）。
+        db.rollback()
+        rec = db.get(BacktestRecord, record_id)
+        if rec is not None:
+            rec.status = "failed"
+            rec.error_message = str(e) or repr(e)
+            db.commit()
         raise
 
     return {

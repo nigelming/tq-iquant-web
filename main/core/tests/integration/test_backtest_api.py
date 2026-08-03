@@ -39,7 +39,7 @@ def client(tmp_path):
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as c:
+    with TestClient(app, raise_server_exceptions=False) as c:
         yield c, Session
     app.dependency_overrides.clear()
 
@@ -353,5 +353,37 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
     rec = db.get(BacktestRecord, record_id)
     assert rec.status == "failed"  # 不是 completed
     assert rec.error_message is not None and rec.error_message != ""
+    db.close()
+
+
+def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
+    """引擎/TQ 抛异常时（如 polars panic），record 必须落库为 failed（非永久 running）。
+    验证 except 块的 rollback+重提交能持久化失败状态。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    # build_klines 抛异常 — 模拟 polars PanicException 等真机错误
+    def _boom(ps, start, end, db=None):
+        raise RuntimeError("polars panic: str cannot be int")
+    monkeypatch.setattr(bt_api, "build_klines", _boom)
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "boom_test",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+    }
+    # raise_server_exceptions 在 TestClient 构造时已关，异常转成 500 响应
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 500  # 异常上抛
+
+    # 从 DB 直接查（异常上抛后端点未返回 record_id，但 record 已建）
+    db = Session()
+    rec = db.query(BacktestRecord).filter_by(name="boom_test").first()
+    assert rec is not None
+    assert rec.status == "failed"  # 关键：不是 running
+    assert "polars panic" in rec.error_message
     db.close()
 
