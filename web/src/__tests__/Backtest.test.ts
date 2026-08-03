@@ -6,11 +6,13 @@ vi.mock('../api', () => ({
   getBacktestDetail: vi.fn(),
   runBacktest: vi.fn(),
   getPortfolios: vi.fn(),
+  deleteBacktestRecord: vi.fn(),
 }))
 
 import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
+  deleteBacktestRecord,
 } from '../api'
 
 const mockRecords = [
@@ -75,6 +77,37 @@ describe('Backtest.vue — 列表视图', () => {
     const w = mount(Backtest)
     await flushPromises()
     expect(w.findAll('button').filter(b => b.text().includes('查看')).length).toBe(2)
+  })
+
+  it('每行含[删除]按钮，点击确认后调 deleteBacktestRecord 并刷新列表', async () => {
+    ;(deleteBacktestRecord as any).mockResolvedValue({})
+    vi.stubGlobal('confirm', () => true)  // 用户点确认
+    const w = mount(Backtest)
+    await flushPromises()
+
+    const delBtns = w.findAll('button').filter(b => b.text().includes('删除'))
+    expect(delBtns.length).toBe(2)  // 每行一个
+    await delBtns[0].trigger('click')
+    await flushPromises()
+
+    expect(deleteBacktestRecord).toHaveBeenCalledWith(1)  // 删第一条
+    // 列表刷新：getBacktestRecords 被再次调用
+    expect(getBacktestRecords).toHaveBeenCalledTimes(2)  // 初始 1 + 删除后 1
+    vi.unstubAllGlobals()
+  })
+
+  it('删除点取消 → 不调 deleteBacktestRecord', async () => {
+    ;(deleteBacktestRecord as any).mockClear()
+    vi.stubGlobal('confirm', () => false)  // 用户点取消
+    const w = mount(Backtest)
+    await flushPromises()
+
+    const delBtn = w.findAll('button').filter(b => b.text().includes('删除'))[0]
+    await delBtn.trigger('click')
+    await flushPromises()
+
+    expect(deleteBacktestRecord).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
   })
 })
 

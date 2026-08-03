@@ -213,3 +213,8 @@ export async function getBacktestDetail(id: number) {
   const res = await api.get<ApiResponse<any>>(`/backtest/records/${id}`)
   return res.data.data
 }
+
+export async function deleteBacktestRecord(id: number) {
+  const res = await api.delete<ApiResponse<any>>(`/backtest/records/${id}`)
+  return res.data.data
+}

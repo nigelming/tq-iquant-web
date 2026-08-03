@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
+  deleteBacktestRecord,
 } from '../api'
 
 // ===== 列表 =====
@@ -74,6 +75,16 @@ async function submit() {
 async function openDetail(id: number) {
   detail.value = await getBacktestDetail(id)
   currentRecord.value = detail.value?.record || null
+}
+
+async function onDelete(id: number) {
+  if (!confirm('确定删除该回测记录？删除后不可恢复。')) return
+  try {
+    await deleteBacktestRecord(id)
+    await load()
+  } catch (e) {
+    alert(`删除失败：${errMsg(e)}`)
+  }
 }
 
 function backToList() {
@@ -167,6 +178,7 @@ onMounted(load)
             <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:#888">-</span></td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
+              <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
             </td>
           </tr>
         </tbody>

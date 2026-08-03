@@ -283,6 +283,46 @@ def test_get_record_detail_not_found(client):
 
 
 # ===========================================================================
+# DELETE /records/{id} — 删 record + 级联子表（trades/snapshots/evaluations）
+# ===========================================================================
+def test_delete_record_removes_record_and_children(client, monkeypatch):
+    """DELETE /records/{id} → 删 record，trades/snapshots/evaluations 全清。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    # 删前：子表有数据
+    db = Session()
+    assert db.query(BacktestTrade).filter_by(backtest_record_id=record_id).count() == 2
+    assert db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).count() == 3
+    assert db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).count() == 1
+    db.close()
+
+    resp = c.delete(f"/api/backtest/records/{record_id}")
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+
+    # 删后：record + 三张子表全空
+    db = Session()
+    assert db.get(BacktestRecord, record_id) is None
+    assert db.query(BacktestTrade).filter_by(backtest_record_id=record_id).count() == 0
+    assert db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).count() == 0
+    assert db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).count() == 0
+    db.close()
+
+
+def test_delete_record_not_found(client):
+    """DELETE /records/9999 → 404。"""
+    c, _ = client
+    body = c.delete("/api/backtest/records/9999").json()
+    assert body["code"] == 404
+
+
+# ===========================================================================
 # 日期区间校验 — start 必须 < end；起止不可在未来。
 # 防止 TQ 拉到空行情后静默"成功"标 completed（真机 bug 根因）。
 # ===========================================================================

@@ -567,6 +567,21 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
     }
 
 
+@router.delete("/records/{record_id}")
+def delete_record(record_id: int, db: Session = Depends(get_db)):
+    """删除回测记录 + 级联子表（trades/snapshots/evaluations）。
+    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return {"code": 404, "message": "回测记录不存在"}
+    db.query(BacktestTrade).filter_by(backtest_record_id=record_id).delete()
+    db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).delete()
+    db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).delete()
+    db.delete(rec)
+    db.commit()
+    return {"code": 0, "data": None}
+
+
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     """回测请求基础校验，返回错误消息或 None（通过）。
     校验日期区间：start < end，且 start 不在未来（TQ 拉不到未来行情）。"""
