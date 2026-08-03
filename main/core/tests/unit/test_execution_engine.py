@@ -116,3 +116,63 @@ def _buy(price, quantity, trade_time):
         amount=Decimal(price) * quantity, commission=Decimal("0"),
         stamp_duty=Decimal("0"), trade_time=trade_time,
     )
+
+
+# ---------------------------------------------------------------------------
+# 交易成本参数化（来自组合表，非硬编码）
+# ---------------------------------------------------------------------------
+def _order_open(stock_code, trade_type, quantity, price, bar_time=None):
+    return OrderEvent(
+        strategy_id=1,
+        portfolio_id=1,
+        stock_code=stock_code,
+        trade_type=trade_type,
+        signal_type=SignalType.OPEN,
+        quantity=quantity,
+        price=Decimal(price),
+        bar_time=bar_time or datetime(2026, 7, 30, 15, 0),
+    )
+
+
+def test_dispatcher_uses_portfolio_cost_params():
+    """成本参数从组合表传入：min_commission=10、buy_rate=0.001、sell_rate=0.002、
+    stamp_duty_rate=0.001、slippage=0.01。
+    BUY 2000@10 → fill=10.1, amt=20200, comm=max(10,20.2)=20.2, stamp=0；
+    SELL 2000@10 → fill=9.9, amt=19800, comm=max(10,39.6)=39.6, stamp=19.8。
+    """
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10")},
+        min_commission=Decimal("10"),
+        buy_commission_rate=Decimal("0.001"),
+        sell_commission_rate=Decimal("0.002"),
+        stamp_duty_rate=Decimal("0.001"),
+        slippage=Decimal("0.01"),
+    )
+    buy_trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.BUY, 2000, "10")
+    )
+    assert buy_trade.price == Decimal("10.1")
+    assert buy_trade.amount == Decimal("10.1") * 2000
+    assert buy_trade.commission == Decimal("20.2")
+    assert buy_trade.stamp_duty == Decimal("0")
+
+    sell_trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.SELL, 2000, "10")
+    )
+    assert sell_trade.price == Decimal("9.9")
+    assert sell_trade.amount == Decimal("9.9") * 2000
+    assert sell_trade.commission == Decimal("39.6")
+    assert sell_trade.stamp_duty == Decimal("19.8")
+
+
+def test_dispatcher_min_commission_floor():
+    """小单：amt=1000, rate=0.00025 → 算得 0.25 < min_commission=5 → 取 5。"""
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10")},
+        min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"),
+    )
+    trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.BUY, 100, "10")
+    )
+    assert trade.commission == Decimal("5")

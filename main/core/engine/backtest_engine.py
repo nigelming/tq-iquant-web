@@ -41,7 +41,7 @@ class BacktestEngine:
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
             if pending_orders:
                 bar_open_prices = self._bar_open_prices(klines, t)
-                dispatcher = SimulatedDispatcher(bar_open_prices)
+                dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
                 engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
                 for order in pending_orders:
                     # 成交日 = 当前 bar 时间 t（T+1 据此判断）
@@ -68,6 +68,11 @@ class BacktestEngine:
             # 4. 日终快照（日线：每根 bar 即一日）
             total_value = self._total_value(portfolio, bar)
             snapshots.append(portfolio.snapshot(t.date(), total_value, bar))
+
+            # 5. 熔断检测：日终更新峰值/日内盈亏，按 §88 推进熔断次日恢复时序
+            portfolio.risk_manager.update(
+                total_value, t.date(), portfolio.account.initial_capital
+            )
 
             if progress_callback:
                 progress_callback(i + 1)

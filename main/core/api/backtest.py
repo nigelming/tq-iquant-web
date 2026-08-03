@@ -327,6 +327,13 @@ def _assemble_portfolio(ps: PortfolioStrategy, strategies: list, db: Session) ->
         portfolio_id=ps.id,
         initial_capital=Decimal(str(ps.initial_capital)),
         risk_manager=pm,
+        cost_params={
+            "min_commission": Decimal(str(ps.min_commission)),
+            "buy_commission_rate": Decimal(str(ps.buy_commission_rate)),
+            "sell_commission_rate": Decimal(str(ps.sell_commission_rate)),
+            "stamp_duty_rate": Decimal(str(ps.stamp_duty_rate)),
+            "slippage": Decimal(str(ps.slippage)),
+        },
     )
     for strat in strategies:
         ctx = StrategyContext(
@@ -334,6 +341,13 @@ def _assemble_portfolio(ps: PortfolioStrategy, strategies: list, db: Session) ->
             period=strat.period,
             capital_ratio=Decimal(str(strat.capital_ratio)),
             max_positions=strat.max_positions,
+            single_open_ratio=Decimal(str(strat.single_open_ratio)),
+            add_position_threshold=Decimal(str(strat.add_position_threshold)),
+            max_add_count=strat.max_add_count,
+            add_position_ratio=Decimal(str(strat.add_position_ratio)),
+            reduce_position_ratio=Decimal(str(strat.reduce_position_ratio)),
+            role=strat.role,
+            master_strategy_id=strat.master_strategy_id,
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()

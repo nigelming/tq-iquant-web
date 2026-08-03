@@ -22,23 +22,48 @@ class T1Checker(ABC):
 
 
 class SimulatedDispatcher(OrderDispatcher):
-    def __init__(self, open_prices: dict = None):
+    def __init__(
+        self,
+        open_prices: dict = None,
+        *,
+        min_commission: Decimal = Decimal("5"),
+        buy_commission_rate: Decimal = Decimal("0.00025"),
+        sell_commission_rate: Decimal = Decimal("0.00025"),
+        stamp_duty_rate: Decimal = Decimal("0.0005"),
+        slippage: Decimal = Decimal("0"),
+    ):
+        """成本参数来自组合表，默认值 = 历史硬编码值，老调用不破。"""
         self.open_prices = open_prices or {}
+        self.min_commission = min_commission
+        self.buy_commission_rate = buy_commission_rate
+        self.sell_commission_rate = sell_commission_rate
+        self.stamp_duty_rate = stamp_duty_rate
+        self.slippage = slippage
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         price = self.open_prices.get(order.stock_code)
         if not price:
             return None
+        # 滑点：买入成交价上浮、卖出成交价下浮
+        if order.trade_type.value == "BUY":
+            fill_price = price * (Decimal("1") + self.slippage)
+        else:
+            fill_price = price * (Decimal("1") - self.slippage)
+        amount = fill_price * order.quantity
+        is_sell = order.trade_type.value == "SELL"
+        rate = self.sell_commission_rate if is_sell else self.buy_commission_rate
+        commission = max(self.min_commission, amount * rate)
+        stamp_duty = amount * self.stamp_duty_rate if is_sell else Decimal("0")
         return TradeEvent(
             strategy_id=order.strategy_id,
             portfolio_id=order.portfolio_id,
             stock_code=order.stock_code,
             trade_type=order.trade_type,
-            price=price,
+            price=fill_price,
             quantity=order.quantity,
-            amount=price * order.quantity,
-            commission=Decimal("5") if price * order.quantity < 20000 else price * order.quantity * Decimal("0.00025"),
-            stamp_duty=price * order.quantity * Decimal("0.0005") if order.trade_type.value == "SELL" else Decimal("0"),
+            amount=amount,
+            commission=commission,
+            stamp_duty=stamp_duty,
             trade_time=order.bar_time,
             signal_type=order.signal_type,
         )

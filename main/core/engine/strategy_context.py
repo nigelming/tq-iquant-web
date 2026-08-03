@@ -13,11 +13,28 @@ class StrategyContext:
         period: str,
         capital_ratio: Decimal,
         max_positions: int,
+        *,
+        single_open_ratio: Decimal = Decimal("0.1"),
+        add_position_threshold: Decimal = Decimal("0.05"),
+        max_add_count: int = 2,
+        add_position_ratio: Decimal = Decimal("0.1"),
+        reduce_position_ratio: Decimal = Decimal("0.3"),
+        role: str = "independent",
+        master_strategy_id: Optional[int] = None,
     ):
         self.strategy_id = strategy_id
         self.period = period
         self.capital_ratio = capital_ratio
         self.max_positions = max_positions
+        # 下单量参数（对应策略表字段，默认值同表默认）
+        self.single_open_ratio = single_open_ratio
+        self.add_position_threshold = add_position_threshold
+        self.max_add_count = max_add_count
+        self.add_position_ratio = add_position_ratio
+        self.reduce_position_ratio = reduce_position_ratio
+        # 主从角色（independent/master/slave）
+        self.role = role
+        self.master_strategy_id = master_strategy_id
         self.positions: Dict[str, Position] = {}
         # 公式信号配置：[{"signal_name", "signal_type": SignalType, "trigger_value": int}]
         self.formula_signals: List[dict] = []

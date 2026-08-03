@@ -8,6 +8,7 @@ from core.engine.portfolio import Portfolio
 from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import StrategyRiskManager, PortfolioRiskManager
 from core.engine.execution_engine import SimulatedDispatcher
+from core.engine.position import Position
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -136,3 +137,64 @@ def test_run_progress_callback():
                open_prices={stock: {}}, progress_callback=lambda i: progresses.append(i))
 
     assert progresses == [1, 2]
+
+
+def _buy_trade(price, quantity, trade_time):
+    """构造 BUY TradeEvent 用于预置持仓。"""
+    from core.engine.event import TradeEvent
+    return TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+        trade_type=TradeType.BUY, price=Decimal(price), quantity=quantity,
+        amount=Decimal(price) * quantity, commission=Decimal("0"),
+        stamp_duty=Decimal("0"), trade_time=trade_time,
+    )
+
+
+def test_run_breaker_triggers_on_drawdown_and_halts_next_bar_buy():
+    """预置持仓后让组合回撤破 20% → 熔断触发；次日 OPEN 信号被剥（无 BUY trade）。
+
+    构造：预置 2000 股 @40（市值 80000）+ 现金 20000 = 总值 100000（峰值）。
+    bar1 close=30 → 市值 60000 + 现金 20000 = 80000 → 回撤 20% → update 触发熔断。
+    bar1 同时触发 OPEN 信号 → 生成 bar1 BUY 订单（下一 bar open 成交）。
+    bar2 open=30 执行 bar1 的 BUY 订单（熔断前已生成，仍成交）。
+    bar2 close=30 → update 已熔断；bar2 OPEN 信号 → on_bar 因熔断剥 BUY（无新订单）。
+    最终 bar2 无新增 BUY trade（熔断生效）。"""
+    stock = "000001.SZ"
+    # 4 根 bar，价格从 40 跌到 30 触发回撤
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("40"), Decimal("40"), Decimal("40"), Decimal("40"), 1000),
+        (datetime(2026, 7, 30), Decimal("30"), Decimal("30"), Decimal("30"), Decimal("30"), 1000),
+        (datetime(2026, 7, 31), Decimal("30"), Decimal("30"), Decimal("30"), Decimal("30"), 1000),
+        (datetime(2026, 8, 1), Decimal("30"), Decimal("30"), Decimal("30"), Decimal("30"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.5"))  # 止损放宽避免抢跑
+
+    # 预置持仓 2000 股 @40，现金调整到 20000
+    pos = ctx.positions.setdefault(stock, Position(stock))
+    pos.apply_trade(_buy_trade("40", 2000, datetime(2026, 7, 28, 9, 30)))
+    port.account.cash = Decimal("20000")  # 总值 80000+20000=100000
+
+    # 每根 bar 都触发 OPEN（试图买入）
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 8, 1)): [{"name": "open_sig", "value": 1}],
+    }
+    open_prices = {stock: {
+        datetime(2026, 7, 30): Decimal("30"),
+        datetime(2026, 7, 31): Decimal("30"),
+        datetime(2026, 8, 1): Decimal("30"),
+    }}
+
+    engine = BacktestEngine()
+    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+
+    # bar1(7/29) 收盘价 40 → 峰值 100000，无回撤；OPEN 生成 bar1 订单（bar2 open 成交 #1）。
+    # bar2(7/30) 收盘价 30 → 总值 80000，回撤 20% → update 触发熔断；
+    #   bar2 on_bar 的 OPEN 订单在熔断前生成（update 在 on_bar 后）→ bar3 open 成交 #2。
+    # bar3/bar4 on_bar：熔断已激活 → OPEN BUY 被剥，无新订单 → 无第 3 笔成交。
+    assert port.risk_manager.consecutive_drawdown_triggers >= 1
+    assert port.risk_manager.circuit_breaker_active is True
+    buy_trades = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
+    assert len(buy_trades) == 2  # 仅熔断生效前两笔；后续被剥

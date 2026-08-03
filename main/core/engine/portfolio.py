@@ -41,12 +41,15 @@ class Portfolio:
         portfolio_id: int,
         initial_capital: Decimal,
         risk_manager: PortfolioRiskManager,
+        cost_params: Optional[Dict] = None,
     ):
         self.portfolio_id = portfolio_id
         self.account = Account(initial_capital)
         self.risk_manager = risk_manager
         self.strategies: List[StrategyContext] = []
         self.benchmark_value: Optional[Decimal] = None
+        # 交易成本参数（来自组合表），供 BacktestEngine 构建 dispatcher 时透传
+        self.cost_params: Dict = cost_params or {}
 
     def on_bar(
         self,
@@ -62,6 +65,10 @@ class Portfolio:
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
             orders.extend(self._process_strategy(ctx, bar, signal_cache))
+        # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
+        # §88：熔断期间不清仓，仅暂停新开仓。
+        if self.risk_manager.is_trading_halted():
+            orders = [o for o in orders if o.trade_type != TradeType.BUY]
         return orders
 
     def _process_strategy(
@@ -123,9 +130,25 @@ class Portfolio:
     def _signal_to_order(
         self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent
     ) -> Optional[OrderEvent]:
-        """信号转 OrderEvent。SELL 类需有持仓；BUY 类给一个初始量（资金审批在 ExecutionEngine）。"""
+        """信号转 OrderEvent。下单量按策略表参数计算（非硬编码）。
+        - 全平类（CLOSE/止损/止盈/移动止损）：量 = 持仓全量
+        - REDUCE：量 = 持仓 × reduce_position_ratio
+        - OPEN：量 = single_open_ratio × 策略资金 / 价（受 max_positions 约束）
+        - ADD：需现价较成本下跌 ≥ add_position_threshold 且 add_count < max_add_count，
+               量 = add_position_ratio × 策略资金 / 价
+        资金审批（现金/策略上限）仍在 ExecutionEngine 缩减。"""
         pos = ctx.positions.get(sig.stock_code)
         close = bar.stocks[sig.stock_code]["close"]
+        # 策略资金 = capital_ratio × 组合初始资金
+        strategy_fund = ctx.capital_ratio * self.account.initial_capital
+
+        # 主从联动（§89）：从策略 OPEN 需主策略持有任意股；主策略清仓后不可新开仓。
+        # 仅约束新开仓（OPEN），ADD/REDUCE/全平类不受约束。
+        if sig.signal_type == SignalType.OPEN and ctx.role == "slave":
+            master_ctx = self._find_strategy_by_id(ctx.master_strategy_id)
+            if master_ctx is None or not self._has_any_position(master_ctx):
+                return None
+
         if sig.signal_type in (SignalType.CLOSE, SignalType.STOP_LOSS,
                                SignalType.TAKE_PROFIT, SignalType.TRAILING_STOP):
             # 全平类：需有持仓
@@ -136,13 +159,31 @@ class Portfolio:
         elif sig.signal_type == SignalType.REDUCE:
             if pos is None or pos.quantity == 0:
                 return None
-            quantity = int(pos.quantity * Decimal("0.3") / 100) * 100
+            quantity = int(pos.quantity * ctx.reduce_position_ratio / 100) * 100
             if quantity < 100:
                 return None
             trade_type = TradeType.SELL
-        elif sig.signal_type in (SignalType.OPEN, SignalType.ADD):
-            # 买入类：初始量占位，资金审批在 ExecutionEngine 缩减
-            quantity = 1000
+        elif sig.signal_type == SignalType.OPEN:
+            # 受 max_positions 约束：已达上限不开新仓
+            held = sum(1 for p in ctx.positions.values() if p.quantity > 0)
+            if held >= ctx.max_positions:
+                return None
+            quantity = int(ctx.single_open_ratio * strategy_fund / close / 100) * 100
+            if quantity < 100:
+                return None
+            trade_type = TradeType.BUY
+        elif sig.signal_type == SignalType.ADD:
+            # ADD：需有持仓，且现价较成本下跌 ≥ threshold，且未超 max_add_count
+            if pos is None or pos.quantity == 0:
+                return None
+            drop = (pos.avg_cost - close) / pos.avg_cost
+            if drop < ctx.add_position_threshold:
+                return None
+            if pos.add_count >= ctx.max_add_count:
+                return None
+            quantity = int(ctx.add_position_ratio * strategy_fund / close / 100) * 100
+            if quantity < 100:
+                return None
             trade_type = TradeType.BUY
         else:
             return None
@@ -159,6 +200,19 @@ class Portfolio:
 
     def check_circuit_breaker(self) -> bool:
         return self.risk_manager.circuit_breaker_active
+
+    def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
+        """按 strategy_id 在本组合策略列表中找上下文。"""
+        if strategy_id is None:
+            return None
+        for ctx in self.strategies:
+            if ctx.strategy_id == strategy_id:
+                return ctx
+        return None
+
+    def _has_any_position(self, ctx: StrategyContext) -> bool:
+        """策略是否持有任意股票（任一 pos.quantity > 0）。"""
+        return any(pos.quantity > 0 for pos in ctx.positions.values())
 
     def snapshot(self, snap_date: date, current_value: Decimal, bar: BarEvent = None) -> dict:
         market_value = Decimal("0")

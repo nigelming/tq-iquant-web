@@ -3,7 +3,7 @@ from datetime import date, datetime
 from typing import Dict, Optional
 
 from .event import TradeEvent
-from tq_iquant_shared.constants import TradeType
+from tq_iquant_shared.constants import TradeType, SignalType
 
 
 class Position:
@@ -15,12 +15,19 @@ class Position:
         self.buy_time: Optional[datetime] = None
         # 按买入日期分桶的份额，用于 T+1 可卖判断
         self._lots: Dict[date, int] = {}
+        # 已加仓次数（首次建仓清零，全平清零），受 max_add_count 约束
+        self.add_count = 0
 
     @property
     def market_value(self) -> Decimal:
         return self.avg_cost * self.quantity
 
-    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None) -> None:
+    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None, is_add: bool = False) -> None:
+        # 新开仓（原无持仓）重置加仓计数；加仓（原有持仓）累加
+        if is_add and self.quantity > 0:
+            self.add_count += 1
+        elif self.quantity == 0:
+            self.add_count = 0
         total_cost = self.avg_cost * self.quantity + price * quantity
         self.quantity += quantity
         self.avg_cost = total_cost / self.quantity
@@ -38,6 +45,9 @@ class Position:
         cost_amount = self.avg_cost * quantity
         pnl = sell_amount - cost_amount
         self.quantity -= quantity
+        # 全平清零加仓计数
+        if self.quantity == 0:
+            self.add_count = 0
         # 按先进先出从最早的可卖桶扣减
         if trade_time is not None:
             remaining = quantity
@@ -54,7 +64,8 @@ class Position:
     def apply_trade(self, trade: TradeEvent) -> None:
         """成交后统一更新持仓（买入加权均价+最高价，卖出减仓）。"""
         if trade.trade_type == TradeType.BUY:
-            self.buy(trade.quantity, trade.price, trade.trade_time)
+            is_add = trade.signal_type == SignalType.ADD
+            self.buy(trade.quantity, trade.price, trade.trade_time, is_add=is_add)
         else:
             self.sell(trade.quantity, trade.price, trade.trade_time)
 
