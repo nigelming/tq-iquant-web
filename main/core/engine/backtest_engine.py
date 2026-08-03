@@ -77,7 +77,7 @@ class BacktestEngine:
             if progress_callback:
                 progress_callback(i + 1)
 
-        evaluations = Evaluator().evaluate(snapshots, benchmark_data=benchmark_data)
+        evaluations = Evaluator().evaluate(snapshots, benchmark_data=benchmark_data, trades=trades)
         return {"trades": trades, "snapshots": snapshots, "evaluations": evaluations}
 
     def _build_timeline(self, klines: dict) -> List[datetime]:
