@@ -146,11 +146,12 @@ class Portfolio:
         # 策略资金 = capital_ratio × 组合初始资金
         strategy_fund = ctx.capital_ratio * self.account.initial_capital
 
-        # 主从联动（§89）：从策略 OPEN 需主策略持有任意股；主策略清仓后不可新开仓。
-        # 仅约束新开仓（OPEN），ADD/REDUCE/全平类不受约束。
+        # 主从联动（§89）：从策略 OPEN 只能买主策略当前持有的同一只股票；
+        # 主策略清仓（含该股）后从策略不可新开仓。仅约束新开仓（OPEN），
+        # ADD/REDUCE/全平类不受约束（存量可自行卖出/加减）。
         if sig.signal_type == SignalType.OPEN and ctx.role == "slave":
             master_ctx = self._find_strategy_by_id(ctx.master_strategy_id)
-            if master_ctx is None or not self._has_any_position(master_ctx):
+            if master_ctx is None or not self._has_position(master_ctx, sig.stock_code):
                 return None
 
         if sig.signal_type in (SignalType.CLOSE, SignalType.STOP_LOSS,
@@ -214,9 +215,10 @@ class Portfolio:
                 return ctx
         return None
 
-    def _has_any_position(self, ctx: StrategyContext) -> bool:
-        """策略是否持有任意股票（任一 pos.quantity > 0）。"""
-        return any(pos.quantity > 0 for pos in ctx.positions.values())
+    def _has_position(self, ctx: StrategyContext, stock_code: str) -> bool:
+        """策略是否持有指定股票（quantity > 0）。用于主从联动约束从策略开仓范围。"""
+        pos = ctx.positions.get(stock_code)
+        return pos is not None and pos.quantity > 0
 
     def snapshot(self, snap_date: date, current_value: Decimal, bar: BarEvent = None) -> dict:
         market_value = Decimal("0")

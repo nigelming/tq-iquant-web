@@ -307,14 +307,15 @@ def test_open_signal_respects_max_positions():
 
 
 # ===========================================================================
-# 主从策略联动（§89）：slave OPEN 需 master 持任意股；master 清仓后 slave 不可
-# 新开仓但存量可卖。ADD/REDUCE/全平类不受 master 状态约束（仅约束新开仓 OPEN）。
+# 主从策略联动（§89）：从策略 OPEN 只能买主策略当前持有的同一只股票；主策略
+# 清仓（含该股）后从策略不可新开仓但存量可卖。ADD/REDUCE/全平类不受 master
+# 状态约束（仅约束新开仓 OPEN）。
 # ===========================================================================
 def _master_slave_portfolio(*, slave_role="slave", master_has_position=True,
-                            master_holds_stock="600000.SH"):
+                            master_holds_stock="000001.SZ"):
     """master(id=1) + slave(id=2, master=1) 双策略组合。
-    master_holds_position=False 时 master 无持仓，slave OPEN 应被拦。
-    slave 目标股 000001.SZ 触 OPEN 信号。"""
+    master_has_position=False 时 master 无持仓，slave OPEN 应被拦。
+    slave 目标股 000001.SZ 触 OPEN 信号；master_holds_stock 控制主策略持哪只股。"""
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
 
@@ -361,14 +362,27 @@ def test_slave_open_blocked_when_master_no_position():
     assert buy_orders == []
 
 
-def test_slave_open_allowed_when_master_holds():
-    """master 持有任意股 → slave OPEN 出单。"""
-    port, master, slave = _master_slave_portfolio(master_has_position=True)
+def test_slave_open_allowed_when_master_holds_same_stock():
+    """master 持有同一只股 000001.SZ → slave OPEN 该股出单。"""
+    port, master, slave = _master_slave_portfolio(master_has_position=True,
+                                                  master_holds_stock="000001.SZ")
     bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
     cache = {(2, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
     orders = port.on_bar(bar, signal_cache=cache)
     buy_orders = [o for o in orders if o.trade_type == TradeType.BUY and o.strategy_id == 2]
     assert len(buy_orders) == 1
+
+
+def test_slave_open_blocked_when_master_holds_other_stock():
+    """master 持有 600000.SH（非目标股）→ slave OPEN 000001.SZ 被拦。
+    主从联动约束的是"同一只股票"，非"master 有任意持仓"。"""
+    port, master, slave = _master_slave_portfolio(master_has_position=True,
+                                                  master_holds_stock="600000.SH")
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(2, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    buy_orders = [o for o in orders if o.trade_type == TradeType.BUY and o.strategy_id == 2]
+    assert buy_orders == []
 
 
 def test_slave_sell_allowed_after_master_cleared():
