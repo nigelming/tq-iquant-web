@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import polars as pl
 from fastapi import APIRouter, Depends, HTTPException
@@ -204,14 +204,22 @@ _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
 
 
 def _convert_formula_output(
-    raw: dict, strategy_id: int, stocks: list
+    raw: dict, strategy_id: int, stocks: list,
+    bar_times_by_code: Optional[Dict[str, List[datetime]]] = None,
 ) -> dict:
     """TQ 公式输出（formula_process_mul_zb）→ signal_cache 条目。
 
     raw: {stock_code: {var_name: [{"Date":"YYYYMMDD","Value":float}, ...]}}，
-         顶层可能有 ErrorId。日期串需转 datetime 对齐 klines 时间轴。
+         顶层可能有 ErrorId。
     返回: {(strategy_id, stock_code, bar_time): [{"name": str, "value": int}]}。
     ErrorId 非 0/19 → 视为出错，返回空。
+
+    时间轴对齐（两种模式）：
+    - 日线（bar_times_by_code=None）：公式输出 Date=YYYYMMDD 转午夜 datetime 作 key。
+      日线 bar 也是日粒度，1:1 对齐。
+    - 分钟级（bar_times_by_code 传入）：TQ 输出 Date 只标到日（丢时分），但输出条目
+      按 bar 顺序排列。按索引对齐：第 i 条输出 → bar_times_by_code[code][i]。
+      输出条数 < bar 数 → 多余 bar 无信号；> bar 数 → 多余输出丢弃。
     """
     if not isinstance(raw, dict) or not raw:
         return {}
@@ -223,6 +231,7 @@ def _convert_formula_output(
         stock_data = raw.get(code)
         if not isinstance(stock_data, dict):
             continue
+        bar_times = bar_times_by_code.get(code) if bar_times_by_code else None
         # 按 bar_time 聚合该股票所有变量
         by_time: dict = {}
         for var_name, val_list in stock_data.items():
@@ -230,16 +239,25 @@ def _convert_formula_output(
                 continue
             if not isinstance(val_list, list):
                 continue
-            for entry in val_list:
+            for i, entry in enumerate(val_list):
                 if not isinstance(entry, dict):
                     continue
-                d = entry.get("Date")
                 v = entry.get("Value")
-                if not d or v is None:
+                if v is None:
                     continue
-                bar_time = _parse_date_str(d)
-                if bar_time is None:
-                    continue
+                if bar_times is not None:
+                    # 分钟级：按索引对齐 bar_times；越界（i >= len）丢弃
+                    if i >= len(bar_times):
+                        break
+                    bar_time = bar_times[i]
+                else:
+                    # 日线：按 Date 转午夜 datetime
+                    d = entry.get("Date")
+                    if not d:
+                        continue
+                    bar_time = _parse_date_str(d)
+                    if bar_time is None:
+                        continue
                 key = (strategy_id, code, bar_time)
                 by_time.setdefault(key, []).append({"name": var_name, "value": _to_int(v)})
         entries.update(by_time)
@@ -257,11 +275,38 @@ def _parse_date_str(d: str):
     return None
 
 
+_MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "60m"}
+
+
+def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
+    """从 klines 提取每只股票的时间轴（升序去重），供分钟级公式输出按索引对齐。"""
+    result: Dict[str, List[datetime]] = {}
+    for code, periods in klines.items():
+        times: List[datetime] = []
+        for df in periods.values():
+            if "datetime" in df.columns:
+                times.extend(df["datetime"].to_list())
+        if times:
+            # 去重保序（多周期合并时可能重复）
+            seen = set()
+            uniq = []
+            for t in sorted(times):
+                if t not in seen:
+                    seen.add(t)
+                    uniq.append(t)
+            result[code] = uniq
+    return result
+
+
 def build_signal_cache(ps: PortfolioStrategy, klines: dict, db: Session = None) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
     对每个策略：读 Formula（公式名）+ FormulaSignal（信号配置），
     调 TQFormula.compute 跑公式，转 signal_cache。cache-first，TQ 兜底。
+
+    分钟级（5m/15m/30m/60m）：TQ 公式输出 Date 只标到日（丢时分），按输出条目顺序
+    对齐 klines 时间轴（_convert_formula_output 的 bar_times_by_code）。
+    日线：按 Date 匹配（1:1 对齐）。
     """
     if db is None:
         return {}
@@ -270,6 +315,8 @@ def build_signal_cache(ps: PortfolioStrategy, klines: dict, db: Session = None) 
         return {}
     strategies = _portfolio_strategies(ps, db)
     tq_formula = TQFormula()
+    # 分钟级时间轴（所有策略共用同一 klines 时间轴）
+    bar_times_by_code = _bar_times_by_code(klines)
     cache: dict = {}
     for strat in strategies:
         formula = db.get(Formula, strat.formula_id)
@@ -283,7 +330,9 @@ def build_signal_cache(ps: PortfolioStrategy, klines: dict, db: Session = None) 
             count=-1, dividend_type=1,
             start_time=start_str, end_time=end_str,
         )
-        entries = _convert_formula_output(raw, strat.id, stocks)
+        # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
+        bt = bar_times_by_code if period in _MINUTE_PERIODS else None
+        entries = _convert_formula_output(raw, strat.id, stocks, bar_times_by_code=bt)
         cache.update(entries)
     return cache
 
