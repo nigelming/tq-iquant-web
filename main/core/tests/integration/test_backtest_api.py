@@ -179,3 +179,105 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     snaps = db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).all()
     assert len(snaps) == 3
     db.close()
+
+
+# ===========================================================================
+# list_records — 真实查询（非桩）
+# ===========================================================================
+def _mock_data(monkeypatch):
+    """统一 mock 数据获取层，供多测试复用。"""
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {
+        (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    })
+    monkeypatch.setattr(bt_api, "build_open_prices", lambda ps, klines: {
+        "000001.SZ": {
+            datetime(2026, 7, 30): Decimal("10.2"),
+            datetime(2026, 7, 31): Decimal("9.0"),
+        }
+    })
+
+
+def _post_backtest(c, ps_id):
+    return c.post("/api/backtest", json={
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_list_test",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+    })
+
+
+def test_list_records_returns_persisted(client, monkeypatch):
+    """POST 跑回测后，GET /records 返回该记录（非空桩）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    resp = _post_backtest(c, ps_id)
+    record_id = resp.json()["data"]["record_id"]
+
+    # GET 列表
+    body = c.get("/api/backtest/records").json()
+    assert body["code"] == 0
+    assert isinstance(body["data"], list)
+    assert len(body["data"]) >= 1
+    rec = next(r for r in body["data"] if r["id"] == record_id)
+    assert rec["name"] == "bt_list_test"
+    assert rec["status"] == "completed"
+    assert rec["progress"] == 100
+    assert rec["portfolio_strategy_id"] == ps_id
+    assert "created_at" in rec
+
+
+def test_get_record_detail(client, monkeypatch):
+    """GET /records/{id} 返回 record + snapshots + trades + evaluations。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    body = c.get(f"/api/backtest/records/{record_id}").json()
+    assert body["code"] == 0
+    data = body["data"]
+
+    # record 元信息
+    assert data["record"]["id"] == record_id
+    assert data["record"]["name"] == "bt_list_test"
+    assert data["record"]["status"] == "completed"
+
+    # snapshots：按日期升序，3 个交易日
+    snaps = data["snapshots"]
+    assert len(snaps) == 3
+    assert snaps[0]["snap_date"] == "2026-07-29"
+    assert snaps[2]["snap_date"] == "2026-07-31"
+    for s in snaps:
+        assert "total_value" in s and "cash" in s and "market_value" in s
+
+    # trades：按 bar_time 升序，2 笔（BUY+SELL）
+    trades = data["trades"]
+    assert len(trades) == 2
+    assert trades[0]["trade_type"] == "BUY"
+    for t in trades:
+        assert "stock_code" in t and "price" in t and "quantity" in t and "amount" in t
+
+    # evaluations：单对象，含核心指标
+    ev = data["evaluations"]
+    assert ev is not None
+    assert "total_return" in ev
+    assert "max_drawdown" in ev
+    assert "sharpe_ratio" in ev
+
+
+def test_get_record_detail_not_found(client):
+    """GET /records/9999 → 404。"""
+    c, _ = client
+    body = c.get("/api/backtest/records/9999").json()
+    assert body["code"] == 404
+

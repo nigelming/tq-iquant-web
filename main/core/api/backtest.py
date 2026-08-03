@@ -417,11 +417,120 @@ def _persist_result(
 
 
 # ---------------------------------------------------------------------------
+# 序列化
+# ---------------------------------------------------------------------------
+def _serialize_record(r: BacktestRecord) -> dict:
+    return {
+        "id": r.id,
+        "portfolio_strategy_id": r.portfolio_strategy_id,
+        "name": r.name,
+        "start_date": r.start_date.isoformat() if r.start_date else None,
+        "end_date": r.end_date.isoformat() if r.end_date else None,
+        "status": r.status,
+        "progress": r.progress,
+        "error_message": r.error_message,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+    }
+
+
+def _f(v) -> float | None:
+    """Decimal → float，None 透传（沿用 _serialize_strategy 模式）。"""
+    return float(v) if v is not None else None
+
+
+def _serialize_snapshot(s: BacktestDailySnapshot) -> dict:
+    return {
+        "snap_date": s.snap_date.isoformat() if s.snap_date else None,
+        "total_value": _f(s.total_value),
+        "cash": _f(s.cash),
+        "market_value": _f(s.market_value),
+        "daily_return": _f(s.daily_return),
+        "cumulative_return": _f(s.cumulative_return),
+        "benchmark_value": _f(s.benchmark_value),
+    }
+
+
+def _serialize_trade(t: BacktestTrade) -> dict:
+    return {
+        "id": t.id,
+        "strategy_id": t.strategy_id,
+        "signal_name": t.signal_name,
+        "signal_type": t.signal_type,
+        "stock_code": t.stock_code,
+        "trade_type": t.trade_type,
+        "price": _f(t.price),
+        "quantity": t.quantity,
+        "amount": _f(t.amount),
+        "commission": _f(t.commission),
+        "stamp_duty": _f(t.stamp_duty),
+        "bar_time": t.bar_time.isoformat() if t.bar_time else None,
+    }
+
+
+def _serialize_evaluation(e: BacktestEvaluation) -> dict:
+    return {
+        "total_return": _f(e.total_return),
+        "annual_return": _f(e.annual_return),
+        "max_drawdown": _f(e.max_drawdown),
+        "volatility": _f(e.volatility),
+        "sharpe_ratio": _f(e.sharpe_ratio),
+        "sortino_ratio": _f(e.sortino_ratio),
+        "calmar_ratio": _f(e.calmar_ratio),
+        "win_rate": _f(e.win_rate),
+        "profit_factor": _f(e.profit_factor),
+        "total_trades": e.total_trades,
+        "benchmark_return": _f(e.benchmark_return),
+        "avg_holding_days": _f(e.avg_holding_days),
+        "var_95": _f(e.var_95),
+        "cvar_95": _f(e.cvar_95),
+        "avg_recovery_days": _f(e.avg_recovery_days),
+        "max_recovery_days": e.max_recovery_days,
+        "ulcer_index": _f(e.ulcer_index),
+        "return_stability": _f(e.return_stability),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
 @router.get("/records")
 def list_records(db: Session = Depends(get_db)):
-    return {"code": 0, "data": []}
+    recs = db.query(BacktestRecord).order_by(BacktestRecord.created_at.desc()).all()
+    return {"code": 0, "data": [_serialize_record(r) for r in recs]}
+
+
+@router.get("/records/{record_id}")
+def get_record(record_id: int, db: Session = Depends(get_db)):
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return {"code": 404, "message": "回测记录不存在"}
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestTrade.bar_time)
+        .all()
+    )
+    evals = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id)
+        .first()
+    )
+    return {
+        "code": 0,
+        "data": {
+            "record": _serialize_record(rec),
+            "snapshots": [_serialize_snapshot(s) for s in snaps],
+            "trades": [_serialize_trade(t) for t in trades],
+            "evaluations": _serialize_evaluation(evals) if evals else None,
+        },
+    }
 
 
 @router.post("")

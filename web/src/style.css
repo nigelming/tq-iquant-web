@@ -73,3 +73,17 @@ tbody tr:last-child td{border-bottom:none}
 .sub-strategy-name{font-size:13px;font-weight:500;color:var(--text)}
 .sub-strategy-meta{font-size:12px;color:var(--text-secondary)}
 .sub-strategy-actions{margin-left:auto;display:flex;align-items:center}
+
+/* 回测详情：评估指标卡 */
+.metric-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.metric-card{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.metric-label{font-size:12px;color:var(--text-secondary)}
+.metric-value{font-size:18px;font-weight:600;color:var(--text-heading);font-variant-numeric:tabular-nums}
+
+/* 回测详情：净值曲线 */
+.chart-wrap{padding:16px}
+.chart-title{font-size:14px;font-weight:600;color:var(--text-heading);margin-bottom:8px}
+.net-value-chart{width:100%;height:auto;display:block}
+.chart-tooltip{display:inline-flex;flex-direction:column;gap:2px;background:#1a1f36;color:#fff;padding:6px 10px;border-radius:var(--radius);font-size:12px;margin-top:4px}
+.chart-tooltip .tt-date{color:#9ca3af;font-size:11px}
+.chart-tooltip .tt-value{font-weight:600;font-variant-numeric:tabular-nums}

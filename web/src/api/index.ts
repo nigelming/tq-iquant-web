@@ -196,3 +196,20 @@ export async function getBacktestRecords() {
   const res = await api.get<ApiResponse<any[]>>('/backtest/records')
   return res.data.data
 }
+
+export interface BacktestRequest {
+  portfolio_strategy_id: number
+  name: string
+  start_date: string  // YYYY-MM-DD
+  end_date: string    // YYYY-MM-DD
+}
+
+export async function runBacktest(req: BacktestRequest) {
+  const res = await api.post<ApiResponse<{ record_id: number }>>('/backtest', req)
+  return res.data.data
+}
+
+export async function getBacktestDetail(id: number) {
+  const res = await api.get<ApiResponse<any>>(`/backtest/records/${id}`)
+  return res.data.data
+}
