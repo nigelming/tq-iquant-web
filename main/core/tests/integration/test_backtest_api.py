@@ -281,3 +281,77 @@ def test_get_record_detail_not_found(client):
     body = c.get("/api/backtest/records/9999").json()
     assert body["code"] == 404
 
+
+# ===========================================================================
+# 日期区间校验 — start 必须 < end；起止不可在未来。
+# 防止 TQ 拉到空行情后静默"成功"标 completed（真机 bug 根因）。
+# ===========================================================================
+def test_post_backtest_start_after_end_rejected(client):
+    """start_date 晚于 end_date → 400，不写 record。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bad_range",
+        "start_date": "2026-08-31",
+        "end_date": "2026-08-01",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.json()["code"] == 400
+
+    # 不应落库任何 record
+    db = Session()
+    recs = db.query(BacktestRecord).filter_by(name="bad_range").all()
+    assert recs == []
+    db.close()
+
+
+def test_post_backtest_future_date_rejected(client):
+    """start_date 在未来 → 400（今天 2026-08-03，2027 是未来）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "future_range",
+        "start_date": "2027-01-01",
+        "end_date": "2027-06-01",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.json()["code"] == 400
+
+
+def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypatch):
+    """TQ 返回空行情（区间无交易日/股票池无数据）→ 标 failed 并写明原因，
+    而非静默标 completed（这正是"启动了但没运行直接完成"的根因）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    # mock 三层全返回空 — 模拟 TQ 拉不到行情
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(bt_api, "build_open_prices", lambda ps, klines: {})
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "empty_klines",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.json()["code"] == 0  # 请求本身成功，record 已建
+    record_id = resp.json()["data"]["record_id"]
+
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    assert rec.status == "failed"  # 不是 completed
+    assert rec.error_message is not None and rec.error_message != ""
+    db.close()
+

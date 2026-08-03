@@ -134,6 +134,25 @@ describe('Backtest.vue — 发起回测', () => {
     expect(w.text()).toContain('发起回测')  // 弹窗仍开
     vi.unstubAllGlobals()
   })
+
+  it('开始日期晚于结束日期 → 前端拦截，不调 runBacktest', async () => {
+    ;(runBacktest as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开 Modal
+    await w.find('input[placeholder*="回测"]').setValue('RANGE_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-08-31')  // start 晚于 end
+    await dateInputs[1].setValue('2026-08-01')
+    await w.find('.modal-actions button.btn-primary').trigger('click')  // 确定
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(runBacktest).not.toHaveBeenCalled()  // 前端拦截，不发请求
+    vi.unstubAllGlobals()
+  })
 })
 
 describe('Backtest.vue — 详情视图', () => {

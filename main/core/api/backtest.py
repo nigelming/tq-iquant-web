@@ -547,11 +547,27 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
     }
 
 
+def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
+    """回测请求基础校验，返回错误消息或 None（通过）。
+    校验日期区间：start < end，且 start 不在未来（TQ 拉不到未来行情）。"""
+    if req.start_date >= req.end_date:
+        return f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}"
+    today = date.today()
+    if req.start_date > today:
+        return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    return None
+
+
 @router.post("")
 def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     ps = db.get(PortfolioStrategy, req.portfolio_strategy_id)
     if ps is None:
         raise HTTPException(status_code=404, detail="portfolio strategy not found")
+
+    err = _validate_backtest_request(req)
+    if err:
+        return {"code": 400, "message": err}
+
     strategies = (
         db.query(Strategy)
         .filter_by(portfolio_id=ps.id)
@@ -577,6 +593,22 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         klines = build_klines(ps, req.start_date, req.end_date, db)
         signal_cache = build_signal_cache(ps, klines, db)
         open_prices = build_open_prices(ps, klines)
+
+        # 空行情保护：TQ 在该区间/股票池拉不到任何 K 线 → 标 failed 而非静默 completed。
+        # 这正是"启动了但没运行直接完成"的根因（日期填反/未来日/股票池空等）。
+        if not klines:
+            rec.status = "failed"
+            rec.error_message = (
+                f"未取到任何行情数据：区间 {req.start_date}~{req.end_date}，"
+                f"股票池 id={ps.stock_pool_id}。请检查日期区间与股票池成分。"
+            )
+            db.commit()
+            return {
+                "code": 0,
+                "message": "ok",
+                "data": {"record_id": record_id, "trades_count": 0,
+                         "snapshots_count": 0, "evaluations": {}},
+            }
 
         def on_progress(p: int):
             rec.progress = p

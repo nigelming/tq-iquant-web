@@ -53,6 +53,11 @@ async function submit() {
   if (!form.value.portfolio_strategy_id) { alert('请选择组合'); return }
   if (!form.value.name.trim()) { alert('请填写回测名称'); return }
   if (!form.value.start_date || !form.value.end_date) { alert('请选择起止日期'); return }
+  // 前端拦截日期区间错误：start 必须 ≤ end，避免发到后端才报错
+  if (form.value.start_date > form.value.end_date) {
+    alert(`开始日期不能晚于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
+    return
+  }
   submitting.value = true
   try {
     const res = await runBacktest(form.value)
