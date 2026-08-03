@@ -139,6 +139,10 @@ class Portfolio:
         资金审批（现金/策略上限）仍在 ExecutionEngine 缩减。"""
         pos = ctx.positions.get(sig.stock_code)
         close = bar.stocks[sig.stock_code]["close"]
+        # 停牌/无数据 bar：close 经 TQ NaN 规整为 0 → 无法计算下单量（除零）
+        # 也无有效成交价 → 跳过该 bar 所有订单
+        if close <= Decimal("0"):
+            return None
         # 策略资金 = capital_ratio × 组合初始资金
         strategy_fund = ctx.capital_ratio * self.account.initial_capital
 

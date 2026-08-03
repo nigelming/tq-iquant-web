@@ -72,6 +72,27 @@ def test_on_bar_open_signal_produces_buy_order():
     assert orders[0].stock_code == "000001.SZ"
 
 
+def test_on_bar_zero_close_skips_order():
+    """停牌/无数据 bar 收盘价=0（TQ NaN 规整而来）→ 不下单（避免 DivisionByZero）。
+    真机 5m 场景：停牌 bar OHLC 为 NaN，转换层规整为 0，公式可能仍输出信号，
+    但 close=0 无法计算下单量（除零）也无有效成交价 → 跳过该 bar 所有订单。"""
+    port, ctx = _portfolio_with_strategy(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    # close=0 模拟停牌 bar
+    bar = BarEvent(
+        stocks={"000001.SZ": {
+            "open": Decimal("0"), "high": Decimal("0"),
+            "low": Decimal("0"), "close": Decimal("0"), "volume": 0,
+        }},
+        bar_time=datetime(2026, 7, 30, 13, 5),
+    )
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert orders == []  # close=0 不下单，不抛 DivisionByZero
+
+
 def test_on_bar_stop_loss_prioritized_over_formula_close():
     """止损风控信号优先于公式 CLOSE 信号。持仓亏损触发止损 + 同时有 CLOSE 信号 →
     风控先执行（清仓后公式信号不再执行），只产 1 个 SELL。"""
