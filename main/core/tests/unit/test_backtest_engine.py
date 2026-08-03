@@ -119,25 +119,6 @@ def test_run_no_signal_no_trade():
     assert port.account.cash == Decimal("100000")
 
 
-def test_run_progress_callback():
-    """progress_callback 收到每 bar 的进度。"""
-    stock = "000001.SZ"
-    klines = _klines(stock, [
-        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
-        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
-    ])
-    port, ctx = _portfolio_with_strategy()
-    cache = {
-        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
-        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
-    }
-    progresses = []
-    engine = BacktestEngine()
-    engine.run(port, klines=klines, signal_cache=cache,
-               open_prices={stock: {}}, progress_callback=lambda i: progresses.append(i))
-
-    assert progresses == [1, 2]
-
 
 def _buy_trade(price, quantity, trade_time):
     """构造 BUY TradeEvent 用于预置持仓。"""

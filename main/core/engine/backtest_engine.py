@@ -1,8 +1,6 @@
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime, date
 from decimal import Decimal
-
-import polars as pl
 
 from .portfolio import Portfolio
 from .strategy_context import StrategyContext
@@ -20,7 +18,6 @@ class BacktestEngine:
         signal_cache: dict = None,
         open_prices: Optional[Dict[str, Dict[datetime, Decimal]]] = None,
         benchmark_data: object = None,
-        progress_callback: Callable = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -33,6 +30,7 @@ class BacktestEngine:
         open_prices = open_prices or {}
 
         times = self._build_timeline(klines)
+        price_index = self._build_price_index(klines)
         pending_orders: List[OrderEvent] = []
         trades: List[TradeEvent] = []
         snapshots: List[dict] = []
@@ -44,7 +42,7 @@ class BacktestEngine:
         for i, t in enumerate(times):
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
             if pending_orders:
-                bar_open_prices = self._bar_open_prices(klines, t)
+                bar_open_prices = self._bar_open_prices(price_index, t)
                 dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
                 engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
                 for order in pending_orders:
@@ -63,8 +61,8 @@ class BacktestEngine:
                         trades.append(trade)
                 pending_orders = []
 
-            # 2. 构造 BarEvent（从 polars 取 t 行 OHLCV）
-            bar = self._build_bar(klines, t)
+            # 2. 构造 BarEvent（从预建索引 O(1) 查表）
+            bar = self._build_bar(price_index, t)
 
             # 3. portfolio.on_bar → 新订单入 pending（下一 bar 成交）
             pending_orders = portfolio.on_bar(bar, signal_cache=signal_cache)
@@ -87,10 +85,7 @@ class BacktestEngine:
                 total_value, t.date(), portfolio.account.initial_capital
             )
 
-            if progress_callback:
-                progress_callback(i + 1)
-
-        # 基准序列喂 Evaluator：从快照 benchmark_value 抽取（按日期顺序），
+        # 基准序列喂 Evaluator
         # 形如 [{"value": Decimal}]。无任何基准值 → 传 None，benchmark_return 退化为 0。
         bench_series = (
             [{"value": s["benchmark_value"]} for s in snapshots if s.get("benchmark_value") is not None]
@@ -132,37 +127,45 @@ class BacktestEngine:
                 unique.append(t)
         return unique
 
-    def _bar_open_prices(self, klines: dict, t: datetime) -> Dict[str, Decimal]:
-        """取时间 t 所有股票的 open 价，供 dispatcher 成交。"""
-        prices: Dict[str, Decimal] = {}
-        for stock_code, periods in klines.items():
-            for period, df in periods.items():
-                if "datetime" not in df.columns or "Open" not in df.columns:
-                    continue
-                row = df.filter(pl.col("datetime") == t)
-                if row.height > 0:
-                    prices[stock_code] = row["Open"][0]
-        return prices
+    def _build_price_index(self, klines: dict) -> Dict[datetime, Dict[str, dict]]:
+        """预建 {datetime: {stock_code: {open,high,low,close,volume}}} 索引。
 
-    def _build_bar(self, klines: dict, t: datetime) -> BarEvent:
-        """从 polars 取 t 行构造 BarEvent。"""
-        stocks: Dict[str, Dict[str, object]] = {}
+        一次 O(total_rows) 扫描替代逐 bar 的 O(n²) polars df.filter()，将每 bar
+        的 72 次 Python↔Rust FFI 查表降为 O(1) 字典查找。
+        多周期重叠时间点时，后周期覆盖前周期（与旧 _build_bar 行为兼容）。
+        """
+        index: Dict[datetime, Dict[str, dict]] = {}
         for stock_code, periods in klines.items():
             for period, df in periods.items():
                 if "datetime" not in df.columns:
                     continue
-                row = df.filter(pl.col("datetime") == t)
-                if row.height == 0:
+                times = df["datetime"].to_list()
+                if "Open" not in df.columns:
                     continue
-                stocks[stock_code] = {
-                    "open": row["Open"][0],
-                    "high": row["High"][0],
-                    "low": row["Low"][0],
-                    "close": row["Close"][0],
-                    "volume": row["Volume"][0],
-                }
-                break  # 单周期取第一份
-        return BarEvent(stocks=stocks, bar_time=t)
+                opens = df["Open"].to_list()
+                highs = df["High"].to_list()
+                lows = df["Low"].to_list()
+                closes = df["Close"].to_list()
+                volumes = df["Volume"].to_list()
+                for i, t in enumerate(times):
+                    row = {
+                        "open": opens[i],
+                        "high": highs[i],
+                        "low": lows[i],
+                        "close": closes[i],
+                        "volume": volumes[i],
+                    }
+                    index.setdefault(t, {})[stock_code] = row
+        return index
+
+    def _bar_open_prices(self, price_index: dict, t: datetime) -> Dict[str, Decimal]:
+        """O(1) 查表取时间 t 所有股票的 open 价。"""
+        row = price_index.get(t, {})
+        return {code: data["open"] for code, data in row.items()}
+
+    def _build_bar(self, price_index: dict, t: datetime) -> BarEvent:
+        """O(1) 查表取时间 t 的 OHLCV 构造 BarEvent。"""
+        return BarEvent(stocks=price_index.get(t, {}), bar_time=t)
 
     def _find_strategy(
         self, portfolio: Portfolio, strategy_id: int

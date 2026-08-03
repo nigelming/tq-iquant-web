@@ -23,6 +23,30 @@ from core.tq.formula import TQFormula
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 
+def _log_timing(msg: str) -> None:
+    """打印耗时日志，带时间戳。同步端点（uvicorn 单线程），print 安全。"""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{ts} {msg}", flush=True)
+
+
+def _log_kline_summary(record_id: int, klines: dict) -> None:
+    """打印 K 线数据量摘要：股票数、各周期 bar 数。"""
+    if not klines:
+        _log_timing(f"[回测#{record_id}] K线数据为空")
+        return
+    stock_count = len(klines)
+    first_code = next(iter(klines))
+    period_bars = {}
+    for period, df in klines[first_code].items():
+        period_bars[period] = len(df) if df is not None else 0
+    _log_timing(
+        f"[回测#{record_id}] K线: {stock_count}只股票, "
+        + ", ".join(f"{p}={n}bar" for p, n in period_bars.items())
+    )
+
+
+
+
 class BacktestRequest(BaseModel):
     portfolio_strategy_id: int
     name: str
@@ -797,11 +821,27 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     record_id = rec.id
 
     try:
+        t0 = datetime.now()
         portfolio = _assemble_portfolio(ps, strategies, db)
+        t1 = datetime.now()
         klines = build_klines(ps, req.start_date, req.end_date, db)
+        t2 = datetime.now()
+        # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
+        _log_kline_summary(record_id, klines)
         signal_cache = build_signal_cache(ps, klines, db)
+        t3 = datetime.now()
         open_prices = build_open_prices(ps, klines)
+        t4 = datetime.now()
         benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
+        t5 = datetime.now()
+
+        # 各阶段耗时日志（定位回测慢的根因）
+        _log_timing(f"[回测#{record_id}] 组装组合: {(t1-t0).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ K线拉取: {(t2-t1).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ 公式计算: {(t3-t2).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 提取开盘价: {(t4-t3).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t5-t4).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 数据准备合计: {(t5-t0).total_seconds():.1f}s")
 
         # 空行情保护：TQ 在该区间/股票池拉不到任何 K 线 → 标 failed 而非静默 completed。
         # 这正是"启动了但没运行直接完成"的根因（日期填反/未来日/股票池空等）。
@@ -819,10 +859,7 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
                          "snapshots_count": 0, "evaluations": {}},
             }
 
-        def on_progress(p: int):
-            rec.progress = p
-            db.commit()
-
+        t6 = datetime.now()
         engine = BacktestEngine()
         result = engine.run(
             portfolio,
@@ -830,14 +867,18 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
             signal_cache=signal_cache,
             open_prices=open_prices,
             benchmark_data=benchmark_data,
-            progress_callback=on_progress,
         )
+        t7 = datetime.now()
+        _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
 
         _persist_result(db, record_id, ps.id, result, strategies)
+        t8 = datetime.now()
+        _log_timing(f"[回测#{record_id}] 结果持久化: {(t8-t7).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 总耗时: {(t8-t0).total_seconds():.1f}s")
 
         rec.status = "completed"
         rec.progress = 100
-        rec.completed_at = datetime.now()
+        rec.completed_at = datetime.utcnow()
         db.commit()
     except Exception as e:
         # 异常时把 record 标 failed 并落库。session 可能因异常处于脏状态，
