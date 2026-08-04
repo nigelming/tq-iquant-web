@@ -86,6 +86,11 @@ def test_run_minimal_buy_then_stop_loss():
     assert trades[0].price == Decimal("10.2")
     assert trades[1].trade_type == TradeType.SELL
     assert trades[1].price == Decimal("9.0")
+    # 信号来源透传：BUY 来自公式 open_sig(OPEN)，SELL 来自风控 stop_loss(STOP_LOSS)
+    assert trades[0].signal_name == "open_sig"
+    assert trades[0].signal_type == SignalType.OPEN
+    assert trades[1].signal_name == "stop_loss"
+    assert trades[1].signal_type == SignalType.STOP_LOSS
     # 3 个日终快照
     assert len(snapshots) == 3
     # 末态：已清仓，cash = 100000 - 买入支出 + 卖出回款

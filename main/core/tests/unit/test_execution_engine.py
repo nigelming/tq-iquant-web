@@ -176,3 +176,40 @@ def test_dispatcher_min_commission_floor():
         _order_open("000001.SZ", TradeType.BUY, 100, "10")
     )
     assert trade.commission == Decimal("5")
+
+
+def test_signal_name_propagates_order_to_trade():
+    """OrderEvent.signal_name/signal_type 透传到 TradeEvent（交易明细定位信号来源）。
+    公式信号（open_sig·OPEN）与风控信号（stop_loss·STOP_LOSS）两条路径各验一例。"""
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+
+    # 公式信号
+    formula_order = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        signal_name="open_sig", quantity=100, price=Decimal("10"),
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    formula_trade = dispatcher.place_order(formula_order)
+    assert formula_trade.signal_name == "open_sig"
+    assert formula_trade.signal_type == SignalType.OPEN
+
+    # 风控信号
+    risk_order = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+        trade_type=TradeType.SELL, signal_type=SignalType.STOP_LOSS,
+        signal_name="stop_loss", quantity=100, price=Decimal("10"),
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    risk_trade = dispatcher.place_order(risk_order)
+    assert risk_trade.signal_name == "stop_loss"
+    assert risk_trade.signal_type == SignalType.STOP_LOSS
+
+
+def test_signal_name_defaults_empty_when_unset():
+    """未传 signal_name 的 OrderEvent → TradeEvent.signal_name 为空串（旧调用不破）。"""
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.BUY, 100, "10")  # 不传 signal_name
+    )
+    assert trade.signal_name == ""
