@@ -66,6 +66,7 @@ class SimulatedDispatcher(OrderDispatcher):
             stamp_duty=stamp_duty,
             trade_time=order.bar_time,
             signal_type=order.signal_type,
+            signal_name=order.signal_name,
         )
 
 

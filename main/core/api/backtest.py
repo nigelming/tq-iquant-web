@@ -512,7 +512,7 @@ def _persist_result(
             backtest_record_id=record_id,
             strategy_id=trade.strategy_id,
             formula_signal_id=None,
-            signal_name="",
+            signal_name=trade.signal_name or "",
             signal_type=trade.signal_type.value,
             stock_code=trade.stock_code,
             trade_type=trade.trade_type.value,

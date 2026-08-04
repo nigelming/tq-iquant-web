@@ -39,6 +39,8 @@ class OrderEvent:
     quantity: int
     price: Optional[Decimal] = None
     bar_time: Optional[datetime] = None
+    # 触发该订单的信号名（公式变量名如 open_sig，风控如 stop_loss/take_profit/trailing_stop）
+    signal_name: str = ""
 
 
 @dataclass
@@ -54,3 +56,5 @@ class TradeEvent:
     stamp_duty: Decimal
     trade_time: datetime
     signal_type: Optional[SignalType] = None
+    # 触发该成交的信号名，由 OrderEvent 透传（供交易明细定位来源）
+    signal_name: str = ""

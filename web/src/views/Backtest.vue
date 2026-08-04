@@ -33,6 +33,15 @@ const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
 }
 
+// 信号类型 → 中文（公式 OPEN/ADD/REDUCE/CLOSE + 风控 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP）
+const SIGNAL_TYPE_LABEL: Record<string, string> = {
+  OPEN: '开仓', ADD: '加仓', REDUCE: '减仓', CLOSE: '清仓',
+  STOP_LOSS: '止损', TAKE_PROFIT: '止盈', TRAILING_STOP: '移动止损',
+}
+function signalTypeLabel(t: string): string {
+  return SIGNAL_TYPE_LABEL[t] || t || ''
+}
+
 function errMsg(e: any): string {
   const d = e?.response?.data
   if (d?.message) return d.message
@@ -499,7 +508,7 @@ onUnmounted(() => {
       <table class="trade-table">
         <thead>
           <tr>
-            <th>时间</th><th>策略</th><th>买卖</th><th>代码</th>
+            <th>时间</th><th>策略</th><th>信号来源</th><th>买卖</th><th>代码</th>
             <th>数量</th><th>价格</th><th>金额</th><th>佣金</th><th>印花税</th>
           </tr>
         </thead>
@@ -507,6 +516,10 @@ onUnmounted(() => {
           <tr v-for="t in paginatedTrades" :key="t.id">
             <td style="font-size:12px;color:#888">{{ t.bar_time?.replace('T', ' ') }}</td>
             <td><span class="strategy-badge">{{ t.strategy_name || `#${t.strategy_id}` }}</span></td>
+            <td>
+              <span style="font-size:12px">{{ t.signal_name || '—' }}</span>
+              <span v-if="t.signal_type" class="signal-badge">{{ signalTypeLabel(t.signal_type) }}</span>
+            </td>
             <td :class="t.trade_type === 'BUY' ? 'text-green' : 'text-red'">{{ t.trade_type === 'BUY' ? '买入' : '卖出' }}</td>
             <td>{{ t.stock_code }}</td>
             <td>{{ t.quantity }}</td>
@@ -705,6 +718,16 @@ onUnmounted(() => {
   font-weight: 600;
   background: #e0e7ff;
   color: #4338ca;
+}
+.signal-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #f0f1f3;
+  color: #666;
 }
 
 /* 分页 */

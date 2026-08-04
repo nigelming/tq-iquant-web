@@ -198,6 +198,7 @@ class Portfolio:
             stock_code=sig.stock_code,
             trade_type=trade_type,
             signal_type=sig.signal_type,
+            signal_name=sig.signal_name,
             quantity=quantity,
             price=close,
             bar_time=bar.bar_time,
