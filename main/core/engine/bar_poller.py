@@ -1,54 +1,102 @@
-"""BarPoller — 实盘行情通道（0009 切片3）。
+"""BarPoller — 实盘行情通道(0009 切片3)。
 
-定时拉桥 GET /quote → bar 完成检测（stime <= now）→ 只触发 > last_bar_time 的已完成 bar
+定时拉桥 GET /quote → 用**两次拉取的相对变化**判定 bar 完成 → 只触发新完成的 bar
 → 合并多股票为一根 BarEvent → 驱动 Portfolio.on_bar。
 
-桥 /quote 返回（live/bridge/iquant_bridge.py get_quote）：
+★ 不依赖任何绝对时钟(不用 iQuant 时间、不用本机时间)★
+bar 完成判定:一根 bar 不再是「该股票最新一根」时,它就完成了。
+  第 N 次拉取:  [..., 10:08, 10:09]           ← 10:09 最新(进行中)
+  第 N+1 次:    [..., 10:08, 10:09, 10:10]   ← 10:10 出现,10:09 退居第二 → 10:09 完成,触发
+判定只比较两次拉取的 bar stime 相对变化,不碰 now / 服务器时间 / 本机时间,
+彻底消除部署时区与本机时钟漂移导致的「哑火 / 未来函数」风险——
+Core 部署在 UTC、本机时钟跑偏、iQuant 客户端机时钟跑偏,均不影响判定。
+
+★ 多股票按 code 独立判定完成 ★
+每只股票有各自的 latest,该股票的 bar < 其 latest 才算完成。
+不用全局 max stime —— 否则快股票的进度会把慢股票的「最新 bar」误判为已完成。
+每 code 独立维护 last_completed,避免快股票把全局水位推高导致慢股票漏触发。
+同一时间戳、各股票已完成的 bar 合并为一根 BarEvent.stocks。
+
+桥 /quote 返回(live/bridge/iquant_bridge.py get_quote):
   {"ok": True, "data": {code: [bar, ...]}}
-每 bar = DataFrame reset_index().to_dict("records")，字段含
-stime（yyyymmddHHMMSS 字符串，bar **结束**时间）/ open / high / low / close / volume。
+每 bar = DataFrame reset_index().to_dict("records"),字段含 stime(bar 结束时间,
+yyyymmddHHMMSS)/time(毫秒或秒时间戳)/open/high/low/close/volume。
+parse_bar_time 优先 stime(14 位串),次选 time(按 Asia/Shanghai +8 显式转换,
+不依赖本机时区),兼容验证脚本观察到的字段名。
 
-bar 完成检测（0009 §5.2 验证语义）：
-  - stime 是 bar 结束时间（如 10:08:00 = 10:07–10:08 那根结束）
-  - stime <= now → 已完成，可触发信号
-  - stime > now  → 进行中（OHLC 还在变），忽略，防信号闪烁/未来函数
-  - > last_bar_time → 新 bar，触发；<= last_bar_time → 旧 bar，不重复触发
-
-5m 是原生周期直接拉（0009 §5.1 验证定案，不做 1m→5m 聚合）。
+5m 是原生周期直接拉(0009 §5.1 验证定案,不做 1m→5m 聚合)。
 """
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional
 
 from .event import BarEvent
 from .http_bridge_dispatcher import HttpBridgeDispatcher
 
+# Asia/Shanghai 固定时区(时间戳路径显式转换用,不依赖本机时区)
+_CST = timezone(timedelta(hours=8))
 
-def parse_bar_time(stime) -> Optional[datetime]:
-    """桥 bar 的 stime（yyyymmddHHMMSS 字符串）→ datetime。
 
-    stime 是 bar **结束**时间。非法/空 → None。
+def parse_bar_time(bar: dict) -> Optional[datetime]:
+    """桥 bar dict → bar 结束时间 datetime。
+
+    优先 stime(yyyymmddHHMMSS 字符串,bar 结束时间,北京时间,无时区问题);
+    次选 time / Time(13 位毫秒或 10 位秒时间戳,按 +8 显式转,不依赖本机);
+    兼容 time 为 14 位串的情况。非法 / 空 → None。
+
+    注:相对变化方案下,两次 poll 用同一规则解析,时区偏移恒定,不影响比较;
+    仍按北京时间解析是为了 BarEvent.bar_time 语义与策略公式一致。
     """
-    if not stime:
+    if not isinstance(bar, dict):
         return None
-    s = str(stime).strip()
-    # yyyymmddHHMMSS（14 位数字）
-    if len(s) >= 14 and s[:14].isdigit():
+
+    def _parse_14digit(s) -> Optional[datetime]:
+        s = str(s).strip()
+        if len(s) >= 14 and s[:14].isdigit():
+            try:
+                return datetime.strptime(s[:14], "%Y%m%d%H%M%S")
+            except ValueError:
+                return None
+        return None
+
+    # 1. stime(bar 结束时间字符串)
+    st = bar.get("stime")
+    if st:
+        t = _parse_14digit(st)
+        if t is not None:
+            return t
+
+    # 2. time / Time(时间戳或 14 位串)
+    t_raw = bar.get("time")
+    if t_raw is None:
+        t_raw = bar.get("Time")
+    if t_raw is not None:
+        t = _parse_14digit(t_raw)
+        if t is not None:
+            return t
         try:
-            return datetime.strptime(s[:14], "%Y%m%d%H%M%S")
-        except ValueError:
+            ts = float(str(t_raw).strip())
+            if ts > 1e12:               # 13 位毫秒时间戳
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts, tz=_CST).replace(tzinfo=None)
+        except (ValueError, OSError):
             return None
+
     return None
 
 
 class BarPoller:
-    """定时拉桥 /quote，对每根新已完成 bar 触发 on_bar 回调。
+    """定时拉桥 /quote,用相对变化判定 bar 完成,对每根新完成 bar 触发 on_bar。
+
+    无绝对时钟依赖:bar 是否完成,看它是否从「最新」退居第二(下次拉取出现更新的 bar)。
+    多股票按 code 独立判定完成(各自 latest),再按时间合并为 BarEvent。
+    首次拉取建立基线不触发(不回放历史 bar);之后每次触发「上次之后新完成」的 bar。
 
     Usage:
         poller = BarPoller(dispatcher, stock_codes=["600000.SH"], period="1m")
         poller.on_bar = lambda bar: portfolio.on_bar(bar)  # 注入回调
-        # 每隔 N 秒（由上层调度）：
-        poller.poll(now=datetime.now())
+        # 每隔 N 秒(由上层调度):
+        poller.poll()
     """
 
     def __init__(
@@ -62,52 +110,85 @@ class BarPoller:
         self._stock_codes = list(stock_codes)
         self._period = period
         self._count = count
-        # 已触发的最新 bar 时间（防同一 bar 重复触发）
-        self.last_bar_time: Optional[datetime] = None
-        # 回调：每根新已完成 bar 触发一次，参数为 BarEvent
+        # 是否已建立基线(首次 poll 只记录,不触发)
+        self._initialized: bool = False
+        # 每 code 已见过的最高【完成】bar 时间(防重复触发 + 标记进度)
+        self._last_completed: Dict[str, Optional[datetime]] = {}
+        # 回调:每根新完成 bar 触发一次,参数为 BarEvent
         self.on_bar: Callable[[BarEvent], None] = lambda bar: None
 
-    def poll(self, now: Optional[datetime] = None) -> List[BarEvent]:
-        """拉一次 /quote，触发所有新已完成 bar，返回触发的 BarEvent 列表。
+    @property
+    def last_completed_stime(self) -> Optional[datetime]:
+        """所有 code 中最高的完成 bar 时间(观测值,供测试/监控;判定逻辑用 per-code)。"""
+        vals = [t for t in self._last_completed.values() if t is not None]
+        return max(vals) if vals else None
 
-        now: 当前时间（用于 bar 完成检测）；不传则用 datetime.now()。
-        桥不可用 → 抛 BridgeUnavailableError（交上层暂停交易，不吞异常）。
+    def poll(self) -> List[BarEvent]:
+        """拉一次 /quote,触发所有新完成的 bar,返回触发的 BarEvent 列表。
+
+        无 now 参数(不依赖任何绝对时钟)。bar 完成 = 它不再是该股票最新 bar。
+        多股票按 code 独立判定完成,同一时间戳的已完成 bar 合并为一根 BarEvent。
+        桥不可用 → 抛 BridgeUnavailableError(交上层暂停交易,不吞异常)。
         """
-        if now is None:
-            now = datetime.now()
+        # 本轮新完成 bar,按时间合并:stime -> {code: ohlcv}
+        new_by_time: Dict[datetime, Dict[str, dict]] = {}
+        any_data = False
 
-        # 按 bar 时间收集 {bar_time: {stock_code: ohlcv}}，多股票同时间合并为一根 BarEvent
-        by_time: Dict[datetime, Dict[str, dict]] = {}
         for code in self._stock_codes:
             bars = self._dispatcher.query_quote(code, period=self._period, count=self._count)
+            # 该 code 的 stime -> ohlcv
+            stime_map: Dict[datetime, dict] = {}
+            stimes: List[datetime] = []
             for bar in bars:
-                bt = parse_bar_time(bar.get("stime"))
+                bt = parse_bar_time(bar)
                 if bt is None:
                     continue
-                # bar 完成检测：stime > now = 进行中，忽略
-                if bt > now:
-                    continue
-                # 只触发 > last_bar_time 的新 bar
-                if self.last_bar_time is not None and bt <= self.last_bar_time:
-                    continue
-                by_time.setdefault(bt, {})[code] = self._to_ohlcv(bar)
+                stimes.append(bt)
+                stime_map[bt] = self._to_ohlcv(bar)
+            if not stimes:
+                continue
+            any_data = True
 
-        # 按时间排序触发（旧→新），每根推进 last_bar_time
+            latest = max(stimes)
+            # 该 code 已完成 = stime < latest(进行中那根不触发)
+            completed = [t for t in stimes if t < latest]
+
+            # 首次:建立该 code 基线,不触发(实盘启动不回放历史 bar)
+            if not self._initialized:
+                self._last_completed[code] = completed[-1] if completed else None
+                continue
+
+            last = self._last_completed.get(code)
+            if last is None:
+                new_times = completed
+            else:
+                new_times = [t for t in completed if t > last]
+
+            # 推进该 code last_completed 到本次最高完成 bar
+            if completed:
+                self._last_completed[code] = completed[-1]
+
+            # 收集新完成 bar 到合并字典
+            for t in new_times:
+                new_by_time.setdefault(t, {})[code] = stime_map[t]
+
+        # 首次有数据 → 标记初始化完成,不触发
+        if not self._initialized:
+            if any_data:
+                self._initialized = True
+            return []
+
+        # 按时间排序触发(旧→新),每根构造 BarEvent
         triggered: List[BarEvent] = []
-        for bt in sorted(by_time):
-            bar_event = BarEvent(stocks=by_time[bt], bar_time=bt)
-            self.last_bar_time = bt
-            try:
-                self.on_bar(bar_event)
-            except Exception:
-                # 回调异常不阻断后续 bar 处理，但向上层暴露
-                raise
+        for t in sorted(new_by_time):
+            bar_event = BarEvent(stocks=new_by_time[t], bar_time=t)
+            self.on_bar(bar_event)
             triggered.append(bar_event)
         return triggered
 
     @staticmethod
     def _to_ohlcv(bar: dict) -> dict:
-        """桥 bar dict → BarEvent.stocks 用的 OHLCV dict（Decimal 化，与回测一致）。"""
+        """桥 bar dict → BarEvent.stocks 用的 OHLCV dict(Decimal 化,与回测一致)。"""
         def _d(key):
             v = bar.get(key)
             if v is None or v == "":
