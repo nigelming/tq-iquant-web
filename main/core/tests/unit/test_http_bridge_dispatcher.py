@@ -95,6 +95,13 @@ def test_place_order_sell_op():
     assert _last_json(rec)["op"] == "sell"
 
 
+def test_place_order_sends_prtype_14():
+    """0009 切片4：place_order payload 含 pr_type=14（对手价）。"""
+    disp, rec = _make_dispatcher(_Recorder())
+    disp.place_order(_make_order())
+    assert _last_json(rec)["pr_type"] == 14
+
+
 def test_place_order_price_none_sends_zero():
     disp, rec = _make_dispatcher(_Recorder())
     order = _make_order(price=None)

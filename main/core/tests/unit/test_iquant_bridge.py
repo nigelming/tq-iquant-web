@@ -107,11 +107,40 @@ def test_order_real_calls_passorder():
     assert data["ok"] is True
     assert data["passorder_result"] == "0"
     assert len(calls) == 1
-    # 前 5 参语义：opType=23(买), orderType=0, account, code, prType int
+    # 前 5 参语义：opType=23(买), orderType=1101, account, code, prType int
     assert calls[0][0] == 23
     assert calls[0][2] == br.ACCOUNT
     assert calls[0][3] == "600000.SH"
     assert isinstance(calls[0][4], int)
+
+
+def test_do_place_uses_prtype_14_and_ordertype_1101():
+    """0009 切片4：_do_place 固定 prType=14(对手价) + orderType=1101(单股标准)。"""
+    br.DRY_RUN = False
+    calls = []
+    br.passorder = lambda *a, **k: calls.append(a) or 0
+    body = json.dumps({"order_id": "oid1", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 0}).encode()
+    _resp("POST", "/order", {}, body)
+    assert calls[0][1] == 1101            # orderType=1101 单股/单账号/普通/按股数
+    assert calls[0][4] == 14              # prType=14 对手价(对方一档)
+    # SELL 同样用 14/1101
+    calls.clear()
+    body = json.dumps({"order_id": "oid2", "code": "600000.SH", "op": "sell",
+                       "volume": 100, "price": 0}).encode()
+    _resp("POST", "/order", {}, body)
+    assert calls[0][0] == 24              # opType=24 (sell)
+    assert calls[0][1] == 1101
+    assert calls[0][4] == 14
+
+
+def test_dry_run_returns_pr_type():
+    """DRY_RUN 返回 params 含 pr_type=14，便于观测/断言。"""
+    br.DRY_RUN = True
+    body = json.dumps({"order_id": "oid1", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 0}).encode()
+    status, data = _resp("POST", "/order", {}, body)
+    assert data["params"]["pr_type"] == 14
 
 
 def test_order_missing_code():

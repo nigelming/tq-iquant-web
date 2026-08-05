@@ -76,6 +76,17 @@ class SimulatedT1Checker(T1Checker):
         return position.available_shares_on(query_date)
 
 
+class LiveT1Checker(T1Checker):
+    """实盘 T+1 检查（首期简化：持仓全量可卖）。
+
+    真实 T+1 由券商端风控挡，Core 侧不重复判断（避免桥 /positions 查询往返拖慢下单）。
+    后续切片可接桥 query_positions 查 m_dAvailable 实际可用股数。
+    """
+
+    def get_available_shares(self, position: Position, query_date: date) -> int:
+        return position.quantity
+
+
 class ExecutionEngine:
     def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker):
         self._dispatcher = dispatcher

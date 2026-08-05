@@ -5,8 +5,8 @@
 
 真实下单语义：
   - place_order 桥「受理成功」（passorder 返回 0）即构造 TradeEvent 返回。
-    成交价格首期用请求价（桥 side 是市价单时价格以实际成交为准，真实成交回报
-    轮询在后续切片完善）。
+    成交价格首期用请求价（order.price = bar.close 近似）；prType=14 对手价实际
+    成交价是盘口一档价（≠ close），真实成交回报轮询在切片5 /deals 回填。
   - 桥业务拒绝（白名单/限额/重复）→ 返回 None（不成交）。
   - 桥网络不可用（iQuant 客户端离线）→ 抛 BridgeUnavailableError，上层暂停交易。
 
@@ -71,6 +71,10 @@ class HttpBridgeDispatcher(OrderDispatcher):
             "op": "buy" if order.trade_type.value == "BUY" else "sell",
             "volume": order.quantity,
             "price": float(order.price) if order.price is not None else 0,
+            # prType=14 对手价:BUY 取卖1价、SELL 取买1价报限价单 -> 立即成交。
+            # 桥 _do_place 据此调 passorder(op, 1101, acct, code, 14, 0, vol, ...)。
+            # price 对 prType!=11 无效,传 close 仅作记录/切片5 回填参考。
+            "pr_type": 14,
         }
         try:
             r = self._client.post(self._base_url + "/order", json=payload, headers=self._headers())
