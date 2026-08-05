@@ -54,7 +54,7 @@ _listen_sock = None
 _placed = {}                      # order_id -> result (idempotency)
 _placing = set()                  # in-flight order_ids
 _requests = []                    # rate-limit timestamps
-_quote_cache = {}                 # (code, period) -> (ts, bars)
+_quote_cache = {}                 # (code, period, count) -> (ts, bars)
 _downloaded = set()               # (code, period) already history-downloaded
 
 
@@ -137,13 +137,19 @@ def _do_place(params):
     account = params.get("account", ACCOUNT)
 
     op_type = 23 if op == "buy" else 24           # passorder opType: 23 buy, 24 sell
-    pr_type = 5 if price <= 0 else 0              # prType int: 0=limit, 5=latest (int, not str)
+    # prType=14 = opposite best price (client-side orderbook-price limit order):
+    #   BUY takes sell1 price, SELL takes buy1 price -> immediate fill.
+    #   NOT an exchange market order, so no market-order symbol/session limits.
+    #   price param has no effect for prType!=11; pass 0 as placeholder.
+    #   Real fill price is backfilled from /deals in a later slice.
+    pr_type = 14
     print("[BRIDGE] order %s %s prType=%s vol=%s price=%s acct=%s"
           % (op, code, pr_type, volume, price, account))
 
     if DRY_RUN:
         return {"ok": True, "dry_run": True,
-                "params": {"code": code, "op": op, "volume": volume, "price": price}}
+                "params": {"code": code, "op": op, "volume": volume,
+                           "price": price, "pr_type": pr_type}}
 
     fn = _iq("passorder")
     if fn is None:
@@ -152,7 +158,9 @@ def _do_place(params):
         # iQuant real C++ signature (10-arg variant, verified returns 0 = accepted):
         # passorder(opType, orderType, accountID, orderCode, prType, price,
         #           volume, strategyName, quickTrade, ContextInfo)
-        result = fn(op_type, 0, account, code, pr_type, float(price), float(volume),
+        # orderType=1101 = single-stock/single-account/normal/by-share
+        #   (official single-stock standard value; old 0 was non-standard).
+        result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
                     "iquant_bridge", 2, _CTX)
         return {"ok": True, "passorder_result": str(result)}
     except Exception as e:
@@ -249,9 +257,9 @@ def _fetch_quote(code, period, count):
         res = xtdata.get_market_data_ex([], [code], period=period, count=count)
         df = (res or {}).get(code)
         if df is not None and len(df) > 0:
-            print("[BRIDGE] xtdata ok %s %s" % (code, period))
+            print("[BRIDGE] xtdata ok %s %s count=%d got=%d" % (code, period, count, len(df)))
             return df
-        print("[BRIDGE] xtdata empty %s %s" % (code, period))
+        print("[BRIDGE] xtdata empty %s %s count=%d" % (code, period, count))
     except Exception as e:
         print("[BRIDGE] xtdata FAIL %s %s: %s" % (code, period, e))
     # 2) fallback: ContextInfo (depends on current symbol context)
@@ -286,7 +294,8 @@ def get_quote(params):
         count = QUOTE_COUNT
 
     now = time.time()
-    cached = _quote_cache.get((code, period))
+    cache_key = (code, period, count)
+    cached = _quote_cache.get(cache_key)
     if cached is not None and now - cached[0] <= QUOTE_CACHE_TTL:
         return {"ok": True, "data": {code: cached[1]}, "cached": True}
 
@@ -294,16 +303,24 @@ def get_quote(params):
     if df is None:
         return {"ok": False, "error": "no data for %s %s" % (code, period)}
     bars = _df_to_bars(df)
-    _quote_cache[(code, period)] = (now, bars)
+    _quote_cache[cache_key] = (now, bars)
     return {"ok": True, "data": {code: bars}, "cached": False}
 
 
 def _refresh_quote_cache():
-    """Event-loop timer: refresh bars for all cached (code, period)."""
-    for (code, period) in list(_quote_cache.keys()):
-        df = _fetch_quote(code, period, QUOTE_COUNT)
+    """Event-loop timer: keep default-count entries warm.
+
+    Only refreshes cache keys whose count == QUOTE_COUNT (the bar-completion
+    polling count). Non-default counts (e.g. large history pulls for formula
+    injection) are fetched on demand by get_quote and left to expire on their
+    own, so they are never silently replaced by a 10-bar refresh."""
+    for key in list(_quote_cache.keys()):
+        code, period, count = key
+        if count != QUOTE_COUNT:
+            continue
+        df = _fetch_quote(code, period, count)
         if df is not None:
-            _quote_cache[(code, period)] = (time.time(), _df_to_bars(df))
+            _quote_cache[key] = (time.time(), _df_to_bars(df))
 
 
 # ---------------- HTTP ----------------
