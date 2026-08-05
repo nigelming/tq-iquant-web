@@ -3,6 +3,8 @@
 > 基于 `system-plan-draft.md` 设计文档生成。TDD 驱动，pytest + vitest。
 > 每步先写测试，再写实现。
 
+> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期实施草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关 / `NatsDispatcher`）已全部废弃**，Core↔iQuant 改为 iQuant 客户端内 HTTP 桥。下文凡涉及 NATS 的内容仅作历史记录，不再实施。
+
 ---
 
 ## 实现状态（截至 2026-07-30）

@@ -13,14 +13,16 @@
 ## 核心架构（4 模块）
 
 ```
-Core (main, Python 3.13) ──NATS──→ iQuant Gateway (live, Python 3.7)
-  └─ 同进程嵌入 TQ 模块（通达信，直接函数调用，不走 NATS）
+Core (main, Python 3.13) ──HTTP──→ iQuant 桥策略 (live/bridge, iQuant 客户端内 Python 3.6)
+  └─ 同进程嵌入 TQ 模块（通达信，直接函数调用）
 Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 ```
 
-**关键约束**：两个独立的 uv 虚拟环境。`main/` 用 Python 3.13，`live/` 用 Python 3.7。
+**关键约束**：两个独立的 uv 虚拟环境。`main/` 用 Python 3.13；`live/` 桥策略在 iQuant 客户端自带 Python 3.6.8 内运行（桥代码须兼容 3.6，纯标准库实现）。
 
-> **Python 版本说明**：国信 iQuant 自带 Python 3.6.8，但 xquant(xtquant) 也支持 Python 3.7。live 环境用 3.7 是因为 NATS 客户端(nats-py)最低要求 3.7，且 3.6 已 EOL。
+> **Python 版本说明**：国信 iQuant 自带 Python 3.6.8，桥策略直接在该解释器内运行（不引入 nats-py 等需 3.7+ 的第三方库，HTTP 层用标准库 `socket` 手写）。
+
+> **架构变更（2026-08）**：原 NATS 网关方案已废弃，Core↔iQuant 改为 HTTP 桥（iQuant 客户端内策略，`init` 阻塞主循环）。详见 [docs/plans/0009-iquant-http-bridge.md](docs/plans/0009-iquant-http-bridge.md)。原 `live/iguant_gateway/` NATS mock 网关已删除。
 
 > **shared 包兼容性**：`shared/` 包被 main(3.13) 和 live(3.7) 共同引用，代码必须兼容 Python 3.7（不可用 walrus `:=`、match、pydantic v2 等）。数据结构用 dataclasses 或 pydantic v1。
 
@@ -80,8 +82,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
 - **复权方式**：统一前复权
-- **TQ 数据传递**：polars DataFrame 进程内传递（不走 NATS），通过 tqcenter SDK 直连运行中通达信
-- **NATS 仅用于 Core↔iQuant 通信**，5 个 subject（下单/查订单/撤单/持仓查询/状态）
+- **TQ 数据传递**：polars DataFrame 进程内传递，通过 tqcenter SDK 直连运行中通达信
+- **Core↔iQuant 通信**：HTTP 桥（`127.0.0.1:8790`），iQuant 客户端内桥策略受理下单/查单/持仓/资金 + 行情拉取，端点见计划 0009
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
 - **资金模型**：策略资金占比是持仓上限（非预分），多策略上限之和可超过 100%
 - **T+1 约束**：回测强制 T+1，实盘实时查可用股票
@@ -97,7 +99,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 
 | 接口 | 回测实现 | 实盘实现 |
 |------|----------|----------|
-| `OrderDispatcher` | `SimulatedDispatcher` 按 next_bar.open 模拟成交 | `NatsDispatcher` 通过 NATS 向 iQuant 下单 |
+| `OrderDispatcher` | `SimulatedDispatcher` 按 next_bar.open 模拟成交 | `HttpBridgeDispatcher` 通过 HTTP 桥向 iQuant 下单 |
 | `T1Checker` | `SimulatedT1Checker` 直接返回持仓量 | `LiveT1Checker` 查 iQuant 实际可用股数 |
 
 执行引擎 `ExecutionEngine` 持有这两个接口，不感知具体实现。

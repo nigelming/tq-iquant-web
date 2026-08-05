@@ -4,6 +4,8 @@
 > 验证日期：2026-08-04（交易日 10:27-10:35 盘中）
 > 关联方案：[docs/plans/0008-live-engine-simulation-pipeline.md](0008-live-engine-simulation-pipeline.md)
 
+> ⚠️ **次期方案已变更（见 0009）**：本文档中关于「NATS 网关加行情通道」「miniQMT」的结论已被推翻——miniQMT 个人账户无交易权限，NATS 网关已废弃。最终采用「iQuant 客户端内 HTTP 桥」，行情用 `xtdata.get_market_data_ex` 拉取（非订阅）。以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) §12 为准。
+
 ## 验证目的
 
 确认 0008 实盘方案的几个关键风险点，决定方案是否需要调整。

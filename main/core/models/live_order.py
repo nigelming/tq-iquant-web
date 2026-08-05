@@ -20,7 +20,6 @@ class LiveOrder(Base):
     filled_price = Column(Numeric(10, 3), nullable=True)
     status = Column(String(15), nullable=False)
     error_message = Column(String(500), nullable=True)
-    nats_request_id = Column(String(64), nullable=True)
     signal_name = Column(String(50), nullable=True)
     signal_type = Column(String(15), nullable=True)
     bar_time = Column(DateTime, nullable=True)

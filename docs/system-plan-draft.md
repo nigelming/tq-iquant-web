@@ -1,5 +1,7 @@
 # 整合多平台的量化回测和交易平台的设计草稿
 
+> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期设计草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关）已全部废弃**。Core↔iQuant 现改为 **iQuant 客户端内 HTTP 桥**（`127.0.0.1:8790`，`HttpBridgeDispatcher` + `BarPoller`）。下文凡涉及 NATS/natsio/网关 subject 的内容仅作历史记录，不再实施。iQuant 网关也由独立进程改为客户端内策略。
+
 ## 1.项目架构和技术栈
 ### 1.1项目名称：创懿量化交易平台
 ### 1.2项目居于windows 10 专业版开发，开发语言为python

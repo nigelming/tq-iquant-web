@@ -1,5 +1,5 @@
-# 生产环境用 PostgreSQL + NATS
-# 开发期用 SQLite（main/data/dev.db），NATS 不需要时可注释
+# 生产环境用 PostgreSQL
+# 开发期用 SQLite（main/data/dev.db）
 services:
   postgres:
     image: postgres:16
@@ -11,11 +11,6 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-
-  nats:
-    image: nats:latest
-    ports:
-      - "4222:4222"
 
 volumes:
   pgdata:

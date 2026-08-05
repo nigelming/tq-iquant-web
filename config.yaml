@@ -5,6 +5,3 @@ max_concurrent_backtest: 1
 
 database:
   sqlite_path: data/dev.db
-
-nats:
-  url: nats://localhost:4222

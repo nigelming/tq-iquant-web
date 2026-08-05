@@ -6,6 +6,8 @@
 > 验证：[0008-verify-results.md](0008-verify-results.md)（SDK 接口链路已实测确认，2026-08-04 盘中）
 > 依据：[system-plan-draft.md](../system-plan-draft.md) §2.4 实盘信号流程 / §5.3.3 并发模型 / §5.3.2 第9条虚拟持仓 / 实盘恢复机制；用户 4 项决策（见下）
 
+> ⚠️ **次期方案已变更（见 0009）**：本计划原定「次期 `NatsDispatcher` + iQuant NATS 网关」**已废弃**，改为「iQuant 客户端内 HTTP 桥（`HttpBridgeDispatcher`）」。NATS 通信拓扑整体移除。下文凡涉及 `NatsDispatcher`/NATS 网关的内容仅作历史记录，以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) 为准。
+
 ## 1. 目标
 
 打通「TQ 实时通知 → 主动拉数 → 内存注入公式 → 信号 → 风控 → 模拟撮合 → 落库 → SSE 推送 → 前端监控」实盘全链路。**首期成交用 `SimulatedDispatcher` 本地撮合**（与回测同），不接 iQuant 真实下单。一个会话跑多个组合（1:N），各组合虚拟持仓/虚拟现金隔离。落地后实盘具备「能跑能看能恢复」的产品级状态，与回测对称。

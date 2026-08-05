@@ -11,7 +11,6 @@ name = "live"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "nats-py" },
     { name = "pyyaml", version = "6.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.8'" },
     { name = "pyyaml", version = "6.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.8'" },
     { name = "tq-iquant-shared" },
@@ -19,16 +18,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "nats-py", specifier = "<2.7" },
     { name = "pyyaml" },
     { name = "tq-iquant-shared", directory = "../shared" },
 ]
-
-[[package]]
-name = "nats-py"
-version = "2.6.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/65/13/717eea9ffdc81231b97e636cb7a16d1f55a1d79de661781b710781ee58b5/nats-py-2.6.0.tar.gz", hash = "sha256:7c535fb62d8dc9c743b4afb42775d9f36924f6a1ca1486efdd2e29f1e4ee30b8", size = 94639, upload-time = "2023-10-27T23:59:36.939Z" }
 
 [[package]]
 name = "pyyaml"

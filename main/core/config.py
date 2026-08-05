@@ -20,9 +20,6 @@ def _defaults() -> dict:
         "database": {
             "sqlite_path": "data/dev.db",
         },
-        "nats": {
-            "url": "nats://localhost:4222",
-        },
     }
 
 

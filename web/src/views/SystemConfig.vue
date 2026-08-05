@@ -32,10 +32,6 @@ async function save() {
       <input v-model="config.iquant_path" placeholder="D:\iquant" />
     </div>
     <div class="field">
-      <label>NATS 地址</label>
-      <input v-model="config.nats.url" />
-    </div>
-    <div class="field">
       <label>数据库主机</label>
       <input v-model="config.database.host" />
     </div>
