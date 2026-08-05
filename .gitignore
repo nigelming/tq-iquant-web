@@ -31,6 +31,9 @@ Thumbs.db
 .env
 .env.local
 
+# iQuant bridge secret (token file, never commit)
+live/bridge/.bridge_token
+
 # Runtime
 logs/
 *.log
