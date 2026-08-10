@@ -209,7 +209,7 @@ F6、G5、I4
 
 1. **✅ 已完成:E5/E6 熔断接线**(2026-08-10 TDD 实现,测试全过)——实盘熔断/日内亏损已接线。
 2. **C6 三段式实盘周期链路** — 不等开盘,休市可 TDD,回测=实盘硬要求,高优先级(C3 三段式+C5 边界分发已定:1m 单轮询 30s + stime 边界分发 5m/15m/30m/1h / 1d 14:30 快照 / 1w+1mon 启动通达信算+14:30 统一下单)。
-3. **G1/G2/G6 切片5 订单同步实现** — ✅ G3/G4 匹配键已真机定案(`m_strOrderRef`),卡点解除,可开写(依赖:桥 query_deals/query_orders 字段已改)。
+3. **G1/G2/G6 切片5 订单同步实现** — ✅ G3/G4 匹配键已真机定案(`m_strOrderRef`),卡点解除;✅ **0011 计划文档已写**([docs/plans/0011-order-sync-deal-backfill.md](plans/0011-order-sync-deal-backfill.md)),可开写实现(依赖:桥 query_deals/query_orders 字段已改)。
 4. **F5 `LiveT1Checker` 接 available** — ✅ `m_nCanUseVolume` 已真机验证,实现可开写。
 5. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
 6. **🧠 决策项** — 随时可在本表逐点过,不阻塞代码。
