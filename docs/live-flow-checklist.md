@@ -53,7 +53,7 @@
 | B3 | `mode` 字段语义 + 模式匹配 | ✅ | 🧠 | Core 按 `mode` 连对应桥(实盘桥/模拟桥,见 A3)。**启动会话时先匹配模式**:读 `session.mode` → 连对应桥地址 → 再组装引擎。不再依赖单一 `DRY_RUN`。**配置需两套桥地址**(mode→bridge_url 映射,扩 `config.iquant_bridge` 段) | ✅ 启动先匹配模式→连对应桥 |
 | B4 | 前端实盘启动页 | ⏸ | 📖 | 前端页面暂不确定,后续再定。不阻塞 Core/桥的设计 | ⏸ 暂缓 |
 | B5 | SSE 成交/信号推送 | ⏸ | ✅ | `/stream` 当前只发 ping(→ design §1.5)。暂时不确定,后续再定,不阻塞主链路 | ⏸ 暂缓 |
-| B6 | 多 session 并发限制 | ⚠️规则/❌代码 | 🧠 | **限制同一时刻全局只跑 1 个实盘 session**(2026-08-07 定)。简化隔离,避免多引擎争抢桥单线程 + 持仓归属混乱(Q1 未解)。**代码缺口**:`live.py:191` 现状 `if session_id in _ENGINES` 只防**同一 session 重复 start**(返回 running),**不防全局多个不同 session 并跑** → 待改成 `_ENGINES` 非空即拒绝任何新 start(返回错误提示已有 session 在跑) | ✅ 全局限 1 个;⚠️ `live.py:191` 只防重复 start 不防全局,待改 |
+| B6 | 多 session 并发限制 | ✅已实现 | 🧠 | **限制同一时刻全局只跑 1 个实盘 session**(2026-08-07 定)。简化隔离,避免多引擎争抢桥单线程 + 持仓归属混乱(Q1 未解)。**代码缺口**:`live.py:191` 现状 `if session_id in _ENGINES` 只防**同一 session 重复 start**(返回 running),**不防全局多个不同 session 并跑** → 待改成 `_ENGINES` 非空即拒绝任何新 start(返回错误提示已有 session 在跑) | ✅ 已实现(2026-08-10,3c826e8):`live.py:191` 同 session 重复 start 幂等返回 running;`_ENGINES` 非空即拒新 start(409 业务错误,提示已有 session 在跑) |
 
 ---
 
@@ -113,7 +113,7 @@
 | F2 | 信号优先级(风控>公式) | ✅ | 📖 | CLOSE>REDUCE>ADD>OPEN(→ design §5.4) | — |
 | F3 | 主从联动约束 | ✅ | 📖 | 从策略 OPEN 只能买主策略持有的股 | — |
 | F4 | BUY 资金审批 | ✅ | 📖 | `account.approve_order`(→ design §5.5) | — |
-| F5 | **SELL 量上限(T+1)** | ✅字段已验/❌实现待改 | 🔬+✅ | **2026-08-10 真机已验**:POSITION 对象 `m_nCanUseVolume` **精确反映 T+1 可用**——持仓 600(昨仓 200+今买 400),`m_nCanUseVolume=200`、`m_nCoveredVolume=400`、`m_nOnRoadVolume=400`,今日买入 400 不可卖 ✅。**桥 query_positions 的 available 已改取 `m_nCanUseVolume`**(原取 ACCOUNT 的 `m_dAvailable` 是资金非股数,且 POSITION 对象上无此字段→null)。实现:`LiveT1Checker` 改 `min(本策略持有量, 桥 available)` | ✅ 字段已验(`m_nCanUseVolume` 精确 T+1);❌ LiveT1Checker 待改接桥 available |
+| F5 | **SELL 量上限(T+1)** | ✅已实现 | 🔬+✅ | **2026-08-10 真机已验**:POSITION 对象 `m_nCanUseVolume` **精确反映 T+1 可用**——持仓 600(昨仓 200+今买 400),`m_nCanUseVolume=200`、`m_nCoveredVolume=400`、`m_nOnRoadVolume=400`,今日买入 400 不可卖 ✅。**桥 query_positions 的 available 已改取 `m_nCanUseVolume`**(原取 ACCOUNT 的 `m_dAvailable` 是资金非股数,且 POSITION 对象上无此字段→null)。实现:`LiveT1Checker` 改 `min(本策略持有量, 桥 available)` | ✅ 已实现(2026-08-10 TDD,3c826e8):`LiveT1Checker` 持 `_available_map`(LiveEngine 每 bar 刷一次 /positions,强引用去重),`min(持有量, m_nCanUseVolume)`;桥无该仓/未取到→全量放行(券商端 T+1 兜底,G6 处理拒单);`_handle_bar` 先 `cap_quantity` 再落 submitted,DB 量=实发量 |
 | F6 | **同 bar 多策略超卖** | ⚠️ | 🧠 | A 卖 600 + B 卖 400,券商 available 只 800。需「bar 内可用量递减记账」?(→ open-questions Q2) | （待确认） |
 | F7 | 成交时机 | ✅ | 📖 | 当根 bar 立即成交(非下一 bar open) | — |
 | F8 | 成交价近似 | ✅已修正 | — | 用 `bar.close`,prType=14 实际是盘口一档价。切片5 回填修正(→ design §5.6) | ✅ 切片5 已修正:成交价/量/佣金取 /deals 真实回报,成交均价=金额/量(`_backfill_order`,live_engine.py:741),不再用 bar.close 近似 |
@@ -189,10 +189,8 @@
 
 | # | 细节 | 优先级 | 依赖 |
 |---|---|---|---|
-| B6 | 全局限 1 个实盘 session:`live.py:191` 改 `_ENGINES` 非空即拒新 start | 中(小改,防多引擎争抢桥) | ✅ 规则已定(B6 行) |
 | #27 | `Formula.formula_count` 字段+迁移+前端公式页(count 按公式配) | 中高(C4 去重前置) | — |
 | #28 | C4 三维去重(拉取 `(code,period)` + 计算 `(code,period,formula)`) | 中高(省重复 TQ 计算) | #27 |
-| F5 | `LiveT1Checker` 接桥 available(`min(持有量, m_nCanUseVolume)`) | 中高(实盘卖出精度) | ✅ 字段已验 |
 | D4 | 熔断计数读回 | 中 | — |
 | H4 | 熔断计数持久化 | 中 | — |
 | B5 | SSE 成交/信号推送 | 低 | — |
@@ -217,9 +215,8 @@ F6、G5
 1. **✅ 已完成:E5/E6 熔断接线**(2026-08-10 TDD,测试全过)——实盘熔断/日内亏损已接线。
 2. **✅ 已完成:C6 三段式实盘周期链路 + E8**(c2e1482)——1m 边界分发 5m/15m/30m/1h + 1d 14:30 快照 + 1w/1mon 通达信注入;离线恢复不补 bar。
 3. **✅ 已完成:切片5 订单同步 G1/G2/G6 + G7 + F10 + I4**(eb4bc40)——订单状态机、/deals 回填(按 `m_strOrderRef`)、桥状态并入 session、submitted 拆分、recover 挂回未完结单。
-4. **F5 `LiveT1Checker` 接 available** — ✅ `m_nCanUseVolume` 已真机验证,实现可开写(中高,实盘卖出精度)。
-5. **B6 全局限 1 个实盘 session** — `live.py:191` 现只防同 session 重复 start,待改 `_ENGINES` 非空即拒(小改,防多引擎争抢桥)。
-6. **#27 formula_count 字段 + #28 C4 三维去重** — C4 前置 #27,省重复 TQ 计算(中高)。
-7. **D4/H4 熔断计数读回/持久化** — 重启后累计次数丢失待补(中)。
-8. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
-9. **🧠 决策项** — F6/G5 随时可在本表逐点过,不阻塞代码。
+4. **✅ 已完成:F5 + B6**(3c826e8)——`LiveT1Checker` 接桥 `m_nCanUseVolume`(每 bar 刷一次 /positions,SELL 封顶);全局限 1 个实盘 session(`_ENGINES` 非空即拒)。
+5. **#27 formula_count 字段 + #28 C4 三维去重** — C4 前置 #27,省重复 TQ 计算(中高)。
+6. **D4/H4 熔断计数读回/持久化** — 重启后累计次数丢失待补(中)。
+7. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
+8. **🧠 决策项** — F6/G5 随时可在本表逐点过,不阻塞代码。
