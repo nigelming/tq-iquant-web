@@ -158,6 +158,9 @@ class LiveEngine:
         # recover 预置当前值；_persist_breaker_count 只在计数变化时落库（避免每 bar 写）。
         # key=portfolio.portfolio_id。
         self._breaker_count_written: Dict[int, int] = {}
+        # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
+        # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
+        self._reconcile_mismatches: List[dict] = []
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -1122,6 +1125,51 @@ class LiveEngine:
             if link.circuit_breaker_count >= 3:
                 port.risk_manager.manual_recovery = True
                 port.risk_manager.circuit_breaker_active = True
+        # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
+        self._reconcile_positions()
+
+    def _reconcile_positions(self) -> None:
+        """D3：对账——虚拟持仓(按 code 聚合) vs 桥实际 /positions，不一致仅记录+告警。
+
+        recover 重建的虚拟持仓以 live_trades 为唯一源；桥 /positions 是账户真实持仓。
+        比对口径：按 stock_code 聚合所有组合策略虚拟净持仓 vs 桥 volume。
+        差异只记 `_reconcile_mismatches` + 告警日志，**不自动修正账面**（首期安全：
+        在途单未回填/桥行情延迟期可能假不一致，自动修正反而引入错账；真机跑顺后
+        如需自动校准再放开）。桥离线 → 记日志跳过（不阻断 start）。
+        附加提示：实际有仓但虚拟无仓（如 Core 宕机期手动下单）也记录，供人工核对。
+        """
+        self._reconcile_mismatches = []
+        try:
+            rows = self._dispatcher.query_positions()
+        except BridgeUnavailableError:
+            logger.warning("reconcile skipped: bridge offline (session %s)", self.session_id)
+            return
+        real: Dict[str, int] = {}
+        for r in rows or []:
+            inst = r.get("instrument")
+            exch = r.get("exchange")
+            vol = r.get("volume")
+            if inst and exch and vol is not None:
+                real["%s.%s" % (inst, exch)] = int(vol)
+        virtual: Dict[str, int] = {}
+        for port in self.portfolios:
+            for ctx in port.strategies:
+                for code, pos in ctx.positions.items():
+                    if pos.quantity == 0:
+                        continue
+                    virtual[code] = virtual.get(code, 0) + pos.quantity
+        for code in sorted(set(real) | set(virtual)):
+            v = virtual.get(code, 0)
+            r = real.get(code, 0)
+            if v == r:
+                continue
+            self._reconcile_mismatches.append(
+                {"code": code, "virtual": v, "real": r, "diff": v - r}
+            )
+            logger.warning(
+                "reconcile mismatch (session %s) %s: virtual=%d real=%d diff=%d",
+                self.session_id, code, v, r, v - r,
+            )
 
     @property
     def bridge_online(self) -> bool:

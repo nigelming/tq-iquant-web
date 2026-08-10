@@ -1822,3 +1822,84 @@ def test_deals_loop_polls_deals_at_own_interval():
     asyncio.run(run_a_bit())
     assert len(calls) >= 3
 
+
+# ---------------- D3 对账（虚拟持仓 vs 桥实际，仅告警不修正）----------------
+def _seed_trade(db, stock, qty, price="9.0"):
+    """预置一笔 BUY 成交（recover 据此重建虚拟持仓）。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="buy", order_type="limit", price=Decimal(price), quantity=qty,
+        filled_quantity=qty, filled_price=Decimal(price), status="accepted",
+        signal_name="open_sig", signal_type="OPEN", bar_time=datetime(2026, 8, 5, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type="buy", price=Decimal(price), quantity=qty,
+        amount=Decimal(price) * qty, commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 8, 5, 10, 0),
+    ))
+
+
+def _positions_respond(volume):
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": volume, "volume": volume,
+                 "yesterday_volume": volume, "on_road_volume": 0},
+            ]})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    return respond
+
+
+def _reconcile_engine(factory, seed_qty, respond=None, fail_paths=None):
+    """seeded BUY + 指定 /positions respond 的引擎；recover 后返回 (engine, port, ctx)。"""
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    db = factory()
+    _seed_trade(db, stock, seed_qty)
+    db.commit()
+    db.close()
+    rec = _Recorder(respond=respond, fail_paths=fail_paths)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    db = factory()
+    engine.recover(db)
+    db.close()
+    return engine, port, ctx
+
+
+def test_reconcile_positions_reports_virtual_vs_real_mismatch():
+    """D3：虚拟 1000 vs 桥实际 800 → 记录 mismatch，账面不修正（仍 1000）。"""
+    factory, _ = _db_factory()
+    engine, _, ctx = _reconcile_engine(factory, 1000, respond=_positions_respond(800))
+
+    assert ctx.positions["600000.SH"].quantity == 1000  # 只告警，不改虚拟持仓
+    assert engine._reconcile_mismatches == [
+        {"code": "600000.SH", "virtual": 1000, "real": 800, "diff": 200},
+    ]
+
+
+def test_reconcile_positions_clean_when_matching():
+    """D3：虚拟 == 桥实际 → 无 mismatch 记录。"""
+    factory, _ = _db_factory()
+    engine, _, _ = _reconcile_engine(factory, 800, respond=_positions_respond(800))
+
+    assert engine._reconcile_mismatches == []
+
+
+def test_reconcile_positions_offline_skips():
+    """D3：桥离线 → 跳过对账不崩，无 mismatch 记录。"""
+    factory, _ = _db_factory()
+    engine, _, _ = _reconcile_engine(factory, 1000, fail_paths={"/positions"})
+
+    assert engine._reconcile_mismatches == []
+
