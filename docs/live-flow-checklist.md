@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README、B5 SSE 事件流(signal/order/trade/position/risk 五类推送),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/本提交),对应行已标 ✅。🧠 决策已清零,🔲 待实现表已清空。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README、B5 SSE 事件流(signal/order/trade/position/risk 五类推送)、B4 前端实盘工作台(SSE 事件日志 + 持仓/委托/成交三表 + 历史加载 + B4b orders/trades/positions 历史查询端点),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/411127b/d0b66d4/本提交),对应行已标 ✅。🧠 决策已清零,🔲 待实现表已清空。
 
 ---
 
@@ -51,8 +51,8 @@
 | B1 | `POST /sessions` 建会话 | ✅ | 📖 | `api/live.py:72`,建 LiveSession + 关联组合(→ design §1.1) | — |
 | B2 | `POST /sessions/{id}/start` | ✅ | 📖 | `api/live.py:173`(→ design §1.2) | — |
 | B3 | `mode` 字段语义 + 模式匹配 | ✅ | 🧠 | Core 按 `mode` 连对应桥(实盘桥/模拟桥,见 A3)。**启动会话时先匹配模式**:读 `session.mode` → 连对应桥地址 → 再组装引擎。不再依赖单一 `DRY_RUN`。**配置需两套桥地址**(mode→bridge_url 映射,扩 `config.iquant_bridge` 段) | ✅ 启动先匹配模式→连对应桥 |
-| B4 | 前端实盘启动页 | ⏸ | 📖 | 前端页面暂不确定,后续再定。不阻塞 Core/桥的设计 | ⏸ 暂缓 |
-| B5 | SSE 成交/信号推送 | ✅已实现 | 📖 | `/stream` 当前只发 ping(→ design §1.5)。暂时不确定,后续再定,不阻塞主链路 | ✅ 已实现(2026-08-10,本提交):`LiveEngine._emit`/`stream_events` 广播五类事件(signal/order/trade/position/risk,均带 `portfolio_id`)+ `/stream` 端点运行中转发、空闲 30s ping、未运行 ping-only。前端消费留待 B4 实盘启动页 |
+| B4 | 前端实盘启动页 | ✅已实现 | ✅ | **工作台**(`LiveSessions.vue` 扩展):① SSE 实时事件日志(B4a)——消费 `/sessions/{id}/stream` 五类事件(signal/order/trade/position/risk)渲染为可读日志,运行中 session 自动连接、停止/卸载关闭、200 条封顶、ping 心跳不进日志;② 持仓/委托/成交三表聚合工作台 + 历史加载(B4b)——运行中读引擎内存态虚拟持仓、停止后从 live_trades 聚合;历史查询端点 `GET /sessions/{id}/orders?status=`(委托,可选状态过滤)、`/trades`(成交,time 倒序)、`/positions`(虚拟持仓,与 recover 同口径)。SSE position 事件按 code upsert,order/trade 事件顶部插入封顶 | ✅ 已实现(2026-08-10,411127b B4a + d0b66d4 B4b 后端 + 后续前端):纯函数 `liveEvents.ts`/`liveWorkbench.ts` 可单测(vitest 12+4 用例);事件日志 + 工作台均 TDD |
+| B5 | SSE 成交/信号推送 | ✅已实现 | 📖 | `/stream` 当前只发 ping(→ design §1.5)。暂时不确定,后续再定,不阻塞主链路 | ✅ 已实现(2026-08-10,本提交):`LiveEngine._emit`/`stream_events` 广播五类事件(signal/order/trade/position/risk,均带 `portfolio_id`)+ `/stream` 端点运行中转发、空闲 30s ping、未运行 ping-only。前端已消费(2026-08-10,411127b):事件日志 + 工作台 |
 | B6 | 多 session 并发限制 | ✅已实现 | 🧠 | **限制同一时刻全局只跑 1 个实盘 session**(2026-08-07 定)。简化隔离,避免多引擎争抢桥单线程 + 持仓归属混乱(Q1 未解)。**代码缺口**:`live.py:191` 现状 `if session_id in _ENGINES` 只防**同一 session 重复 start**(返回 running),**不防全局多个不同 session 并跑** → 待改成 `_ENGINES` 非空即拒绝任何新 start(返回错误提示已有 session 在跑) | ✅ 已实现(2026-08-10,3c826e8):`live.py:191` 同 session 重复 start 幂等返回 running;`_ENGINES` 非空即拒新 start(409 业务错误,提示已有 session 在跑) |
 
 ---

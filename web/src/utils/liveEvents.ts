@@ -32,12 +32,12 @@ export const EVENT_TYPE_COLOR: Record<string, string> = {
   risk: 'red',
 }
 
-const TRADE_TYPE_LABEL: Record<string, string> = {
+export const TRADE_TYPE_LABEL: Record<string, string> = {
   BUY: '买入',
   SELL: '卖出',
 }
 
-const ORDER_STATUS_LABEL: Record<string, string> = {
+export const ORDER_STATUS_LABEL: Record<string, string> = {
   submitted: '已提交',
   filled: '成交',
   partial: '部分成交',

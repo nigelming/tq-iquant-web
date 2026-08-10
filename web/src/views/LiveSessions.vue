@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, TRADE_TYPE_LABEL, ORDER_STATUS_LABEL, type LiveEvent } from '../utils/liveEvents'
+import {
+  orderEventToRow, orderHistoryToRows,
+  tradeEventToRow, tradeHistoryToRows,
+  upsertPositionRows, positionHistoryToRows, prependCapped,
+  type OrderRow, type TradeRow, type PositionRow,
+} from '../utils/liveWorkbench'
+import { getLiveOrders, getLiveTrades, getLivePositions } from '../api'
 
 const sessions = ref<any[]>([])
 const showCreate = ref(false)
@@ -15,16 +22,44 @@ let es: EventSource | null = null
 const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk'] as const
 const LOG_CAP = 200
 
-function pushLog(type: string, data: Record<string, unknown>) {
+// ---- B4b: 工作台（持仓/委托/成交）----
+const positions = ref<PositionRow[]>([])
+const orders = ref<OrderRow[]>([])
+const trades = ref<TradeRow[]>([])
+const wbTab = ref<'positions' | 'orders' | 'trades'>('positions')
+const TAB_LABEL: Record<string, string> = { positions: '持仓', orders: '委托', trades: '成交' }
+
+const nowTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false })
+
+function pushLog(type: string, data: Record<string, unknown>, time: string) {
   const text = formatEvent(type, data)
   if (!text) return // ping 心跳不进日志
   events.value.push({
     id: nextEventId(),
     type: type as LiveEvent['type'],
-    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    time,
     text,
   })
   if (events.value.length > LOG_CAP) events.value = events.value.slice(-LOG_CAP)
+}
+
+function applyToWorkbench(type: string, data: Record<string, unknown>, time: string) {
+  if (type === 'position') positions.value = upsertPositionRows(positions.value, data)
+  else if (type === 'order') orders.value = prependCapped(orders.value, orderEventToRow(data, time))
+  else if (type === 'trade') trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
+}
+
+async function loadHistory(id: number) {
+  try {
+    const [pos, ord, trd] = await Promise.all([
+      getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
+    ])
+    positions.value = positionHistoryToRows(pos)
+    orders.value = orderHistoryToRows(ord)
+    trades.value = tradeHistoryToRows(trd)
+  } catch {
+    // 会话已删除等 → 保持现状
+  }
 }
 
 function startEventStream(id: number) {
@@ -33,12 +68,16 @@ function startEventStream(id: number) {
   const source = new EventSource(`/api/live/sessions/${id}/stream`)
   EVENT_TYPES.forEach((t) => {
     source.addEventListener(t, (e: MessageEvent) => {
-      pushLog(t, JSON.parse(e.data))
+      const data = JSON.parse(e.data)
+      const time = nowTime()
+      pushLog(t, data, time)
+      applyToWorkbench(t, data, time)
     })
   })
   source.onopen = () => { connState.value = 'open' }
   source.onerror = () => { connState.value = 'closed' } // EventSource 自动重连,不主动 close
   es = source
+  loadHistory(id)
 }
 
 function closeEventStream() {
@@ -98,6 +137,68 @@ onUnmounted(closeEventStream)
       </tbody>
     </table>
     <div v-if="sessions.length === 0" class="empty-state"><p>暂无实盘 session</p></div>
+  </div>
+
+  <!-- B4b: 工作台（持仓/委托/成交） -->
+  <div class="card" style="margin-top:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">实盘工作台</h3>
+      <div>
+        <button
+          v-for="(label, key) in TAB_LABEL" :key="key"
+          class="btn btn-sm" :class="wbTab === key ? 'btn-primary' : ''"
+          @click="wbTab = key as any"
+        >{{ label }}</button>
+      </div>
+    </div>
+
+    <!-- 持仓 -->
+    <div v-if="wbTab === 'positions'" class="table-wrap">
+      <table>
+        <thead><tr><th>代码</th><th>数量</th><th>成本价</th><th>市值</th></tr></thead>
+        <tbody>
+          <tr v-for="p in positions" :key="p.stock_code">
+            <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_cost }}</td><td>{{ p.market_value }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="positions.length === 0" class="empty-state"><p>暂无持仓</p></div>
+    </div>
+
+    <!-- 委托 -->
+    <div v-if="wbTab === 'orders'" class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th></tr></thead>
+        <tbody>
+          <tr v-for="o in orders" :key="o.key">
+            <td style="color:#888">{{ o.time }}</td>
+            <td>{{ TRADE_TYPE_LABEL[o.trade_type] || o.trade_type }}</td>
+            <td>{{ o.stock_code }}</td>
+            <td><span class="badge" :class="o.status === 'filled' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-gray'">{{ ORDER_STATUS_LABEL[o.status] || o.status }}</span></td>
+            <td>{{ o.quantity }}</td>
+            <td>{{ o.price ?? '-' }}</td>
+            <td>{{ o.filled_quantity ?? '-' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="orders.length === 0" class="empty-state"><p>暂无委托</p></div>
+    </div>
+
+    <!-- 成交 -->
+    <div v-if="wbTab === 'trades'" class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>价格</th><th>数量</th><th>金额</th></tr></thead>
+        <tbody>
+          <tr v-for="t in trades" :key="t.key">
+            <td style="color:#888">{{ t.time }}</td>
+            <td>{{ TRADE_TYPE_LABEL[t.trade_type] || t.trade_type }}</td>
+            <td>{{ t.stock_code }}</td>
+            <td>{{ t.price }}</td><td>{{ t.quantity }}</td><td>{{ t.amount }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="trades.length === 0" class="empty-state"><p>暂无成交</p></div>
+    </div>
   </div>
 
   <!-- B4a: 实时事件日志 -->

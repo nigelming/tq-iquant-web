@@ -219,3 +219,57 @@ export async function deleteBacktestRecord(id: number) {
   const res = await api.delete<ApiResponse<any>>(`/backtest/records/${id}`)
   return res.data.data
 }
+
+// ---- B4b: 实盘历史查询（订单/成交/持仓）----
+
+export interface LiveOrderItem {
+  id: number
+  stock_code: string
+  trade_type: string  // BUY|SELL
+  order_type: string
+  price: number | null
+  quantity: number
+  filled_quantity: number
+  filled_price: number | null
+  status: string  // submitted|filled|partial|rejected|canceled
+  error_message: string | null
+  signal_name: string | null
+  signal_type: string | null
+  bar_time: string | null
+  created_at: string | null
+}
+
+export interface LiveTradeItem {
+  id: number
+  stock_code: string
+  trade_type: string
+  price: number
+  quantity: number
+  amount: number
+  commission: number
+  stamp_duty: number
+  trade_time: string | null
+}
+
+export interface LivePositionItem {
+  stock_code: string
+  quantity: number
+  avg_cost: number
+  market_value: number
+}
+
+export async function getLiveOrders(sessionId: number, status?: string) {
+  const params = status ? { status } : {}
+  const res = await api.get<ApiResponse<LiveOrderItem[]>>(`/live/sessions/${sessionId}/orders`, { params })
+  return res.data.data
+}
+
+export async function getLiveTrades(sessionId: number) {
+  const res = await api.get<ApiResponse<LiveTradeItem[]>>(`/live/sessions/${sessionId}/trades`)
+  return res.data.data
+}
+
+export async function getLivePositions(sessionId: number) {
+  const res = await api.get<ApiResponse<LivePositionItem[]>>(`/live/sessions/${sessionId}/positions`)
+  return res.data.data
+}

@@ -69,7 +69,6 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - 前端 6 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig）
 
 **当前缺口**（实时状态见 [docs/live-flow-checklist.md](docs/live-flow-checklist.md) 与 [docs/implementation-plan.md](docs/implementation-plan.md)）：
-- 前端 SSE 消费 + 实盘工作台（B4，⏸ 暂缓）——B5 SSE 后端已就绪，前端 `EventSource` 未接
 - F9 印花税仍 0（`/deals` 印花税字段待真机验证）；D3 对账自动校准待真机跑顺放开
 - 首页仪表盘前端页、监控/告警骨架、conftest `dependency_overrides` 字符串 key、`data_feed.py`（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖）
 

@@ -16,7 +16,7 @@
 
 ### 总体
 
-4 模块结构、14 张 ORM 表、API 路由、前端视图、引擎层均已就位；**回测链路（TQ 数据→公式→引擎→评估）与实盘链路（HTTP 桥→订单状态机→/deals 回填→SSE 推送）已全打通**（切片 1-5：含熔断接线、订单同步、三段式周期链路、SSE 事件流）。剩余缺口集中在：前端 SSE 消费/实盘工作台（B4 暂缓）、回测并发 409、首页仪表盘前端页、监控/告警骨架、`data_feed.py`（功能由直接调用覆盖）。通信拓扑按架构变更改 HTTP 桥（NATS 内容仅历史记录）。
+4 模块结构、14 张 ORM 表、API 路由、前端视图、引擎层均已就位；**回测链路（TQ 数据→公式→引擎→评估）与实盘链路（HTTP 桥→订单状态机→/deals 回填→SSE 推送→前端工作台）已全打通**（切片 1-5 + B4/B4b：含熔断接线、订单同步、三段式周期链路、SSE 事件流、前端事件日志 + 持仓/委托/成交工作台、orders/trades/positions 历史查询端点）。剩余缺口集中在：首页仪表盘前端页、监控/告警骨架、`data_feed.py`（功能由直接调用覆盖）。通信拓扑按架构变更改 HTTP 桥（NATS 内容仅历史记录）。
 
 ### P0 配置链修复（2026-07-30 已完成）
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | 1.1 main 环境 | ✅ | FastAPI app + /health |
 | 1.2 live 环境 | ✅ | HTTP 桥策略 `live/bridge/iquant_bridge.py`（原 NATS 网关废弃） |
-| 1.3 前端项目 | ⚠️ | Vite+Vue+路由+axios 齐；**Pinia 已装未启用，无 stores**；无前端 SSE 消费（归 B4 暂缓） |
+| 1.3 前端项目 | ✅ | Vite+Vue+路由+axios 齐；**Pinia 已装未启用，无 stores**（现有视图均直接 ref 状态，未成问题）；SSE 消费已做（B4，LiveSessions.vue 事件日志 + 工作台） |
 | 1.4 数据库 | ✅ | 固定 SQLite（P0 修复后配置链通）；docker-compose.yml 保留备用 |
 | 1.5 NATS 连通测试 | ~~❌~~ | 废弃（架构变更，无 NATS） |
 | 2.1 shared 包 | ✅ | constants/nats_schemas/stock_utils 齐，3.7 兼容 |
@@ -49,15 +49,15 @@
 | 5.4 回测 API+前端 | ⚠️ | `POST /api/backtest` 在且同步跑完；**409 并发冲突未实现**（无锁、非 ProcessPoolExecutor，与 CLAUDE.md 描述不符） |
 | 6.1 实盘引擎 | ✅ | LiveEngine 完整实现（切片 1-5 TDD） |
 | 6.2 iQuant 网关 | ✅ | 改 HTTP 桥（原 NATS 网关废弃）；桥端字段/账号/模式已真机验证 |
-| 6.3 实盘 API+前端+SSE | ⚠️ | SSE 后端全（B5）；**前端 EventSource 消费未做**（B4 暂缓）；缺 orders/trades 查询端点 |
+| 6.3 实盘 API+前端+SSE | ✅ | SSE 后端全（B5）+ 前端消费（B4：事件日志 + 持仓/委托/成交工作台 + 历史加载）；orders/trades/positions 历史查询端点已补（B4b） |
 | 7.1 系统配置 | ✅ | GET/PUT configs + SystemConfig.vue |
 | 7.2 首页仪表盘 | ⚠️ | `/api/status` 在；前端无仪表盘页 |
 | 7.3 日志/监控/告警 | ⚠️ | logging_config 在；监控/告警骨架缺 |
 
 ### 待办优先级（2026-08-10 更新，原 P0-P3 多数已完成）
 
-1. **前端 SSE 消费 + 实盘工作台**（B4，⏸ 暂缓）：B5 SSE 后端已就绪，前端 EventSource 消费与实盘面板未做。
-2. **P1**：回测并发 409——`POST /api/backtest` 现同步内联执行、无锁，补全局锁 + 409；CLAUDE.md 的"ProcessPoolExecutor 子进程单实例"描述待同步修正。
+1. **~~前端 SSE 消费 + 实盘工作台~~**（B4，✅ 已实现 2026-08-10）：事件日志 + 持仓/委托/成交工作台 + 历史查询端点（orders/trades/positions）均已 TDD 完成。
+2. **~~P1 回测并发 409~~**（✅ 已实现 2026-08-10, e9284cc）：`_BACKTEST_LOCK` 全局锁 + 409，校验在锁外、finally 释放；CLAUDE.md 并发描述已同步（43c4a00）。
 3. **P2**：`data_feed.py` 未建（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖，是否需独立层待定）。
 4. **P2**：首页仪表盘前端页（`/api/status` 后端已就绪）+ 监控/告警骨架。
 5. **P3**：conftest `dependency_overrides["get_db"]` 字符串 key 改函数 key；Pinia 若启用则建 stores。
@@ -978,8 +978,8 @@ LOGGING_CONFIG = {
 第二阶段：数据层     ██████████████████░░  ~95%   [#6-#9]  14 表+级联+索引齐；NATS 客户端废弃；conftest 字符串 key 待修
 第三阶段：TQ 模块    ████████████████████  ~100%  [#10-#11] 真机连通通达信；tdx_path 已配置化；公式 API/前端齐
 第四阶段：核心引擎   ██████████████████░░  ~90%   [#12-#17] 回测引擎已实现；`data_feed.py` 未建（直接调 TQData/TQFormula 覆盖）
-第五阶段：回测       ██████████████████░░  ~90%   [#18-#21] Evaluator 指标实算；**409 并发冲突未实现**（同步内联执行）
-第六阶段：实盘       ██████████████████░░  ~90%   [#22-#24] LiveEngine/HTTP 桥/订单状态机/SSE 后端全实现；**前端 SSE 消费未做（B4 暂缓）**
+第五阶段：回测       ████████████████████  ~95%   [#18-#21] Evaluator 指标实算；409 并发锁已实现（e9284cc）
+第六阶段：实盘       ████████████████████  ~95%   [#22-#24] LiveEngine/HTTP 桥/订单状态机/SSE 后端全实现；**前端 SSE 消费 + 工作台 + 历史查询已做（B4/B4b，2026-08-10）**
 第七阶段：收尾       ████████████░░░░░░░░  ~60%   [#25-#27] 配置/日志在；仪表盘前端页 + 监控/告警缺
 ```
 

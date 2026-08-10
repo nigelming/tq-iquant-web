@@ -83,9 +83,8 @@ Web 前端 ──HTTP/SSE──→ Core (FastAPI, main/, Py3.13)
 ### 1.5 SSE 实时推送
 
 **端点**:`GET /api/live/sessions/{id}/stream`
-**已实现**:`api/live.py:237`,当前仅发 `ping` 心跳。
-
-**【缺口】**:实盘的成交/信号/持仓变化尚未通过 SSE 推前端,前端无法实时看到下单。待切片5/后续补。
+**已实现**:`api/live.py:237`。`LiveEngine._emit`/`stream_events` 广播五类事件 `signal/order/trade/position/risk`(均带 `portfolio_id`),`/stream` 运行中转发、空闲 30s ping、未运行 ping-only。帧格式 `event: <type>\ndata: <json>\n\n`(B5,2026-08-10)。
+**前端消费**:`LiveSessions.vue`(B4,2026-08-10):事件日志面板 + 持仓/委托/成交工作台实时更新。
 
 ---
 
@@ -493,6 +492,8 @@ submitted(受理未成交) → partial(部分成交) → filled(全部成交)
 | 持仓对账 | ✅ 已实现(D3,recover 后虚拟 vs 桥 /positions 比对,仅告警不修正) |
 | SSE 成交推送 | ✅ 已实现(B5,`_emit` 五类事件 signal/order/trade/position/risk + `/stream` 转发) |
 | 桥状态并入 session API | ✅ 已实现(切片5 G7:`bridge_online`/`pending_orders`/`last_backfill_time`) |
+| 前端实盘工作台 | ✅ 已实现(B4,`LiveSessions.vue` 事件日志 + 持仓/委托/成交三表 + 历史加载) |
+| 历史查询端点 | ✅ 已实现(B4b:`GET /sessions/{id}/orders?status=`、`/trades`、`/positions`) |
 
 **下一步**:实现进度见 [live-flow-checklist.md](live-flow-checklist.md)(已全 ✅ 清零,🔲 待实现/🧠 决策均已清空)。2026-08-10 已真机验:D3 /positions 字段拼接可行、F5 `m_nCanUseVolume` 精确 T+1、G3/G4 订单/成交字段定案。剩余真机验证项:桥 /deals **印花税字段**(F9,当前印花税仍 0)、D3 对账自动校准放开、三段式周期链路开盘跑一遍。
 

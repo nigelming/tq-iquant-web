@@ -10,6 +10,13 @@ vi.mock('axios', () => ({
   default: { get: axiosGet, post: axiosPost },
 }))
 
+// B4b 工作台历史查询走 ../api 客户端（import 的即 mock 的 vi.fn）
+vi.mock('../api', () => ({
+  getLivePositions: vi.fn(),
+  getLiveOrders: vi.fn(),
+  getLiveTrades: vi.fn(),
+}))
+
 // happy-dom 无 EventSource,用可手动 emit 的 fake
 class FakeEventSource {
   static instances: FakeEventSource[] = []
@@ -35,6 +42,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
+import { getLivePositions, getLiveOrders, getLiveTrades } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running' }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped' }
@@ -43,6 +51,10 @@ beforeEach(() => {
   vi.clearAllMocks()
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
+  // 历史查询默认空
+  ;(getLivePositions as any).mockResolvedValue([])
+  ;(getLiveOrders as any).mockResolvedValue([])
+  ;(getLiveTrades as any).mockResolvedValue([])
 })
 
 afterEach(() => {
@@ -108,5 +120,97 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
 
     w.unmount()
     expect(es.close).toHaveBeenCalled()
+  })
+})
+
+describe('LiveSessions.vue 工作台(B4b)', () => {
+  it('连接运行中 session → 加载三表历史', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 },
+    ])
+    ;(getLiveOrders as any).mockResolvedValue([
+      { id: 3, stock_code: '600000.SH', trade_type: 'BUY', status: 'filled',
+        quantity: 100, price: 10.5, filled_quantity: 100, filled_price: 10.5,
+        error_message: null, bar_time: '2026-08-05T10:30:00' },
+    ])
+    ;(getLiveTrades as any).mockResolvedValue([
+      { id: 1, stock_code: '600000.SH', trade_type: 'BUY', price: 10.5,
+        quantity: 600, amount: 6300, trade_time: '2026-08-05T10:31:00' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledWith(7)
+    expect(getLiveOrders).toHaveBeenCalledWith(7)
+    expect(getLiveTrades).toHaveBeenCalledWith(7)
+
+    // 默认展示持仓表历史行
+    expect(w.text()).toContain('600000.SH')
+    expect(w.text()).toContain('700')
+    w.unmount()
+  })
+
+  it('持仓 tab 切到委托 → 显示委托历史;切到成交 → 显示成交历史', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveOrders as any).mockResolvedValue([
+      { id: 3, stock_code: '000001.SZ', trade_type: 'SELL', status: 'submitted',
+        quantity: 200, price: null, filled_quantity: 0, filled_price: null,
+        error_message: null, bar_time: null },
+    ])
+    ;(getLiveTrades as any).mockResolvedValue([
+      { id: 2, stock_code: '000001.SZ', trade_type: 'SELL', price: 11.0,
+        quantity: 100, amount: 1100, trade_time: '2026-08-05T10:35:00' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const ordersTab = w.findAll('button').find((b) => b.text().includes('委托'))!
+    await ordersTab.trigger('click')
+    expect(w.text()).toContain('000001.SZ')
+    expect(w.text()).toContain('已提交')
+
+    const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
+    await tradesTab.trigger('click')
+    expect(w.text()).toContain('1100')
+    w.unmount()
+  })
+
+  it('SSE position 事件 → 持仓表 upsert(新 code 追加/同 code 替换)', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('position', { stock_code: '600000.SH', quantity: 600, avg_cost: 10.2, market_value: 6120 })
+    await flushPromises()
+    expect(w.text()).toContain('6120')
+
+    // 同 code 新快照替换,不重复
+    es.emit('position', { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 })
+    await flushPromises()
+    const cells = w.findAll('td').filter((c) => c.text() === '700')
+    expect(cells.length).toBe(1)
+    w.unmount()
+  })
+
+  it('SSE order/trade 事件 → 委托/成交表顶部插入', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('order', { trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100, price: 10.5 })
+    es.emit('trade', { trade_type: 'BUY', stock_code: '600000.SH', price: 10.5, quantity: 100, amount: 1050 })
+    await flushPromises()
+
+    const ordersTab = w.findAll('button').find((b) => b.text().includes('委托'))!
+    await ordersTab.trigger('click')
+    expect(w.text()).toContain('买入')
+
+    const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
+    await tradesTab.trigger('click')
+    expect(w.text()).toContain('1050')
+    w.unmount()
   })
 })
