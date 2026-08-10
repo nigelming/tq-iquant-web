@@ -435,3 +435,71 @@ def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
     assert "polars panic" in rec.error_message
     db.close()
 
+
+def _post_payload(ps_id, name):
+    return {
+        "portfolio_strategy_id": ps_id,
+        "name": name,
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+    }
+
+
+def test_post_backtest_409_when_already_running(client, monkeypatch):
+    """并发保护：已有回测在跑（模块锁被持有）→ 新 POST 返回 HTTP 409，不被放行。
+
+    回测是同步内联执行（一个请求阻塞到跑完），两并发请求不会真的重叠，故用
+    「直接持有 _BACKTEST_LOCK」模拟"回测进行中"：持锁时 acquire(blocking=False)
+    失败 → 409。释放后正常放行。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(bt_api, "build_open_prices", lambda ps, klines: {})
+    payload = _post_payload(ps_id, "conflict_test")
+
+    # 持锁模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
+    bt_api._BACKTEST_LOCK.acquire()
+    try:
+        resp = c.post("/api/backtest", json=payload)
+        assert resp.status_code == 409
+        assert "回测正在进行中" in resp.json()["detail"]
+        # 未被放行 → 不应落库 record
+        db = Session()
+        assert db.query(BacktestRecord).filter_by(name="conflict_test").count() == 0
+        db.close()
+    finally:
+        bt_api._BACKTEST_LOCK.release()
+
+    # 锁释放后 → 正常放行
+    resp2 = c.post("/api/backtest", json=payload)
+    assert resp2.status_code == 200
+    assert resp2.json()["code"] == 0
+
+
+def test_post_backtest_lock_released_after_failure(client, monkeypatch):
+    """回测中途抛异常（→ 500）后，锁必须已释放——后续回测不被 409 误拒（防永久楔死）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    payload = _post_payload(ps_id, "wedge_test")
+
+    def _boom(ps, start, end, db=None):
+        raise RuntimeError("polars panic: str cannot be int")
+    monkeypatch.setattr(bt_api, "build_klines", _boom)
+
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 500  # 异常上抛
+
+    # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
+    monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(bt_api, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(bt_api, "build_open_prices", lambda ps, klines: {})
+    resp2 = c.post("/api/backtest", json=payload)
+    assert resp2.status_code == 200
+    assert resp2.json()["code"] == 0
+

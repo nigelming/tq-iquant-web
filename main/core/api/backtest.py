@@ -1,5 +1,6 @@
 from datetime import datetime, date
 from decimal import Decimal
+from threading import Lock
 from typing import Dict, List, Optional
 
 import polars as pl
@@ -25,6 +26,10 @@ from core.tq.data import TQData
 from core.tq.formula import TQFormula
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
+
+# 并发保护：同一时刻全局只允许 1 个回测在跑（回测是同步内联执行，双并发会抢 TQ
+# 资源 + 重复写库）。与实盘互不互斥——实盘有自己的 B6 单 session 守卫（live.py）。
+_BACKTEST_LOCK = Lock()
 
 
 def _log_timing(msg: str) -> None:
@@ -747,6 +752,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
 
 @router.post("")
 def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
+    """启动回测（同步内联执行）。并发保护：同一时刻全局最多 1 个回测，已有在跑则 409。
+
+    校验（404/400）在锁外，只对合法请求抢锁；锁由 finally 保证异常路径也释放。
+    """
     ps = db.get(PortfolioStrategy, req.portfolio_strategy_id)
     if ps is None:
         raise HTTPException(status_code=404, detail="portfolio strategy not found")
@@ -755,6 +764,19 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     if err:
         return {"code": 400, "message": err}
 
+    if not _BACKTEST_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="回测正在进行中，请等待当前回测完成后再启动（同一时刻仅允许 1 个回测）",
+        )
+    try:
+        return _run_backtest_locked(req, db, ps)
+    finally:
+        _BACKTEST_LOCK.release()
+
+
+def _run_backtest_locked(req: BacktestRequest, db: Session, ps: PortfolioStrategy) -> dict:
+    """持锁执行回测主链路。锁由 run_backtest 获取，finally 保证异常路径也释放。"""
     strategies = (
         db.query(Strategy)
         .filter_by(portfolio_id=ps.id)
