@@ -10,11 +10,12 @@ vi.mock('axios', () => ({
   default: { get: axiosGet, post: axiosPost },
 }))
 
-// B4b 工作台历史查询走 ../api 客户端（import 的即 mock 的 vi.fn）
+// B4b 工作台历史查询 + 新建实盘选组合走 ../api 客户端（import 的即 mock 的 vi.fn）
 vi.mock('../api', () => ({
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
+  getPortfolios: vi.fn(),
 }))
 
 // happy-dom 无 EventSource,用可手动 emit 的 fake
@@ -42,7 +43,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLivePositions, getLiveOrders, getLiveTrades } from '../api'
+import { getLivePositions, getLiveOrders, getLiveTrades, getPortfolios } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running' }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped' }
@@ -51,10 +52,11 @@ beforeEach(() => {
   vi.clearAllMocks()
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
-  // 历史查询默认空
+  // 历史查询/组合默认空
   ;(getLivePositions as any).mockResolvedValue([])
   ;(getLiveOrders as any).mockResolvedValue([])
   ;(getLiveTrades as any).mockResolvedValue([])
+  ;(getPortfolios as any).mockResolvedValue([])
 })
 
 afterEach(() => {
@@ -211,6 +213,67 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
     await tradesTab.trigger('click')
     expect(w.text()).toContain('1050')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 新建实盘选组合', () => {
+  const mockPortfolios = [
+    { id: 1, name: '稳健组合' },
+    { id: 2, name: '进取组合' },
+  ]
+
+  it('新建实盘弹窗可多选组合策略,提交带 portfolio_ids', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [stoppedSession] } })
+    ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const boxes = w.findAll('input[type="checkbox"]')
+    expect(boxes.length).toBe(2)
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('进取组合')
+
+    await boxes[0].setValue(true)
+    await boxes[1].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(axiosPost).toHaveBeenCalledWith('/api/live/sessions', expect.objectContaining({
+      name: '', mode: 'simulation', portfolio_ids: [1, 2],
+    }))
+    w.unmount()
+  })
+
+  it('未选组合直接提交 → 提示且不发请求', async () => {
+    axiosGet.mockResolvedValue({ data: { data: [stoppedSession] } })
+    ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(alert).toHaveBeenCalled()
+    expect(axiosPost).not.toHaveBeenCalledWith('/api/live/sessions', expect.anything())
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('会话列表显示所选组合名称(由 portfolio_ids 解析)', async () => {
+    axiosGet.mockResolvedValue({
+      data: { data: [{ id: 9, name: '组合盘', mode: 'live', status: 'stopped', portfolio_ids: [1, 2] }] },
+    })
+    ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('进取组合')
     w.unmount()
   })
 })

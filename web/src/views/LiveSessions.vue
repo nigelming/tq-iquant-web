@@ -8,11 +8,18 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped,
   type OrderRow, type TradeRow, type PositionRow,
 } from '../utils/liveWorkbench'
-import { getLiveOrders, getLiveTrades, getLivePositions } from '../api'
+import { getLiveOrders, getLiveTrades, getLivePositions, getPortfolios } from '../api'
 
 const sessions = ref<any[]>([])
+const portfolios = ref<any[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
-const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] })
+const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] as number[] })
+
+// 组合名称解析(会话 portfolio_ids → 名称列表)
+function portfolioNames(ids: number[] | undefined): string {
+  if (!ids || ids.length === 0) return '-'
+  return ids.map((id) => portfolios.value.find((p) => p.id === id)?.name || `#${id}`).join('、')
+}
 
 // ---- B4a: 实时事件日志面板（SSE）----
 const events = ref<LiveEvent[]>([])
@@ -88,12 +95,22 @@ function closeEventStream() {
 async function load() {
   const res = await axios.get('/api/live/sessions')
   sessions.value = res.data.data
+  portfolios.value = await getPortfolios().catch(() => [])
   // B6 全局限 1 个运行 session,自动接它的流
   const running = sessions.value.find((s: any) => s.status === 'running')
   if (running) startEventStream(running.id)
 }
 
+function openCreate() {
+  form.value = { name: '', mode: 'simulation', portfolio_ids: [] }
+  showCreate.value = true
+}
+
 async function create() {
+  if (form.value.portfolio_ids.length === 0) {
+    alert('请至少选择一个组合策略')
+    return
+  }
   await axios.post('/api/live/sessions', form.value)
   showCreate.value = false
   form.value = { name: '', mode: 'simulation', portfolio_ids: [] }
@@ -117,16 +134,17 @@ onUnmounted(closeEventStream)
 
 <template>
   <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
-    <button @click="showCreate = true" class="btn btn-primary">+ 新建实盘</button>
+    <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </div>
 
   <div class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:#888">#{{ s.id }}</td>
           <td>{{ s.name }}</td>
+          <td style="color:#666">{{ portfolioNames(s.portfolio_ids) }}</td>
           <td>{{ s.mode === 'simulation' ? '模拟' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
@@ -222,6 +240,16 @@ onUnmounted(closeEventStream)
       <h3>新建实盘</h3>
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
       <label>模式</label><select v-model="form.mode"><option value="simulation">模拟</option><option value="live">实盘</option></select>
+      <label>组合策略（可多选）</label>
+      <div class="portfolio-check-list">
+        <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
+          <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" />
+          {{ p.name }}<span style="color:#999">（#{{ p.id }}）</span>
+        </label>
+      </div>
+      <div v-if="portfolios.length === 0" class="empty-state" style="padding:8px">
+        <p>暂无组合策略，请先在"组合管理"页创建</p>
+      </div>
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
         <button @click="showCreate = false" class="btn">取消</button>
@@ -250,4 +278,21 @@ onUnmounted(closeEventStream)
 .event-row:last-child { border-bottom: none; }
 .event-time { color: #999; font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .event-text { word-break: break-all; }
+.portfolio-check-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.portfolio-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  background: #fafafa;
+}
 </style>
