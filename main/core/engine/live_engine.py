@@ -97,7 +97,11 @@ class LiveEngine:
         self._last_daily_date: Optional[date] = None
         # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
         # 主循环 _poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
+        # 运行中 _handle_bar 发单也计入、拒单弹出；_poll_deals 每轮回合重查 DB 同步（G7）。
         self._pending_orders: Dict[int, "LiveOrder"] = {}
+        # G7（0011 §5.11）：最近一次 /deals 成交回报回填时点（None=尚无回填），
+        # 供 session API 桥状态并入。
+        self._last_backfill_time: Optional[datetime] = None
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -224,8 +228,9 @@ class LiveEngine:
                 if pos is None and order.trade_type == TradeType.BUY:
                     pos = Position(order.stock_code)
                     ctx.positions[order.stock_code] = pos
-                # ① 先写 submitted + commit（I4 命门窗口闭合）
+                # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
+                self._pending_orders[live_order.id] = live_order
                 db.commit()
                 try:
                     # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
@@ -235,12 +240,14 @@ class LiveEngine:
                     live_order.status = "rejected"
                     live_order.error_message = "bridge unavailable"
                     self._bridge_online = False
+                    self._pending_orders.pop(live_order.id, None)
                     db.commit()
                     continue
                 if trade is None:
                     # 审批不过 / 桥业务拒绝 → rejected（不成交，不 apply）
                     live_order.status = "rejected"
                     live_order.error_message = "approval failed or bridge rejected"
+                    self._pending_orders.pop(live_order.id, None)
                     db.commit()
                     continue
                 # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
@@ -472,6 +479,7 @@ class LiveEngine:
                 .all()
             )
             if not pending:
+                self._sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
                 return
             # 1. 未回填 order_ref 的单：尝试定位
             for lo in pending:
@@ -481,6 +489,7 @@ class LiveEngine:
             # 2. 有 order_ref 的单：查 /deals 回填
             need_ref = [lo for lo in pending if lo.order_ref is not None]
             if not need_ref:
+                self._sync_pending_orders(db)
                 return
             try:
                 deals = self._dispatcher.query_deals()
@@ -492,11 +501,30 @@ class LiveEngine:
                     continue
                 self._backfill_order(db, lo, matched)
             db.commit()
+            # 3. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected 自然移除）
+            self._sync_pending_orders(db)
         except Exception:
             db.rollback()
             logger.exception("_poll_deals error")
         finally:
             db.close()
+
+    def _sync_pending_orders(self, db: Session) -> None:
+        """重查 DB 剩余 submitted/partial 同步在途集合（G7 计数）。
+
+        以 DB 为准：回填置 filled / 拒单置 rejected 的单自然移除，_handle_bar 新增
+        的单（已 commit）自然纳入。调用点在 _poll_deals 各出口，保证 get_session
+        读到的是最近一轮的实际在途单数。
+        """
+        remaining = (
+            db.query(LiveOrder)
+            .filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.status.in_(["submitted", "partial"]),
+            )
+            .all()
+        )
+        self._pending_orders = {lo.id: lo for lo in remaining}
 
     def _backfill_order(self, db: Session, live_order: LiveOrder, matched_deals: list) -> None:
         """据成交回报回填 LiveOrder + LiveTrade + apply_trade（G2/G6）。
@@ -516,6 +544,7 @@ class LiveEngine:
         live_order.filled_quantity = total_qty
         live_order.filled_price = avg_price
         live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
+        self._last_backfill_time = datetime.now()  # G7：记录最近一次回填时点
 
         # 写/更新 LiveTrade（按 order_ref 聚合为一笔）
         trade_time = self._parse_trade_time(matched_deals[-1])
@@ -677,6 +706,16 @@ class LiveEngine:
     def bridge_online(self) -> bool:
         """桥是否在线（心跳/下单成功为 True，离线暂停期间为 False）。"""
         return self._bridge_online
+
+    @property
+    def pending_orders_count(self) -> int:
+        """在途未完结单数（submitted/partial），供 session API 桥状态并入（G7）。"""
+        return len(self._pending_orders)
+
+    @property
+    def last_backfill_time(self) -> Optional[datetime]:
+        """最近一次 /deals 成交回报回填时点（None=尚无回填）。"""
+        return self._last_backfill_time
 
     @property
     def dispatcher(self) -> HttpBridgeDispatcher:

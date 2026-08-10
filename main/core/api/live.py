@@ -95,19 +95,32 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
-    return {
-        "code": 0,
-        "data": {
-            "id": session.id,
-            "name": session.name,
-            "mode": session.mode,
-            "status": session.status,
-            "portfolios": [
-                {"portfolio_id": p.portfolio_strategy_id, "status": p.status}
-                for p in portfolios
-            ],
-        },
+    data = {
+        "id": session.id,
+        "name": session.name,
+        "mode": session.mode,
+        "status": session.status,
+        "portfolios": [
+            {"portfolio_id": p.portfolio_strategy_id, "status": p.status}
+            for p in portfolios
+        ],
     }
+    # G7（0011 §5.11）：桥状态并入 session API。运行中取引擎实时态：
+    # bridge_online 为实时心跳（/ping），pending_orders 在途单计数，last_backfill_time
+    # 最近一次成交回报回填时点；未运行返回空值。
+    engine = _ENGINES.get(session_id)
+    if engine is not None:
+        data["bridge_online"] = engine.dispatcher.heartbeat()
+        data["pending_orders"] = engine.pending_orders_count
+        data["last_backfill_time"] = (
+            engine.last_backfill_time.strftime("%Y-%m-%d %H:%M:%S")
+            if engine.last_backfill_time is not None else None
+        )
+    else:
+        data["bridge_online"] = None
+        data["pending_orders"] = 0
+        data["last_backfill_time"] = None
+    return {"code": 0, "data": data}
 
 
 def _build_engine(session_id: int, db: Session) -> LiveEngine:

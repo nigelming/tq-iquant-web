@@ -802,3 +802,81 @@ def test_recover_finds_pending_orders():
 
     assert len(engine._pending_orders) == 2  # 只有 submitted + partial
 
+
+# ===========================================================================
+# G7：桥状态并入 session API（0011 §5.11）
+# ===========================================================================
+def test_handle_bar_tracks_pending_orders():
+    """_handle_bar 发单后该单计入 _pending_orders（G7 pending 计数）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    assert engine.pending_orders_count == 1  # 发单后在途
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    db.close()
+
+
+def test_poll_deals_syncs_pending_orders_from_db():
+    """未成交的单：_poll_deals 后仍在 pending（计数 1），last_backfill_time 为空。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 无匹配 → 保持 pending
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    assert engine.pending_orders_count == 1
+    assert engine.last_backfill_time is None
+
+
+def test_backfill_updates_last_backfill_time_and_clears_pending():
+    """_poll_deals 回填 filled 后：last_backfill_time 更新，pending 计数清零（G7）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-abc-123",
+    }], deals=[{
+        "order_ref": "ref-abc-123", "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39, "trade_time": "150001",
+        "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    assert engine.last_backfill_time is not None
+    assert engine.pending_orders_count == 0  # filled 后不在途
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "filled"
+    db.close()
+

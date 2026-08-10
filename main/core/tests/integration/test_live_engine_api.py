@@ -179,6 +179,30 @@ def test_bridge_status_endpoint(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
+def test_get_session_includes_bridge_status(client, mock_bridge):
+    """G7（0011 §5.11）：GET /sessions/{id} 并入 bridge_online/pending_orders/last_backfill_time。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    # 未运行 → 三字段空值
+    body = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert body["bridge_online"] is None
+    assert body["pending_orders"] == 0
+    assert body["last_backfill_time"] is None
+
+    # 运行中 → bridge_online 实时心跳（mock /ping ok），pending/last_backfill 键存在
+    c.post("/api/live/sessions/%d/start" % sid)
+    body = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert body["bridge_online"] is True
+    assert body["pending_orders"] == 0
+    assert body["last_backfill_time"] is None
+
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+
 def test_build_engine_fills_formula_mapping(client, mock_bridge):
     """_build_engine 后 LiveEngine 持有 _formula_by_strategy（strategy_id → formula_name）。"""
     c, Session = client
