@@ -1693,3 +1693,132 @@ def test_recover_breaker_count_three_sets_manual_halt():
     assert port.risk_manager.circuit_breaker_active is True
     assert port.risk_manager.is_trading_halted() is True
 
+
+# ---------------- F6 同 bar 多策略超卖（bar 内可用量递减记账）----------------
+def test_live_t1_checker_consume_available_decrements():
+    """F6：consume_available 递减 bar 可用量——同 bar 后续 SELL 见递减后的值；重设快照恢复全量。"""
+    checker = LiveT1Checker()
+    checker.set_available_map({"600000.SH": 800})
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 10, 0))
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 800
+
+    checker.consume_available("600000.SH", 600)  # A 卖 600 → 余 200
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 200
+
+    checker.consume_available("600000.SH", 500)  # 超出 → 钳到 0，不出现负值
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 0
+
+    checker.set_available_map({"600000.SH": 800})  # 下一 bar 重设快照 → 恢复全量
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 800
+
+
+def test_handle_bar_two_sells_share_bar_available():
+    """F6：同 bar A 卖 600 + B 卖 400，桥 available 800 → 递减记账后 B 只下 200（不超卖）。"""
+    factory, _ = _db_factory()
+    port, ctxs = _portfolio_two(periods=("1m", "1m"))  # 策略 1/2 同周期
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    for ctx, qty in zip(ctxs, (600, 400)):
+        ctx.formula_signals = [
+            {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": -1},
+        ]
+        ctx.positions[stock] = Position(stock)
+        ctx.positions[stock].buy(qty, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": 800, "volume": 1000,
+                 "yesterday_volume": 1000, "on_road_volume": 0},
+            ]})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {
+        (1, stock, bar_time): [{"name": "close_sig", "value": -1}],
+        (2, stock, bar_time): [{"name": "close_sig", "value": -1}],
+    }
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.strategy_id).all()
+    assert len(orders) == 2
+    by_sid = {o.strategy_id: o for o in orders}
+    assert by_sid[1].quantity == 600
+    assert by_sid[2].quantity == 200  # B 见递减后 available=200，不超卖
+    placed = [json.loads(r.content)["volume"] for r in rec.requests if r.url.path == "/order"]
+    assert placed == [600, 200]
+    db.close()
+
+
+# ---------------- G5 回填轮询独立更短节拍（5s）----------------
+def test_start_creates_independent_deals_task():
+    """G5：start() 起独立 _deals_task（回填轮询，独立于主循环），stop() 取消。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    import asyncio
+
+    async def run_a_bit():
+        await engine.start()
+        assert engine._deals_task is not None
+        assert not engine._deals_task.done()
+        await asyncio.sleep(0.01)
+        await engine.stop()
+
+    asyncio.run(run_a_bit())
+    assert engine._deals_task is None
+    assert engine._task is None
+
+
+def test_deals_loop_polls_deals_at_own_interval():
+    """G5：_deals_loop 按 deals_poll_interval(5s 默认) 独立调 _poll_deals，不依赖主循环节拍。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        deals_poll_interval=0.01,
+    )
+    calls = []
+    engine._poll_deals = lambda: calls.append(1)
+    import asyncio
+
+    async def run_a_bit():
+        await engine.start()
+        await asyncio.sleep(0.05)  # 0.01s 间隔 × 0.05s → 至少数轮
+        await engine.stop()
+
+    asyncio.run(run_a_bit())
+    assert len(calls) >= 3
+

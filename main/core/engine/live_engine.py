@@ -88,6 +88,7 @@ class LiveEngine:
         bar_poller: BarPoller,
         db_session_factory: Callable[[], Session],
         poll_interval: float = 30.0,
+        deals_poll_interval: float = 5.0,
         tq_formula: Optional[TQFormula] = None,
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
@@ -99,6 +100,9 @@ class LiveEngine:
         self._bar_poller = bar_poller
         self._db_session_factory = db_session_factory
         self._poll_interval = poll_interval
+        # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 30s 更短）——成交秒级回报，
+        # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
+        self._deals_poll_interval = deals_poll_interval
         # 实盘执行引擎：复用回测 ExecutionEngine，注入桥 dispatcher + 实盘 T+1 检查
         # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
         self._t1_checker = LiveT1Checker()
@@ -133,6 +137,8 @@ class LiveEngine:
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # G5：/deals 回填轮询的独立任务（与主循环并行，见 _deals_loop）
+        self._deals_task: Optional[asyncio.Task] = None
         self._bridge_online = True
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
         self._last_daily_date: Optional[date] = None
@@ -166,6 +172,8 @@ class LiveEngine:
         )
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
+        # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 30s 拉 bar 一起）
+        self._deals_task = asyncio.create_task(self._deals_loop())
 
     async def stop(self) -> None:
         """停循环任务。"""
@@ -179,9 +187,22 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("live loop task ended with error on stop")
             self._task = None
+        if self._deals_task is not None:
+            self._deals_task.cancel()
+            try:
+                await self._deals_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("deals loop task ended with error on stop")
+            self._deals_task = None
 
     async def _loop(self) -> None:
-        """主循环：心跳 → 拉 bar → 日终 → 回填 → sleep。桥离线则暂停下单、标状态，不抛异常。"""
+        """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。
+
+        /deals 成交回报回填不在本循环（G5）：独立 _deals_loop 5s 节拍处理，
+        免得成交秒级回报被 30s 拉 bar 节拍拖慢。
+        """
         while self._running:
             try:
                 # E8：心跳前的在线状态，用于离线→在线转场时重建基线
@@ -205,8 +226,6 @@ class LiveEngine:
                 self._maybe_daily_close()
                 # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
                 self._maybe_daily_bars()
-                # 切片5 G2：每轮查未完结 LiveOrder → 轮询桥 /deals 回填真实成交
-                self._poll_deals()
             except BridgeUnavailableError as e:
                 self._bridge_online = False
                 logger.warning("bridge unavailable: %s, skip this round", e)
@@ -215,6 +234,21 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("live loop unexpected error")
             await asyncio.sleep(self._poll_interval)
+
+    async def _deals_loop(self) -> None:
+        """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
+
+        成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 30s 拉 bar。
+        与主循环同事件循环（无并发问题），_poll_deals 内部已兜底桥离线/查失败。
+        """
+        while self._running:
+            try:
+                self._poll_deals()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("deals loop unexpected error")
+            await asyncio.sleep(self._deals_poll_interval)
 
     # ---------------- 日终（E5/E6）----------------
     def _maybe_daily_close(self) -> None:
@@ -430,6 +464,10 @@ class LiveEngine:
                 # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
                 live_order.bridge_order_id = self._dispatcher._order_id(order)
                 self._try_match_order_ref(live_order)
+                # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
+                # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
+                if order.trade_type == TradeType.SELL:
+                    self._t1_checker.consume_available(order.stock_code, order.quantity)
                 db.commit()
         except Exception:
             db.rollback()

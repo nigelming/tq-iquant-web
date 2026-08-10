@@ -96,6 +96,18 @@ class LiveT1Checker(T1Checker):
             return position.quantity
         return min(position.quantity, avail)
 
+    def consume_available(self, stock_code: str, quantity: int) -> None:
+        """F6：SELL 下单成功后从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值）。
+
+        每 bar _refresh_available_map 重设快照（一次 /positions），本 bar 内按成交顺序
+        递减——A 卖 600 + B 卖 400、available 800 → B 只见 200，避免同 bar 多策略超卖
+        （券商拒掉超出的部分）。只在下单成功（桥受理）后调用，拒单/失败不扣。
+        """
+        avail = self._available_map.get(stock_code)
+        if avail is None:
+            return
+        self._available_map[stock_code] = max(0, avail - quantity)
+
 
 class ExecutionEngine:
     def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker):
