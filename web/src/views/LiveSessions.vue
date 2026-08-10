@@ -1,14 +1,57 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, type LiveEvent } from '../utils/liveEvents'
 
 const sessions = ref<any[]>([])
 const showCreate = ref(false)
 const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] })
 
+// ---- B4a: 实时事件日志面板（SSE）----
+const events = ref<LiveEvent[]>([])
+const connState = ref<'closed' | 'connecting' | 'open'>('closed')
+const connLabel: Record<string, string> = { closed: '未连接', connecting: '连接中', open: '已连接' }
+let es: EventSource | null = null
+const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk'] as const
+const LOG_CAP = 200
+
+function pushLog(type: string, data: Record<string, unknown>) {
+  const text = formatEvent(type, data)
+  if (!text) return // ping 心跳不进日志
+  events.value.push({
+    id: nextEventId(),
+    type: type as LiveEvent['type'],
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    text,
+  })
+  if (events.value.length > LOG_CAP) events.value = events.value.slice(-LOG_CAP)
+}
+
+function startEventStream(id: number) {
+  closeEventStream()
+  connState.value = 'connecting'
+  const source = new EventSource(`/api/live/sessions/${id}/stream`)
+  EVENT_TYPES.forEach((t) => {
+    source.addEventListener(t, (e: MessageEvent) => {
+      pushLog(t, JSON.parse(e.data))
+    })
+  })
+  source.onopen = () => { connState.value = 'open' }
+  source.onerror = () => { connState.value = 'closed' } // EventSource 自动重连,不主动 close
+  es = source
+}
+
+function closeEventStream() {
+  if (es) { es.close(); es = null }
+  connState.value = 'closed'
+}
+
 async function load() {
   const res = await axios.get('/api/live/sessions')
   sessions.value = res.data.data
+  // B6 全局限 1 个运行 session,自动接它的流
+  const running = sessions.value.find((s: any) => s.status === 'running')
+  if (running) startEventStream(running.id)
 }
 
 async function create() {
@@ -20,15 +63,17 @@ async function create() {
 
 async function startSession(id: number) {
   await axios.post(`/api/live/sessions/${id}/start`)
-  load()
+  load() // load 内自动连接新运行 session 的流
 }
 
 async function stopSession(id: number) {
+  closeEventStream()
   await axios.post(`/api/live/sessions/${id}/stop`)
   load()
 }
 
 onMounted(load)
+onUnmounted(closeEventStream)
 </script>
 
 <template>
@@ -55,6 +100,22 @@ onMounted(load)
     <div v-if="sessions.length === 0" class="empty-state"><p>暂无实盘 session</p></div>
   </div>
 
+  <!-- B4a: 实时事件日志 -->
+  <div class="card" style="margin-top:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">实时事件日志</h3>
+      <span class="badge" :class="connState === 'open' ? 'badge-green' : 'badge-gray'">{{ connLabel[connState] }}</span>
+    </div>
+    <div class="event-log" data-test="event-log">
+      <div v-if="events.length === 0" class="empty-state"><p>运行中 session 的信号 / 委托 / 成交 / 持仓 / 风控事件将实时显示在这里</p></div>
+      <div v-for="ev in events" :key="ev.id" class="event-row">
+        <span class="event-time">{{ ev.time }}</span>
+        <span class="badge" :class="`badge-${EVENT_TYPE_COLOR[ev.type] || 'gray'}`">{{ ev.type }}</span>
+        <span class="event-text">{{ ev.text }}</span>
+      </div>
+    </div>
+  </div>
+
   <div v-if="showCreate" class="modal-overlay" @click.self="showCreate = false">
     <div class="modal-content">
       <h3>新建实盘</h3>
@@ -67,3 +128,25 @@ onMounted(load)
     </div>
   </div>
 </template>
+
+<style scoped>
+.event-log {
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+  background: #fafafa;
+}
+.event-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #eee;
+}
+.event-row:last-child { border-bottom: none; }
+.event-time { color: #999; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.event-text { word-break: break-all; }
+</style>
