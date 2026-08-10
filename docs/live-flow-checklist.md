@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/本提交),对应行已标 ✅。仍待办:D3 对账逻辑,🧠 决策已清零。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/本提交),对应行已标 ✅。仍待办:B5 SSE(暂缓),🧠 决策已清零。
 
 ---
 
@@ -80,7 +80,7 @@
 |---|---|---|---|---|---|
 | D1 | 重放 live_trades 重建持仓 | ✅ | 📖 | `live_engine.py:367`(→ design §3.1) | — |
 | D2 | 虚拟现金以成本计 | ✅ | 📖 | AGENTS §93,与在线时 `Account.apply_trade` 一致(→ design §3.2) | — |
-| D3 | **对账(虚拟 vs 桥 /positions)** | ✅字段已验/❌逻辑待实现 | 🔬+✅ | recover 后查桥 `/positions` 按 code 聚合比对。**2026-08-10 真机已验字段**:POSITION 对象 `m_strInstrumentID=600000`+`m_strExchangeID=SH`(拼接 `600000.SH` 对账可行)、`m_nVolume`(总持仓)、`m_nCanUseVolume`(T+1 可用)、`m_nYesterdayVolume`/`m_nCoveredVolume`/`m_nOnRoadVolume`(昨仓/今仓/在途)。**桥 query_positions 已改**:instrument+exchange+volume+available(=m_nCanUseVolume)+yesterday/on_road/market_value。不一致如何处理(告警/以真实为准修正)仍待定 → 归到切片5 对账实现 | ✅ 字段已验(拼接后缀对账可行);❌ 对账逻辑待实现,桥字段已改 |
+| D3 | **对账(虚拟 vs 桥 /positions)** | ✅已实现 | 🔬+✅ | recover 后查桥 `/positions` 按 code 聚合比对。**2026-08-10 真机已验字段**:POSITION 对象 `m_strInstrumentID=600000`+`m_strExchangeID=SH`(拼接 `600000.SH` 对账可行)、`m_nVolume`(总持仓)、`m_nCanUseVolume`(T+1 可用)、`m_nYesterdayVolume`/`m_nCoveredVolume`/`m_nOnRoadVolume`(昨仓/今仓/在途)。**桥 query_positions 已改**:instrument+exchange+volume+available(=m_nCanUseVolume)+yesterday/on_road/market_value。不一致如何处理(告警/以真实为准修正)仍待定 → 归到切片5 对账实现 | 🧠 已定+✅ 已实现(仅告警不修正):recover 末尾 `_reconcile_positions` 按 code 聚合虚拟净持仓 vs 桥 volume,差异记 `_reconcile_mismatches`+告警日志,不自动改账(在途单/延迟期防误改);桥离线跳过不崩。自动校准留待真机跑顺再放开 |
 | D4 | 熔断计数读回 | ✅已实现 | ✅ | `LiveSessionPortfolio.circuit_breaker_count` 字段存在但引擎未读写。重启后累计次数丢失,recover 时读回(→ design §8.3) | ✅ 已实现(recover 读回):`recover()` 读 `circuit_breaker_count` → `risk_manager.consecutive_drawdown_triggers`;达 3 次 → `manual_recovery=True`+`circuit_breaker_active=True`(停新开仓等待人工);<3 次单日熔断当天已恢复不补挂(单一计数模型)。预置 `_breaker_count_written` 避免首 bar 重复写 |
 | D5 | recover 时机 | ✅ | 📖 | start 时 `engine.recover(db)`,在 `engine.start()` 之前 | — |
 
@@ -217,5 +217,6 @@
 5. **✅ 已完成:#27 formula_count 字段 + #28 C4 三维去重**(3b74cbf)——公式级注入根数(字段+迁移+前端公式页);df_cache 拉取去重 + raw_cache 计算去重(省重复 TQ 计算)。
 6. **✅ 已完成:D4/H4 熔断计数读回/持久化**——max_drawdown 触发计数落库(`circuit_breaker_count`,未变不写),recover 读回;达 3 次转手动恢复(停新开仓等待人工)。
 7. **✅ 已完成:F6 同 bar 超卖 + G5 独立回填轮询**——SELL 发单成功后 `consume_available` bar 内可用量递减记账(多策略同 bar 卖不超券商 available);`/deals` 回填拆独立 5s 轮询(`_deals_loop`),主循环仍 30s 拉 bar。
-8. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
-9. **🧠 决策项** — 当前无待定决策(F6/G5 已定);随时可过。
+8. **✅ 已完成:D3 对账(仅告警不修正)**——recover 末尾按 code 聚合虚拟持仓 vs 桥 /positions,差异记 `_reconcile_mismatches`+告警日志,不自动改账;桥离线跳过不崩。
+9. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
+10. **🧠 决策项** — 当前无待定决策(F6/G5/D3 已定);随时可过。
