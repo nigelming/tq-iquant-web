@@ -85,7 +85,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - **熔断**：max_drawdown 触发次日恢复（累计 3 次转手动）；daily_loss_limit 当日暂停次日恢复。熔断期间不清仓，仅暂停新开仓
 - **主从策略**：从策略只能买入主策略当前持有的同一只股票；主策略清仓（含该股）后从策略不可新开仓但存量可自行卖出
 - **数据库迁移**：用 Alembic，禁止手动改表结构。`config.yaml` 不存密码（从环境变量 `TQ_DB_PASSWORD` 读取）
-- **并发**：回测用 `ProcessPoolExecutor` 子进程，同一时刻最多 1 个；实盘 TQ 回调线程经 `asyncio.run_coroutine_threadsafe` 转入主事件循环，主循环不可被 TQ 回调阻塞
+- **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘全局限 1 个 session（`_ENGINES` 非空即拒，B6）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程经 `asyncio.run_coroutine_threadsafe` 转入主事件循环，主循环不可被 TQ 回调阻塞
 
 ## 开发范式
 
