@@ -10,6 +10,8 @@ from tq_iquant_shared.constants import SignalType, TradeType
 class BarEvent:
     stocks: Dict[str, Dict[str, object]] = field(default_factory=dict)
     bar_time: Optional[datetime] = None
+    # C6：驱动 bar 所属周期（"1m"/"5m"/"1d"...）。None=未标注（回测/旧调用，处理全部策略）。
+    period: Optional[str] = None
 
 
 @dataclass

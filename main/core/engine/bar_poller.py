@@ -42,7 +42,8 @@ def parse_bar_time(bar: dict) -> Optional[datetime]:
 
     优先 stime(yyyymmddHHMMSS 字符串,bar 结束时间,北京时间,无时区问题);
     次选 time / Time(13 位毫秒或 10 位秒时间戳,按 +8 显式转,不依赖本机);
-    兼容 time 为 14 位串的情况。非法 / 空 → None。
+    兼容 time 为 14 位串的情况;末选 index(部分历史工具 DataFrame reset 的索引列,
+    14 位时间戳或 8 位日期)。非法 / 空 → None。
 
     注:相对变化方案下,两次 poll 用同一规则解析,时区偏移恒定,不影响比较;
     仍按北京时间解析是为了 BarEvent.bar_time 语义与策略公式一致。
@@ -82,7 +83,69 @@ def parse_bar_time(bar: dict) -> Optional[datetime]:
         except (ValueError, OSError):
             return None
 
+    # 3. index(部分历史工具 DataFrame reset 索引列;14 位时间戳或 8 位日期)
+    idx_raw = bar.get("index")
+    if idx_raw is not None:
+        t = _parse_14digit(idx_raw)
+        if t is not None:
+            return t
+        s = str(idx_raw).strip()
+        if len(s) >= 8 and s[:8].isdigit():
+            try:
+                return datetime.strptime(s[:8], "%Y%m%d")
+            except ValueError:
+                return None
+
     return None
+
+
+def to_ohlcv(bar: dict) -> dict:
+    """桥 bar dict → BarEvent.stocks 用的 OHLCV dict(Decimal 化,与回测一致)。
+
+    模块级函数(供 LiveEngine C6 边界/日终分发复用,不依赖 BarPoller 实例)。
+    """
+    def _d(key):
+        v = bar.get(key)
+        if v is None or v == "":
+            return Decimal("0")
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return Decimal("0")
+
+    vol = bar.get("volume")
+    try:
+        vol = int(float(vol)) if vol is not None else 0
+    except Exception:
+        vol = 0
+    return {
+        "open": _d("open"),
+        "high": _d("high"),
+        "low": _d("low"),
+        "close": _d("close"),
+        "volume": vol,
+    }
+
+
+def latest_completed_bar(bars: list) -> Optional[dict]:
+    """bars 中「最新已完成」bar(非 forming 最新一根),供 C6 边界分发取该周期 bar。
+
+    完成规则同 BarPoller.poll:stime < 本批 latest 才算完成;取完成里时间最大的那根。
+    无完成 bar → None(如开盘首根边界,该周期 bar 尚未完成,跳过等下一根)。
+    """
+    stime_map: Dict[datetime, dict] = {}
+    for b in bars:
+        t = parse_bar_time(b)
+        if t is not None:
+            stime_map[t] = b
+    if not stime_map:
+        return None
+    latest = max(stime_map)
+    completed = {t: b for t, b in stime_map.items() if t < latest}
+    if not completed:
+        return None
+    target = max(completed)
+    return stime_map[target]
 
 
 class BarPoller:
@@ -144,7 +207,7 @@ class BarPoller:
                 if bt is None:
                     continue
                 stimes.append(bt)
-                stime_map[bt] = self._to_ohlcv(bar)
+                stime_map[bt] = to_ohlcv(bar)
             if not stimes:
                 continue
             any_data = True
@@ -178,35 +241,19 @@ class BarPoller:
                 self._initialized = True
             return []
 
-        # 按时间排序触发(旧→新),每根构造 BarEvent
+        # 按时间排序触发(旧→新),每根构造 BarEvent(带周期,C6 节拍过滤用)
         triggered: List[BarEvent] = []
         for t in sorted(new_by_time):
-            bar_event = BarEvent(stocks=new_by_time[t], bar_time=t)
+            bar_event = BarEvent(stocks=new_by_time[t], bar_time=t, period=self._period)
             self.on_bar(bar_event)
             triggered.append(bar_event)
         return triggered
 
-    @staticmethod
-    def _to_ohlcv(bar: dict) -> dict:
-        """桥 bar dict → BarEvent.stocks 用的 OHLCV dict(Decimal 化,与回测一致)。"""
-        def _d(key):
-            v = bar.get(key)
-            if v is None or v == "":
-                return Decimal("0")
-            try:
-                return Decimal(str(v))
-            except Exception:
-                return Decimal("0")
+    def reset_baseline(self) -> None:
+        """E8:离线恢复后重建基线——下次 poll 走首次基线分支,只记录水位不触发。
 
-        vol = bar.get("volume")
-        try:
-            vol = int(float(vol)) if vol is not None else 0
-        except Exception:
-            vol = 0
-        return {
-            "open": _d("open"),
-            "high": _d("high"),
-            "low": _d("low"),
-            "close": _d("close"),
-            "volume": vol,
-        }
+        清空每 code 已见过的完成水位,恢复后拉到的最新完成 bar 直接建基线,
+        离线期间错过的 bar 自然丢弃(不补触发:补触发=过时信号+现价成交,价格错位)。
+        """
+        self._initialized = False
+        self._last_completed = {}

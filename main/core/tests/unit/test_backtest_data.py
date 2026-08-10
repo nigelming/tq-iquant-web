@@ -548,15 +548,17 @@ def test_minute_periods_membership():
     assert bt_api._MINUTE_PERIODS == {"1m", "5m", "15m", "30m", "1h"}
     assert "60m" not in bt_api._MINUTE_PERIODS
     assert "1d" not in bt_api._MINUTE_PERIODS
+    assert "1w" not in bt_api._MINUTE_PERIODS
+    assert "1mon" not in bt_api._MINUTE_PERIODS
 
 
 def test_minute_periods_aligned_with_valid_periods():
     """_MINUTE_PERIODS 应是 VALID_PERIODS 的「带时分 bar」子集（两处白名单不可漂移）。"""
     from core.api.strategies import VALID_PERIODS
     assert bt_api._MINUTE_PERIODS.issubset(VALID_PERIODS)
-    # VALID_PERIODS 的日粒度（1d）不在 _MINUTE_PERIODS，走 Date 匹配
+    # VALID_PERIODS 的日粒度（1d/1w/1mon）不在 _MINUTE_PERIODS，走 Date 匹配
     non_minute = VALID_PERIODS - bt_api._MINUTE_PERIODS
-    assert non_minute == {"1d"}
+    assert non_minute == {"1d", "1w", "1mon"}
 
 
 def test_build_signal_cache_1h_uses_index_align(db_session, monkeypatch):

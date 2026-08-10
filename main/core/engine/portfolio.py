@@ -55,15 +55,20 @@ class Portfolio:
         self,
         bar: BarEvent,
         signal_cache: Optional[Dict] = None,
+        period: Optional[str] = None,
     ) -> List[OrderEvent]:
         """处理一根 bar：取信号 + 风控检查 + 优先级排序 → 返回待执行订单列表。
 
         订单在下一个 bar 的 open 成交（由 BacktestEngine 调度）。
         信号优先级：风控（止损/止盈/移动止损）> 公式；公式内 CLOSE>REDUCE>ADD>OPEN。
         风控清仓后公式信号不再执行。
+        period：C6 按周期节拍驱动——非 None 时只处理 period 相同的策略
+        （实盘 5m 边界 bar 不触发 1m 策略，避免风控单串周期）；None=全部（回测/旧调用）。
         """
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
+            if period is not None and ctx.period != period:
+                continue
             orders.extend(self._process_strategy(ctx, bar, signal_cache))
         # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
         # §88：熔断期间不清仓，仅暂停新开仓。

@@ -72,12 +72,12 @@ def _make_dispatcher(rec, fail_paths=None):
     return HttpBridgeDispatcher(base_url="http://127.0.0.1:8790", client=client), rec
 
 
-def _portfolio_single():
+def _portfolio_single(period="1m", strategy_id=1):
     """单组合单策略，formula_signal 配 OPEN（trigger_value=1）。"""
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
     ctx = StrategyContext(
-        strategy_id=1, period="1m",
+        strategy_id=strategy_id, period=period,
         capital_ratio=Decimal("0.6"), max_positions=5,
         single_open_ratio=Decimal("0.1"),
     )
@@ -91,6 +91,30 @@ def _portfolio_single():
     )
     port.strategies.append(ctx)
     return port, ctx
+
+
+def _portfolio_two(periods=("1m", "5m")):
+    """单组合两策略（periods 指定各自周期），各配 OPEN 信号。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctxs = []
+    for sid, period in enumerate(periods, start=1):
+        ctx = StrategyContext(
+            strategy_id=sid, period=period,
+            capital_ratio=Decimal("0.6"), max_positions=5,
+            single_open_ratio=Decimal("0.1"),
+        )
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        ctx.strategy_risk = StrategyRiskManager(
+            stop_loss_ratio=Decimal("0.05"),
+            take_profit_ratio=Decimal("0.2"),
+            trailing_stop_ratio=Decimal("0"),
+        )
+        port.strategies.append(ctx)
+        ctxs.append(ctx)
+    return port, ctxs
 
 
 def _bar(stock, close, bar_time):
@@ -879,4 +903,383 @@ def test_backfill_updates_last_backfill_time_and_clears_pending():
     lo2 = db.get(LiveOrder, lo.id)
     assert lo2.status == "filled"
     db.close()
+
+
+# ===========================================================================
+# C6 三段式实盘周期链路 + E8 离线恢复（0011 切片5 定案）
+# ===========================================================================
+from core.engine.live_engine import periods_on_boundary  # noqa: E402
+
+
+def _make_engine_formula_portfolio(disp, factory, port, formula_by_strategy, formula_count=200):
+    """构造带 tq_formula + formula_by_strategy 且含组合的 LiveEngine（C6 注入/分发用）。"""
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        tq_formula=TQFormula(), formula_by_strategy=formula_by_strategy,
+        formula_count=formula_count,
+    )
+
+
+def _respond_quote_bars(stock, bars, fail_orders=False):
+    """respond：/quote 固定返回 bars，/order 受理成功。"""
+    def respond(request):
+        path = request.url.path
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {stock: bars}})
+        if path == "/order":
+            if fail_orders:
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    return respond
+
+
+# ---- 周期边界判定 ----
+def test_periods_on_boundary():
+    """C6：1m bar 结束时刻 → 命中边界周期（可累积，只读 stime 不引本机时钟）。"""
+    assert periods_on_boundary(datetime(2026, 8, 5, 10, 5)) == ["5m"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 10, 15)) == ["5m", "15m"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 10, 30)) == ["5m", "15m", "30m"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 11, 0)) == ["5m", "15m", "30m", "1h"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 10, 3)) == []
+    assert periods_on_boundary(None) == []
+
+
+# ---- 周期过滤（核心节拍正确性）----
+def test_on_bar_1m_bar_only_drives_1m_strategy():
+    """C6：1m bar(period=1m) 只驱动 1m 策略；5m 策略不被 1m 节拍触发。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 5)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    # 两策略同 bar_time 同价都有 open_sig=1
+    engine.signal_cache = {
+        (1, stock, bar_time): [{"name": "open_sig", "value": 1}],
+        (2, stock, bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert [o.strategy_id for o in orders] == [1]  # 只有 1m 策略下单
+    db.close()
+
+
+def test_on_bar_5m_bar_only_drives_5m_strategy():
+    """C6：5m 边界 bar(period=5m) 只驱动 5m 策略；1m 策略不被 5m 边界触发（防风控单串周期）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 5)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {
+        (1, stock, bar_time): [{"name": "open_sig", "value": 1}],
+        (2, stock, bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "5m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert [o.strategy_id for o in orders] == [2]  # 只有 5m 策略下单
+    db.close()
+
+
+def test_on_bar_no_period_processes_all_strategies():
+    """C6：bar 无 period（回测/旧调用）→ 处理全部策略（向后兼容）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 5)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {
+        (1, stock, bar_time): [{"name": "open_sig", "value": 1}],
+        (2, stock, bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    bar = _bar(stock, "9.3", bar_time)  # period=None
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert sorted(o.strategy_id for o in orders) == [1, 2]
+    db.close()
+
+
+# ---- 边界分发 C6(A) ----
+def test_dispatch_period_bar_drives_5m_strategy_only():
+    """C6(A)：5m 边界 → 拉 5m bars → 注入信号填 cache(2, code, boundary) → 只 5m 策略下单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 5, 10, 5)
+    bars_5m = [
+        {"stime": "20260805100000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805100500", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805101000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
+    # mock compute_injected：返回 open_sig=1（无论周期）
+    engine._tq_formula.compute_injected = lambda **kw: {
+        stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
+    }
+
+    engine._dispatch_period_bar("5m", boundary)
+
+    # 信号缓存填了 5m 策略(2)的 key（bar.period=5m → 只注入 5m 策略）
+    assert (2, stock, boundary) in engine.signal_cache
+    assert (1, stock, boundary) not in engine.signal_cache
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert [o.strategy_id for o in orders] == [2]
+    db.close()
+
+
+def test_dispatch_period_bar_uses_latest_completed_bar():
+    """C6(A)：BarEvent.stocks 用「最新已完成 bar」（非 forming 最新一根）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 5, 10, 5)
+    # forming 最新一根 10:10 的 close=9.8，完成 bar 10:05 close=9.4
+    bars_5m = [
+        {"stime": "20260805100000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805100500", "open": 9.2, "high": 9.5, "low": 9.2, "close": 9.4, "volume": 10000, "amount": 94000.0},
+        {"stime": "20260805101000", "open": 9.4, "high": 9.8, "low": 9.4, "close": 9.8, "volume": 10000, "amount": 98000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
+    engine._tq_formula.compute_injected = lambda **kw: {
+        stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
+    }
+
+    engine._dispatch_period_bar("5m", boundary)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    # 下单价用完成 bar 10:05 的 close=9.4（而非 forming 10:10 的 9.8）
+    assert orders[0].price == Decimal("9.4")
+    db.close()
+
+
+def test_dispatch_period_bar_bridge_offline_sets_offline():
+    """C6(A)：分发拉 quote 桥离线 → 置离线返回，不崩。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 5, 10, 5)
+    rec = _Recorder(fail_paths={"/quote"})
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
+
+    with pytest.raises(BridgeUnavailableError):
+        engine._dispatch_period_bar("5m", boundary)
+
+
+# ---- 日终 1d C6(B) ----
+def test_maybe_daily_bars_14_30_drives_1d_strategy():
+    """C6(B)：14:30 日终 → 拉 1d 快照 → 注入 1d 策略 → 下单；同日幂等只驱动一次。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [
+        {"stime": "20260807000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260810000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._tq_formula.compute_injected = lambda **kw: {
+        stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}
+    }
+    daily_time = datetime(2026, 8, 10, 0, 0)
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+
+    assert (1, stock, daily_time) in engine.signal_cache
+    assert engine._last_daily_bar_date == datetime(2026, 8, 10).date()
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].strategy_id == 1
+    db.close()
+
+    # 同日幂等：14:31 再调不重复驱动
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 31))
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    db.close()
+
+
+def test_maybe_daily_bars_before_1430_no_trigger():
+    """C6(B)：未到 14:30 不触发（不拉快照、不驱动、不记幂等标记）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 29))
+
+    assert engine._last_daily_bar_date is None
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+# ---- 1w/1mon 通达信注入 C6(C) ----
+def test_inject_startup_periods_fills_signal_cache():
+    """C6(C)：1w 启动注入 → TQFormula.compute 通达信 → signal_cache 填 (sid, code, daily_time)。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1w", strategy_id=1)
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine._tq_formula.compute = lambda *a, **kw: {
+        stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}
+    }
+
+    engine._inject_startup_periods(daily_time)
+
+    assert engine.signal_cache[(1, stock, daily_time)] == [{"name": "open_sig", "value": 1}]
+
+
+def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
+    """C6(C)：1w 策略日终驱动命中启动预填信号，不拉桥注入（compute_injected 不调）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1w")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine.signal_cache[(1, stock, daily_time)] = [{"name": "open_sig", "value": 1}]
+    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].strategy_id == 1
+    db.close()
+    engine._tq_formula.compute_injected.assert_not_called()  # 1w 不走桥注入
+
+
+def test_maybe_daily_bars_day_rollover_reinjects_1w():
+    """C6(C)：日切后 1w cache miss → 通达信补注入再驱动。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1w")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260811000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    # 启动注入在 08-10，日终落在 08-11 → 新 daily_time cache miss
+    old_daily_time = datetime(2026, 8, 10, 0, 0)
+    new_daily_time = datetime(2026, 8, 11, 0, 0)
+    engine.signal_cache[(1, stock, old_daily_time)] = [{"name": "open_sig", "value": 1}]
+    engine._tq_formula.compute = lambda *a, **kw: {
+        stock: {"open_sig": [{"Date": "20260811", "Value": 1}], "ErrorId": 0}
+    }
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 11, 14, 30))
+
+    # 日切补注入：新 daily_time 的 cache 已填
+    assert (1, stock, new_daily_time) in engine.signal_cache
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].strategy_id == 1
+    db.close()
+
+
+# ---- _bars_to_formula_df 时间解析统一（修潜在 bug）----
+def test_bars_to_formula_df_accepts_stime_only():
+    """C6：stime-only bars（无 index/time）→ 仍能解析时间注入（统一 parse_bar_time）。"""
+    bars = [
+        {"stime": "20260805100000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805100100", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    df = LiveEngine._bars_to_formula_df(bars, "600000.SH")
+    assert df is not None
+    assert len(df["Close"]) == 2
+    idx = list(df["Close"].index)
+    assert idx[0] == datetime(2026, 8, 5, 10, 0, 0)
+    assert idx[1] == datetime(2026, 8, 5, 10, 1, 0)
+
+
+# ---- E8 离线→在线转场 ----
+def test_loop_offline_to_online_resets_baseline():
+    """E8：桥离线→在线转场 → _loop 调 reset_baseline（重建基线，不补 bar）。"""
+    import asyncio
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+
+    class FlakyPing:
+        """首次 /ping 失败（模拟启动时离线），之后恢复。"""
+        def __init__(self):
+            self.requests = []
+            self.fail_remaining = 1
+
+        def handler(self, request):
+            self.requests.append(request)
+            path = request.url.path
+            if path == "/ping":
+                if self.fail_remaining > 0:
+                    self.fail_remaining -= 1
+                    raise httpx.ConnectError("connection refused")
+                return httpx.Response(200, json={"ok": True})
+            if path == "/quote":
+                return httpx.Response(200, json={"ok": True, "data": {}})
+            if path == "/order":
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404, json={"ok": False})
+
+    rec = FlakyPing()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    reset_calls = []
+    orig_reset = poller.reset_baseline
+    poller.reset_baseline = lambda: (reset_calls.append(1), orig_reset())[1]
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory, poll_interval=0.01,
+    )
+
+    async def run_a_bit():
+        await engine.start()
+        await asyncio.sleep(0.08)
+        await engine.stop()
+
+    asyncio.run(run_a_bit())
+
+    assert engine.bridge_online is True
+    assert len(reset_calls) == 1  # 离线→在线只转场一次
 

@@ -28,9 +28,10 @@ const editingStrategyId = ref<number | null>(null)
 const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
-// 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 交集（open-questions Q4）：
-// 1m/5m/15m/30m/1h/1d 两端均已验证。1w/1mon 待桥端真机，暂不放行。60m 两端都不认。
-const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d']
+// 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 交集（open-questions Q4）+ C6 三段式：
+// 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；1w/1mon 走通达信注入。
+// 60m 两端都不认。
+const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
 const ROLES = [
   { value: 'independent', label: '对立' },
   { value: 'master', label: '主策略' },

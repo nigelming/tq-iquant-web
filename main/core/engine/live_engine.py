@@ -24,7 +24,7 @@ from .position import Position
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
 from .http_bridge_dispatcher import HttpBridgeDispatcher, BridgeUnavailableError
-from .bar_poller import BarPoller
+from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
 from core.models import LiveOrder, LiveTrade
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -33,6 +33,30 @@ logger = logging.getLogger(__name__)
 
 # TQ 公式输出中需跳过的非变量键（同 backtest._FORMULA_META_KEYS）
 _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
+
+# C6(C)：1w/1mon 走通达信启动/日终注入（桥端 xtdata 拉不到），_fill_signal_cache 跳过不拉桥
+_STARTUP_ONLY_PERIODS = ("1w", "1mon")
+
+
+def periods_on_boundary(bar_time: Optional[datetime]) -> List[str]:
+    """1m bar 结束时刻 → 命中的边界周期列表（可累积，只读 bar stime，不引入本机时钟）。
+
+    minute%5==0→5m、%15→15m、%30→30m、minute==0→1h。可累积：10:30 → [5m,15m,30m]，
+    11:00 → [5m,15m,30m,1h]。非边界时刻（如 10:03）→ []。
+    """
+    if bar_time is None:
+        return []
+    result: List[str] = []
+    minute = bar_time.minute
+    if minute % 5 == 0:
+        result.append("5m")
+    if minute % 15 == 0:
+        result.append("15m")
+    if minute % 30 == 0:
+        result.append("30m")
+    if minute == 0:
+        result.append("1h")
+    return result
 
 
 def _to_int(val) -> int:
@@ -63,7 +87,7 @@ class LiveEngine:
         dispatcher: HttpBridgeDispatcher,
         bar_poller: BarPoller,
         db_session_factory: Callable[[], Session],
-        poll_interval: float = 15.0,
+        poll_interval: float = 30.0,
         tq_formula: Optional[TQFormula] = None,
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
@@ -95,6 +119,8 @@ class LiveEngine:
         self._bridge_online = True
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
         self._last_daily_date: Optional[date] = None
+        # C6(B/C)：14:30 日终 1d 快照 bar + 1w/1mon 注入已驱动的日期标记（每日一次）
+        self._last_daily_bar_date: Optional[date] = None
         # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
         # 主循环 _poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
         # 运行中 _handle_bar 发单也计入、拒单弹出；_poll_deals 每轮回合重查 DB 同步（G7）。
@@ -109,6 +135,11 @@ class LiveEngine:
         if self._running:
             return
         self._running = True
+        # C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路）。
+        # 一次同步 TDX 计算（get_tdx_lock 串行），阻塞事件循环可接受（启动一次性）。
+        self._inject_startup_periods(
+            datetime.combine(datetime.now().date(), datetime.min.time())
+        )
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
 
@@ -126,19 +157,30 @@ class LiveEngine:
             self._task = None
 
     async def _loop(self) -> None:
-        """主循环：心跳 → 拉 bar → sleep。桥离线则暂停下单、标状态，不抛异常。"""
+        """主循环：心跳 → 拉 bar → 日终 → 回填 → sleep。桥离线则暂停下单、标状态，不抛异常。"""
         while self._running:
             try:
+                # E8：心跳前的在线状态，用于离线→在线转场时重建基线
+                was_online = self._bridge_online
                 if not self._dispatcher.heartbeat():
                     self._bridge_online = False
                     logger.warning("bridge offline, pause trading (session %s)", self.session_id)
                     await asyncio.sleep(self._poll_interval)
                     continue
                 self._bridge_online = True
+                if not was_online:
+                    # E8：离线恢复 → 重建基线，跳过离线期间错过的 bar（不补触发）
+                    self._bar_poller.reset_baseline()
+                    logger.info(
+                        "bridge back online, reset poller baseline (session %s)",
+                        self.session_id,
+                    )
                 # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
                 self._bar_poller.poll()
                 # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
                 self._maybe_daily_close()
+                # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
+                self._maybe_daily_bars()
                 # 切片5 G2：每轮查未完结 LiveOrder → 轮询桥 /deals 回填真实成交
                 self._poll_deals()
             except BridgeUnavailableError as e:
@@ -184,9 +226,73 @@ class LiveEngine:
                     portfolio.portfolio_id, today,
                 )
 
+    def _maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
+        """C6(B/C)：日终（≥14:30 当日一次）1d 快照 bar + 1w/1mon 通达信注入驱动。
+
+        C6(B) 1d：拉桥 /quote?period=1d 最新 forming 1d bar → 构造 BarEvent(period="1d")
+          → _fill_signal_cache 注入（period="1d"）→ on_bar 驱动 1d 策略。
+        C6(C) 1w/1mon：走 TQFormula.compute 通达信自取（桥端 xtdata 拉不到），信号预填
+          signal_cache[(sid, code, daily_time)]，此处驱动命中预填信号。
+        幂等：_last_daily_bar_date 记录当日已触发。日切时（新 daily_time 的 1w/1mon
+        cache miss）→ 通达信补注入。用本机 Asia/Shanghai 时钟（实盘固有时点，同 E5/E6）。
+        """
+        if now is None:
+            now = datetime.now()
+        if (now.hour, now.minute) < (14, 30):
+            return
+        today = now.date()
+        if self._last_daily_bar_date == today:
+            return
+        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）
+        bars_by_code: Dict[str, list] = {}
+        for code in self._bar_poller._stock_codes:
+            try:
+                bars = self._dispatcher.query_quote(
+                    code, period="1d", count=self._formula_count
+                )
+            except BridgeUnavailableError:
+                self._bridge_online = False
+                logger.warning("bridge offline on daily bars (session %s)", self.session_id)
+                return
+            if bars:
+                bars_by_code[code] = bars
+        if not bars_by_code:
+            return
+        # daily_time = 任一 code 最新 1d bar 的 stime（交易日 00:00）；解析失败用今日零点兜底
+        daily_time = parse_bar_time(next(iter(bars_by_code.values()))[-1])
+        if daily_time is None:
+            daily_time = datetime.combine(today, datetime.min.time())
+        self._last_daily_bar_date = today
+        # 日切检测：新 daily_time 的 1w/1mon cache miss → 通达信补注入
+        if self._startup_periods_missing(daily_time):
+            self._inject_startup_periods(daily_time)
+        # 1d 快照即最终值（14:30 后），每 code 取最新 forming 1d bar 的 OHLCV
+        stocks = {code: to_ohlcv(bars[-1]) for code, bars in bars_by_code.items()}
+        for period in ("1d", "1w", "1mon"):
+            bar_event = BarEvent(stocks=stocks, bar_time=daily_time, period=period)
+            for portfolio in self.portfolios:
+                try:
+                    self._handle_bar(portfolio, bar_event, bars_by_code=bars_by_code)
+                except BridgeUnavailableError as e:
+                    self._bridge_online = False
+                    logger.warning(
+                        "bridge unavailable on daily %s bar %s: %s",
+                        period, daily_time, e,
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "daily %s bar error (portfolio %s, time %s)",
+                        period, portfolio.portfolio_id, daily_time,
+                    )
+
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
-        """BarPoller 回调：对每个组合驱动 _handle_bar。"""
+        """BarPoller 回调（1m 节拍）：① 驱动 1m 策略；② 按 bar stime 边界分发长周期。
+
+        边界判定只读 1m bar stime（periods_on_boundary），不引入本机时钟；
+        5m/15m/30m/1h 策略在边界时点才被驱动（C6(A)），1m 节拍不再每 bar 算长周期。
+        """
         for portfolio in self.portfolios:
             try:
                 self._handle_bar(portfolio, bar)
@@ -200,8 +306,22 @@ class LiveEngine:
                     "handle_bar error (portfolio %s, bar %s)",
                     portfolio.portfolio_id, bar.bar_time,
                 )
+        # C6(A)：1m bar 边界 → 分发 5m/15m/30m/1h（可累积）
+        for period in periods_on_boundary(bar.bar_time):
+            try:
+                self._dispatch_period_bar(period, bar.bar_time)
+            except BridgeUnavailableError as e:
+                self._bridge_online = False
+                logger.warning(
+                    "bridge unavailable on %s boundary %s: %s", period, bar.bar_time, e
+                )
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
 
-    def _handle_bar(self, portfolio: Portfolio, bar: BarEvent) -> None:
+    def _handle_bar(
+        self, portfolio: Portfolio, bar: BarEvent, bars_by_code: Optional[Dict[str, list]] = None
+    ) -> None:
         """一根 bar：盯回撤 → 取信号/风控 → 先落 submitted → 发单 → 等回填。
 
         复用回测 Portfolio.on_bar（信号优先级/风控/主从/熔断全复用），
@@ -213,8 +333,9 @@ class LiveEngine:
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
-        self._fill_signal_cache(portfolio, bar)
-        orders = portfolio.on_bar(bar, signal_cache=self.signal_cache)
+        self._fill_signal_cache(portfolio, bar, bars_by_code=bars_by_code)
+        # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
+        orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
         if not orders:
             return
         db = self._db_session_factory()
@@ -260,6 +381,33 @@ class LiveEngine:
         finally:
             db.close()
 
+    def _dispatch_period_bar(self, period: str, boundary_time: datetime) -> None:
+        """C6(A) 边界分发：period 边界到（1m stime 判定）→ 拉该周期 bar → 注入 → 驱动该周期策略。
+
+        对每 code 拉 query_quote(period, count=formula_count) 一次，既供公式注入又供 BarEvent。
+        取每 code「最新已完成 bar」（stime < 本批 latest）的 OHLCV 构造 BarEvent
+        （bar_time=boundary_time，与 1m 节拍对齐）——不用 forming 最新一根（未来函数）。
+        桥拉取抛 BridgeUnavailableError → 向上传播由 _on_bar 置离线。无完成 bar 的 code 跳过。
+        """
+        bars_by_code: Dict[str, list] = {}
+        stocks: Dict[str, dict] = {}
+        for code in self._bar_poller._stock_codes:
+            bars = self._dispatcher.query_quote(
+                code, period=period, count=self._formula_count
+            )
+            if not bars:
+                continue
+            bars_by_code[code] = bars
+            cb = latest_completed_bar(bars)
+            if cb is None:
+                continue
+            stocks[code] = to_ohlcv(cb)
+        if not stocks:
+            return
+        bar_event = BarEvent(stocks=stocks, bar_time=boundary_time, period=period)
+        for portfolio in self.portfolios:
+            self._handle_bar(portfolio, bar_event, bars_by_code=bars_by_code)
+
     @staticmethod
     def _total_value(portfolio: Portfolio, bar: BarEvent) -> Decimal:
         """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值。同回测 _total_value。"""
@@ -280,7 +428,9 @@ class LiveEngine:
         return None
 
     # ---------------- 公式信号注入（0010）----------------
-    def _fill_signal_cache(self, portfolio: Portfolio, bar: BarEvent) -> None:
+    def _fill_signal_cache(
+        self, portfolio: Portfolio, bar: BarEvent, bars_by_code: Optional[Dict[str, list]] = None
+    ) -> None:
         """实盘逐 bar 算公式信号填 signal_cache。预填模式（不改 Portfolio）。
 
         对每个策略 × bar.stocks 每只股票：
@@ -289,6 +439,9 @@ class LiveEngine:
           → TQFormula.compute_injected 内存注入算公式
           → _extract_latest_signal 取最后一条（当前 bar 信号）
           → 填 signal_cache[(strategy_id, code, bar.bar_time)]
+        C6 节拍过滤：bar.period 非 None 时只注入匹配周期的策略（5m 边界 bar 不注入 1m 策略）；
+        1w/1mon（_STARTUP_ONLY_PERIODS）走通达信启动/日终注入，不拉桥。
+        bars_by_code：调用方已预拉好的 bars（边界/日终分发），避免二次拉桥。
         无 tq_formula / 策略无公式映射 / 拉取为空 / 算失败 → 跳过（该股该 bar 无公式信号）。
         """
         if self._tq_formula is None or not self._formula_by_strategy:
@@ -297,12 +450,21 @@ class LiveEngine:
             formula_name = self._formula_by_strategy.get(ctx.strategy_id)
             if not formula_name:
                 continue
+            # C6：该 bar 只注入匹配周期的策略
+            if bar.period is not None and ctx.period != bar.period:
+                continue
+            # C6(C)：1w/1mon 走通达信启动/日终注入，不拉桥
+            if ctx.period in _STARTUP_ONLY_PERIODS:
+                continue
             period = ctx.period
             for code in bar.stocks:
                 try:
-                    bars = self._dispatcher.query_quote(
-                        code, period=period, count=self._formula_count
-                    )
+                    if bars_by_code is not None and code in bars_by_code:
+                        bars = bars_by_code[code]
+                    else:
+                        bars = self._dispatcher.query_quote(
+                            code, period=period, count=self._formula_count
+                        )
                 except BridgeUnavailableError:
                     # 拉历史失败：跳过该股（不阻断 on_bar，风控信号仍可触发）
                     logger.warning("quote failed for formula inject %s %s", code, period)
@@ -322,8 +484,9 @@ class LiveEngine:
     def _bars_to_formula_df(bars: list, code: str) -> Optional[dict]:
         """桥 bar dict 列表 → {Amount/Volume/Close/Open/High/Low: pandas.DataFrame}。
 
-        桥 bar 字段：index(yyyymmddHHMMSS)/open/high/low/close/volume/amount（小写）。
-        输出：每字段单列 DataFrame（列=[code]，行=DatetimeIndex，从 index 解析）。
+        桥 bar 字段：stime(yyyymmddHHMMSS)/time(时间戳)/index(历史工具) + 小写 OHLCV。
+        时间统一用 parse_bar_time（与 BarPoller 同规则），兼容 stime/time/index 各来源。
+        输出：每字段单列 DataFrame（列=[code]，行=DatetimeIndex）。
         空 bars / 无有效时间 → None（调用方跳过）。
         """
         if not bars:
@@ -332,18 +495,8 @@ class LiveEngine:
 
         times, o, h, l, c, v, a = [], [], [], [], [], [], []
         for b in bars:
-            idx = b.get("index")
-            if not idx:
-                continue
-            s = str(idx).strip()
-            try:
-                if len(s) >= 14 and s[:14].isdigit():
-                    t = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
-                elif len(s) >= 8 and s[:8].isdigit():
-                    t = datetime.strptime(s[:8], "%Y%m%d")
-                else:
-                    continue
-            except ValueError:
+            t = parse_bar_time(b)
+            if t is None:
                 continue
 
             def _num(key):
@@ -404,6 +557,52 @@ class LiveEngine:
                 continue
             outputs.append({"name": var_name, "value": _to_int(v)})
         return outputs
+
+    def _inject_startup_periods(self, daily_time: datetime) -> None:
+        """C6(C)：1w/1mon 策略通达信注入——TQFormula.compute 自取历史 → 最新信号填 signal_cache。
+
+        key=(strategy_id, stock_code, daily_time)，与日终 _maybe_daily_bars 驱动用的
+        bar_time 一致，驱动时命中预填信号。桥端 xtdata 拉不到 1w/1mon，通达信是唯一通路。
+        start() 启动调一次；_maybe_daily_bars 检测日切 cache miss 时补调。
+        单策略/单股 compute 失败 → 跳过（不阻断其余）。
+        """
+        if self._tq_formula is None or not self._formula_by_strategy:
+            return
+        codes = list(self._bar_poller._stock_codes)
+        for portfolio in self.portfolios:
+            for ctx in portfolio.strategies:
+                if ctx.period not in _STARTUP_ONLY_PERIODS:
+                    continue
+                formula_name = self._formula_by_strategy.get(ctx.strategy_id)
+                if not formula_name:
+                    continue
+                for code in codes:
+                    try:
+                        raw = self._tq_formula.compute(
+                            formula_name, "", [code], period=ctx.period, count=-1
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "startup period compute failed %s %s", ctx.period, code
+                        )
+                        continue
+                    outputs = self._extract_latest_signal(raw, code)
+                    if outputs:
+                        self.signal_cache[(ctx.strategy_id, code, daily_time)] = outputs
+
+    def _startup_periods_missing(self, daily_time: datetime) -> bool:
+        """1w/1mon 策略在 daily_time 的信号是否全部已预填（cache miss → 需补注入）。
+
+        _maybe_daily_bars 日切检测用：新交易日的 daily_time 尚无 cache 键 → True。
+        """
+        for portfolio in self.portfolios:
+            for ctx in portfolio.strategies:
+                if ctx.period not in _STARTUP_ONLY_PERIODS:
+                    continue
+                for code in self._bar_poller._stock_codes:
+                    if (ctx.strategy_id, code, daily_time) not in self.signal_cache:
+                        return True
+        return False
 
     # ---------------- 订单状态机 + 成交回报回填（切片5）----------------
     def _persist_order_submitted(self, db: Session, order: OrderEvent) -> LiveOrder:

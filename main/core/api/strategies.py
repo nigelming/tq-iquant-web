@@ -18,9 +18,10 @@ router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
 # 枚举校验集合（出处：docs/system-plan-draft.md §5.3.2）
 # 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
-# 两端均已真机/源码验证：1m/5m/15m/30m/1h/1d。1w/1mon TQ 支持但桥走远程分支未真机验，暂不放行。
+# 实盘三段式（C6）：1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；
+# 1w/1mon 桥端 xtdata 拉不到，走通达信 TQFormula.compute 启动/日终注入（见 live_engine._STARTUP_ONLY_PERIODS）。
 # 注意 60m 两端都不认（TQ periodstr error + xtdata 白名单是 1h 不是 60m）。
-VALID_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d"}
+VALID_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"}
 VALID_ROLES = {"independent", "master", "slave"}  # draft:223
 VALID_TRADING_SESSIONS = {"full", "am", "pm"}  # draft:499，非 morning/afternoon
 VALID_STATUSES = {"active", "archived"}  # draft:500

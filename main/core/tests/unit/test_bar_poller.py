@@ -120,6 +120,22 @@ def test_parse_bar_time_stime_preferred_over_time():
     assert parse_bar_time(bar) == datetime(2026, 8, 5, 10, 8, 0)
 
 
+def test_parse_bar_time_index_14digit_fallback():
+    """index 14 位时间戳兜底(无 stime/time 时)。"""
+    assert parse_bar_time({"index": "20260805100800"}) == datetime(2026, 8, 5, 10, 8, 0)
+
+
+def test_parse_bar_time_index_8digit_date():
+    """index 8 位日期(日线)兜底。"""
+    assert parse_bar_time({"index": "20260805"}) == datetime(2026, 8, 5, 0, 0, 0)
+
+
+def test_parse_bar_time_stime_still_preferred_over_index():
+    """stime 仍优先于 index(两者都存在时用 stime)。"""
+    bar = {"stime": "20260805100800", "index": "20260805100900"}
+    assert parse_bar_time(bar) == datetime(2026, 8, 5, 10, 8, 0)
+
+
 def test_parse_bar_time_invalid_returns_none():
     assert parse_bar_time({}) is None
     assert parse_bar_time({"stime": "abc"}) is None
@@ -318,6 +334,79 @@ def test_multiple_stocks_different_times_trigger_separate_bars():
     assert set(r1[0].stocks.keys()) == {"600000.SH"}
     assert len(r2) == 1 and r2[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
     assert set(r2[0].stocks.keys()) == {"000001.SZ"}
+
+
+# ---------------- E8 离线恢复重建基线 ----------------
+def test_reset_baseline_after_offline_drops_gap_then_triggers_normally():
+    """E8:离线→在线转场 reset_baseline 后,首次 poll 只建基线不触发(离线期间错过的
+    bar 直接丢弃,不补触发——补触发=过时信号+现价成交,价格错位);再 poll 正常触发。"""
+    # 第 1 轮:基线 [10:08, 10:09]
+    # reset_baseline()(模拟离线恢复)
+    # 第 2 轮:[10:08, 10:09, 10:10, 10:11](离线期间新出现 10:10/10:11)
+    #   → 重建基线,last_completed=10:10,**不触发任何 bar**
+    # 第 3 轮:[.., 10:12] 出现 → 10:11 完成,正常触发
+    rec = _QuoteRecorder(per_code={"600000.SH": [
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+         _bar("20260805101000", 9.40), _bar("20260805101100", 9.45)],
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+         _bar("20260805101000", 9.40), _bar("20260805101100", 9.45),
+         _bar("20260805101200", 9.50)],
+    ]})
+    poller, _ = _make_poller(rec)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                       # 基线建立
+    assert fired == []
+    assert poller._initialized is True
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 8, 0)
+
+    # 模拟离线→在线转场
+    poller.reset_baseline()
+    assert poller._initialized is False
+    assert poller._last_completed == {}
+
+    # 首次 poll:只重建基线,离线期间错过的 10:09/10:10 不补触发
+    result = poller.poll()
+    assert fired == []
+    assert result == []
+    assert poller._initialized is True
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 10, 0)
+
+    # 再 poll:10:12 出现 → 10:11 完成,正常触发
+    result2 = poller.poll()
+    assert len(fired) == 1
+    assert result2 == fired
+    assert fired[0].bar_time == datetime(2026, 8, 5, 10, 11, 0)
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 11, 0)
+
+
+def test_reset_baseline_dropped_completed_bar_not_triggered_later():
+    """E8:离线期间已完成但被基线吞掉的 bar,恢复后不因水位推进而补触发。"""
+    # 第 1 轮:基线 [10:08, 10:09]
+    # reset_baseline()
+    # 第 2 轮:[10:08, 10:09, 10:10, 10:11] → 基线推到 10:10,10:09/10:10 被吞
+    # 第 3 轮:[.., 10:10, 10:11, 10:12] → 只触发 10:11(10:09/10:10 已落基线)
+    rec = _QuoteRecorder(per_code={"600000.SH": [
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+         _bar("20260805101000", 9.40), _bar("20260805101100", 9.45)],
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+         _bar("20260805101000", 9.40), _bar("20260805101100", 9.45),
+         _bar("20260805101200", 9.50)],
+    ]})
+    poller, _ = _make_poller(rec)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()
+    poller.reset_baseline()
+    poller.poll()                       # 重建基线(吞掉 10:09/10:10)
+    result = poller.poll()              # 只触发 10:11
+
+    assert [b.bar_time for b in result] == [datetime(2026, 8, 5, 10, 11, 0)]
+    assert len(fired) == 1
 
 
 # ---------------- 桥离线 / 空数据 ----------------

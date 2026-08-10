@@ -223,9 +223,9 @@ def test_create_portfolio_invalid_period(client):
     assert "period" in body["message"]
 
 
-@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
+@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"])
 def test_create_portfolio_valid_period(client, period):
-    """6 个合法周期（open-questions Q4 交集）应放行。"""
+    """8 个合法周期（C6 三段式：分钟走桥、1d 快照、1w/1mon 通达信）应放行。"""
     c, Session = client
     db = Session()
     _seed_pool(db); _seed_formula(db)
@@ -238,9 +238,9 @@ def test_create_portfolio_valid_period(client, period):
     assert body["data"]["strategies"][0]["period"] == period
 
 
-@pytest.mark.parametrize("period", ["60m", "1w", "1mon", "3m", "2h"])
+@pytest.mark.parametrize("period", ["60m", "3m", "2h"])
 def test_create_portfolio_rejected_period(client, period):
-    """非法周期（含暂未放行的 1w/1mon）应在组合创建时被拒绝。"""
+    """非法周期（60m 两端不认 / 3m/2h TQ 不支持）应在组合创建时被拒绝。"""
     c, Session = client
     db = Session()
     _seed_pool(db); _seed_formula(db)
@@ -528,9 +528,9 @@ def test_create_strategy_invalid_period(client):
     assert body["code"] == 400
 
 
-@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
+@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"])
 def test_create_strategy_valid_period(client, period):
-    """6 个合法周期（TQ 公式 ∩ iQuant 桥 xtdata 交集，open-questions Q4）应放行。"""
+    """8 个合法周期（C6 三段式：分钟走桥、1d 快照、1w/1mon 通达信）应放行。"""
     c, Session = client
     db = Session()
     pid = _seed_portfolio(db, strategies=[])
@@ -544,11 +544,10 @@ def test_create_strategy_valid_period(client, period):
     assert body["data"]["period"] == period
 
 
-@pytest.mark.parametrize("period", ["60m", "1w", "1mon", "3m", "2h", "1q"])
+@pytest.mark.parametrize("period", ["60m", "3m", "2h", "1q"])
 def test_create_strategy_rejected_period(client, period):
     """非法周期应拒绝：
     60m — 两端都不认（TQ periodstr error + xtdata 白名单是 1h）；
-    1w/1mon — TQ 支持但 iQuant 桥 xtdata 走远程分支未真机验，暂不放行；
     3m/2h/1q — TQ 不支持。"""
     c, Session = client
     db = Session()
