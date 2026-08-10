@@ -2,7 +2,8 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from decimal import Decimal
+from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
@@ -10,13 +11,16 @@ from core.config import load_config
 from core.db import SessionLocal, get_db
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
-    StockPool, StockPoolStock, Formula,
+    StockPool, StockPoolStock, Formula, LiveOrder, LiveTrade,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
+from core.engine.event import TradeEvent
+from core.engine.position import Position
 from core.tq.formula import TQFormula
+from tq_iquant_shared.constants import TradeType
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/live", tags=["live"])
@@ -242,6 +246,167 @@ def bridge_status(session_id: int, db: Session = Depends(get_db)):
     if engine is None:
         return {"code": 0, "data": {"online": None, "status": "not_running"}}
     return {"code": 0, "data": {"online": engine.dispatcher.heartbeat(), "status": session.status}}
+
+
+# ---- B4b: 历史查询端点（orders / trades / positions）----
+
+def _serialize_order(o: LiveOrder) -> dict:
+    return {
+        "id": o.id,
+        "live_session_id": o.live_session_id,
+        "portfolio_strategy_id": o.portfolio_strategy_id,
+        "strategy_id": o.strategy_id,
+        "stock_code": o.stock_code,
+        "trade_type": o.trade_type,
+        "order_type": o.order_type,
+        "price": float(o.price) if o.price is not None else None,
+        "quantity": o.quantity,
+        "filled_quantity": o.filled_quantity,
+        "filled_price": float(o.filled_price) if o.filled_price is not None else None,
+        "status": o.status,
+        "error_message": o.error_message,
+        "signal_name": o.signal_name,
+        "signal_type": o.signal_type,
+        "bar_time": o.bar_time.isoformat() if o.bar_time else None,
+        "order_ref": o.order_ref,
+        "bridge_order_id": o.bridge_order_id,
+        "created_at": o.created_at.isoformat() if o.created_at else None,
+        "updated_at": o.updated_at.isoformat() if o.updated_at else None,
+    }
+
+
+def _serialize_trade(t: LiveTrade) -> dict:
+    return {
+        "id": t.id,
+        "live_session_id": t.live_session_id,
+        "live_order_id": t.live_order_id,
+        "portfolio_strategy_id": t.portfolio_strategy_id,
+        "strategy_id": t.strategy_id,
+        "stock_code": t.stock_code,
+        "trade_type": t.trade_type,
+        "price": float(t.price) if t.price is not None else None,
+        "quantity": t.quantity,
+        "amount": float(t.amount) if t.amount is not None else None,
+        "commission": float(t.commission) if t.commission is not None else None,
+        "stamp_duty": float(t.stamp_duty) if t.stamp_duty is not None else None,
+        "trade_time": t.trade_time.isoformat() if t.trade_time else None,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _aggregate_positions_from_trades(trades: List[LiveTrade]) -> List[dict]:
+    """从 live_trades 重放聚合虚拟持仓（与 recover/Position.apply_trade 同口径）。
+
+    按 trade_time 顺序：BUY 加权累加持仓+均价，SELL 减仓均价不变。返回按 code 排序。
+    """
+    agg: Dict[str, Position] = {}
+    for tr in trades:
+        pos = agg.get(tr.stock_code)
+        if pos is None:
+            pos = Position(tr.stock_code)
+            agg[tr.stock_code] = pos
+        pos.apply_trade(TradeEvent(
+            strategy_id=tr.strategy_id,
+            portfolio_id=tr.portfolio_strategy_id,
+            stock_code=tr.stock_code,
+            trade_type=TradeType(tr.trade_type.upper()),
+            price=Decimal(str(tr.price)),
+            quantity=tr.quantity,
+            amount=Decimal(str(tr.amount)),
+            commission=Decimal(str(tr.commission)),
+            stamp_duty=Decimal(str(tr.stamp_duty)),
+            trade_time=tr.trade_time,
+        ))
+    return [
+        {
+            "stock_code": code,
+            "quantity": pos.quantity,
+            "avg_cost": float(pos.avg_cost),
+            "market_value": float(pos.market_value),
+        }
+        for code, pos in sorted(agg.items())
+        if pos.quantity != 0
+    ]
+
+
+def _engine_virtual_positions(engine: LiveEngine) -> List[dict]:
+    """运行中：聚合引擎各组合策略虚拟持仓（按 code 汇总净仓，多组合加权均价）。
+
+    只读引擎内存态，不修改 Position 对象；含当日已成交未落库的变动（更实时）。
+    """
+    agg: Dict[str, dict] = {}
+    for port in engine.portfolios:
+        for ctx in port.strategies:
+            for code, pos in ctx.positions.items():
+                if pos.quantity == 0:
+                    continue
+                row = agg.get(code)
+                if row is None:
+                    agg[code] = {"quantity": pos.quantity, "avg_cost": pos.avg_cost}
+                else:
+                    total = row["quantity"] + pos.quantity
+                    row["avg_cost"] = (
+                        row["avg_cost"] * row["quantity"] + pos.avg_cost * pos.quantity
+                    ) / total
+                    row["quantity"] = total
+    return [
+        {
+            "stock_code": code,
+            "quantity": r["quantity"],
+            "avg_cost": float(r["avg_cost"]),
+            "market_value": float(r["avg_cost"] * r["quantity"]),
+        }
+        for code, r in sorted(agg.items())
+    ]
+
+
+@router.get("/sessions/{session_id}/orders")
+def session_orders(session_id: int, status: Optional[str] = None, db: Session = Depends(get_db)):
+    """B4b：委托历史。可选 ?status= 过滤（submitted/filled/partial/rejected/canceled）。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return {"code": 404, "message": "资源不存在"}
+    q = db.query(LiveOrder).filter(LiveOrder.live_session_id == session_id)
+    if status:
+        q = q.filter(LiveOrder.status == status)
+    rows = q.order_by(LiveOrder.created_at.desc(), LiveOrder.id.desc()).all()
+    return {"code": 0, "data": [_serialize_order(o) for o in rows]}
+
+
+@router.get("/sessions/{session_id}/trades")
+def session_trades(session_id: int, db: Session = Depends(get_db)):
+    """B4b：成交历史，按 trade_time 倒序。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return {"code": 404, "message": "资源不存在"}
+    rows = (
+        db.query(LiveTrade)
+        .filter(LiveTrade.live_session_id == session_id)
+        .order_by(LiveTrade.trade_time.desc(), LiveTrade.id.desc())
+        .all()
+    )
+    return {"code": 0, "data": [_serialize_trade(t) for t in rows]}
+
+
+@router.get("/sessions/{session_id}/positions")
+def session_positions(session_id: int, db: Session = Depends(get_db)):
+    """B4b：虚拟持仓。运行中读引擎内存态（含未落库当日变动）；停止后从 live_trades
+    重放聚合（与 recover 同口径：BUY 加、SELL 减，均价加权）。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return {"code": 404, "message": "资源不存在"}
+    engine = _ENGINES.get(session_id)
+    if engine is not None:
+        positions = _engine_virtual_positions(engine)
+    else:
+        trades = (
+            db.query(LiveTrade)
+            .filter(LiveTrade.live_session_id == session_id)
+            .order_by(LiveTrade.trade_time, LiveTrade.id)
+            .all()
+        )
+        positions = _aggregate_positions_from_trades(trades)
+    return {"code": 0, "data": positions}
 
 
 @router.delete("/sessions/{session_id}")

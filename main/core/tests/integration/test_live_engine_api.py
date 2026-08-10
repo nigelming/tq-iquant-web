@@ -2,7 +2,9 @@
 
 验证 /api/live/sessions/{id}/start 接 LiveEngine（组装 portfolios + dispatcher + bar_poller
 → recover → start），/stop 停引擎，registry 按状态切换。
+B4b：/orders、/trades、/positions 三个历史查询端点。
 """
+from datetime import datetime
 from decimal import Decimal
 
 import httpx
@@ -16,8 +18,9 @@ from core.main import app
 from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
-    PortfolioStrategy, Strategy,
+    PortfolioStrategy, Strategy, LiveOrder, LiveTrade,
 )
+from core.engine.position import Position
 import core.api.live as live_api
 
 
@@ -337,4 +340,154 @@ def test_build_engine_fills_formula_mapping(client, mock_bridge):
     assert engine._formula_count == 200
     # #27：formula_count 按公式配 → 引擎收到 {formula_name: count}（_seed 默认 200）
     assert engine._formula_count_by_name == {"open_formula": 200}
+
+
+# ---- B4b: 历史查询端点（orders / trades / positions）----
+
+def _add_order(db, sid, stock="600000.SH", status="filled", trade_type="BUY",
+               qty=100, price="10.5", signal_name="open_sig", signal_type="OPEN",
+               filled_qty=None):
+    """插入一条 LiveOrder，返回实例（未 commit，由调用方控制）。"""
+    return LiveOrder(
+        live_session_id=sid, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type=trade_type, order_type="LIMIT",
+        price=Decimal(price), quantity=qty,
+        filled_quantity=qty if filled_qty is None else filled_qty,
+        filled_price=Decimal(price) if filled_qty is None else None,
+        status=status, signal_name=signal_name, signal_type=signal_type,
+        bar_time=datetime(2026, 8, 5, 10, 30),
+    )
+
+
+def _add_trade(db, sid, stock="600000.SH", trade_type="BUY", qty=100, price="10.5",
+               trade_time=None, order=None):
+    """插入一条 LiveTrade，返回实例（未 commit）。"""
+    p = Decimal(price)
+    return LiveTrade(
+        live_session_id=sid,
+        live_order_id=order.id if order else None,
+        portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type=trade_type,
+        price=p, quantity=qty, amount=p * qty,
+        commission=Decimal("0.50"), stamp_duty=Decimal("0"),
+        trade_time=trade_time or datetime(2026, 8, 5, 10, 31),
+    )
+
+
+def test_query_orders_history(client, mock_bridge):
+    """GET /sessions/{id}/orders → 返回全部委托；?status= 过滤。"""
+    c, Session = client
+    sid = _create_session(c)
+    db = Session()
+    db.add_all([
+        _add_order(db, sid, status="filled"),
+        _add_order(db, sid, status="submitted", trade_type="SELL", qty=200),
+    ])
+    db.commit()
+    db.close()
+
+    resp = c.get("/api/live/sessions/%d/orders" % sid)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert len(body["data"]) == 2
+    assert {o["status"] for o in body["data"]} == {"filled", "submitted"}
+    # 同 created_at 时按 id 倒序 → 新单(submitted)在前
+    assert body["data"][0]["status"] == "submitted"
+    assert body["data"][1]["status"] == "filled"
+
+    resp2 = c.get("/api/live/sessions/%d/orders?status=submitted" % sid)
+    rows = resp2.json()["data"]
+    assert len(rows) == 1
+    assert rows[0]["trade_type"] == "SELL"
+
+    # 会话不存在 → body code 404
+    resp3 = c.get("/api/live/sessions/9999/orders")
+    assert resp3.json()["code"] == 404
+
+
+def test_query_orders_returns_empty_list_when_none(client, mock_bridge):
+    """无任何委托 → data 为空列表（非 null）。"""
+    c, Session = client
+    sid = _create_session(c)
+    resp = c.get("/api/live/sessions/%d/orders" % sid)
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"] == []
+
+
+def test_query_trades_history(client, mock_bridge):
+    """GET /sessions/{id}/trades → 成交明细按 trade_time 倒序。"""
+    c, Session = client
+    sid = _create_session(c)
+    db = Session()
+    lo = _add_order(db, sid)
+    db.add(lo)
+    db.flush()
+    db.add_all([
+        _add_trade(db, sid, order=lo, trade_time=datetime(2026, 8, 5, 10, 31)),
+        _add_trade(db, sid, trade_type="SELL", qty=100, price="11.0",
+                   trade_time=datetime(2026, 8, 5, 10, 35)),
+    ])
+    db.commit()
+    db.close()
+
+    resp = c.get("/api/live/sessions/%d/trades" % sid)
+    body = resp.json()
+    assert body["code"] == 0
+    assert len(body["data"]) == 2
+    # 倒序：SELL(10:35) 在前
+    assert body["data"][0]["trade_type"] == "SELL"
+    assert body["data"][1]["trade_type"] == "BUY"
+    assert body["data"][1]["price"] == 10.5
+    assert body["data"][1]["amount"] == 1050.0
+
+
+def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge):
+    """未运行 → /positions 从 live_trades 重放聚合（BUY 加、SELL 减，均价加权）。
+
+    600@10 BUY + 200@12 BUY + 100@11 SELL → 净 700 股，均价 (600*10+200*12)/800=10.5。
+    """
+    c, Session = client
+    sid = _create_session(c)
+    db = Session()
+    db.add_all([
+        _add_trade(db, sid, qty=600, price="10"),
+        _add_trade(db, sid, qty=200, price="12"),
+        _add_trade(db, sid, trade_type="SELL", qty=100, price="11"),
+    ])
+    db.commit()
+    db.close()
+
+    resp = c.get("/api/live/sessions/%d/positions" % sid)
+    body = resp.json()
+    assert body["code"] == 0
+    row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
+    assert row["quantity"] == 700
+    assert row["avg_cost"] == 10.5
+    assert row["market_value"] == pytest.approx(700 * 10.5)
+
+
+def test_query_positions_uses_engine_when_running(client, mock_bridge):
+    """运行中 → /positions 读引擎内存态虚拟持仓（含未落库的当日变动）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    try:
+        engine = live_api._ENGINES[sid]
+        # 直接往引擎内存态塞一个持仓（模拟当日已成交未落库/或恢复态）
+        pos = Position("600000.SH")
+        pos.buy(600, Decimal("10.5"))
+        engine.portfolios[0].strategies[0].positions["600000.SH"] = pos
+
+        resp = c.get("/api/live/sessions/%d/positions" % sid)
+        body = resp.json()
+        assert body["code"] == 0
+        row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
+        assert row["quantity"] == 600
+        assert row["avg_cost"] == 10.5
+    finally:
+        c.post("/api/live/sessions/%d/stop" % sid)
 
