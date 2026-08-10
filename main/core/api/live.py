@@ -57,6 +57,11 @@ def _resolve_stock_codes(db: Session, portfolio_strategy_id: int) -> list:
 @router.get("/sessions")
 def list_sessions(db: Session = Depends(get_db)):
     sessions = db.query(LiveSession).all()
+    # 一次取全部分组关系,避免 N+1(单用户规模可忽略,但分组写更干净)
+    links = db.query(LiveSessionPortfolio).all()
+    by_session: Dict[int, list] = {}
+    for l in links:
+        by_session.setdefault(l.session_id, []).append(l.portfolio_strategy_id)
     return {
         "code": 0,
         "data": [
@@ -67,6 +72,7 @@ def list_sessions(db: Session = Depends(get_db)):
                 "status": s.status,
                 "started_at": s.started_at,
                 "stopped_at": s.stopped_at,
+                "portfolio_ids": sorted(by_session.get(s.id, [])),
             }
             for s in sessions
         ],

@@ -126,6 +126,49 @@ def _create_session(c, name="live-test", portfolio_ids=(1,)):
     return body["data"]["id"]
 
 
+def test_create_session_with_multiple_portfolios(client, mock_bridge):
+    """POST /sessions 带 portfolio_ids → LiveSessionPortfolio 落多行;list_sessions 返回 portfolio_ids。"""
+    c, Session = client
+    db = Session()
+    ps1 = _seed(db)
+    # 再建一个组合,拿第二个 portfolio id
+    pool2 = StockPool(code="TEST2", name="test_pool2")
+    db.add(pool2)
+    db.flush()
+    db.add(StockPoolStock(pool_id=pool2.id, stock_code="000001.SZ"))
+    formula2 = Formula(name="open_formula2", content="REF(CLOSE,1)")
+    db.add(formula2)
+    db.flush()
+    ps2 = PortfolioStrategy(
+        name="test_portfolio2", stock_pool_id=pool2.id,
+        initial_capital=Decimal("200000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(ps2)
+    db.commit()
+    ps2_id = ps2.id
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps1, ps2_id))
+
+    # list_sessions 返回两个组合 id
+    resp = c.get("/api/live/sessions")
+    row = next(s for s in resp.json()["data"] if s["id"] == sid)
+    assert sorted(row["portfolio_ids"]) == sorted([ps1, ps2_id])
+
+    # get_session 同样返回
+    detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert {p["portfolio_id"] for p in detail["portfolios"]} == {ps1, ps2_id}
+
+    # 引擎组装:两个组合都进了 portfolios
+    c.post("/api/live/sessions/%d/start" % sid)
+    try:
+        engine = live_api._ENGINES[sid]
+        assert len(engine.portfolios) == 2
+    finally:
+        c.post("/api/live/sessions/%d/stop" % sid)
+
+
 def test_start_session_runs_engine(client, mock_bridge):
     """POST /start → session status=running，registry 有引擎实例。"""
     c, Session = client
