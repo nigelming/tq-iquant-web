@@ -77,20 +77,61 @@ class SimulatedT1Checker(T1Checker):
 
 
 class LiveT1Checker(T1Checker):
-    """实盘 T+1 检查（首期简化：持仓全量可卖）。
+    """实盘 T+1 检查：以桥 /positions 的 available（m_nCanUseVolume）为 SELL 上限。
 
-    真实 T+1 由券商端风控挡，Core 侧不重复判断（避免桥 /positions 查询往返拖慢下单）。
-    后续切片可接桥 query_positions 查 m_dAvailable 实际可用股数。
+    LiveEngine 每 bar 刷一次 _available_map（一次 /positions HTTP），
+    get_available_shares 取 min(本策略持有量, 桥可用)——Core 账面虚高时不再超发 SELL。
+    桥无该仓/未取到 → 全量放行（券商端 T+1 兜底，G6 处理拒单；避免误伤正常卖出）。
     """
 
+    def __init__(self):
+        self._available_map = {}
+
+    def set_available_map(self, available_map: dict) -> None:
+        self._available_map = available_map or {}
+
     def get_available_shares(self, position: Position, query_date: date) -> int:
-        return position.quantity
+        avail = self._available_map.get(position.stock_code)
+        if avail is None:
+            return position.quantity
+        return min(position.quantity, avail)
 
 
 class ExecutionEngine:
     def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker):
         self._dispatcher = dispatcher
         self._t1_checker = t1_checker
+
+    def cap_quantity(
+        self,
+        order: OrderEvent,
+        account: Account,
+        position: Optional[Position],
+    ) -> Optional[int]:
+        """审批/T+1 量上限：返回最终下单量（None=不通过不下单）。
+
+        BUY：account.approve_order（策略持仓上限 + 组合现金）；
+        SELL：t1_checker 可用股数（回测 Simulated 按日分桶 / 实盘桥 available）。
+        execute 与 LiveEngine._handle_bar（切片5 落 submitted 前）共用，保证 DB
+        下单量与实发一致。
+        """
+        if order.trade_type.value == "BUY":
+            approved, qty = account.approve_order(
+                order.quantity, order.price or Decimal("0"),
+                position.market_value if position else Decimal("0"),
+            )
+            if not approved or qty < 100:
+                return None
+            return qty
+        if position is None or order.bar_time is None:
+            return None
+        available = self._t1_checker.get_available_shares(
+            position, order.bar_time.date()
+        )
+        qty = min(order.quantity, available)
+        if qty < 100:
+            return None
+        return qty
 
     def execute(
         self,
@@ -106,24 +147,10 @@ class ExecutionEngine:
         确认 filled 后才由 LiveEngine._apply_filled_trade 更新（submitted 阶段不 apply，
         避免受理即成交的近似；I4 崩溃窗口下 DB 有 submitted 记录即可）。
         """
-        if order.trade_type.value == "BUY":
-            approved, qty = account.approve_order(
-                order.quantity, order.price or Decimal("0"),
-                position.market_value if position else Decimal("0"),
-            )
-            if not approved or qty < 100:
-                return None
-            order.quantity = qty
-        else:
-            if position is None or order.bar_time is None:
-                return None
-            available = self._t1_checker.get_available_shares(
-                position, order.bar_time.date()
-            )
-            qty = min(order.quantity, available)
-            if qty < 100:
-                return None
-            order.quantity = qty
+        capped = self.cap_quantity(order, account, position)
+        if capped is None:
+            return None
+        order.quantity = capped
 
         trade = self._dispatcher.place_order(order)
         if not trade:

@@ -140,6 +140,43 @@ def test_start_session_runs_engine(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
+def test_start_second_session_rejected_while_one_running(client, mock_bridge):
+    """B6：全局限 1 个实盘 session——已有 session 运行，新 session start 被拒。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid1 = _create_session(c, portfolio_ids=(ps_id,))
+    sid2 = _create_session(c, portfolio_ids=(ps_id,))
+
+    assert c.post("/api/live/sessions/%d/start" % sid1).json()["data"]["status"] == "running"
+    assert sid1 in live_api._ENGINES
+
+    resp = c.post("/api/live/sessions/%d/start" % sid2)
+    assert resp.status_code == 200  # 统一响应格式，业务错误在 body.code
+    assert resp.json()["code"] != 0
+    assert sid2 not in live_api._ENGINES
+
+    c.post("/api/live/sessions/%d/stop" % sid1)
+
+
+def test_restart_same_running_session_is_idempotent(client, mock_bridge):
+    """B6：同一 session 重复 start → 幂等返回 running（非拒绝）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    resp = c.post("/api/live/sessions/%d/start" % sid)
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "running"
+
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+
 def test_stop_session_stops_engine(client, mock_bridge):
     """/stop → status=stopped，registry 清空引擎。"""
     c, Session = client

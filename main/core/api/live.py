@@ -190,6 +190,11 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         return {"code": 404, "message": "资源不存在"}
     if session_id in _ENGINES:
         return {"code": 0, "data": {"id": session.id, "status": "running"}}
+    if _ENGINES:
+        # B6：全局限 1 个实盘 session（防多引擎争抢桥单线程 + 持仓归属混乱，Q1 未解）。
+        # 任一 session 在跑即拒绝新 start（同 session 重复 start 已被上方幂等拦截）。
+        running_id = next(iter(_ENGINES))
+        return {"code": 409, "message": "已有实盘会话 %d 运行中，全局限 1 个" % running_id}
 
     engine = _build_engine(session_id, db)
     # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金

@@ -99,7 +99,9 @@ class LiveEngine:
         self._db_session_factory = db_session_factory
         self._poll_interval = poll_interval
         # 实盘执行引擎：复用回测 ExecutionEngine，注入桥 dispatcher + 实盘 T+1 检查
-        self._engine = ExecutionEngine(dispatcher, LiveT1Checker())
+        # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
+        self._t1_checker = LiveT1Checker()
+        self._engine = ExecutionEngine(dispatcher, self._t1_checker)
 
         # 公式注入（0010）：tq_formula 封装内存注入链路；formula_by_strategy 预加载
         # {strategy_id: formula_name}，避免每 bar 查库；formula_count 为注入历史根数
@@ -128,6 +130,9 @@ class LiveEngine:
         # G7（0011 §5.11）：最近一次 /deals 成交回报回填时点（None=尚无回填），
         # 供 session API 桥状态并入。
         self._last_backfill_time: Optional[datetime] = None
+        # F5：最近处理 bar 的强引用（多组合共享同一 bar 对象 → 每 bar 只刷一次桥可用
+        # 持仓；强引用防对象 id 复用导致的漏刷）。None=尚未处理任何 bar。
+        self._available_bar: Optional["BarEvent"] = None
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -333,6 +338,11 @@ class LiveEngine:
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
+        # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
+        # SELL 减仓上限用 m_nCanUseVolume（T+1 可用），供 cap_quantity 取数。
+        if self._available_bar is not bar:
+            self._available_bar = bar
+            self._refresh_available_map()
         self._fill_signal_cache(portfolio, bar, bars_by_code=bars_by_code)
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
         orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
@@ -349,6 +359,12 @@ class LiveEngine:
                 if pos is None and order.trade_type == TradeType.BUY:
                     pos = Position(order.stock_code)
                     ctx.positions[order.stock_code] = pos
+                # F5/BUY 量上限：先定最终下单量（账户资金审批 / 桥 T+1 可用）再落
+                # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
+                capped = self._engine.cap_quantity(order, portfolio.account, pos)
+                if capped is None:
+                    continue
+                order.quantity = capped
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
                 self._pending_orders[live_order.id] = live_order
@@ -426,6 +442,27 @@ class LiveEngine:
             if ctx.strategy_id == strategy_id:
                 return ctx
         return None
+
+    # ---------------- F5：桥可用持仓（SELL 减仓上限）----------------
+    def _refresh_available_map(self) -> None:
+        """F5：拉桥 /positions，按 code(instrument.exchange) 聚合 m_nCanUseVolume。
+
+        桥无该仓/拉取失败（离线）→ 空表 → get_available_shares 全量放行（券商端
+        T+1 兜底，避免误伤正常卖出；G6 处理券商拒单）。
+        """
+        try:
+            rows = self._dispatcher.query_positions()
+        except BridgeUnavailableError:
+            self._t1_checker.set_available_map({})
+            return
+        m: Dict[str, int] = {}
+        for r in rows or []:
+            inst = r.get("instrument")
+            exch = r.get("exchange")
+            avail = r.get("available")
+            if inst and exch and avail is not None:
+                m["%s.%s" % (inst, exch)] = int(avail)
+        self._t1_checker.set_available_map(m)
 
     # ---------------- 公式信号注入（0010）----------------
     def _fill_signal_cache(

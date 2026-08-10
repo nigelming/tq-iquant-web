@@ -64,6 +64,8 @@ class _Recorder:
             return httpx.Response(200, json={"ok": True})
         if path == "/quote":
             return httpx.Response(200, json={"ok": True, "data": {}})
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": []})
         return httpx.Response(404, json={"ok": False, "error": "unknown"})
 
 
@@ -240,13 +242,110 @@ def test_recover_rebuilds_positions_from_trades():
 
 
 # ---------------- LiveT1Checker ----------------
-def test_live_t1_checker_returns_full_quantity():
-    """实盘首期：持仓全量可卖（真实 T+1 交券商端）。"""
+def test_live_t1_checker_full_quantity_without_bridge_map():
+    """F5：桥可用表未取到（空表）→ 全量放行（券商端 T+1 兜底，不误伤正常卖出）。"""
     pos = Position("600000.SH")
     pos.buy(100, Decimal("9.0"), datetime(2026, 8, 5, 10, 0))
     checker = LiveT1Checker()
-    # 即便当日买入，实盘首期也返回全量可卖
     assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 100
+
+
+def test_live_t1_checker_caps_by_bridge_available():
+    """F5：桥 available=200（昨仓 200、今买 400 不可卖）→ SELL 上限 min(600,200)=200。"""
+    pos = Position("600000.SH")
+    pos.buy(600, Decimal("9.0"), datetime(2026, 8, 5, 10, 0))
+    checker = LiveT1Checker()
+    checker.set_available_map({"600000.SH": 200})
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 200
+
+
+def test_live_t1_checker_min_when_bridge_available_larger():
+    """F5：桥 available > 持有量 → 以持有量为准（min）。"""
+    pos = Position("600000.SH")
+    pos.buy(100, Decimal("9.0"), datetime(2026, 8, 5, 10, 0))
+    checker = LiveT1Checker()
+    checker.set_available_map({"600000.SH": 500})
+    assert checker.get_available_shares(pos, datetime(2026, 8, 5).date()) == 100
+
+
+def test_handle_bar_sell_capped_by_bridge_available():
+    """F5：CLOSE 信号 SELL 600，桥 /positions available=200 → LiveOrder.quantity==200。
+
+    先 cap_quantity 定最终量再落 submitted——DB 下单量与实发一致，回填不误判 partial。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": -1},
+    ]
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    # 虚拟持仓 600 股（昨仓 200 + 今买 400，今买不可卖 → 桥 available=200）
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(600, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": 200, "volume": 600,
+                 "yesterday_volume": 200, "on_road_volume": 400},
+            ]})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "close_sig", "value": -1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert orders[0].status == "submitted"
+    assert orders[0].quantity == 200  # 先 cap 再落库：DB 量与实发一致
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert placed and json.loads(placed[0].content)["volume"] == 200
+    db.close()
+
+
+def test_handle_bar_refreshes_available_once_per_bar():
+    """F5：多组合共享同一 bar 对象 → 每 bar 只刷一次 /positions（强引用去重）。"""
+    factory, _ = _db_factory()
+    port1, _ = _portfolio_single(strategy_id=1)
+    port2, _ = _portfolio_single(strategy_id=2)
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port1, port2], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port1, bar)
+    engine._handle_bar(port2, bar)
+
+    pos_reqs = [r for r in rec.requests if r.url.path == "/positions"]
+    assert len(pos_reqs) == 1
 
 
 # ---------------- 桥离线暂停 ----------------
