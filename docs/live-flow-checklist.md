@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf),对应行已标 ✅。仍待办:D3/D4/H4 对账与熔断计数(读回/持久化)。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/本提交),对应行已标 ✅。仍待办:D3 对账(读回已并),F6/G5 决策。
 
 ---
 
@@ -81,7 +81,7 @@
 | D1 | 重放 live_trades 重建持仓 | ✅ | 📖 | `live_engine.py:367`(→ design §3.1) | — |
 | D2 | 虚拟现金以成本计 | ✅ | 📖 | AGENTS §93,与在线时 `Account.apply_trade` 一致(→ design §3.2) | — |
 | D3 | **对账(虚拟 vs 桥 /positions)** | ✅字段已验/❌逻辑待实现 | 🔬+✅ | recover 后查桥 `/positions` 按 code 聚合比对。**2026-08-10 真机已验字段**:POSITION 对象 `m_strInstrumentID=600000`+`m_strExchangeID=SH`(拼接 `600000.SH` 对账可行)、`m_nVolume`(总持仓)、`m_nCanUseVolume`(T+1 可用)、`m_nYesterdayVolume`/`m_nCoveredVolume`/`m_nOnRoadVolume`(昨仓/今仓/在途)。**桥 query_positions 已改**:instrument+exchange+volume+available(=m_nCanUseVolume)+yesterday/on_road/market_value。不一致如何处理(告警/以真实为准修正)仍待定 → 归到切片5 对账实现 | ✅ 字段已验(拼接后缀对账可行);❌ 对账逻辑待实现,桥字段已改 |
-| D4 | 熔断计数读回 | ❌ | ✅ | `LiveSessionPortfolio.circuit_breaker_count` 字段存在但引擎未读写。重启后累计次数丢失,recover 时读回(→ design §8.3) | （待确认） |
+| D4 | 熔断计数读回 | ✅已实现 | ✅ | `LiveSessionPortfolio.circuit_breaker_count` 字段存在但引擎未读写。重启后累计次数丢失,recover 时读回(→ design §8.3) | ✅ 已实现(recover 读回):`recover()` 读 `circuit_breaker_count` → `risk_manager.consecutive_drawdown_triggers`;达 3 次 → `manual_recovery=True`+`circuit_breaker_active=True`(停新开仓等待人工);<3 次单日熔断当天已恢复不补挂(单一计数模型)。预置 `_breaker_count_written` 避免首 bar 重复写 |
 | D5 | recover 时机 | ✅ | 📖 | start 时 `engine.recover(db)`,在 `engine.start()` 之前 | — |
 
 ---
@@ -147,7 +147,7 @@
 | H1 | `POST /sessions/{id}/stop` | ✅ | 📖 | 取消循环任务,status=stopped(→ design §1.3) | — |
 | H2 | 休市时桥是否在跑 | ✅ | 🧠 | **(2026-08-07 定:不通知)** 桥无 `/shutdown` 端点(只有 ping/order/positions/account/orders/deals/quote),是 iQuant 客户端内策略,Core 无法让它停。Core stop session 后桥继续监听但无请求 = 空转无害;下次 start session 桥还在,省重连。不改桥 | ✅ 不通知,桥空转无害 |
 | H3 | 持仓快照留存 | ✅ | 🧠 | **(2026-08-07 定:不存快照,只靠 live_trades 重放)** 实盘无快照表(只有回测 `BacktestDailySnapshot`);`recover`(live_engine.py:367)重放 `live_trades` 重建持仓+现金,逻辑完整,成本 O(交易笔数),单用户毫秒级可忽略。**为何不存**:(1)快照不增加对账能力——D3 拿重放结果即可对账,快照只是"某一刻的",无额外价值;(2)快照不解决非交易状态丢失——熔断计数/peak/prev_close 那是 D4/H4 的活,不是持仓;(3)快照+live_trades 两套源,写快照后又成交没更新 → 脏数据风险;(4)只省可忽略的重放成本,却引入双源维护负担。**单一事实源 = live_trades**,不引入快照表 | ✅ 不存快照,只靠 live_trades 重放;非交易状态走 D4/H4 |
-| H4 | 熔断计数持久化 | ❌ | ✅ | 触发熔断时写 `circuit_breaker_count`,目前不写(→ design §8.3) | （待确认） |
+| H4 | 熔断计数持久化 | ✅已实现 | ✅ | 触发熔断时写 `circuit_breaker_count`,目前不写(→ design §8.3) | ✅ 已实现:`_handle_bar` 每 bar update_peak 后调 `_persist_breaker_count`——max_drawdown 触发(计数+1)才落库(未变跳过,避免每 bar 写);达 3 次 status 转 `circuit_broken` |
 | H5 | 次日开盘自动恢复 | ✅ | 🧠 | **(2026-08-07 定:手动)** 停盘后次日不自动 start,用户手动点启动。与 B6 限 1 个 session 一致(避免自动恢复撞上用户已开的新 session);`recover` 重放 live_trades 已能重建持仓,手动 start 即接上。不引入定时任务,运维可控 | ✅ 手动启动 |
 
 ---
@@ -191,8 +191,6 @@
 
 | # | 细节 | 优先级 | 依赖 |
 |---|---|---|---|
-| D4 | 熔断计数读回 | 中 | — |
-| H4 | 熔断计数持久化 | 中 | — |
 | B5 | SSE 成交/信号推送 | 低 | — |
 
 ### 🧠 设计决策(需人定,不阻塞读码)
@@ -217,6 +215,6 @@ F6、G5
 3. **✅ 已完成:切片5 订单同步 G1/G2/G6 + G7 + F10 + I4**(eb4bc40)——订单状态机、/deals 回填(按 `m_strOrderRef`)、桥状态并入 session、submitted 拆分、recover 挂回未完结单。
 4. **✅ 已完成:F5 + B6**(3c826e8)——`LiveT1Checker` 接桥 `m_nCanUseVolume`(每 bar 刷一次 /positions,SELL 封顶);全局限 1 个实盘 session(`_ENGINES` 非空即拒)。
 5. **✅ 已完成:#27 formula_count 字段 + #28 C4 三维去重**(3b74cbf)——公式级注入根数(字段+迁移+前端公式页);df_cache 拉取去重 + raw_cache 计算去重(省重复 TQ 计算)。
-6. **D4/H4 熔断计数读回/持久化** — 重启后累计次数丢失待补(中)。
+6. **✅ 已完成:D4/H4 熔断计数读回/持久化**——max_drawdown 触发计数落库(`circuit_breaker_count`,未变不写),recover 读回;达 3 次转手动恢复(停新开仓等待人工)。
 7. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
 8. **🧠 决策项** — F6/G5 随时可在本表逐点过,不阻塞代码。
