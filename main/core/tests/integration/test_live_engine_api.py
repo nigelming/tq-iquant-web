@@ -240,6 +240,78 @@ def test_get_session_includes_bridge_status(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
+def test_sse_line_formats_event():
+    """B5：_sse_line 把 {type, **payload} 格式化为 SSE 行（data 去掉 type 字段）。"""
+    line = live_api._sse_line({"type": "signal", "portfolio_id": 1, "strategy_id": 1})
+    assert line == "event: signal\ndata: {\"portfolio_id\": 1, \"strategy_id\": 1}\n\n"
+    ping = live_api._sse_line({"type": "ping", "time": "2026-08-05T14:30:00"})
+    assert ping.startswith("event: ping\ndata: ")
+    assert "\"time\"" in ping
+
+
+def test_heartbeat_stream_yields_ping_when_idle():
+    """B5：未运行 session 的心跳流（_heartbeat_stream）发 event: ping 保活。"""
+    import asyncio
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def drive():
+        gen = live_api._heartbeat_stream(_FakeRequest())
+        it = gen.__aiter__()
+        first = await it.__anext__()
+        assert first.startswith("event: ping\ndata: ")
+        assert "\"time\"" in first
+        await gen.aclose()
+
+    asyncio.run(drive())
+
+
+def test_stream_endpoint_pings_when_not_running(client, mock_bridge, monkeypatch):
+    """B5：未运行 session → /stream 走 _heartbeat_stream，返回 SSE 心跳。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+
+    async def fake_heartbeat(request):
+        yield "event: ping\ndata: {\"time\": \"x\"}\n\n"
+    monkeypatch.setattr(live_api, "_heartbeat_stream", fake_heartbeat)
+
+    resp = c.get("/api/live/sessions/%d/stream" % sid)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert "event: ping" in resp.text
+
+
+def test_stream_endpoint_relays_engine_events_when_running(client, mock_bridge):
+    """B5：运行中 session → /stream 转发引擎 stream_events（引擎事件 → SSE 行）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    engine = live_api._ENGINES[sid]
+
+    async def fake_stream():
+        yield {"type": "signal", "portfolio_id": 1, "strategy_id": 1, "signal_name": "open_sig"}
+        yield {"type": "ping", "time": "2026-08-05T14:30:00"}
+    engine.stream_events = fake_stream  # 实例属性遮蔽方法，端点消费该有限流
+
+    resp = c.get("/api/live/sessions/%d/stream" % sid)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert "event: signal" in resp.text
+    assert '"portfolio_id": 1' in resp.text
+    assert '"signal_name": "open_sig"' in resp.text
+    assert "event: ping" in resp.text
+
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+
 def test_build_engine_fills_formula_mapping(client, mock_bridge):
     """_build_engine 后 LiveEngine 持有 _formula_by_strategy（strategy_id → formula_name）。"""
     c, Session = client

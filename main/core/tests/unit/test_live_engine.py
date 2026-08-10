@@ -4,6 +4,7 @@
 以及 Core 重启后从 live_trades 恢复虚拟持仓/虚拟现金。引擎核心（Portfolio/ExecutionEngine）
 复用回测逻辑，仅注入 HttpBridgeDispatcher + LiveT1Checker。
 """
+import asyncio
 import json
 from datetime import datetime
 from decimal import Decimal
@@ -1902,4 +1903,254 @@ def test_reconcile_positions_offline_skips():
     engine, _, _ = _reconcile_engine(factory, 1000, fail_paths={"/positions"})
 
     assert engine._reconcile_mismatches == []
+
+
+# ---------------- B5 SSE 事件流（signal/order/trade/position/risk 推送）----------------
+def _ss_engine(factory, port=None):
+    """B5 辅助：单组合引擎 + 独立订阅队列，返回 (engine, q)。"""
+    if port is None:
+        port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    return engine, q
+
+
+def test_emit_pushes_event_to_all_subscribers():
+    """B5：_emit 向所有订阅队列广播 {type, **payload}；队列满丢弃不崩。"""
+    factory, _ = _db_factory()
+    engine, _ = _ss_engine(factory)
+    q1 = asyncio.Queue()
+    q2 = asyncio.Queue(maxsize=1)
+    q2.put_nowait("full")
+    engine._stream_subscribers.extend([q1, q2])
+
+    engine._emit("signal", {"portfolio_id": 1, "strategy_id": 1})
+
+    assert q1.get_nowait() == {"type": "signal", "portfolio_id": 1, "strategy_id": 1}
+    assert q2.get_nowait() == "full"  # 积压队列丢新事件，原事件保留，不抛异常
+
+
+def test_handle_bar_emits_signal_and_order_submitted():
+    """B5：OPEN 信号 → 先 signal 后 order(submitted) 事件；未回填不 emit trade/position。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    events = [q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "signal"
+    assert events[0]["portfolio_id"] == 1
+    assert events[0]["strategy_id"] == 1
+    assert events[0]["stock_code"] == stock
+    assert events[0]["signal_name"] == "open_sig"
+    assert events[0]["signal_type"] == "OPEN"
+    assert events[1]["type"] == "order"
+    assert events[1]["status"] == "submitted"
+    assert events[1]["portfolio_id"] == 1
+    assert events[1]["order_id"] is not None
+    assert events[1]["stock_code"] == stock
+    assert events[1]["trade_type"] == "buy"
+    assert events[1]["quantity"] > 0
+    assert q.empty()  # 未成交回报前不 emit trade/position
+
+
+def test_handle_bar_bridge_reject_emits_order_rejected():
+    """B5：桥拒单（/order 连接失败）→ order(submitted) 后跟 order(rejected)，带 error_message。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder(fail_paths={"/order"})
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    events = [q.get_nowait(), q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "signal"
+    assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
+    assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
+    assert events[2]["order_id"] == events[1]["order_id"]
+    assert "error_message" in events[2]
+    assert q.empty()
+
+
+def test_handle_bar_emits_risk_on_max_drawdown_trigger():
+    """B5：max_drawdown 熔断触发（计数递增）→ risk(max_drawdown) 事件；计数未变不重发。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 下跌 bar（close 5）亏损 44% < 50% 止损线、无止盈 → 不产生风控 SELL，聚焦熔断事件
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("1.0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    # bar1: close=9 → 总市值 9000 建峰，无熔断无信号
+    engine._handle_bar(port, _bar(stock, "9", datetime(2026, 8, 5, 10, 0)))
+    assert q.empty()
+
+    # bar2: close=5 → 回撤 44% > 20% → 熔断，计数+1 → risk 事件
+    engine._handle_bar(port, _bar(stock, "5", datetime(2026, 8, 5, 10, 1)))
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "max_drawdown"
+    assert ev["triggered"] is True
+    assert ev["count"] == 1
+    assert ev["portfolio_id"] == 1
+    assert q.empty()  # 计数未再变不重发
+
+
+def test_backfill_emits_order_filled_trade_position():
+    """B5：成交回报回填 filled → order(filled) + trade + position 事件（真实价/量）。"""
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref1",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, q = _ss_engine(factory, port)
+
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    deals = [{
+        "order_ref": "ref1", "volume": 1000, "amount": 9000,
+        "commission": 0, "trade_date": "20260805", "trade_time": "100100",
+    }]
+    engine._backfill_order(db, lo, deals)
+    db.commit()
+    db.close()
+
+    events = [q.get_nowait(), q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "order" and events[0]["status"] == "filled"
+    assert events[0]["order_id"] == lo_id
+    assert events[0]["filled_quantity"] == 1000
+    assert events[0]["filled_price"] == 9.0
+    assert events[1]["type"] == "trade"
+    assert events[1]["portfolio_id"] == 1
+    assert events[1]["trade_id"] is not None
+    assert events[1]["stock_code"] == "600000.SH"
+    assert events[1]["trade_type"] == "buy"
+    assert events[1]["quantity"] == 1000
+    assert events[1]["price"] == 9.0
+    assert events[1]["amount"] == 9000
+    assert events[2]["type"] == "position"
+    assert events[2]["portfolio_id"] == 1
+    assert events[2]["stock_code"] == "600000.SH"
+    assert events[2]["quantity"] == 1000
+    assert events[2]["avg_cost"] == 9.0
+    assert q.empty()
+
+
+def test_maybe_daily_close_emits_risk_on_daily_loss(monkeypatch):
+    """B5：日内亏损触发 → risk(daily_loss) 事件，当日暂停新开仓。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.account.cash = Decimal("90000")
+    port.risk_manager.prev_close_value = Decimal("100000")  # 昨日收盘基准
+    engine, q = _ss_engine(factory, port)
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 5, 14, 30)
+    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+
+    engine._maybe_daily_close()
+
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "daily_loss"
+    assert ev["triggered"] is True
+    assert ev["portfolio_id"] == 1
+    assert port.risk_manager.daily_pause_active is True
+
+
+def _ss_plain_engine(factory, ping_interval=0.05):
+    """B5 辅助：无预订阅队列的引擎（stream_events 测试用，断言退订精确）。"""
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine._stream_ping_interval = ping_interval
+    return engine
+
+
+def test_stream_events_yields_events_then_ping_when_idle():
+    """B5：stream_events 先 yield 事件，空闲超 ping 间隔 → yield ping 心跳；结束退订。"""
+    factory, _ = _db_factory()
+    engine = _ss_plain_engine(factory)
+    engine._running = True
+
+    async def drive():
+        agen = engine.stream_events()
+        it = agen.__aiter__()
+        # 首轮 __anext__ 让生成器订阅（队列空开始等事件）；让出后 emit 才广播进队列
+        first_task = asyncio.create_task(it.__anext__())
+        await asyncio.sleep(0)
+        engine._emit("signal", {"portfolio_id": 1, "strategy_id": 1})
+        first = await first_task
+        assert first["type"] == "signal"
+        assert first["portfolio_id"] == 1
+        second = await it.__anext__()  # 空闲 0.05s → ping
+        assert second["type"] == "ping"
+        assert "time" in second
+        await agen.aclose()
+        assert engine._stream_subscribers == []  # 退订
+
+    asyncio.run(drive())
+
+
+def test_stream_events_ends_when_engine_not_running():
+    """B5：引擎未运行 → stream_events 无事件即结束并退订（端点侧转 ping-only 保活）。"""
+    factory, _ = _db_factory()
+    engine = _ss_plain_engine(factory)
+
+    async def drive():
+        events = [ev async for ev in engine.stream_events()]
+        assert events == []
+        assert engine._stream_subscribers == []
+
+    asyncio.run(drive())
 

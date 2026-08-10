@@ -14,7 +14,7 @@ import asyncio
 import logging
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Callable, Dict, List, Optional
+from typing import AsyncIterator, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -89,6 +89,7 @@ class LiveEngine:
         db_session_factory: Callable[[], Session],
         poll_interval: float = 30.0,
         deals_poll_interval: float = 5.0,
+        stream_ping_interval: float = 30.0,
         tq_formula: Optional[TQFormula] = None,
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
@@ -161,6 +162,47 @@ class LiveEngine:
         # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
         # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
         self._reconcile_mismatches: List[dict] = []
+        # B5：SSE 事件流——_stream_subscribers 为当前已连接客户端的订阅队列，
+        # _emit 向各队列 put_nowait 广播；stream_events 注册/退订队列。
+        # stream_ping_interval：流空闲无事件时的 ping 心跳间隔（design §5.6.10，30s）。
+        self._stream_ping_interval = stream_ping_interval
+        self._stream_subscribers: List["asyncio.Queue"] = []
+
+    # ---------------- B5 SSE 事件流 ----------------
+    def _emit(self, event_type: str, payload: dict) -> None:
+        """向所有 SSE 订阅队列广播 {type, **payload}（signal/order/trade/position/risk）。
+
+        同步上下文（_handle_bar/_backfill_order 等 bar 线程内）调 put_nowait 即可——
+        队列积压（订阅端消费慢）→ 丢弃该事件（EventSource 断线重连后见最新状态，
+        design §5.6.10：浏览器自动重连，无需重放）。
+        """
+        ev = {"type": event_type, **payload}
+        for q in list(self._stream_subscribers):
+            try:
+                q.put_nowait(ev)
+            except asyncio.QueueFull:
+                pass  # 积压丢弃，不阻塞引擎
+
+    async def stream_events(self) -> AsyncIterator[dict]:
+        """SSE 事件流：订阅引擎事件队列，逐条 yield；空闲超 ping 间隔 yield ping 心跳。
+
+        每个 /stream 连接调用一次（/stream 端点 async for 消费）。连接结束（aclose）
+        → finally 退订。引擎停止（_running=False）→ 队列空则流结束（端点侧转 ping-only）。
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._stream_subscribers.append(q)
+        try:
+            while self._running or not q.empty():
+                try:
+                    ev = await asyncio.wait_for(
+                        q.get(), timeout=self._stream_ping_interval
+                    )
+                except asyncio.TimeoutError:
+                    ev = {"type": "ping", "time": datetime.now().isoformat()}
+                yield ev
+        finally:
+            if q in self._stream_subscribers:
+                self._stream_subscribers.remove(q)
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -278,9 +320,18 @@ class LiveEngine:
                             continue
                         # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
                         total += pos.avg_cost * pos.quantity
+                was_paused = portfolio.risk_manager.daily_pause_active
                 portfolio.risk_manager.update_daily(
                     total, today, portfolio.account.initial_capital
                 )
+                # B5：日内亏损熔断刚触发（daily_pause_active 变 True）→ 推送风控事件
+                if portfolio.risk_manager.daily_pause_active and not was_paused:
+                    self._emit("risk", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "rule": "daily_loss",
+                        "triggered": True,
+                        "message": "日内亏损熔断触发，当日暂停新开仓",
+                    })
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "update_daily error (portfolio %s, date %s)",
@@ -431,6 +482,15 @@ class LiveEngine:
                 ctx = self._find_strategy(portfolio, order.strategy_id)
                 if ctx is None:
                     continue
+                # B5：信号触发推送（在下单前——被 cap/拒单的信号也可见）
+                self._emit("signal", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "strategy_id": order.strategy_id,
+                    "stock_code": order.stock_code,
+                    "signal_name": order.signal_name,
+                    "signal_type": order.signal_type.value if order.signal_type else None,
+                    "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+                })
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
                 pos = ctx.positions.get(order.stock_code)
                 if pos is None and order.trade_type == TradeType.BUY:
@@ -445,6 +505,18 @@ class LiveEngine:
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
                 self._pending_orders[live_order.id] = live_order
+                # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "strategy_id": live_order.strategy_id,
+                    "stock_code": live_order.stock_code,
+                    "trade_type": live_order.trade_type,
+                    "status": "submitted",
+                    "quantity": live_order.quantity,
+                    "price": float(live_order.price) if live_order.price is not None else None,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                })
                 db.commit()
                 try:
                     # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
@@ -455,6 +527,13 @@ class LiveEngine:
                     live_order.error_message = "bridge unavailable"
                     self._bridge_online = False
                     self._pending_orders.pop(live_order.id, None)
+                    self._emit("order", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "order_id": live_order.id,
+                        "status": "rejected",
+                        "stock_code": live_order.stock_code,
+                        "error_message": live_order.error_message,
+                    })
                     db.commit()
                     continue
                 if trade is None:
@@ -462,6 +541,13 @@ class LiveEngine:
                     live_order.status = "rejected"
                     live_order.error_message = "approval failed or bridge rejected"
                     self._pending_orders.pop(live_order.id, None)
+                    self._emit("order", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "order_id": live_order.id,
+                        "status": "rejected",
+                        "stock_code": live_order.stock_code,
+                        "error_message": live_order.error_message,
+                    })
                     db.commit()
                     continue
                 # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
@@ -486,8 +572,18 @@ class LiveEngine:
         （组合未关联本 session）→ 跳过。写库失败不阻断交易，记日志。
         """
         count = portfolio.risk_manager.consecutive_drawdown_triggers
-        if self._breaker_count_written.get(portfolio.portfolio_id) == count:
+        old = self._breaker_count_written.get(portfolio.portfolio_id)
+        if old == count:
             return
+        # B5：计数递增（max_drawdown 熔断刚触发）→ 推送风控事件（首 bar old=None 不推）
+        if old is not None and count > old:
+            self._emit("risk", {
+                "portfolio_id": portfolio.portfolio_id,
+                "rule": "max_drawdown",
+                "triggered": True,
+                "count": count,
+                "message": "最大回撤熔断触发（累计 %d 次）" % count,
+            })
         db = self._db_session_factory()
         try:
             link = (
@@ -951,6 +1047,15 @@ class LiveEngine:
         live_order.filled_price = avg_price
         live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
         self._last_backfill_time = datetime.now()  # G7：记录最近一次回填时点
+        # B5：订单状态推送（filled/partial 都由成交回报回填推进）
+        self._emit("order", {
+            "portfolio_id": live_order.portfolio_strategy_id,
+            "order_id": live_order.id,
+            "status": live_order.status,
+            "stock_code": live_order.stock_code,
+            "filled_quantity": live_order.filled_quantity,
+            "filled_price": float(avg_price),
+        })
 
         # 写/更新 LiveTrade（按 order_ref 聚合为一笔）
         trade_time = self._parse_trade_time(matched_deals[-1])
@@ -965,8 +1070,9 @@ class LiveEngine:
             existing.amount = total_amount
             existing.commission = total_commission
             existing.trade_time = trade_time
+            trade_rec = existing
         else:
-            db.add(LiveTrade(
+            trade_rec = LiveTrade(
                 live_session_id=self.session_id,
                 live_order_id=live_order.id,
                 portfolio_strategy_id=live_order.portfolio_strategy_id,
@@ -979,7 +1085,19 @@ class LiveEngine:
                 commission=total_commission,
                 stamp_duty=Decimal("0"),  # 首期 0：DEAL 印花税字段待真机验证
                 trade_time=trade_time,
-            ))
+            )
+            db.add(trade_rec)
+        db.flush()  # 取 trade_rec.id（B5 trade 事件用）
+        # B5：成交回报推送
+        self._emit("trade", {
+            "portfolio_id": live_order.portfolio_strategy_id,
+            "trade_id": trade_rec.id,
+            "stock_code": trade_rec.stock_code,
+            "trade_type": trade_rec.trade_type,
+            "price": float(avg_price),
+            "quantity": total_qty,
+            "amount": float(total_amount),
+        })
 
         # filled：回填确认后 apply_trade（submitted 阶段未 apply，此处首次落持仓）
         if live_order.status == "filled":
@@ -1041,6 +1159,15 @@ class LiveEngine:
         portfolio.account.apply_trade(trade)
         if pos is not None:
             pos.apply_trade(trade)
+            # B5：持仓变化推送（filled 后真实持仓/成本；pnl 无市价标记暂为 0）
+            self._emit("position", {
+                "portfolio_id": live_order.portfolio_strategy_id,
+                "stock_code": live_order.stock_code,
+                "quantity": pos.quantity,
+                "avg_cost": float(pos.avg_cost),
+                "market_value": float(pos.avg_cost * pos.quantity),
+                "pnl": 0,
+            })
 
     # ---------------- 持仓恢复 ----------------
     def recover(self, db: Session) -> None:

@@ -257,18 +257,53 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
     return {"code": 0}
 
 
+def _sse_line(ev: dict) -> str:
+    """把引擎事件 dict 格式化为一条 SSE：event: <type>\ndata: <json>\n\n。
+
+    data 去掉 type 字段（type 进 event 行，design §5.6.10）；ensure_ascii=False
+    让中文信号名（如 signal_name）原样下发。
+    """
+    ev_type = ev.get("type", "message")
+    data = {k: v for k, v in ev.items() if k != "type"}
+    return "event: %s\ndata: %s\n\n" % (ev_type, json.dumps(data, ensure_ascii=False))
+
+
+async def _heartbeat_stream(request: Request):
+    """未运行 session 的 /stream：仅 30s ping 保活心跳（EventSource 自动重连，无需重连逻辑）。"""
+    while True:
+        if await request.is_disconnected():
+            break
+        yield _sse_line({"type": "ping", "time": datetime.now().isoformat()})
+        await asyncio.sleep(30)
+
+
 @router.get("/sessions/{session_id}/stream")
 async def session_stream(session_id: int, request: Request, db: Session = Depends(get_db)):
+    """实盘 session 实时事件流（SSE，design §5.6.10）。
+
+    运行中：转发引擎 stream_events（signal/order/trade/position/risk 五类事件，
+    空闲 30s 由引擎内置 ping 心跳）；未运行：仅 ping 保活。
+    每个连接绑定一个 session（无鉴权，EventSource 断线自动重连）。
+    """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return {"code": 404, "message": "资源不存在"}
 
+    engine = _ENGINES.get(session_id)
+
     async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
-            yield f"event: ping\ndata: {json.dumps({'time': datetime.now().isoformat()})}\n\n"
-            await asyncio.sleep(30)
+        if engine is not None:
+            agen = engine.stream_events()
+            try:
+                async for ev in agen:
+                    if await request.is_disconnected():
+                        break
+                    yield _sse_line(ev)
+            finally:
+                await agen.aclose()
+        else:
+            async for line in _heartbeat_stream(request):
+                yield line
 
     from fastapi.responses import StreamingResponse
     return StreamingResponse(
