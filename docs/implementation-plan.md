@@ -7,16 +7,16 @@
 
 ---
 
-## 实现状态（截至 2026-07-30）
+## 实现状态（更新：2026-08-10）
 
-> 本节由 Claude Code 在从 opencode 迁移开发后补充，记录**真实完成度**。
-> 文末进度表曾由 opencode 标注为全 100%，但实际多数模块为脚手架/桩代码，已据实修正。
+> **本节原为 2026-07-30 opencode 脚手架时代记录，已过时。** 此后经切片 1-5 多轮 TDD，核心业务逻辑已基本全实现。
+> **当前真实进度以 [docs/live-flow-checklist.md](live-flow-checklist.md) 与 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md) 为准**；本节的阶段性任务细节仅作设计参考。
 
-**图例**：✅ 已实现　⚠️ 部分实现/有缺陷　❌ 未实现/桩代码
+**图例**：✅ 已实现　⚠️ 部分实现/偏离计划/待补　❌ 未实现　~~❌~~ 废弃（架构变更）
 
 ### 总体
 
-opencode 已完成项目脚手架搭建：4 模块结构、14 张 ORM 表、7 个 API 路由注册、NATS 客户端、前端 5 视图、引擎层类骨架。但**核心业务逻辑多为空桩**（回测引擎空循环、实盘引擎全 `pass`、多数 API 返回 `{"code":0,"data":[]}`、iQuant 网关全 mock）。
+4 模块结构、14 张 ORM 表、API 路由、前端视图、引擎层均已就位；**回测链路（TQ 数据→公式→引擎→评估）与实盘链路（HTTP 桥→订单状态机→/deals 回填→SSE 推送）已全打通**（切片 1-5：含熔断接线、订单同步、三段式周期链路、SSE 事件流）。剩余缺口集中在：前端 SSE 消费/实盘工作台（B4 暂缓）、回测并发 409、首页仪表盘前端页、监控/告警骨架、`data_feed.py`（功能由直接调用覆盖）。通信拓扑按架构变更改 HTTP 桥（NATS 内容仅历史记录）。
 
 ### P0 配置链修复（2026-07-30 已完成）
 
@@ -27,41 +27,42 @@ opencode 已完成项目脚手架搭建：4 模块结构、14 张 ORM 表、7 �
 | 任务 | 状态 | 说明 |
 |---|---|---|
 | 1.1 main 环境 | ✅ | FastAPI app + /health |
-| 1.2 live 环境 | ✅ | 骨架 + mock 网关 |
-| 1.3 前端项目 | ⚠️ | Vite+Vue+路由齐；Pinia 已装未启用，无 stores；无 SSE |
-| 1.4 数据库 | ✅ | 现阶段固定 SQLite（P0 修复后配置链通）；docker-compose.yml 保留备用 |
-| 1.5 NATS 连通测试 | ❌ | `test_nats_connectivity.py` 不存在 |
-| 2.1 shared 包 | ✅ | constants/nats_schemas/stock_utils 齐 |
-| 2.2 14 张 ORM 表 | ⚠️ | 14 表全齐；但 `live_session_portfolios` 缺 `circuit_breaker_count/created_at/updated_at` |
-| 2.3 Alembic | ⚠️ | init + 迁移在；env.py 已接 config（P0 修复）；**级联删除仅 1 处、索引全缺** |
-| 2.4 NATS 客户端 | ⚠️ | main 侧 NatsClient 在；live 侧无独立 nats_client 目录（网关内联） |
-| 2.5 测试框架 | ⚠️ | conftest 在但 `dependency_overrides["get_db"]` 用字符串 key 是 bug；测试实际在 `core/tests/` 非计划写的 `tests/` |
-| 3.1 TQ 模块 | ⚠️ | 接口骨架齐；`utils.py` 硬编码 `D:\new_tdx64` 路径；未实测连通通达信 |
-| 3.2 公式 API+前端 | ❌ | API 仅 list 桩，缺 9 个；无前端公式页 |
+| 1.2 live 环境 | ✅ | HTTP 桥策略 `live/bridge/iquant_bridge.py`（原 NATS 网关废弃） |
+| 1.3 前端项目 | ⚠️ | Vite+Vue+路由+axios 齐；**Pinia 已装未启用，无 stores**；无前端 SSE 消费（归 B4 暂缓） |
+| 1.4 数据库 | ✅ | 固定 SQLite（P0 修复后配置链通）；docker-compose.yml 保留备用 |
+| 1.5 NATS 连通测试 | ~~❌~~ | 废弃（架构变更，无 NATS） |
+| 2.1 shared 包 | ✅ | constants/nats_schemas/stock_utils 齐，3.7 兼容 |
+| 2.2 14 张 ORM 表 | ✅ | 14 表全齐；`circuit_breaker_count/created_at/updated_at` 已补 |
+| 2.3 Alembic | ✅ | 6 个迁移；env.py 已接 config；级联删除 13 处、索引已建（原"仅 1 处/全缺"已修） |
+| 2.4 NATS 客户端 | ~~❌~~ | 废弃（被 `HttpBridgeDispatcher` HTTP 桥替代） |
+| 2.5 测试框架 | ⚠️ | 测试在 `core/tests/`；conftest `dependency_overrides["get_db"]` 字符串 key 仍是 bug（个别测试文件已用函数 key 覆盖正确） |
+| 3.1 TQ 模块 | ✅ | data/formula/utils 齐，真机连通通达信；`tdx_path` 已配置化（硬编码仅剩回退默认） |
+| 3.2 公式 API+前端 | ✅ | formulas.py 全路由 + Formulas.vue |
 | 4.1 事件系统 | ✅ | 5 类 event 齐；EventBus 风控优先已实现 |
-| 4.2 数据源+账户+持仓 | ⚠️ | account/position 已实现；**`data_feed.py` 不存在** |
-| 4.3 策略运行时+风控 | ⚠️ | risk_manager 已实现；strategy_context.get_signal 返回 `[]`；SignalEngine 框架；ExecutionEngine 部分 + `reduce_by_ratio` 末尾 `return None` bug |
-| 4.4 组合策略运行时 | ⚠️ | Portfolio 骨架在；`on_bar` 是 `pass` |
-| 4.5 回测引擎 | ❌ | `BacktestEngine.run` 空循环桩，无逐 bar 推进 |
-| 5.1 评估模块 | ⚠️ | Evaluator 实算约 12/18 指标；win_rate/profit_factor 等 6 个硬编码 0（入参缺 trades） |
-| 5.2 股票池 API+前端 | ⚠️ | API 3/5；前端仅列表展示，无新增/同步操作 |
-| 5.3 策略 API+前端 | ❌ | API 1/4（list 桩）；缺 strategies 路由 |
-| 5.4 回测 API+前端 | ❌ | API 1/6；**缺 `POST /api/backtest` 启动 + 409 并发冲突** |
-| 6.1 实盘引擎 | ❌ | LiveEngine 4 方法全 `pass`；recover 未实现 |
-| 6.2 iQuant 网关 | ⚠️ | 骨架在但全 mock；无 trade/nats_client 子目录 |
-| 6.3 实盘 API+前端+SSE | ⚠️ | session CRUD 7/11；SSE 仅 ping 心跳；缺 portfolio 级 start/stop、orders、trades |
-| 7.1 系统配置 | ✅ | GET/PUT configs + 前端页 |
-| 7.2 首页仪表盘 | ⚠️ | `/api/status` 在但 iguant_gateway 固定 false；前端无仪表盘页 |
+| 4.2 数据源+账户+持仓 | ⚠️ | account/position 已实现；**`data_feed.py` 不存在**（回测直接调 `TQData`/`TQFormula` 覆盖） |
+| 4.3 策略运行时+风控 | ✅ | risk_manager/strategy_context 已实现；`reduce_by_ratio` 末尾 bug 已修；SignalEngine 为未接线的冗余壳 |
+| 4.4 组合策略运行时 | ✅ | Portfolio.on_bar 已实现（含周期过滤） |
+| 4.5 回测引擎 | ✅ | `BacktestEngine.run` 完整逐 bar 推进 |
+| 5.1 评估模块 | ✅ | Evaluator 指标实算（win_rate/profit_factor 等原硬编码 0 已修） |
+| 5.2 股票池 API+前端 | ✅ | list/tdx/sync/delete 齐；缺计划中的 `GET /{id}`、`GET /{id}/stocks` 细分路由（列表已含成分，功能覆盖） |
+| 5.3 策略 API+前端 | ✅ | strategies.py 全路由 + Portfolios.vue |
+| 5.4 回测 API+前端 | ⚠️ | `POST /api/backtest` 在且同步跑完；**409 并发冲突未实现**（无锁、非 ProcessPoolExecutor，与 CLAUDE.md 描述不符） |
+| 6.1 实盘引擎 | ✅ | LiveEngine 完整实现（切片 1-5 TDD） |
+| 6.2 iQuant 网关 | ✅ | 改 HTTP 桥（原 NATS 网关废弃）；桥端字段/账号/模式已真机验证 |
+| 6.3 实盘 API+前端+SSE | ⚠️ | SSE 后端全（B5）；**前端 EventSource 消费未做**（B4 暂缓）；缺 orders/trades 查询端点 |
+| 7.1 系统配置 | ✅ | GET/PUT configs + SystemConfig.vue |
+| 7.2 首页仪表盘 | ⚠️ | `/api/status` 在；前端无仪表盘页 |
 | 7.3 日志/监控/告警 | ⚠️ | logging_config 在；监控/告警骨架缺 |
 
-### 待办优先级（下一步）
+### 待办优先级（2026-08-10 更新，原 P0-P3 多数已完成）
 
-1. **P0**：补 `live_session_portfolios` 缺字段 + 新迁移（熔断恢复数据基础）
-2. **P0**：补级联删除 + 设计要求的 9 组索引
-3. **P1**：实现 `BacktestEngine.run` 真实逐 bar 逻辑 + `POST /api/backtest`
-4. **P1**：补 `data_feed.py`、修 `execution_engine.reduce_by_ratio` bug、补 `StrategyContext.get_signal`
-5. **P2**：Evaluator 缺失 6 指标、`LiveEngine.recover`、services 层、前端写操作 + SSE 双端
-6. **P3**：修 TQ utils 硬编码路径、conftest override key bug、文档表数量/进度表
+1. **前端 SSE 消费 + 实盘工作台**（B4，⏸ 暂缓）：B5 SSE 后端已就绪，前端 EventSource 消费与实盘面板未做。
+2. **P1**：回测并发 409——`POST /api/backtest` 现同步内联执行、无锁，补全局锁 + 409；CLAUDE.md 的"ProcessPoolExecutor 子进程单实例"描述待同步修正。
+3. **P2**：`data_feed.py` 未建（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖，是否需独立层待定）。
+4. **P2**：首页仪表盘前端页（`/api/status` 后端已就绪）+ 监控/告警骨架。
+5. **P3**：conftest `dependency_overrides["get_db"]` 字符串 key 改函数 key；Pinia 若启用则建 stores。
+6. **🧠 Q1**：实盘持仓多组合/多策略归属映射待决策（见 [open-questions.md](open-questions.md)）。
+7. **🔬 真机验证**（下次开盘）：F9 印花税字段（DEAL）、三段式周期链路、D3 对账自动校准放开。
 
 ---
 
@@ -970,16 +971,16 @@ LOGGING_CONFIG = {
 
 ## 开发进展跟踪
 
-> **注意（2026-07-30）**：以下为**真实完成度**，已替换 opencode 此前标注的全 100% 进度。各阶段内部任务完成度差异较大，详见上方"实现状态"节。
+> **更新（2026-08-10）**：以下为**截至 2026-08-10 的真实完成度**。回测端到端链路（#17）与实盘主链路（切片 1-5）均已打通并 TDD 验证。
 
 ```
-第一阶段：基础设施   ███████████░░░░░░░░░  ~55%  [#1-#5]  环境齐，DB 固定 SQLite，NATS 连通测试缺
-第二阶段：数据层     ██████████████░░░░░░  ~70%  [#6-#9]  14 表+shared 在，级联/索引缺
-第三阶段：TQ 模块    ███████░░░░░░░░░░░░░  ~35%  [#10-#11] 接口骨架在，未实测，公式 API/前端缺
-第四阶段：核心引擎   ████████░░░░░░░░░░░░  ~40%  [#12-#17] 事件/风控/账户在，回测引擎+数据源缺
-第五阶段：回测       ████░░░░░░░░░░░░░░░░  ~20%  [#18-#21] Evaluator 部分，回测 API/引擎缺
-第六阶段：实盘       ████░░░░░░░░░░░░░░░░  ~20%  [#22-#24] session CRUD 在，引擎/recover/网关缺
-第七阶段：收尾       ██████████░░░░░░░░░░  ~50%  [#25-#27] 配置/日志在，仪表盘/告警缺
+第一阶段：基础设施   ████████████████████  ~100%  [#1-#5]  环境齐；NATS 项已随 HTTP 桥架构废弃
+第二阶段：数据层     ██████████████████░░  ~95%   [#6-#9]  14 表+级联+索引齐；NATS 客户端废弃；conftest 字符串 key 待修
+第三阶段：TQ 模块    ████████████████████  ~100%  [#10-#11] 真机连通通达信；tdx_path 已配置化；公式 API/前端齐
+第四阶段：核心引擎   ██████████████████░░  ~90%   [#12-#17] 回测引擎已实现；`data_feed.py` 未建（直接调 TQData/TQFormula 覆盖）
+第五阶段：回测       ██████████████████░░  ~90%   [#18-#21] Evaluator 指标实算；**409 并发冲突未实现**（同步内联执行）
+第六阶段：实盘       ██████████████████░░  ~90%   [#22-#24] LiveEngine/HTTP 桥/订单状态机/SSE 后端全实现；**前端 SSE 消费未做（B4 暂缓）**
+第七阶段：收尾       ████████████░░░░░░░░  ~60%   [#25-#27] 配置/日志在；仪表盘前端页 + 监控/告警缺
 ```
 
-每条任务完成后标记进度。回测端到端链路打通后（#17）进入可验证状态。**当前尚未到达可验证状态**——`BacktestEngine.run` 仍为空桩。
+每条任务完成后标记进度。**当前状态**：回测与实盘主链路均已可验证；剩余缺口见上方"待办优先级"。CLAUDE.md 中"ProcessPoolExecutor 回测单实例"描述与现状（同步内联执行、无 409）不符，待同步修正。
