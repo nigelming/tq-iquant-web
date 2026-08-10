@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/本提交),对应行已标 ✅。仍待办:D3 对账(读回已并),F6/G5 决策。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/本提交),对应行已标 ✅。仍待办:D3 对账逻辑,🧠 决策已清零。
 
 ---
 
@@ -114,7 +114,7 @@
 | F3 | 主从联动约束 | ✅ | 📖 | 从策略 OPEN 只能买主策略持有的股 | — |
 | F4 | BUY 资金审批 | ✅ | 📖 | `account.approve_order`(→ design §5.5) | — |
 | F5 | **SELL 量上限(T+1)** | ✅已实现 | 🔬+✅ | **2026-08-10 真机已验**:POSITION 对象 `m_nCanUseVolume` **精确反映 T+1 可用**——持仓 600(昨仓 200+今买 400),`m_nCanUseVolume=200`、`m_nCoveredVolume=400`、`m_nOnRoadVolume=400`,今日买入 400 不可卖 ✅。**桥 query_positions 的 available 已改取 `m_nCanUseVolume`**(原取 ACCOUNT 的 `m_dAvailable` 是资金非股数,且 POSITION 对象上无此字段→null)。实现:`LiveT1Checker` 改 `min(本策略持有量, 桥 available)` | ✅ 已实现(2026-08-10 TDD,3c826e8):`LiveT1Checker` 持 `_available_map`(LiveEngine 每 bar 刷一次 /positions,强引用去重),`min(持有量, m_nCanUseVolume)`;桥无该仓/未取到→全量放行(券商端 T+1 兜底,G6 处理拒单);`_handle_bar` 先 `cap_quantity` 再落 submitted,DB 量=实发量 |
-| F6 | **同 bar 多策略超卖** | ⚠️ | 🧠 | A 卖 600 + B 卖 400,券商 available 只 800。需「bar 内可用量递减记账」?(→ open-questions Q2) | （待确认） |
+| F6 | **同 bar 多策略超卖** | ✅已实现 | 🧠已定 | A 卖 600 + B 卖 400,券商 available 只 800。需「bar 内可用量递减记账」?(→ open-questions Q2) | 🧠 已定+✅ 已实现:bar 内可用量递减记账。`_refresh_available_map` 每 bar 重设快照,`LiveT1Checker.consume_available` 在 SELL 发单成功(`_handle_bar` ③桥受理后)扣减——A 卖 600 后 B 只见 200,不超卖;拒单/失败不扣,扣过量钳到 0,券商端仍兜底 |
 | F7 | 成交时机 | ✅ | 📖 | 当根 bar 立即成交(非下一 bar open) | — |
 | F8 | 成交价近似 | ✅已修正 | — | 用 `bar.close`,prType=14 实际是盘口一档价。切片5 回填修正(→ design §5.6) | ✅ 切片5 已修正:成交价/量/佣金取 /deals 真实回报,成交均价=金额/量(`_backfill_order`,live_engine.py:741),不再用 bar.close 近似 |
 | F9 | 佣金/印花税 | ⚠️已知 | — | 首期 0,真实成本从 /deals 回报取 | ⚠️ 佣金已实现:取 /deals commission(`_backfill_order`);印花税仍 0(DEAL 印花税字段待真机验证) |
@@ -132,7 +132,7 @@
 | G2 | 主循环轮询 /deals | ✅已实现 | ✅ | 已定:主循环轮询(已选)。每轮查未完结 LiveOrder(→ design §7.2) | ✅ 已实现(切片5,eb4bc40):`_loop` 每轮 `_poll_deals` 查未完结单→`_try_match_order_ref` 定位→按 `m_strOrderRef` 过滤 /deals→`_backfill_order` 回填;桥离线本轮跳过下轮重试 |
 | G3 | **订单匹配键** | ✅**定案** | 🔬✅ | **2026-08-10 真机定案:匹配键 = `m_strOrderRef`(委托引用号)**。DEAL 与 ORDER 对象**共享同一 `m_strOrderRef`**,3 笔真实成交(BRIDGE×2 + GUI×1)全部对上:`...3499794`↔`...3499794`、`...502163`↔`...502163`、`...502165`↔`...502165`;`m_strOrderSysID`(合同号)同样一致。**passorder 返回 0 无法预知 OrderRef**,故匹配流程:Core 下单→轮询 `/orders` 用组合键(股票+方向+数量+下单后时间窗口;全局限 1 session 串行→取最新未匹配 ORDER 即自己的单)定位自己的委托→取 `m_strOrderRef` 回写 LiveOrder→轮询 `/deals` 按 OrderRef 关联成交→回填 | ✅ 匹配键定案=`m_strOrderRef`(ORDER↔DEAL 共享,真机 3 笔全对上);实现见 G2 |
 | G4 | `/deals` 字段够不够 | ✅**定案** | 🔬✅ | **2026-08-10 真机摸全**:DEAL 对象字段齐全——`m_strOrderRef`(匹配键)、`m_strOrderSysID`、`m_strTradeID`(成交编号)、`m_strTradeTime`/`m_strTradeDate`(成交时间)、`m_nDirection`(48买/49卖)、`m_dTradeAmount`、`m_dCommission`、`m_strSource`(BRIDGE/GUI)、`m_strOrderStrategyType`(函数下单/常规下单)。**桥 query_deals 已改**:原取 `m_nOrderID`(对象上不存在→null,是 order_id 一直为 null 的根因),现返回 order_ref/order_sysid/trade_id/instrument/exchange/direction/price/volume/amount/commission/trade_time/trade_date/source/order_type。**ORDER 对象同理补全**(query_orders 已改,status 用 `m_nOrderStatus` 54撤/56成) | ✅ 字段已全摸 + 桥 query_deals/query_orders 已改;根因=m_nOrderID 字段不存在 |
-| G5 | 回填轮询频率 | ⚠️ | 🧠 | 跟 poll_interval(15s)同?还是单独更短?成交回报秒级,15s 可能太慢 | （待确认） |
+| G5 | 回填轮询频率 | ✅已实现 | 🧠已定 | 跟 poll_interval(15s)同?还是单独更短?成交回报秒级,15s 可能太慢 | 🧠 已定+✅ 已实现:独立更短轮询 5s。`_deals_loop` 独立 asyncio task(`deals_poll_interval=5.0` 默认)处理 `/deals` 回填,主循环仍 30s 拉 bar——成交秒级落库,持仓/资金近实时 |
 | G6 | **拒单/部分成交修正** | ✅已实现 | ✅ | 当前按全量成交记账,拒单需反向退回(加回现金/持仓/还原 _lots)。`apply_trade` 只有正向,需补反向或重放修正(→ design §7.4) | ✅ 已实现(切片5,eb4bc40):`_backfill_order` 据真实成交回填(总成交量/金额/佣金,成交均价=金额/量),filled 才 `_apply_filled_trade` 落持仓;拒单置 `status=rejected` 不 apply;partial 只写/更新 LiveTrade 不 apply,等最终 filled 或撤单 |
 | G7 | 桥状态并入 session API | ✅已实现 | ✅ | 0009 §11.5 要求并入 `/sessions/{id}` 详情(→ design §1.4) | ✅ 已实现(切片5,eb4bc40):session 详情并入 `bridge_online`(实时 /ping)+ `pending_orders` 在途计数 + `last_backfill_time`;另有独立 `/bridge-status` 端点 |
 
@@ -195,7 +195,7 @@
 
 ### 🧠 设计决策(需人定,不阻塞读码)
 
-F6、G5
+（当前无待定决策。F6 bar 内可用量递减记账、G5 独立 5s 回填轮询已定并实现。）
 
 ### ⚠️ 桥端待改(需改 live/,Py3.6 兼容)
 
@@ -216,5 +216,6 @@ F6、G5
 4. **✅ 已完成:F5 + B6**(3c826e8)——`LiveT1Checker` 接桥 `m_nCanUseVolume`(每 bar 刷一次 /positions,SELL 封顶);全局限 1 个实盘 session(`_ENGINES` 非空即拒)。
 5. **✅ 已完成:#27 formula_count 字段 + #28 C4 三维去重**(3b74cbf)——公式级注入根数(字段+迁移+前端公式页);df_cache 拉取去重 + raw_cache 计算去重(省重复 TQ 计算)。
 6. **✅ 已完成:D4/H4 熔断计数读回/持久化**——max_drawdown 触发计数落库(`circuit_breaker_count`,未变不写),recover 读回;达 3 次转手动恢复(停新开仓等待人工)。
-7. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
-8. **🧠 决策项** — F6/G5 随时可在本表逐点过,不阻塞代码。
+7. **✅ 已完成:F6 同 bar 超卖 + G5 独立回填轮询**——SELL 发单成功后 `consume_available` bar 内可用量递减记账(多策略同 bar 卖不超券商 available);`/deals` 回填拆独立 5s 轮询(`_deals_loop`),主循环仍 30s 拉 bar。
+8. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
+9. **🧠 决策项** — 当前无待定决策(F6/G5 已定);随时可过。

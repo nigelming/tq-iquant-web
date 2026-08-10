@@ -44,7 +44,7 @@
 
 ## Q2 实盘卖出如何处理（量与隔离）
 
-**状态**：待决策
+**状态**：2 已定并实现；1/3 已定，见对应实现
 **来源**：2026-08-05
 **关联**：Q1（持仓映射）、Q3（T+0/T+1）
 
@@ -58,8 +58,11 @@
    - 信号要卖的量（`order.quantity`）
    - 本策略持有量（`ctx.positions[code].quantity`，组合隔离）
    - 券商可用量（桥 `query_positions(code).available`，体现 T+0/T+1，见 Q3）
+   **已定**：min 三者。`cap_quantity` SELL 分支 `t1_checker.get_available_shares` 取 `min(策略持有量, 桥可用)`，信号量经此 cap（F5）。
 2. **同 bar 多策略超卖**：同一根 bar 内，A 策略先卖 600、B 策略再卖 400，但券商 `available` 只有 800。第二次查若拿到旧缓存（仍 800）会超卖。是否需要「bar 内可用量递减记账」？
+   **已定（2026-08-10, F6）**：需要。`_refresh_available_map` 每 bar 重设快照；`LiveT1Checker.consume_available` 在 SELL 发单成功（`_handle_bar` ③桥受理后）扣减——A 卖 600 后 B 只见 200，不超卖；拒单/失败不扣，扣过量钳到 0，券商端仍兜底。
 3. **桥拒单与账面背离**：Core 已记账减仓，但券商端拒单（T+1 当日买、限额等）→ 虚拟持仓与真实持仓背离。如何修正？（依赖 /deals 回填，见 0009 切片5）
+   **已定**：切片5 时序 submitted 阶段不 apply，真实成交由 `_poll_deals`/`_backfill_order` 按 `m_strOrderRef` 回填确认后 `_apply_filled_trade` 落持仓；拒单置 `status=rejected` 不 apply（G2/G6）。回填频率独立 5s（G5）。
 
 ### 相关代码位置
 
