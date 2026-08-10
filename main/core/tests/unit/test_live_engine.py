@@ -34,7 +34,8 @@ def _db_factory():
     """内存 SQLite Session 工厂：返回 () -> Session，引擎每根 bar 取一个独立 Session。"""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(bind=engine)
+    # expire_on_commit=False：commit 后对象属性仍可访问（测试断言方便，不触发 refresh）
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
     def factory():
         return SessionLocal()
@@ -103,9 +104,13 @@ def _bar(stock, close, bar_time):
     )
 
 
-# ---------------- _handle_bar 下单落库 ----------------
+# ---------------- _handle_bar 下单落库（切片5：先 submitted 后回填）----------------
 def test_handle_bar_signal_to_trade_persisted():
-    """OPEN 信号 → BUY 成交 → live_trades/live_orders 各落一行，现金扣减、持仓增加。"""
+    """OPEN 信号 → BUY 发单 → LiveOrder(status=submitted) 落库，不写 LiveTrade、不 apply。
+
+    切片5 时序：先写 submitted + commit，再发 passorder。submitted 阶段不写 LiveTrade
+    （回填确认 filled 才写）、不 apply_trade（持仓/现金不变，避免受理即成交的近似）。
+    """
     factory, _ = _db_factory()
     port, ctx = _portfolio_single()
     stock = "600000.SH"
@@ -128,18 +133,16 @@ def test_handle_bar_signal_to_trade_persisted():
     db = factory()
     trades = db.query(LiveTrade).all()
     orders = db.query(LiveOrder).all()
-    assert len(trades) == 1
+    assert len(trades) == 0  # 回填确认成交前不写 LiveTrade
     assert len(orders) == 1
-    assert trades[0].trade_type == "buy"
-    # 下单量由 _signal_to_order 计算：int(0.1 * 60000 / 9.3 / 100) * 100 = 600
-    assert trades[0].quantity == 600
-    assert trades[0].live_order_id == orders[0].id
-    assert orders[0].status == "accepted"
+    assert orders[0].status == "submitted"
     assert orders[0].signal_name == "open_sig"
-    # 持仓 + 现金：account.apply_trade 已扣现金(amount+佣金)，pos.quantity 增加
-    assert ctx.positions[stock].quantity == 600
-    # amount = 9.3 * 600 = 5580，佣金/印花税首期为 0
-    assert port.account.cash == Decimal("100000") - Decimal("5580")
+    # 下单量由 _signal_to_order 计算：int(0.1 * 60000 / 9.3 / 100) * 100 = 600
+    assert orders[0].quantity == 600
+    assert orders[0].filled_quantity == 0
+    # submitted 阶段不 apply：持仓/现金不变
+    assert ctx.positions[stock].quantity == 0
+    assert port.account.cash == Decimal("100000")
     db.close()
 
 
@@ -259,7 +262,11 @@ def test_bridge_offline_pauses_no_trade():
 
 
 def test_handle_bar_bridge_unavailable_no_persist():
-    """_handle_bar 下单时桥抛 BridgeUnavailableError → 中断、不落库、bridge_online=False。"""
+    """_handle_bar 下单时桥抛 BridgeUnavailableError → 先写 submitted 再标 rejected。
+
+    切片5 时序：submitted 已先落库（I4 命门窗口闭合），发单桥异常 → 标 rejected、
+    _bridge_online=False（上层心跳暂停下单），不写 LiveTrade、不 apply。
+    """
     factory, _ = _db_factory()
     port, ctx = _portfolio_single()
     stock = "600000.SH"
@@ -282,6 +289,11 @@ def test_handle_bar_bridge_unavailable_no_persist():
     assert engine.bridge_online is False
     db = factory()
     assert db.query(LiveTrade).count() == 0
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert orders[0].status == "rejected"
+    assert orders[0].error_message == "bridge unavailable"
+    assert ctx.positions[stock].quantity == 0  # 未 apply
     db.close()
 
 
@@ -490,7 +502,11 @@ def test_fill_signal_cache_empty_bars_skipped():
 
 
 def test_handle_bar_with_formula_signal_triggers_trade():
-    """_handle_bar 接入 _fill_signal_cache：mock 公式返回 open_sig=1 → BUY 落库（非预置 cache）。"""
+    """_handle_bar 接入 _fill_signal_cache：mock 公式返回 open_sig=1 → BUY 落 submitted（非预置 cache）。
+
+    切片5：公式信号触发发单 → LiveOrder(status=submitted) + signal_name=open_sig；
+    不写 LiveTrade（回填确认 filled 才写）。
+    """
     factory, _ = _db_factory()
     port, ctx = _portfolio_single()
     stock = "600000.SH"
@@ -517,10 +533,272 @@ def test_handle_bar_with_formula_signal_triggers_trade():
 
     db = factory()
     trades = db.query(LiveTrade).all()
-    assert len(trades) == 1
-    assert trades[0].trade_type == "buy"
-    # signal_name 来自公式信号 open_sig（非风控）
+    assert len(trades) == 0
+    # signal_name 来自公式信号 open_sig（非风控），status=submitted 待回填
     orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
     assert orders[0].signal_name == "open_sig"
+    assert orders[0].status == "submitted"
+    assert ctx.positions[stock].quantity == 0  # 未 apply
     db.close()
+
+
+# ===========================================================================
+# 切片5：订单状态机 + /deals 回填（0011）
+# ===========================================================================
+def _mock_orders_deals(rec, orders=None, deals=None):
+    """让 _Recorder 的 /orders 与 /deals 返回固定数据。"""
+    orders = orders if orders is not None else []
+    deals = deals if deals is not None else []
+
+    def respond(request):
+        path = request.url.path
+        if path == "/orders":
+            return httpx.Response(200, json={"ok": True, "data": orders})
+        if path == "/deals":
+            return httpx.Response(200, json={"ok": True, "data": deals})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+
+    rec._respond = respond
+
+
+def _make_engine(disp, factory, port):
+    """构造 LiveEngine（含 poller）。dispatcher 由 _make_dispatcher 提供。"""
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+
+
+def _submitted_order(db, quantity=600, status="submitted"):
+    """预置一笔 submitted 状态的 LiveOrder（模拟 _handle_bar 已发单）。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
+        stock_code="600000.SH", trade_type="buy", order_type="limit",
+        price=Decimal("9.3"), quantity=quantity, filled_quantity=0,
+        filled_price=None, status=status, signal_name="open_sig",
+        signal_type="OPEN", bar_time=datetime(2026, 8, 5, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    return lo
+
+
+def test_persist_order_submitted_writes_status_submitted():
+    """_persist_order_submitted → LiveOrder(status=submitted)，无 LiveTrade。"""
+    factory, _ = _db_factory()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    port, _ = _portfolio_single()
+    engine = _make_engine(disp, factory, port)
+    order = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=600, price=Decimal("9.3"), bar_time=datetime(2026, 8, 5, 10, 0),
+        signal_name="open_sig",
+    )
+    db = factory()
+    lo = engine._persist_order_submitted(db, order)
+    lo_id = lo.id  # commit 前取 id（commit 后对象 expire，闭 session 前访问会 Detached）
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "submitted"
+    assert lo2.filled_quantity == 0
+    assert lo2.filled_price is None
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+
+
+def test_order_status_transitions_submitted_to_filled():
+    """submitted → _poll_deals 回填 → filled，真实价/量/佣金写入 LiveTrade + apply。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 返回 BRIDGE 委托（匹配 order_ref），/deals 返回真实成交
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-abc-123",
+    }], deals=[{
+        "order_ref": "ref-abc-123", "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39, "trade_time": "150001",
+        "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "filled"
+    assert lo2.order_ref == "ref-abc-123"
+    assert lo2.filled_quantity == 600
+    assert lo2.filled_price == Decimal("9.25")
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].price == Decimal("9.25")
+    assert trades[0].quantity == 600
+    assert trades[0].amount == Decimal("5550.0")
+    assert trades[0].commission == Decimal("1.39")
+    # filled 后 apply：持仓 600，现金扣 amount+commission
+    assert ctx.positions[stock].quantity == 600
+    assert port.account.cash == Decimal("100000") - (Decimal("5550.0") + Decimal("1.39"))
+    db.close()
+
+
+def test_order_status_transitions_partial_fill():
+    """部分成交 → status=partial，写部分 LiveTrade，不 apply（等最终确认）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-partial",
+    }], deals=[{
+        "order_ref": "ref-partial", "price": 9.25, "volume": 300,
+        "amount": 2775.0, "commission": 0.69, "trade_time": "150001",
+        "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "partial"
+    assert lo2.filled_quantity == 300
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 300
+    # partial 不 apply：持仓不变（该股无 Position 或 quantity==0）
+    assert ctx.positions.get(stock) is None or ctx.positions[stock].quantity == 0
+    assert port.account.cash == Decimal("100000")
+    db.close()
+
+
+def test_try_match_order_ref_ignores_gui_and_mismatch():
+    """_try_match_order_ref：GUI 单/不匹配方向量的单被忽略，找不到 order_ref 留 None。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    # 只有 GUI 单 + 不匹配的 BRIDGE 单（量不符）
+    _mock_orders_deals(rec, orders=[
+        {"source": "GUI", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "gui-ref"},
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 999, "order_ref": "wrong-vol"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None  # 都不匹配
+    db.close()
+
+
+def test_try_match_order_ref_finds_bridge_order():
+    """_try_match_order_ref 定位 BRIDGE 委托 → order_ref 回写。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-found",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-found"
+    db.close()
+
+
+def test_poll_deals_bridge_offline_skips():
+    """query_deals 抛 BridgeUnavailableError → 本轮跳过，状态不变，下轮重试。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    # /orders 匹配成功（order_ref 回写），但 /deals 桥不可用（ConnectError）
+    rec = _Recorder(fail_paths={"/deals"})
+    orders_data = [{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-offline",
+    }]
+
+    def respond(request):
+        path = request.url.path
+        if path == "/orders":
+            return httpx.Response(200, json={"ok": True, "data": orders_data})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+
+    rec._respond = respond
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"  # 未回填，下轮重试
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+
+
+def test_recover_finds_pending_orders():
+    """recover 挂回 submitted/partial，忽略 filled/rejected。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _submitted_order(db, quantity=600, status="submitted")
+    _submitted_order(db, quantity=600, status="partial")
+    _submitted_order(db, quantity=600, status="filled")
+    _submitted_order(db, quantity=600, status="rejected")
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert len(engine._pending_orders) == 2  # 只有 submitted + partial
 

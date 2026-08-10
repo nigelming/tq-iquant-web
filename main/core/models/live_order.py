@@ -23,6 +23,9 @@ class LiveOrder(Base):
     signal_name = Column(String(50), nullable=True)
     signal_type = Column(String(15), nullable=True)
     bar_time = Column(DateTime, nullable=True)
+    # 切片5：桥 m_strOrderRef（匹配成交回报，G3 定案键）+ Core 生成的 MD5 order_id（透传桥幂等键）
+    order_ref = Column(String(30), nullable=True)
+    bridge_order_id = Column(String(32), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

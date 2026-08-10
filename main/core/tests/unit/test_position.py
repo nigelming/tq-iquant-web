@@ -82,3 +82,34 @@ def test_can_sell_t_plus_one():
     assert pos.can_sell_on(buy_day.date()) is False
     # 下一交易日 → 可卖
     assert pos.can_sell_on(datetime(2026, 7, 30).date()) is True
+
+
+# ---------------- apply_reverse（切片5 G6 拒单/撤单反向修正）----------------
+def test_apply_reverse_buy_reduces_quantity():
+    """买入被撤：减持仓（原 apply_trade 加了 quantity）。"""
+    pos = Position("000001.SZ")
+    pos.apply_trade(_trade(TradeType.BUY, "10", 1000, datetime(2026, 7, 30, 9, 30)))
+    assert pos.quantity == 1000
+    pos.apply_reverse(_trade(TradeType.BUY, "10", 1000, datetime(2026, 7, 30, 9, 30)))
+    assert pos.quantity == 0
+    assert pos.avg_cost == Decimal("0")  # 全平后均价重置
+
+
+def test_apply_reverse_buy_partial_keeps_avg_cost():
+    """买入被撤部分：持仓减少但非全平，均价保持原买入成本。"""
+    pos = Position("000001.SZ")
+    pos.apply_trade(_trade(TradeType.BUY, "10", 1000, datetime(2026, 7, 30, 9, 30)))
+    pos.apply_reverse(_trade(TradeType.BUY, "10", 400, datetime(2026, 7, 30, 9, 30)))
+    assert pos.quantity == 600
+    assert pos.avg_cost == Decimal("10")  # 均价不变
+
+
+def test_apply_reverse_sell_adds_quantity_back():
+    """卖出被撤：加持仓（原 apply_trade 减了 quantity），均价不变。"""
+    pos = Position("000001.SZ")
+    pos.apply_trade(_trade(TradeType.BUY, "10", 1000, datetime(2026, 7, 30, 9, 30)))
+    pos.apply_trade(_trade(TradeType.SELL, "12", 400, datetime(2026, 7, 30, 14, 0)))
+    assert pos.quantity == 600
+    pos.apply_reverse(_trade(TradeType.SELL, "12", 400, datetime(2026, 7, 30, 14, 0)))
+    assert pos.quantity == 1000
+    assert pos.avg_cost == Decimal("10")  # 回补不改变成本

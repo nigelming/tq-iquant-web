@@ -75,3 +75,25 @@ def test_approve_order_existing_position_reduces_available_limit():
     approved, qty = acc.approve_order(4000, Decimal("10"), Decimal("30000"))
     assert approved is True
     assert qty == 3000
+
+
+# ---------------- apply_reverse（切片5 G6 拒单/撤单反向修正）----------------
+def test_apply_reverse_buy_adds_cash_back():
+    """买入被撤：现金加回 amount+佣金+印花税（原 apply_trade 扣的）。"""
+    acc = Account(Decimal("100000"))
+    trade = _trade(TradeType.BUY, "10", 1000)  # amount=10000, commission=5
+    acc.apply_trade(trade)
+    assert acc.cash == Decimal("100000") - Decimal("10005")
+    acc.apply_reverse(trade)
+    assert acc.cash == Decimal("100000")  # 全额退回
+
+
+def test_apply_reverse_sell_deducts_cash():
+    """卖出被撤：现金扣回 amount-佣金-印花税（原 apply_trade 加的）。"""
+    acc = Account(Decimal("100000"))
+    trade = _trade(TradeType.SELL, "12", 1000)
+    trade.stamp_duty = Decimal("6")
+    acc.apply_trade(trade)
+    assert acc.cash == Decimal("100000") + Decimal("11989")
+    acc.apply_reverse(trade)
+    assert acc.cash == Decimal("100000")  # 回退扣回

@@ -97,7 +97,15 @@ class ExecutionEngine:
         order: OrderEvent,
         account: Account,
         position: Optional[Position],
+        apply: bool = True,
     ) -> Optional[TradeEvent]:
+        """执行订单。
+
+        apply=True（回测/旧实盘）：place_order 成功后立即 apply_trade 更新账户持仓。
+        apply=False（切片5 实盘）：只审批 + 发单，不 apply_trade——成交回报轮询回填
+        确认 filled 后才由 LiveEngine._apply_filled_trade 更新（submitted 阶段不 apply，
+        避免受理即成交的近似；I4 崩溃窗口下 DB 有 submitted 记录即可）。
+        """
         if order.trade_type.value == "BUY":
             approved, qty = account.approve_order(
                 order.quantity, order.price or Decimal("0"),
@@ -121,10 +129,11 @@ class ExecutionEngine:
         if not trade:
             return None
 
-        # 统一用 apply_trade 更新账户和持仓
-        account.apply_trade(trade)
-        if position is not None:
-            position.apply_trade(trade)
+        if apply:
+            # 统一用 apply_trade 更新账户和持仓
+            account.apply_trade(trade)
+            if position is not None:
+                position.apply_trade(trade)
 
         return trade
 

@@ -95,6 +95,9 @@ class LiveEngine:
         self._bridge_online = True
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
         self._last_daily_date: Optional[date] = None
+        # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
+        # 主循环 _poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
+        self._pending_orders: Dict[int, "LiveOrder"] = {}
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -132,6 +135,8 @@ class LiveEngine:
                 self._bar_poller.poll()
                 # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
                 self._maybe_daily_close()
+                # 切片5 G2：每轮查未完结 LiveOrder → 轮询桥 /deals 回填真实成交
+                self._poll_deals()
             except BridgeUnavailableError as e:
                 self._bridge_online = False
                 logger.warning("bridge unavailable: %s, skip this round", e)
@@ -193,14 +198,14 @@ class LiveEngine:
                 )
 
     def _handle_bar(self, portfolio: Portfolio, bar: BarEvent) -> None:
-        """一根 bar：盯回撤 → 取信号/风控 → 立即下单 → 落库。
+        """一根 bar：盯回撤 → 取信号/风控 → 先落 submitted → 发单 → 等回填。
 
         复用回测 Portfolio.on_bar（信号优先级/风控/主从/熔断全复用），
         通过 self._engine（已注入 HttpBridgeDispatcher + LiveT1Checker）做实盘下单。
-        成交时机：当根 bar 立即成交（非下一 bar open）。
-        公式信号：on_bar 前调 _fill_signal_cache 注入算公式预填 signal_cache（0010）。
-        E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测），
-        14:30 的 update_daily 由 _loop 调。on_bar 内 is_trading_halted 据此剥 BUY。
+        切片5 时序（G1）：先写 LiveOrder(status=submitted)+commit，再发 passorder——
+        崩在 passorder 已发、未确认窗口时 DB 至少有 submitted 记录，供 _poll_deals 挂回回填。
+        submitted 阶段不 apply_trade、不写 LiveTrade，真实成交回报由 _poll_deals 回填确认后 apply。
+        E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测）。
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
@@ -214,16 +219,34 @@ class LiveEngine:
                 ctx = self._find_strategy(portfolio, order.strategy_id)
                 if ctx is None:
                     continue
-                # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine）
+                # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
                 pos = ctx.positions.get(order.stock_code)
                 if pos is None and order.trade_type == TradeType.BUY:
                     pos = Position(order.stock_code)
                     ctx.positions[order.stock_code] = pos
-                trade = self._engine.execute(order, portfolio.account, pos)
-                if trade is None:
+                # ① 先写 submitted + commit（I4 命门窗口闭合）
+                live_order = self._persist_order_submitted(db, order)
+                db.commit()
+                try:
+                    # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
+                    trade = self._engine.execute(order, portfolio.account, pos, apply=False)
+                except BridgeUnavailableError:
+                    # 桥离线：标 rejected + 置离线暂停（_on_bar 上层心跳循环据此暂停下单）
+                    live_order.status = "rejected"
+                    live_order.error_message = "bridge unavailable"
+                    self._bridge_online = False
+                    db.commit()
                     continue
-                self._persist_trade(db, order, trade)
-            db.commit()
+                if trade is None:
+                    # 审批不过 / 桥业务拒绝 → rejected（不成交，不 apply）
+                    live_order.status = "rejected"
+                    live_order.error_message = "approval failed or bridge rejected"
+                    db.commit()
+                    continue
+                # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
+                live_order.bridge_order_id = self._dispatcher._order_id(order)
+                self._try_match_order_ref(live_order)
+                db.commit()
         except Exception:
             db.rollback()
             raise
@@ -375,47 +398,214 @@ class LiveEngine:
             outputs.append({"name": var_name, "value": _to_int(v)})
         return outputs
 
-    # ---------------- 落库 ----------------
-    def _persist_trade(self, db: Session, order: OrderEvent, trade: TradeEvent) -> None:
-        """写 LiveOrder(accepted) + LiveTrade。
+    # ---------------- 订单状态机 + 成交回报回填（切片5）----------------
+    def _persist_order_submitted(self, db: Session, order: OrderEvent) -> LiveOrder:
+        """写 LiveOrder(status=submitted)，不写 LiveTrade（回填确认成交才写）。
 
-        LiveOrder 记录下单意图与受理状态；LiveTrade 记录成交回报。首期受理即成交，
-        filled_quantity/filled_price 即 order 全量/请求价（切片5 /deals 回填真实价）。
+        提交时序（G1/I4）：_handle_bar 先调本方法 + commit，再发 passorder——
+        崩在 passorder 已发、未确认窗口时 DB 至少有 submitted 记录供挂回。
         """
-        trade_type_str = order.trade_type.value.lower()  # "buy"/"sell"
-        signal_type_str = order.signal_type.value if order.signal_type else None
         live_order = LiveOrder(
             live_session_id=self.session_id,
             portfolio_strategy_id=order.portfolio_id,
             strategy_id=order.strategy_id,
             stock_code=order.stock_code,
-            trade_type=trade_type_str,
+            trade_type=order.trade_type.value.lower(),  # "buy"/"sell"
             order_type="limit",
             price=order.price,
             quantity=order.quantity,
-            filled_quantity=trade.quantity,
-            filled_price=trade.price,
-            status="accepted",
+            filled_quantity=0,
+            filled_price=None,
+            status="submitted",
             signal_name=order.signal_name or None,
-            signal_type=signal_type_str,
+            signal_type=order.signal_type.value if order.signal_type else None,
             bar_time=order.bar_time,
         )
         db.add(live_order)
-        db.flush()  # 取 live_order.id 关联 LiveTrade
-        db.add(LiveTrade(
-            live_session_id=self.session_id,
-            live_order_id=live_order.id,
-            portfolio_strategy_id=order.portfolio_id,
-            strategy_id=order.strategy_id,
-            stock_code=order.stock_code,
-            trade_type=trade_type_str,
-            price=trade.price,
-            quantity=trade.quantity,
-            amount=trade.amount,
-            commission=trade.commission,
-            stamp_duty=trade.stamp_duty,
-            trade_time=trade.trade_time,
-        ))
+        db.flush()  # 取 live_order.id
+        return live_order
+
+    def _try_match_order_ref(self, live_order: LiveOrder) -> None:
+        """轮询桥 /orders 定位本单的 m_strOrderRef 回写（G3 匹配键）。
+
+        passorder 返回 0 无法预知 OrderRef，故按组合键从桥 /orders 列表定位：
+        source=BRIDGE（排除 GUI 手动单）+ instrument/exchange 拼接 = 股票代码
+        + direction（48买/49卖）+ volume（委托量）。全局限 1 session 串行，
+        同股票同向同量的在途单唯一，不会撞单。
+        找不到 → order_ref 留 None，下轮 _poll_deals 再找。
+        """
+        try:
+            orders = self._dispatcher.query_orders()
+        except BridgeUnavailableError:
+            return  # 桥离线，下轮再找
+        code = live_order.stock_code
+        op_dir = 48 if live_order.trade_type == "buy" else 49
+        for o in orders or []:
+            if o.get("source") != "BRIDGE":
+                continue
+            inst = o.get("instrument") or ""
+            exch = o.get("exchange") or ""
+            if "%s.%s" % (inst, exch) != code:
+                continue
+            if o.get("direction") != op_dir:
+                continue
+            if o.get("volume") != live_order.quantity:
+                continue
+            live_order.order_ref = o.get("order_ref")
+            return
+
+    def _poll_deals(self) -> None:
+        """主循环每轮：查未完结 LiveOrder → 定位 OrderRef → 轮询桥 /deals → 回填（G2）。
+
+        每轮处理：未回填 order_ref 的单先尝试定位；有 order_ref 的单按 order_ref
+        过滤 /deals 成交回报，调 _backfill_order 更新状态 + 写 LiveTrade + apply。
+        桥离线/查失败 → 本轮跳过（不改状态），下轮重试。
+        """
+        db = self._db_session_factory()
+        try:
+            pending = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+            if not pending:
+                return
+            # 1. 未回填 order_ref 的单：尝试定位
+            for lo in pending:
+                if lo.order_ref is None:
+                    self._try_match_order_ref(lo)
+            db.commit()
+            # 2. 有 order_ref 的单：查 /deals 回填
+            need_ref = [lo for lo in pending if lo.order_ref is not None]
+            if not need_ref:
+                return
+            try:
+                deals = self._dispatcher.query_deals()
+            except BridgeUnavailableError:
+                return  # 桥离线，本轮跳过
+            for lo in need_ref:
+                matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                if not matched:
+                    continue
+                self._backfill_order(db, lo, matched)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("_poll_deals error")
+        finally:
+            db.close()
+
+    def _backfill_order(self, db: Session, live_order: LiveOrder, matched_deals: list) -> None:
+        """据成交回报回填 LiveOrder + LiveTrade + apply_trade（G2/G6）。
+
+        聚合 order_ref 下全部成交：总成交量/总金额/总佣金，成交均价 = 金额/量。
+        filled（成交量 ≥ 委托量）→ status=filled + apply_trade（首次用真实价/量/佣金）；
+        partial（成交量 < 委托量）→ status=partial，写/更新 LiveTrade 但不 apply
+        （等最终 filled 或撤单，避免部分成交误动持仓）。
+        """
+        total_qty = sum(int(d.get("volume") or 0) for d in matched_deals)
+        if total_qty <= 0:
+            return  # 无实际成交（可能已撤），下轮重查
+        total_amount = sum(Decimal(str(d.get("amount") or 0)) for d in matched_deals)
+        total_commission = sum(Decimal(str(d.get("commission") or 0)) for d in matched_deals)
+        avg_price = total_amount / Decimal(total_qty)
+
+        live_order.filled_quantity = total_qty
+        live_order.filled_price = avg_price
+        live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
+
+        # 写/更新 LiveTrade（按 order_ref 聚合为一笔）
+        trade_time = self._parse_trade_time(matched_deals[-1])
+        existing = (
+            db.query(LiveTrade)
+            .filter(LiveTrade.live_order_id == live_order.id)
+            .first()
+        )
+        if existing:
+            existing.price = avg_price
+            existing.quantity = total_qty
+            existing.amount = total_amount
+            existing.commission = total_commission
+            existing.trade_time = trade_time
+        else:
+            db.add(LiveTrade(
+                live_session_id=self.session_id,
+                live_order_id=live_order.id,
+                portfolio_strategy_id=live_order.portfolio_strategy_id,
+                strategy_id=live_order.strategy_id,
+                stock_code=live_order.stock_code,
+                trade_type=live_order.trade_type,
+                price=avg_price,
+                quantity=total_qty,
+                amount=total_amount,
+                commission=total_commission,
+                stamp_duty=Decimal("0"),  # 首期 0：DEAL 印花税字段待真机验证
+                trade_time=trade_time,
+            ))
+
+        # filled：回填确认后 apply_trade（submitted 阶段未 apply，此处首次落持仓）
+        if live_order.status == "filled":
+            self._apply_filled_trade(
+                live_order, avg_price, total_qty, total_amount, total_commission
+            )
+
+    @staticmethod
+    def _parse_trade_time(deal: dict) -> datetime:
+        """DEAL 的 trade_date(YYYYMMDD) + trade_time(HHMMSS / HH:MM:SS) → datetime。
+
+        桥 query_deals 返回 m_strTradeTime/m_strTradeDate 原文；解析失败用 now() 兜底。
+        """
+        d = str(deal.get("trade_date") or "").strip()
+        t = str(deal.get("trade_time") or "").strip()
+        try:
+            if len(t) == 6 and t.isdigit():
+                return datetime.strptime(d + t, "%Y%m%d%H%M%S")
+            if ":" in t:
+                return datetime.strptime(d + " " + t, "%Y%m%d %H:%M:%S")
+        except (ValueError, TypeError):
+            pass
+        return datetime.now()
+
+    def _apply_filled_trade(self, live_order: LiveOrder, price: Decimal,
+                            qty: int, amount: Decimal, commission: Decimal) -> None:
+        """回填确认 filled 后 apply_trade 更新虚拟持仓/现金（G6）。
+
+        仅在此处 apply——submitted 阶段不 apply，真实成交回报确认后才动虚拟账户。
+        signal_type 从 LiveOrder 取（Position.apply_trade 据此判 ADD）。
+        """
+        portfolio = next(
+            (p for p in self.portfolios if p.portfolio_id == live_order.portfolio_strategy_id),
+            None,
+        )
+        if portfolio is None:
+            return
+        ctx = self._find_strategy(portfolio, live_order.strategy_id)
+        if ctx is None:
+            return
+        pos = ctx.positions.get(live_order.stock_code)
+        sig_type = SignalType(live_order.signal_type) if live_order.signal_type else None
+        trade = TradeEvent(
+            strategy_id=live_order.strategy_id,
+            portfolio_id=live_order.portfolio_strategy_id,
+            stock_code=live_order.stock_code,
+            trade_type=TradeType(live_order.trade_type.upper()),
+            price=price,
+            quantity=qty,
+            amount=amount,
+            commission=commission,
+            stamp_duty=Decimal("0"),
+            trade_time=live_order.bar_time or datetime.now(),
+            signal_type=sig_type,
+        )
+        if pos is None and trade.trade_type == TradeType.BUY:
+            pos = Position(live_order.stock_code)
+            ctx.positions[live_order.stock_code] = pos
+        portfolio.account.apply_trade(trade)
+        if pos is not None:
+            pos.apply_trade(trade)
 
     # ---------------- 持仓恢复 ----------------
     def recover(self, db: Session) -> None:
@@ -465,6 +655,23 @@ class LiveEngine:
                 ctx.positions[tr.stock_code] = pos
             port.account.apply_trade(trade)
             pos.apply_trade(trade)
+        # 切片5 I4：挂回未完结 LiveOrder（submitted/partial）供主循环 _poll_deals 回填。
+        # 跨重启场景：passorder 已发券商、Core 崩在落库前 → DB 无 live_trades 但有
+        # submitted 记录，挂回后 _poll_deals 按 OrderRef 匹配真实成交补记（G2/G6）。
+        pending = (
+            db.query(LiveOrder)
+            .filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.status.in_(["submitted", "partial"]),
+            )
+            .all()
+        )
+        self._pending_orders = {lo.id: lo for lo in pending}
+        if pending:
+            logger.info(
+                "recover: %d pending live orders to backfill (session %s)",
+                len(pending), self.session_id,
+            )
 
     @property
     def bridge_online(self) -> bool:

@@ -67,3 +67,15 @@ class Account:
             self.deduct_cash(trade.amount + trade.commission + trade.stamp_duty)
         else:
             self.add_cash(trade.amount - trade.commission - trade.stamp_duty)
+
+    def apply_reverse(self, trade: TradeEvent) -> None:
+        """反向修正（切片5 G6）：撤回已 apply_trade 的成交（拒单/撤单）。
+
+        买入被撤 → 现金加回（原扣了 amount+佣金+印花税）
+        卖出被撤 → 现金扣回（原加了 amount-佣金-印花税）
+        仅在已 apply_trade 且后来确认未成/撤单时调用；submitted 阶段未 apply，无需调用。
+        """
+        if trade.trade_type == TradeType.BUY:
+            self.add_cash(trade.amount + trade.commission + trade.stamp_duty)
+        else:
+            self.deduct_cash(trade.amount - trade.commission - trade.stamp_duty)

@@ -69,6 +69,22 @@ class Position:
         else:
             self.sell(trade.quantity, trade.price, trade.trade_time)
 
+    def apply_reverse(self, trade: TradeEvent) -> None:
+        """反向修正（切片5 G6）：撤回已 apply_trade 的成交（拒单/撤单）。
+
+        买入被撤 → 减持仓（原加了 quantity；均价维持原买入成本不变）
+        卖出被撤 → 加持仓（原减了 quantity；回补不加仓，add_count 不变）
+        全平被撤回 → 持仓归 0 则重置均价，加仓计数在下次真实 buy 时按逻辑重置。
+        仅对已 apply_trade 的部分调用；submitted 阶段未 apply，无需调用。
+        """
+        if trade.trade_type == TradeType.BUY:
+            self.quantity -= trade.quantity
+            if self.quantity <= 0:
+                self.quantity = 0
+                self.avg_cost = Decimal("0")
+        else:
+            self.quantity += trade.quantity
+
     def can_sell_on(self, query_date: date) -> bool:
         """T+1：买入当日不可卖，下一交易日及之后可卖。无持仓或当日买入返回 False。"""
         if self.quantity == 0 or self.buy_time is None:
