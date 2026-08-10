@@ -38,7 +38,7 @@ import time
 HOST = "127.0.0.1"
 PORT = 8790
 ACCOUNT = "110002348760"          # TODO: change to your account
-DRY_RUN = True                    # safe default: only print, no real order. Flip to False when ready
+DRY_RUN = False                    # safe default: only print, no real order. Flip to False when ready
 TOKEN = None                      # auth token, loaded by load_secret()
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
 MAX_VOLUME = 10000                # max shares per order
@@ -178,8 +178,12 @@ def query_positions(params):
         for o in (fn(account, "STOCK", "POSITION") or []):
             rows.append({
                 "instrument": getattr(o, "m_strInstrumentID", None),
+                "exchange": getattr(o, "m_strExchangeID", None),
                 "volume": getattr(o, "m_nVolume", None),
-                "available": getattr(o, "m_dAvailable", None),
+                "available": getattr(o, "m_nCanUseVolume", None),  # T+1 usable qty
+                "yesterday_volume": getattr(o, "m_nYesterdayVolume", None),
+                "on_road_volume": getattr(o, "m_nOnRoadVolume", None),
+                "market_value": getattr(o, "m_dMarketValue", None),
             })
         return {"ok": True, "data": rows}
     except Exception as e:
@@ -196,8 +200,12 @@ def query_account(params):
         for o in (fn(account, "STOCK", "ACCOUNT") or []):
             rows.append({
                 "available": getattr(o, "m_dAvailable", None),
-                "total_asset": getattr(o, "m_dTotalAsset", None),
-                "market_value": getattr(o, "m_dMarketValue", None),
+                "total_asset": getattr(o, "m_dAssetBalance", None),
+                "market_value": getattr(o, "m_dStockValue", None),
+                "balance": getattr(o, "m_dBalance", None),
+                "frozen_cash": getattr(o, "m_dFrozenCash", None),
+                "commission": getattr(o, "m_dCommission", None),
+                "position_profit": getattr(o, "m_dPositionProfit", None),
             })
         return {"ok": True, "data": rows}
     except Exception as e:
@@ -213,11 +221,21 @@ def query_orders(params):
         rows = []
         for o in (fn(account, "STOCK", "ORDER") or []):
             rows.append({
-                "order_id": getattr(o, "m_nOrderID", None),
+                "order_ref": getattr(o, "m_strOrderRef", None),      # matching key
+                "order_sysid": getattr(o, "m_strOrderSysID", None),
                 "instrument": getattr(o, "m_strInstrumentID", None),
-                "price": getattr(o, "m_dPrice", None),
-                "volume": getattr(o, "m_nVolume", None),
-                "status": getattr(o, "m_strStatusMsg", None) or getattr(o, "m_nStatus", None),
+                "exchange": getattr(o, "m_strExchangeID", None),
+                "direction": getattr(o, "m_nDirection", None),       # 48 buy / 49 sell
+                "limit_price": getattr(o, "m_dLimitPrice", None),
+                "traded_price": getattr(o, "m_dTradedPrice", None),
+                "volume": getattr(o, "m_nVolumeTotalOriginal", None),
+                "traded_volume": getattr(o, "m_nVolumeTraded", None),
+                "status": getattr(o, "m_nOrderStatus", None),        # 54 cancel 56 filled
+                "source": getattr(o, "m_strSource", None),           # BRIDGE / GUI
+                "order_type": getattr(o, "m_strOrderStrategyType", None),
+                "insert_time": getattr(o, "m_strInsertTime", None),
+                "insert_date": getattr(o, "m_strInsertDate", None),
+                "cancel_amount": getattr(o, "m_dCancelAmount", None),
             })
         return {"ok": True, "data": rows}
     except Exception as e:
@@ -233,10 +251,20 @@ def query_deals(params):
         rows = []
         for o in (fn(account, "STOCK", "DEAL") or []):
             rows.append({
-                "order_id": getattr(o, "m_nOrderID", None),
+                "order_ref": getattr(o, "m_strOrderRef", None),      # matching key
+                "order_sysid": getattr(o, "m_strOrderSysID", None),
+                "trade_id": getattr(o, "m_strTradeID", None),
                 "instrument": getattr(o, "m_strInstrumentID", None),
+                "exchange": getattr(o, "m_strExchangeID", None),
+                "direction": getattr(o, "m_nDirection", None),       # 48 buy / 49 sell
                 "price": getattr(o, "m_dPrice", None),
                 "volume": getattr(o, "m_nVolume", None),
+                "amount": getattr(o, "m_dTradeAmount", None),
+                "commission": getattr(o, "m_dCommission", None),
+                "trade_time": getattr(o, "m_strTradeTime", None),
+                "trade_date": getattr(o, "m_strTradeDate", None),
+                "source": getattr(o, "m_strSource", None),           # BRIDGE / GUI
+                "order_type": getattr(o, "m_strOrderStrategyType", None),
             })
         return {"ok": True, "data": rows}
     except Exception as e:
