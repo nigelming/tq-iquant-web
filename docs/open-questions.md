@@ -9,7 +9,7 @@
 
 ## Q1 实盘持仓如何映射多组合多策略
 
-**状态**：待决策
+**状态**：已定（2026-08-10，基于 D3/F5/F6 实现定案）
 **来源**：2026-08-05 实盘卖出链路讨论
 **关联**：Q2（卖出处理）、Q3（T+0/T+1）、0009 HTTP 桥、0010 公式注入
 
@@ -31,6 +31,12 @@
 1. **归属来源**：`LiveTrade(portfolio_strategy_id, strategy_id, stock_code, ...)` + `recover()` 重放重建 `ctx.positions` 是否作为唯一可信归属来源？还是需要额外的账户级聚合视图？
 2. **对账**：Core 的策略持仓按 `code` 聚合后，与桥 `query_positions(code).volume` 如何、何时比对？不一致（桥拒单未回填、部分成交、手动操作）时如何处理？
 3. **同一只股票多策略持仓的聚合**：组合 A 策略 s1 持 600 股 + 组合 B 策略 s2 持 400 股 → 账户总持仓 1000 股。桥端只看到 1000，Core 如何维护「哪个策略能卖多少」？
+
+### 结论（2026-08-10，基于 D3/F5/F6 实现定案）
+
+1. **归属来源 = `LiveTrade` + `recover()` 重放**，不建账户级聚合视图。实盘单 session（B6 全局限 1），`LiveOrder/LiveTrade` 带 `portfolio_strategy_id + strategy_id`，recover 重放即重建各 `ctx.positions`，策略归属唯一可信。
+2. **对账 = D3（仅告警不修正）**：recover 末尾 `_reconcile_positions` 按 code 聚合虚拟净持仓 vs 桥 `/positions` volume，差异记 `_reconcile_mismatches` + 告警日志，不自动改账（在途单/延迟期防误改）；桥离线跳过不崩。自动校准留待真机跑顺再放开。
+3. **同股多策略 = F5/F6 策略隔离 + 券商可用量封顶**：每个 `StrategyContext` 独立 `ctx.positions`（各自一份），SELL 量取 `min(本策略持有量, 桥 m_nCanUseVolume)`（`LiveT1Checker`，F5）；同 bar `consume_available` 递减记账防超卖（F6）。多策略共享账户总持仓，各策略只能卖自己那部分、且不超过券商可用量——"哪个策略能卖多少"由 LiveTrade 重放 + 可用量封顶共同保证。
 
 ### 相关代码位置
 
@@ -74,7 +80,7 @@
 
 ## Q3 实盘 T+0/T+1 判定（不建字段方案）
 
-**状态**：待验证前置假设
+**状态**：已解决（2026-08-10 真机验证）
 **来源**：2026-08-05
 **关联**：Q2（卖出处理）
 
@@ -89,31 +95,28 @@
 - 代码现状：**完全没有品种类型标记**。`stock_utils.validate_stock_code` 只校验 6 位代码 + 后缀；`Strategy`/`StockPoolStock` 无品种字段；桥 `passorder` 不传品种类型。
 - 用户决策：**不建立字段区隔 T+0 还是 T+1**（2026-08-05）。排除了 `StockPoolStock` 加品种字段、shared 常量白名单等方案。
 
-### 选定方向（待验证）
+### 选定方向（已验证）
 
-靠券商返回的**可用量** `m_dAvailable` 体现 T+0/T+1，Core 不自己判品种：
+靠券商返回的**可用量**体现 T+0/T+1，Core 不自己判品种（真机验证结果：POSITION 的 `m_nCanUseVolume`，非 ACCOUNT 的 `m_dAvailable`）：
 - T+1 品种当日买入 → 券商 `available=0` → Core 不下单
 - T+0 品种 → 券商 `available=全量` → Core 正常卖
 - 卖出量取 `min(order.quantity, 本策略持有量, bridge_available[code])`
 
-### 前置验证（必须真机确认，未做）
+### 已真机验证（2026-08-10，见 checklist F5）
 
-桥 `query_positions` 返回的 `m_dAvailable`（`iquant_bridge.py:182`）是否：
-1. 准确反映 T+1（当日买入不计入 available）
-2. ETF 的 T+0 是否体现在 available 全量
-3. 是否实时刷新（下单后立即变，还是要等成交回报）
+**结论：方向正确，字段是 `m_nCanUseVolume`（POSITION 对象），不是 `m_dAvailable`——后者是 ACCOUNT 的资金字段，POSITION 对象上无此字段（取到 null，是早期 available=null 的根因）。**
 
-**若 `m_dAvailable` 不准**（如恒等于 volume、延迟刷新）→ 方案塌，只能退回「券商端拒单 + /deals 回填修正」，接受账面有短暂背离窗口。
+验证：持仓 600（昨仓 200 + 今买 400），`m_nCanUseVolume=200`、`m_nCoveredVolume=400`、`m_nOnRoadVolume=400`——**`m_nCanUseVolume` 精确反映 T+1 可用**（今日买入 400 不可卖）。
 
-### 验证方式（待执行）
-
-10 分钟真机测试：建一笔买入成交后立即查 `/positions`，对比买前买后 `available`；对一只 T+0 ETF 做同样测试。
+- **选定方向成立**：Core 不判品种，靠券商可用量体现 T+0/T+1。桥 `query_positions` 的 `available` 已改取 `m_nCanUseVolume`。
+- **ETF T+0**：真机未单独对 T+0 ETF 复验（`m_nCanUseVolume` 对 T+0 品种语义上=全量，券商侧即如此）；后续上 ETF 策略需补验。
+- **实现**：`LiveT1Checker` 接桥 available（F5，`min(本策略持有量, m_nCanUseVolume)`）+ 同 bar 递减记账（F6）。桥无该仓/未取到 → 全量放行，券商端 T+1 兜底（G6 处理拒单）。
 
 ### 相关代码位置
 
-- `live/bridge/iquant_bridge.py:171` — `query_positions` 返回 `m_dAvailable`
-- `main/core/engine/execution_engine.py:79` — `LiveT1Checker` 当前全量放行（待改）
-- `shared/tq_iquant_shared/stock_utils.py` — 仅代码校验，无品种信息
+- `live/bridge/iquant_bridge.py` — `query_positions` 返回 `available=m_nCanUseVolume`
+- `main/core/engine/execution_engine.py` — `LiveT1Checker` 持 `_available_map`，SELL 量 `min(持有量, m_nCanUseVolume)`（F5/F6）
+- `shared/tq_iquant_shared/stock_utils.py` — 仅代码校验，无品种信息（维持不建字段决策）
 
 ---
 

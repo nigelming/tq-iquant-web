@@ -494,15 +494,17 @@ submitted(受理未成交) → partial(部分成交) → filled(全部成交)
 | SSE 成交推送 | ✅ 已实现(B5,`_emit` 五类事件 signal/order/trade/position/risk + `/stream` 转发) |
 | 桥状态并入 session API | ✅ 已实现(切片5 G7:`bridge_online`/`pending_orders`/`last_backfill_time`) |
 
-**下一步**:实现进度见 [live-flow-checklist.md](live-flow-checklist.md)(已全 ✅ 清零);剩余真机验证项(桥 /deals 印花税字段、D3 对账聚合、/positions 字段拼接)开盘后跑脚本。
+**下一步**:实现进度见 [live-flow-checklist.md](live-flow-checklist.md)(已全 ✅ 清零,🔲 待实现/🧠 决策均已清空)。2026-08-10 已真机验:D3 /positions 字段拼接可行、F5 `m_nCanUseVolume` 精确 T+1、G3/G4 订单/成交字段定案。剩余真机验证项:桥 /deals **印花税字段**(F9,当前印花税仍 0)、D3 对账自动校准放开、三段式周期链路开盘跑一遍。
 
 ---
 
-## 13. 已知缺口汇总(按严重度)
+## 13. 已修复缺口汇总(历史记录,均已关闭)
 
-1. **【高·§4.4】熔断/日内亏损实盘哑火**:`_loop` 未调 `risk_manager.update`,组合层风控不生效。这是业务规则(§88)硬要求,优先级高于切片5。
-2. **【高·§7】成交回报未回填**:账面价不准,拒单/部分成交导致虚拟与真实持仓背离。
-3. **【中·§6.3】T+1 实盘不挡**:当日买的 T+1 品种可能被 Core 下卖单→券商拒→背离。靠 `m_dAvailable` 修,前置未验证。
-4. **【中·§3.3】持仓对账未做**:重启后虚拟持仓可能与真实背离无法发现。
-5. **【低·§1.5】SSE 未推成交**:前端看不到实时下单。
-6. **【低·§8.3】熔断计数未持久化**:重启丢失累计次数。
+> 以下缺口在切片 1-5 已全部修复,保留作决策历史。当前剩余事项以 [live-flow-checklist.md](live-flow-checklist.md) 为准。
+
+1. **【高·§4.4】熔断/日内亏损实盘哑火** → ✅ 已修(E5/E6:`update_peak`/`update_daily` 接线 + D4/H4 计数持久化)
+2. **【高·§7】成交回报未回填** → ✅ 已修(切片5 G2/G6:/deals 按 `m_strOrderRef` 回填 + G5 独立 5s 轮询)
+3. **【中·§6.3】T+1 实盘不挡** → ✅ 已修(F5:桥 `m_nCanUseVolume` 封顶;F6:同 bar 递减记账)
+4. **【中·§3.3】持仓对账未做** → ✅ 已修(D3:recover 后按 code 聚合比对,仅告警不修正)
+5. **【低·§1.5】SSE 未推成交** → ✅ 已修(B5:signal/order/trade/position/risk 五类事件流 + 心跳)
+6. **【低·§8.3】熔断计数未持久化** → ✅ 已修(`circuit_breaker_count` 落库读回)

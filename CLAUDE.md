@@ -58,18 +58,20 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 
 > 测试路径注意：AGENTS.md 写的是 `tests/`，实际位于 `main/core/tests/`。
 
-## 实现状态（opencode 已完成的部分）
+## 实现状态（更新：2026-08-10）
 
 **已实现（较完整）**：
-- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ Alembic init 迁移（14 张表）
-- 7 个 API 路由已注册到 [main/core/main.py](main/core/main.py)；`/api/live/sessions` CRUD、`/api/stock-pools` 列表、`/api/system/configs` 读写功能可用
-- iQuant HTTP 桥 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）已实现，桥策略验证版 `live/bridge/iquant_bridge.py`
-- 前端 5 个视图 + 路由 + API 客户端 + 布局
+- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ 6 个 Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count` 等后续迁移）
+- 7 个 API 路由模块已注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status 全部可用（回测、实盘 CRUD + start/stop + SSE 流）
+- iQuant HTTP 桥 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
+- 引擎层全 TDD 实现：`BacktestEngine.run` 完整逐 bar 回测；`LiveEngine` 实盘主链路（订单状态机 + /deals 回填 + 三段式周期 1m 边界/1d 14:30/1w·1mon 通达信 + B5 SSE 五类事件流 + E5/E6 熔断 + D3 对账告警）已接线。`SignalEngine` 为未接线的冗余壳（信号走 `strategy_context` + `Portfolio.on_bar` 直接求值）
+- TQ 模块（[main/core/tq/](main/core/tq/)）data/formula/utils 已对接通达信真机可用；`tdx_path` 从 config.yaml 读取
+- 前端 6 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig）
 
-**脚手架/桩代码（需补全）**：
-- 引擎层（[main/core/engine/](main/core/engine/)）：`BacktestEngine.run` 是空循环桩；`LiveEngine` 方法全为 `pass`；`ExecutionEngine` 部分实现；`SignalEngine` 仅基本框架。引擎层设计目标约 97% 回测/实盘共用，通过策略模式隔离（`OrderDispatcher`/`T1Checker` 接口，见 [execution_engine.py](main/core/engine/execution_engine.py)）
-- 多数 API 路由返回桩 `{"code": 0, "data": []}`（formulas、portfolios、backtest records）
-- TQ 模块（[main/core/tq/](main/core/tq/)）文件已建，需对接通达信
+**当前缺口**（实时状态见 [docs/live-flow-checklist.md](docs/live-flow-checklist.md) 与 [docs/implementation-plan.md](docs/implementation-plan.md)）：
+- 前端 SSE 消费 + 实盘工作台（B4，⏸ 暂缓）——B5 SSE 后端已就绪，前端 `EventSource` 未接
+- F9 印花税仍 0（`/deals` 印花税字段待真机验证）；D3 对账自动校准待真机跑顺放开
+- 首页仪表盘前端页、监控/告警骨架、conftest `dependency_overrides` 字符串 key、`data_feed.py`（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖）
 
 **配置链（已修复）**：[main/core/db.py](main/core/db.py) 与 [main/alembic/env.py](main/alembic/env.py) 均从 [core.config.load_config()](main/core/config.py) 读 `database.sqlite_path`（默认 `data/dev.db`，相对 `main/` 解析为 `main/data/dev.db`），与 `config.yaml` 一致。db.py 逐连接开启 `PRAGMA foreign_keys=ON` 让 ondelete 生效。切换 PostgreSQL 时改 `config.yaml` 的 `database` 段并补 `TQ_DB_PASSWORD` 环境变量。
 
