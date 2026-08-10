@@ -13,7 +13,7 @@ const SIGNAL_TYPES = [
   { value: 'CLOSE', label: '平仓' },
 ]
 
-const emptyForm = () => ({ name: '', content: '', signals: [{ signal_name: '', signal_type: 'OPEN', trigger_value: 1 }] as SignalItem[] })
+const emptyForm = () => ({ name: '', content: '', formula_count: 200, signals: [{ signal_name: '', signal_type: 'OPEN', trigger_value: 1 }] as SignalItem[] })
 const form = ref(emptyForm())
 
 async function load() {
@@ -31,6 +31,7 @@ function openEdit(f: any) {
   form.value = {
     name: f.name,
     content: f.content,
+    formula_count: f.formula_count ?? 200,
     signals: f.signals.length
       ? f.signals.map((s: any) => ({ signal_name: s.signal_name, signal_type: s.signal_type, trigger_value: s.trigger_value }))
       : [{ signal_name: '', signal_type: 'OPEN', trigger_value: 1 }],
@@ -72,12 +73,13 @@ onMounted(load)
 
   <div class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>公式内容</th><th>信号</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>公式内容</th><th>count</th><th>信号</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="f in formulas" :key="f.id">
           <td style="color:#888">#{{ f.id }}</td>
           <td>{{ f.name }}</td>
           <td style="color:#888;font-size:13px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.content }}</td>
+          <td style="color:#888">{{ f.formula_count ?? 200 }}</td>
           <td><span class="badge badge-blue">{{ f.signals.length }} 个信号</span></td>
           <td>
             <button @click="openEdit(f)" class="btn btn-sm btn-primary">编辑</button>
@@ -96,6 +98,9 @@ onMounted(load)
       <input v-model="form.name" placeholder="例如：MACROSSPRO（公式名称）" />
       <label>公式内容</label>
       <textarea v-model="form.content" rows="3" placeholder="通达信公式文本"></textarea>
+
+      <label>注入历史根数 count（公式内最长均线/函数需的 bar 数，默认 200）</label>
+      <input v-model.number="form.formula_count" type="number" min="1" placeholder="200" />
 
       <label>信号配置</label>
       <div v-for="(sig, idx) in form.signals" :key="idx" class="signal-row">

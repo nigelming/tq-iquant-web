@@ -152,17 +152,21 @@ def _build_engine(session_id: int, db: Session) -> LiveEngine:
                 formula_ids.add(strat.formula_id)
                 strategy_formula[strat.id] = strat.formula_id
 
-    # 批量查 Formula，建 {strategy_id: formula_name}
+    # 批量查 Formula，建 {strategy_id: formula_name} + {formula_name: formula_count}
+    # formula_count（Q4 决策4）为公式级注入根数：实盘注入 count 来自该字段，非全局 200。
     formula_by_strategy: Dict[int, str] = {}
+    formula_count_by_name: Dict[str, int] = {}
     if formula_ids:
         formula_map = {
-            f.id: f.name
+            f.id: f
             for f in db.query(Formula).filter(Formula.id.in_(formula_ids)).all()
         }
         for sid, fid in strategy_formula.items():
-            name = formula_map.get(fid)
-            if name:
-                formula_by_strategy[sid] = name
+            f = formula_map.get(fid)
+            if f:
+                formula_by_strategy[sid] = f.name
+                if f.formula_count:
+                    formula_count_by_name[f.name] = f.formula_count
 
     br = _bridge_config()
     dispatcher = HttpBridgeDispatcher(base_url=br["base_url"], token=br["token"])
@@ -180,6 +184,7 @@ def _build_engine(session_id: int, db: Session) -> LiveEngine:
         tq_formula=TQFormula(),
         formula_by_strategy=formula_by_strategy,
         formula_count=200,
+        formula_count_by_name=formula_count_by_name,
     )
 
 

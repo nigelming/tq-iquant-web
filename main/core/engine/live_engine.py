@@ -91,6 +91,7 @@ class LiveEngine:
         tq_formula: Optional[TQFormula] = None,
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
+        formula_count_by_name: Optional[Dict[str, int]] = None,
     ):
         self.session_id = session_id
         self.portfolios = portfolios
@@ -109,6 +110,20 @@ class LiveEngine:
         self._tq_formula = tq_formula
         self._formula_by_strategy: Dict[int, str] = formula_by_strategy or {}
         self._formula_count = formula_count
+        # #27→#28：count 按公式配（Formula.formula_count），同公式恒定 → C4 去重 key
+        # (code, period, formula) 无需 count 进 key。_formula_count 作全局兜底（老调用不破）。
+        self._formula_count_by_name: Dict[str, int] = formula_count_by_name or {}
+        # 每周期预拉最大 count：该周期策略所用公式的最大 formula_count——边界/日终分发
+        # 预拉的 bars 够该周期最长公式（count 不够时注入会缺历史，信号 NaN 静默失效）。
+        self._period_count: Dict[str, int] = {}
+        for _p in portfolios:
+            for _ctx in _p.strategies:
+                _name = self._formula_by_strategy.get(_ctx.strategy_id)
+                if not _name:
+                    continue
+                _cnt = self._formula_count_by_name.get(_name, self._formula_count)
+                if _cnt > self._period_count.get(_ctx.period, 0):
+                    self._period_count[_ctx.period] = _cnt
 
         # 信号缓存：(strategy_id, stock_code, bar_time) -> [{"name": str, "value": int}]
         # 风控信号（止损/止盈/移动止损）由 Portfolio._check_risks 直接生成，无需缓存；
@@ -248,12 +263,13 @@ class LiveEngine:
         today = now.date()
         if self._last_daily_bar_date == today:
             return
-        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）
+        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）；count = 1d 周期最大 formula_count
         bars_by_code: Dict[str, list] = {}
+        count = self._period_count.get("1d", self._formula_count)
         for code in self._bar_poller._stock_codes:
             try:
                 bars = self._dispatcher.query_quote(
-                    code, period="1d", count=self._formula_count
+                    code, period="1d", count=count
                 )
             except BridgeUnavailableError:
                 self._bridge_online = False
@@ -273,11 +289,17 @@ class LiveEngine:
             self._inject_startup_periods(daily_time)
         # 1d 快照即最终值（14:30 后），每 code 取最新 forming 1d bar 的 OHLCV
         stocks = {code: to_ohlcv(bars[-1]) for code, bars in bars_by_code.items()}
+        # C4(#28)：跨三周期共享去重缓存（key 含 period，1d/1w/1mon 互不干扰）
+        df_cache: Dict = {}
+        raw_cache: Dict = {}
         for period in ("1d", "1w", "1mon"):
             bar_event = BarEvent(stocks=stocks, bar_time=daily_time, period=period)
             for portfolio in self.portfolios:
                 try:
-                    self._handle_bar(portfolio, bar_event, bars_by_code=bars_by_code)
+                    self._handle_bar(
+                        portfolio, bar_event, bars_by_code=bars_by_code,
+                        df_cache=df_cache, raw_cache=raw_cache,
+                    )
                 except BridgeUnavailableError as e:
                     self._bridge_online = False
                     logger.warning(
@@ -297,10 +319,14 @@ class LiveEngine:
 
         边界判定只读 1m bar stime（periods_on_boundary），不引入本机时钟；
         5m/15m/30m/1h 策略在边界时点才被驱动（C6(A)），1m 节拍不再每 bar 算长周期。
+        C4(#28)：df_cache/raw_cache 建在此（跨组合共享）——同 (code,period) 只 query_quote
+        一次、同 (code,period,formula) 只 compute_injected 一次（TQ 计算最贵）。
         """
+        df_cache: Dict = {}
+        raw_cache: Dict = {}
         for portfolio in self.portfolios:
             try:
-                self._handle_bar(portfolio, bar)
+                self._handle_bar(portfolio, bar, df_cache=df_cache, raw_cache=raw_cache)
             except BridgeUnavailableError as e:
                 # 下单时桥离线：标记并中断本 bar（循环下一轮心跳会暂停）
                 self._bridge_online = False
@@ -325,7 +351,12 @@ class LiveEngine:
                 logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
 
     def _handle_bar(
-        self, portfolio: Portfolio, bar: BarEvent, bars_by_code: Optional[Dict[str, list]] = None
+        self,
+        portfolio: Portfolio,
+        bar: BarEvent,
+        bars_by_code: Optional[Dict[str, list]] = None,
+        df_cache: Optional[Dict] = None,
+        raw_cache: Optional[Dict] = None,
     ) -> None:
         """一根 bar：盯回撤 → 取信号/风控 → 先落 submitted → 发单 → 等回填。
 
@@ -343,7 +374,10 @@ class LiveEngine:
         if self._available_bar is not bar:
             self._available_bar = bar
             self._refresh_available_map()
-        self._fill_signal_cache(portfolio, bar, bars_by_code=bars_by_code)
+        self._fill_signal_cache(
+            portfolio, bar, bars_by_code=bars_by_code,
+            df_cache=df_cache, raw_cache=raw_cache,
+        )
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
         orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
         if not orders:
@@ -407,9 +441,11 @@ class LiveEngine:
         """
         bars_by_code: Dict[str, list] = {}
         stocks: Dict[str, dict] = {}
+        # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
+        count = self._period_count.get(period, self._formula_count)
         for code in self._bar_poller._stock_codes:
             bars = self._dispatcher.query_quote(
-                code, period=period, count=self._formula_count
+                code, period=period, count=count
             )
             if not bars:
                 continue
@@ -421,8 +457,13 @@ class LiveEngine:
         if not stocks:
             return
         bar_event = BarEvent(stocks=stocks, bar_time=boundary_time, period=period)
+        df_cache: Dict = {}
+        raw_cache: Dict = {}
         for portfolio in self.portfolios:
-            self._handle_bar(portfolio, bar_event, bars_by_code=bars_by_code)
+            self._handle_bar(
+                portfolio, bar_event, bars_by_code=bars_by_code,
+                df_cache=df_cache, raw_cache=raw_cache,
+            )
 
     @staticmethod
     def _total_value(portfolio: Portfolio, bar: BarEvent) -> Decimal:
@@ -464,9 +505,14 @@ class LiveEngine:
                 m["%s.%s" % (inst, exch)] = int(avail)
         self._t1_checker.set_available_map(m)
 
-    # ---------------- 公式信号注入（0010）----------------
+    # ---------------- 公式信号注入（0010 + C4 #28 三维去重）----------------
     def _fill_signal_cache(
-        self, portfolio: Portfolio, bar: BarEvent, bars_by_code: Optional[Dict[str, list]] = None
+        self,
+        portfolio: Portfolio,
+        bar: BarEvent,
+        bars_by_code: Optional[Dict[str, list]] = None,
+        df_cache: Optional[Dict] = None,
+        raw_cache: Optional[Dict] = None,
     ) -> None:
         """实盘逐 bar 算公式信号填 signal_cache。预填模式（不改 Portfolio）。
 
@@ -479,10 +525,20 @@ class LiveEngine:
         C6 节拍过滤：bar.period 非 None 时只注入匹配周期的策略（5m 边界 bar 不注入 1m 策略）；
         1w/1mon（_STARTUP_ONLY_PERIODS）走通达信启动/日终注入，不拉桥。
         bars_by_code：调用方已预拉好的 bars（边界/日终分发），避免二次拉桥。
+        C4(#28) 三维去重（单 bar 生命周期，跨组合共享）：
+          df_cache[(code, period)]   → 同 key 只 query_quote 一次（count 更大时升级重拉）
+          raw_cache[(code,period,formula)] → 同 key 只 compute_injected 一次（TQ 计算最贵）
+          count 不进 key 的前提：count 是 Formula.formula_count 公式级字段（#27），
+          同公式 count 恒定 → 同 (code,period,formula) 的 count 必然相同。
+        signal_cache key 仍带 strategy_id（隔离不变，值相同各自存一份）。
         无 tq_formula / 策略无公式映射 / 拉取为空 / 算失败 → 跳过（该股该 bar 无公式信号）。
         """
         if self._tq_formula is None or not self._formula_by_strategy:
             return
+        if df_cache is None:
+            df_cache = {}
+        if raw_cache is None:
+            raw_cache = {}
         for ctx in portfolio.strategies:
             formula_name = self._formula_by_strategy.get(ctx.strategy_id)
             if not formula_name:
@@ -494,28 +550,61 @@ class LiveEngine:
             if ctx.period in _STARTUP_ONLY_PERIODS:
                 continue
             period = ctx.period
+            # #27→#28：注入 count 来自 Formula.formula_count（公式级），非全局 200
+            count = self._formula_count_by_name.get(formula_name, self._formula_count)
             for code in bar.stocks:
                 try:
-                    if bars_by_code is not None and code in bars_by_code:
-                        bars = bars_by_code[code]
-                    else:
-                        bars = self._dispatcher.query_quote(
-                            code, period=period, count=self._formula_count
-                        )
+                    bars = self._fetch_cached_bars(
+                        df_cache, bars_by_code, code, period, count
+                    )
                 except BridgeUnavailableError:
                     # 拉历史失败：跳过该股（不阻断 on_bar，风控信号仍可触发）
                     logger.warning("quote failed for formula inject %s %s", code, period)
                     continue
-                df = self._bars_to_formula_df(bars, code)
-                if df is None:
-                    continue
-                raw = self._tq_formula.compute_injected(
-                    formula_name=formula_name, ohlcv_df=df,
-                    stocks=[code], period=period,
-                )
-                outputs = self._extract_latest_signal(raw, code)
+                raw_key = (code, period, formula_name)
+                if raw_key not in raw_cache:
+                    df = self._bars_to_formula_df(bars, code)
+                    raw = None
+                    if df is not None:
+                        raw = self._tq_formula.compute_injected(
+                            formula_name=formula_name, ohlcv_df=df,
+                            stocks=[code], period=period,
+                        )
+                    raw_cache[raw_key] = self._extract_latest_signal(raw, code)
+                outputs = raw_cache[raw_key]
                 if outputs:
                     self.signal_cache[(ctx.strategy_id, code, bar.bar_time)] = outputs
+
+    def _fetch_cached_bars(
+        self,
+        df_cache: Dict,
+        bars_by_code: Optional[Dict[str, list]],
+        code: str,
+        period: str,
+        count: int,
+    ) -> list:
+        """拉取去重：df_cache[(code, period)] 同 key 只 query_quote 一次。
+
+        缓存值 (bars, used_count)。同 code+period 的公式 count 更大 → 升级重拉（过小会缺
+        历史，公式长均线 NaN 静默失效）；bars_by_code 已按该周期最大 count 预拉 → 直接复用，
+        记 used=period 最大 count，避免无谓升级重拉。
+        """
+        key = (code, period)
+        cached = df_cache.get(key)
+        if cached is not None:
+            bars, used = cached
+            if count <= used:
+                return bars
+            bars = self._dispatcher.query_quote(code, period=period, count=count)
+            df_cache[key] = (bars, count)
+            return bars
+        if bars_by_code is not None and code in bars_by_code:
+            bars = bars_by_code[code]
+            df_cache[key] = (bars, max(count, self._period_count.get(period, 0)))
+            return bars
+        bars = self._dispatcher.query_quote(code, period=period, count=count)
+        df_cache[key] = (bars, count)
+        return bars
 
     @staticmethod
     def _bars_to_formula_df(bars: list, code: str) -> Optional[dict]:

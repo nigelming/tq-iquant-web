@@ -1010,7 +1010,8 @@ def test_backfill_updates_last_backfill_time_and_clears_pending():
 from core.engine.live_engine import periods_on_boundary  # noqa: E402
 
 
-def _make_engine_formula_portfolio(disp, factory, port, formula_by_strategy, formula_count=200):
+def _make_engine_formula_portfolio(disp, factory, port, formula_by_strategy,
+                                   formula_count=200, formula_count_by_name=None):
     """构造带 tq_formula + formula_by_strategy 且含组合的 LiveEngine（C6 注入/分发用）。"""
     from core.engine.bar_poller import BarPoller
     poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
@@ -1018,7 +1019,7 @@ def _make_engine_formula_portfolio(disp, factory, port, formula_by_strategy, for
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
         tq_formula=TQFormula(), formula_by_strategy=formula_by_strategy,
-        formula_count=formula_count,
+        formula_count=formula_count, formula_count_by_name=formula_count_by_name,
     )
 
 
@@ -1381,4 +1382,168 @@ def test_loop_offline_to_online_resets_baseline():
 
     assert engine.bridge_online is True
     assert len(reset_calls) == 1  # 离线→在线只转场一次
+
+
+# ===========================================================================
+# C4 三维去重（#28：拉取 (code,period) + 计算 (code,period,formula)）
+# ===========================================================================
+def _count_quote(rec):
+    """统计 _Recorder 中 /quote 请求数。"""
+    return [r for r in rec.requests if r.url.path == "/quote"]
+
+
+def _counting_compute(engine, stock, value=1):
+    """把 engine._tq_formula.compute_injected 换成计数版，返回 dict 计数。"""
+    calls = {"n": 0}
+
+    def _compute(**kw):
+        calls["n"] += 1
+        return {
+            "ErrorId": "0",
+            stock: {"open_sig": [
+                {"Date": "202608051000", "Value": 0.0},
+                {"Date": "202608051001", "Value": 0.0},
+                {"Date": "202608051002", "Value": float(value)},
+            ]},
+        }
+
+    engine._tq_formula.compute_injected = _compute
+    return calls
+
+
+def test_on_bar_dedups_quote_and_compute_across_portfolios():
+    """C4：#28 跨组合去重——同股票+周期+公式的多组合只拉一次/算一次。
+
+    _on_bar 级共享 df_cache/raw_cache → /quote 只 1 次、compute_injected 只 1 次；
+    signal_cache 两策略各有条目（隔离不变）。
+    """
+    factory, _ = _db_factory()
+    port1, _ = _portfolio_single(strategy_id=1)
+    port2, _ = _portfolio_single(strategy_id=2)
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port1, port2], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        tq_formula=TQFormula(), formula_by_strategy={1: "MACROSSPRO", 2: "MACROSSPRO"},
+    )
+    calls = _counting_compute(engine, stock)
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._on_bar(bar)
+
+    assert calls["n"] == 1  # 同 (code,period,formula) 只算一次
+    assert len(_count_quote(rec)) == 1  # 同 (code,period) 只拉一次
+    for sid in (1, 2):
+        out_map = {o["name"]: o["value"] for o in engine.signal_cache[(sid, stock, bar_time)]}
+        assert out_map["open_sig"] == 1
+
+
+def test_fill_signal_cache_dedups_compute_by_formula():
+    """C4：#28 计算去重——同 code+period 不同公式 → 拉一次、各算一次（formula 进 raw_cache key）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "1m"))  # 策略 1/2 同周期不同公式
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MACD"})
+    calls = _counting_compute(engine, stock)
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._fill_signal_cache(port, bar)
+
+    assert calls["n"] == 2  # 两公式各算一次
+    assert len(_count_quote(rec)) == 1  # 同 code+period 拉一次
+    for sid in (1, 2):
+        assert (sid, stock, bar_time) in engine.signal_cache
+
+
+def test_fill_signal_cache_uses_formula_count():
+    """#27→#28：注入 count 来自 Formula.formula_count（按公式配），非全局 200。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(strategy_id=1, period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "MA_CROSS"}, formula_count=200,
+        formula_count_by_name={"MA_CROSS": 300},
+    )
+    engine._tq_formula.compute_injected = lambda **kw: {
+        "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
+    }
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._fill_signal_cache(port, bar)
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1
+    assert "count=300" in str(quotes[0].url)  # 用公式级 count，非全局 200
+
+
+def test_fill_signal_cache_upgrades_quote_count_for_larger_formula():
+    """C4：#28 df_cache 升级——同 code+period 两公式 count 200/500 → 大 count 的公式升级重拉。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "1m"))  # 策略1 FORM_A(200) 策略2 FORM_B(500)
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A", 2: "FORM_B"}, formula_count=200,
+        formula_count_by_name={"FORM_A": 200, "FORM_B": 500},
+    )
+    engine._tq_formula.compute_injected = lambda **kw: {
+        "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
+    }
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._fill_signal_cache(port, bar)
+
+    queries = [str(q.url) for q in _count_quote(rec)]
+    assert len(queries) == 2  # 200 后升级重拉 500
+    assert any("count=200" in c for c in queries)
+    assert any("count=500" in c for c in queries)
+
+
+def test_dispatch_period_bar_uses_period_max_formula_count():
+    """C4：#28 边界分发预拉 count = 该周期策略最大 formula_count（供注入，够最长公式）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))  # 5m 策略 strategy_id=2
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 5, 10, 5)
+    bars_5m = [
+        {"stime": "20260805100000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805100500", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260805101000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"}, formula_count=200,
+        formula_count_by_name={"MA_CROSS": 400},
+    )
+    engine._tq_formula.compute_injected = lambda **kw: {
+        "ErrorId": "0", stock: {"open_sig": [{"Date": "20260805", "Value": 1}]},
+    }
+
+    engine._dispatch_period_bar("5m", boundary)
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1
+    assert "count=400" in str(quotes[0].url)  # 该周期公式最大 count=400
 

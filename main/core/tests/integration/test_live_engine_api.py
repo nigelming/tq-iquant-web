@@ -263,4 +263,6 @@ def test_build_engine_fills_formula_mapping(client, mock_bridge):
     # tq_formula 已注入
     assert engine._tq_formula is not None
     assert engine._formula_count == 200
+    # #27：formula_count 按公式配 → 引擎收到 {formula_name: count}（_seed 默认 200）
+    assert engine._formula_count_by_name == {"open_formula": 200}
 

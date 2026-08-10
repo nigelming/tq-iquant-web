@@ -17,14 +17,14 @@ import {
 
 const mockFormulas = [
   {
-    id: 1, name: 'MACROSSPRO', content: 'REF(CLOSE,1)',
+    id: 1, name: 'MACROSSPRO', content: 'REF(CLOSE,1)', formula_count: 500,
     signals: [
       { id: 1, signal_name: '开仓', signal_type: 'OPEN', trigger_value: 1 },
       { id: 2, signal_name: '平仓', signal_type: 'CLOSE', trigger_value: 1 },
     ],
   },
   {
-    id: 2, name: 'OPEN_FORMULA', content: 'MA(CLOSE,5);',
+    id: 2, name: 'OPEN_FORMULA', content: 'MA(CLOSE,5);', formula_count: 200,
     signals: [{ id: 3, signal_name: '开仓', signal_type: 'OPEN', trigger_value: 1 }],
   },
 ]
@@ -90,6 +90,53 @@ describe('Formulas.vue', () => {
     expect(arg.name).toBe('NEW_F')
     expect(arg.content).toBe('MA(CLOSE,5);')
     expect(Array.isArray(arg.signals)).toBe(true)
+  })
+
+  it('列表渲染 count 列（公式级注入根数）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+
+    // 第一条 formula_count=500，第二条默认 200
+    expect(w.text()).toContain('500')
+    expect(w.text()).toContain('200')
+  })
+
+  it('新建弹窗默认 formula_count=200，提交时随请求发出', async () => {
+    ;(createFormula as any).mockResolvedValue({ id: 99 })
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开 Modal
+
+    // 默认 count=200
+    expect((w.find('input[type="number"]').element as HTMLInputElement).value).toBe('200')
+    // 填表 + 修改 count=500
+    await w.find('input[placeholder*="名称"]').setValue('NEW_F')
+    await w.find('textarea').setValue('MA(CLOSE,5);')
+    await w.find('input[type="number"]').setValue('500')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createFormula).toHaveBeenCalledTimes(1)
+    const arg = (createFormula as any).mock.calls[0][0]
+    expect(arg.formula_count).toBe(500)
+  })
+
+  it('编辑时回填 formula_count（无字段回退 200）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+
+    // 第一条（id=1, formula_count=500）编辑 → 回填 500
+    const editBtns = w.findAll('button.btn-sm.btn-primary')
+    await editBtns[0].trigger('click')
+    expect((w.find('input[type="number"]').element as HTMLInputElement).value).toBe('500')
+    w.unmount()
+
+    // 无 formula_count 的老数据 → 回退默认 200
+    ;(getFormulas as any).mockResolvedValue([{ id: 9, name: 'OLD', content: 'X', signals: [] }])
+    const w2 = mount(Formulas)
+    await flushPromises()
+    await w2.findAll('button.btn-sm.btn-primary')[0].trigger('click')
+    expect((w2.find('input[type="number"]').element as HTMLInputElement).value).toBe('200')
   })
 
   it('点某行[删除] → 调 deleteFormula(id)', async () => {

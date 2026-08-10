@@ -253,6 +253,90 @@ def test_update_formula_not_found(client):
 
 
 # ---------------------------------------------------------------------------
+# formula_count 字段（任务 #27：注入历史根数，按公式配）
+# ---------------------------------------------------------------------------
+def test_create_formula_with_formula_count(client):
+    """POST 带 formula_count=500 → 落库 + 序列化返回。"""
+    c, Session = client
+    payload = {
+        "name": "MA255_F", "content": "MA(CLOSE,255);",
+        "signals": [{"signal_name": "开仓", "signal_type": "OPEN", "trigger_value": 1}],
+        "formula_count": 500,
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["formula_count"] == 500
+
+    new_id = body["data"]["id"]
+    db = Session()
+    f = db.get(Formula, new_id)
+    assert f.formula_count == 500
+    db.close()
+
+
+def test_create_formula_default_formula_count_200(client):
+    """POST 不带 formula_count → 默认 200（Q4 决策4）。"""
+    c, Session = client
+    resp = c.post("/api/formulas", json={
+        "name": "DEFAULT_F", "content": "X",
+        "signals": [],
+    })
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["formula_count"] == 200
+
+    db = Session()
+    f = db.get(Formula, resp.json()["data"]["id"])
+    assert f.formula_count == 200
+    db.close()
+
+
+def test_list_formula_includes_formula_count(client):
+    """GET 列表每条含 formula_count（默认 200）。"""
+    c, Session = client
+    db = Session()
+    fid = _seed_formula(db)  # 不带 formula_count → 默认 200
+    db.close()
+
+    resp = c.get("/api/formulas")
+    item = resp.json()["data"][0]
+    assert item["id"] == fid
+    assert item["formula_count"] == 200
+
+
+def test_update_formula_changes_formula_count(client):
+    """PUT 改 formula_count → 落库更新。"""
+    c, Session = client
+    db = Session()
+    fid = _seed_formula(db)
+    db.close()
+
+    payload = {
+        "name": "UPDATED_F", "content": "MA(CLOSE,10);",
+        "signals": [],
+        "formula_count": 300,
+    }
+    resp = c.put(f"/api/formulas/{fid}", json=payload)
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["formula_count"] == 300
+
+    db = Session()
+    assert db.get(Formula, fid).formula_count == 300
+    db.close()
+
+
+def test_formula_count_below_1_rejected(client):
+    """formula_count < 1 → code 400。"""
+    c, Session = client
+    resp = c.post("/api/formulas", json={
+        "name": "BAD", "content": "X", "signals": [], "formula_count": 0,
+    })
+    assert resp.json()["code"] == 400
+    assert "formula_count" in resp.json()["message"]
+
+
+# ---------------------------------------------------------------------------
 # DELETE /api/formulas/{id} — 删公式（信号随 CASCADE 删）
 # ---------------------------------------------------------------------------
 def test_delete_formula_removes_signals(client):

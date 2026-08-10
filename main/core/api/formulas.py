@@ -22,6 +22,8 @@ class FormulaCreate(BaseModel):
     name: str
     content: str
     signals: list[SignalItem]
+    # Q4 决策4：注入历史根数（公式级字段，同公式 count 恒定 → C4 去重 key 无需 count）
+    formula_count: int = 200
 
 
 def _serialize_formula(db: Session, f: Formula) -> dict:
@@ -36,6 +38,7 @@ def _serialize_formula(db: Session, f: Formula) -> dict:
         "id": f.id,
         "name": f.name,
         "content": f.content,
+        "formula_count": f.formula_count,
         "created_at": f.created_at,
         "updated_at": f.updated_at,
         "signals": [
@@ -79,7 +82,9 @@ def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
     err = _validate_signals(req.signals)
     if err:
         return {"code": 400, "message": err}
-    f = Formula(name=req.name, content=req.content)
+    if req.formula_count < 1:
+        return {"code": 400, "message": "formula_count 必须 ≥ 1"}
+    f = Formula(name=req.name, content=req.content, formula_count=req.formula_count)
     db.add(f)
     db.flush()
     for sig in req.signals:
@@ -100,8 +105,11 @@ def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(ge
     err = _validate_signals(req.signals)
     if err:
         return {"code": 400, "message": err}
+    if req.formula_count < 1:
+        return {"code": 400, "message": "formula_count 必须 ≥ 1"}
     f.name = req.name
     f.content = req.content
+    f.formula_count = req.formula_count
     # 信号全量替换：删旧建新（简单可靠）
     db.query(FormulaSignal).filter(FormulaSignal.formula_id == formula_id).delete()
     for sig in req.signals:

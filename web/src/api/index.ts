@@ -51,6 +51,7 @@ export interface FormulaRequest {
   name: string
   content: string
   signals: SignalItem[]
+  formula_count: number  // 注入历史根数（公式级，默认 200）
 }
 
 export async function getFormulaDetail(id: number) {
