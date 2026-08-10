@@ -37,7 +37,8 @@ import time
 # ================= config =================
 HOST = "127.0.0.1"
 PORT = 8790
-ACCOUNT = "110002348760"          # TODO: change to your account
+ACCOUNT_DEFAULT = "110002348760"  # dev placeholder; override via env IQUANT_BRIDGE_ACCOUNT / .bridge_account file
+ACCOUNT = None                     # loaded by load_account() below
 DRY_RUN = False                    # safe default: only print, no real order. Flip to False when ready
 TOKEN = None                      # auth token, loaded by load_secret()
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
@@ -72,6 +73,27 @@ def load_secret():
 
 
 TOKEN = load_secret()
+
+
+def load_account():
+    """Account ID: env IQUANT_BRIDGE_ACCOUNT first, else .bridge_account file.
+
+    Same pattern as load_secret: the account is not hardcoded into the strategy
+    (switch accounts via env var or a local file; the file stays out of git and
+    is written at deploy time). Falls back to ACCOUNT_DEFAULT (dev placeholder).
+    """
+    acc = os.environ.get("IQUANT_BRIDGE_ACCOUNT", "")
+    if not acc:
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridge_account")
+            with open(p, "r") as f:
+                acc = f.read().strip()
+        except Exception:
+            pass
+    return acc or ACCOUNT_DEFAULT
+
+
+ACCOUNT = load_account()
 
 
 # ---------------- iQuant API access (isolated for test mocks) ----------------

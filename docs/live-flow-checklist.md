@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/本提交),对应行已标 ✅。仍待办:B5 SSE(暂缓),🧠 决策已清零。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/本提交),对应行已标 ✅。仍待办:B5 SSE(暂缓),🧠 决策已清零。
 
 ---
 
@@ -201,10 +201,10 @@
 
 | # | 细节 | 依赖 |
 |---|---|---|
-| A2 | `ACCOUNT` 硬编码改配置 | 🧠 |
+| ✅已改 | `ACCOUNT` 硬编码改配置 | ✅ 2026-08-10:env `IQUANT_BRIDGE_ACCOUNT` 优先,否则 `.bridge_account` 文件,回退 `ACCOUNT_DEFAULT`(同 `load_secret` 模式);纯 ASCII,`py_compile` 过 |
 | ✅已改 | `query_deals`/`query_orders`/`query_positions` 字段已补全(`m_strOrderRef`/`m_nCanUseVolume` 等,见 G4/D3/F5 行) | ✅ 2026-08-10 |
 | ✅已改 | `_do_place` 支持 `pr_type`(0 限价/14 对手价)——已恢复硬编码 14(对手价) | ✅ 2026-08-10 |
-| 🔧新增 | **桥策略须以「实盘交易」模式运行**(模拟模式 passorder 不发委托,真机验证) | 部署文档 |
+| ✅已写 | **桥部署 README + 「实盘交易」模式要求**——`live/bridge/README.md` 部署/账号/TOKEN/白名单配置说明,注明必须以实盘交易模式运行(模拟模式 passorder 不发委托,真机验证) | ✅ 2026-08-10 |
 
 ---
 
@@ -218,5 +218,5 @@
 6. **✅ 已完成:D4/H4 熔断计数读回/持久化**——max_drawdown 触发计数落库(`circuit_breaker_count`,未变不写),recover 读回;达 3 次转手动恢复(停新开仓等待人工)。
 7. **✅ 已完成:F6 同 bar 超卖 + G5 独立回填轮询**——SELL 发单成功后 `consume_available` bar 内可用量递减记账(多策略同 bar 卖不超券商 available);`/deals` 回填拆独立 5s 轮询(`_deals_loop`),主循环仍 30s 拉 bar。
 8. **✅ 已完成:D3 对账(仅告警不修正)**——recover 末尾按 code 聚合虚拟持仓 vs 桥 /positions,差异记 `_reconcile_mismatches`+告警日志,不自动改账;桥离线跳过不崩。
-9. **桥部署注意** — 桥策略必须以「实盘交易」模式运行(模拟模式 passorder 不发委托,真机验证),写进部署文档。
-10. **🧠 决策项** — 当前无待定决策(F6/G5/D3 已定);随时可过。
+9. **✅ 已完成:桥部署 README + A2 账号改配置** — `live/bridge/README.md` 部署/账号/TOKEN/白名单说明 + 实盘交易模式硬要求;`ACCOUNT` 改 env/文件配置(同 `load_secret` 模式)。
+10. **🧠 决策项** — 当前无待定决策(F6/G5/D3/A2 已定);随时可过。
