@@ -12,7 +12,7 @@
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional
 
@@ -93,6 +93,8 @@ class LiveEngine:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._bridge_online = True
+        # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
+        self._last_daily_date: Optional[date] = None
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -128,6 +130,8 @@ class LiveEngine:
                 self._bridge_online = True
                 # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
                 self._bar_poller.poll()
+                # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
+                self._maybe_daily_close()
             except BridgeUnavailableError as e:
                 self._bridge_online = False
                 logger.warning("bridge unavailable: %s, skip this round", e)
@@ -136,6 +140,40 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("live loop unexpected error")
             await asyncio.sleep(self._poll_interval)
+
+    # ---------------- 日终（E5/E6）----------------
+    def _maybe_daily_close(self) -> None:
+        """本机时间 ≥ 14:30 且当日未算过 → 对每个组合调一次 update_daily。
+
+        日终一次：日内盈亏 daily_pnl = 当前总市值 - prev_close（昨日收盘，update_peak 跨日刷新），
+        检测 daily_loss 暂停 + 次日恢复。用本机 Asia/Shanghai 时钟（实盘固有时点，同 C6 1d 快照时点）。
+        幂等：_last_daily_date 记录当日已算，避免每轮循环重复触发。
+        """
+        now = datetime.now()
+        if (now.hour, now.minute) < (14, 30):
+            return
+        today = now.date()
+        if self._last_daily_date == today:
+            return
+        self._last_daily_date = today
+        for portfolio in self.portfolios:
+            try:
+                # 日终总市值：用组合最新现金 + 持仓市值（无最新 bar 时以当前持仓市值近似）
+                total = portfolio.account.cash
+                for ctx in portfolio.strategies:
+                    for stock_code, pos in ctx.positions.items():
+                        if pos.quantity == 0:
+                            continue
+                        # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
+                        total += pos.avg_cost * pos.quantity
+                portfolio.risk_manager.update_daily(
+                    total, today, portfolio.account.initial_capital
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "update_daily error (portfolio %s, date %s)",
+                    portfolio.portfolio_id, today,
+                )
 
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
@@ -155,13 +193,17 @@ class LiveEngine:
                 )
 
     def _handle_bar(self, portfolio: Portfolio, bar: BarEvent) -> None:
-        """一根 bar：取信号/风控 → 立即下单 → 落库。
+        """一根 bar：盯回撤 → 取信号/风控 → 立即下单 → 落库。
 
         复用回测 Portfolio.on_bar（信号优先级/风控/主从/熔断全复用），
         通过 self._engine（已注入 HttpBridgeDispatcher + LiveT1Checker）做实盘下单。
         成交时机：当根 bar 立即成交（非下一 bar open）。
         公式信号：on_bar 前调 _fill_signal_cache 注入算公式预填 signal_cache（0010）。
+        E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测），
+        14:30 的 update_daily 由 _loop 调。on_bar 内 is_trading_halted 据此剥 BUY。
         """
+        # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
+        portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
         self._fill_signal_cache(portfolio, bar)
         orders = portfolio.on_bar(bar, signal_cache=self.signal_cache)
         if not orders:
@@ -187,6 +229,18 @@ class LiveEngine:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def _total_value(portfolio: Portfolio, bar: BarEvent) -> Decimal:
+        """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值。同回测 _total_value。"""
+        total = portfolio.account.cash
+        for ctx in portfolio.strategies:
+            for stock_code, pos in ctx.positions.items():
+                if pos.quantity == 0 or stock_code not in bar.stocks:
+                    continue
+                close = bar.stocks[stock_code]["close"]
+                total += close * pos.quantity
+        return total
 
     @staticmethod
     def _find_strategy(portfolio: Portfolio, strategy_id: int) -> Optional[StrategyContext]:
