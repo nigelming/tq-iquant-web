@@ -114,6 +114,103 @@
 
 ---
 
+## Q4 倍数周期内存注入方式与 count
+
+**状态**：已解决（1w/1mon 桥端拉不到，改走通达信放行）
+**来源**：2026-08-06 实盘流程逐点确认 C3
+**关联**：0010 公式注入、live-flow-checklist C3/C6
+
+### 背景
+
+通达信分钟级周期:1m/5m/15m/30m 为原生支持(直接拉原生 bar);50m/120m 等 SDK 不认(`periodstr error`)。
+
+### 已验证结论（2026-08-06 真机，回测版 D:/new_tdx64）
+
+`verify_formula_inject.py --periods 1m,5m,15m,30m,1h,2h,4h,8h,1d,1w,1mon,1q,1y`,MACROSSPRO @ 600000.SH,count=200:
+
+| 周期 | 结果 | 说明 |
+|---|---|---|
+| 1m | ✅ PASS | 1 分钟 |
+| 5m | ✅ PASS | 5 分钟 |
+| 15m | ✅ PASS | 15 分钟 |
+| 30m | ✅ PASS | 30 分钟 |
+| 1h | ✅ PASS | 1 小时(不是 `60m`) |
+| 2h / 4h / 8h | ❌ FAIL | `periodstr error` —— 小时级仅支持 1h |
+| 1d | ✅ PASS | 日线 |
+| 1w | ✅ PASS | 周线 |
+| 1mon | ✅ PASS | 月线 |
+| 1q / 1y | ❌ FAIL | `periodstr error` —— 不支持季线/年线 |
+
+**TQ 公式支持的完整周期列表(8 个)**:`1m / 5m / 15m / 30m / 1h / 1d / 1w / 1mon`,全部内存注入与正常自取**完全等价**(逐变量逐条 Value 全等,且有真实信号)。
+
+**结论**:
+1. **通达信支持的周期有边界**:分钟级 1m/5m/15m/30m,小时级仅 1h(无 2h/4h/8h),日级以上 1d/1w/1mon(无季线 1q/年线 1y)。
+2. **所有支持周期内存注入与正常自取完全等价**,**链路无需特殊处理**,直接拉原生 bar 注入。
+3. **count=200 对所有支持周期均足够**(分钟/小时/日线信号触发充分;月线等长周期历史根数本就少于 200,正常)。
+
+### iQuant 桥端周期(2026-08-07 源码定论,补交集)
+
+实盘 period 一路透传:`ctx.period` → 桥 `/quote?period=` → `xtdata.get_market_data_ex(period=)` 拉 bar → 同一 `ctx.period` → `formula_set_data` + `process_mul_zb` 喂 TQ。**两端必须用同一个 period 字符串**,故实盘可配 = TQ 支持 ∩ iQuant 桥支持。
+
+iQuant 侧有三套 period 说法,**桥实际用 xtdata 那套**(`live/bridge/iquant_bridge.py:_fetch_quote`):
+
+| 来源 | 周期 | 桥用? |
+|---|---|---|
+| `xtquant/xtdata.py` 本地读取白名单(7 处同一集合,line 310/370/448/517) | `1m, 5m, 15m, 30m, 1h, 1d`(6 个) | ✅ 桥用此 |
+| `config/fun.xml` ContextInfo 声明(17 个,含 3m/1q/1hy/1y/mh/mm/md) | ContextInfo 进程内 API | ❌ 桥没用 |
+| `A策略.py:41` perioddic | `1d, 1m, 5m, 15m, 30m, 60m`(含 60m 不含 1h) | ❌ ContextInfo 内部 |
+
+**关键差异**:
+- **xtdata 白名单是 `1h`,不是 `60m`** —— `60m` 在 xtdata 任何列表里都不存在
+- **`1w/1mon` 不在 xtdata 白名单** —— 走 `get_market_data_ex_ori` 远程分支(非本地缓存),源码无特殊处理,**能否拉到未真机验证**(桥连不上 miniQMT 认证,等开盘)
+
+### 实盘可配周期交集表
+
+| 周期 | TQ 公式(真机验) | iQuant 桥 xtdata | 实盘可配? |
+|---|---|---|---|
+| `1m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `5m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `15m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `30m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `1h` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `1d` | ✅ | ✅ 白名单本地 | ✅ 稳 |
+| `1w` | ✅ | ⚠️ 走远程分支,未真机验 | ⚠️ 待真机 |
+| `1mon` | ✅ | ⚠️ 走远程分支,未真机验 | ⚠️ 待真机 |
+| `60m` | ❌ `periodstr error` | ❌ 不在 xtdata 列表 | ❌ 两边都不行 |
+| `3m/1q/1hy/1y` | ❌ | ⚠️ ContextInfo 有,xtdata 未验 | ❌ TQ 不支持 |
+
+### 决策(2026-08-07)
+
+1. **业务周期约束 — 已定(2026-08-07 更新)**:代码 `VALID_PERIODS` / 前端 `PERIODS` 统一为 **`1m, 5m, 15m, 30m, 1h, 1d, 1w, 1mon`**(8 个)。去掉 `60m`(TQ 与 xtdata 双双不支持),放开 `15m/1h`(TQ 与 xtdata 双双支持)。`1w/1mon` 改走通达信算(见决策3 更新),纳入放行。
+2. **`_MINUTE_PERIODS`(索引对齐判定集)— 已定**:`1m, 5m, 15m, 30m, 1h`。语义是「TQ 输出 Date 只标到日、bar 时间带时分、需按 bar_times 索引对齐的周期」—— **1h 含在内**(1h bar 时间带时分 10:00/11:00,走 Date 匹配会落午夜 key 导致引擎查不到信号)。`1d` 走 Date 匹配(日粒度 1:1)。`60m` 移除。注:`_MINUTE_PERIODS` 是**回测**索引对齐用,1d/1w/1mon 走 Date 匹配,故 1w/1mon 不进此集合(回测 1w/1mon 也走 Date 匹配,日级以上粒度)。
+3. **`1w/1mon` 改走通达信放行(2026-08-07 更新,推翻原"暂不放行")** —— 桥端真机已验**拉不到**(xtdata 远程分支 `'NoneType' object is not iterable`,见下方真机结论),但 **TQ+通达信本身支持 1w/1mon**(真机验过注入与自取等价)。故 1w/1mon **不走桥 /quote**,实盘 session 启动时直接 `TQFormula.compute(period="1w"/"1mon")`(正常自取链路,formula.py:6,让 TQ 从通达信拉数据算)算一次公式,14:30 与 1d 统一触发下单(→ live-flow-checklist C3 三段式模式 (C)、C6)。回测 1w/1mon 仍走 `compute` 自取(原本就支持)。**VALID_PERIODS 扩到 8 个**。
+4. **count 按公式配(2026-08-07 定)**:count 是**公式固有属性**(公式里写了要多少 bar,如含 MA60 至少 60、含要 255 bar 的函数至少 255),非全局统一、非策略级。`Formula` 表加 `formula_count` 字段(default 200),人工按公式内容填最小 bar 数。实盘注入 count 来自该字段。**count 是公式级字段 → 同公式 count 恒定**,故 C4 去重 key 用 `(股票, 周期, 公式)` 三维即可,count 无需进 key(→ live-flow-checklist C4)。前置实现见任务 #27,C4 去重见任务 #28。
+
+### 1w/1mon 桥端真机结论(2026-08-07,解决决策3)
+
+`verify_quote_history.py --periods 1w,1mon --counts 200,200` 真机验 3 股(600000.SH/000001.SZ/510300.SH),桥日志:
+```
+[BRIDGE] xtdata FAIL 600000.SH 1w: 'NoneType' object is not iterable
+[BRIDGE] xtdata FAIL 600000.SH 1mon: 'NoneType' object is not iterable
+```
+
+**根因**:`1w/1mon` 不在 xtdata 本地读取白名单 → 走 `get_market_data_ex_ori` 远程分支 → 返回 None → xtdata 内部代码迭代 None 抛 `'NoneType' object is not iterable`(`_fetch_quote` except 捕获打印 `[BRIDGE] xtdata FAIL`)。**不是"空数据"、不是"periodstr error"**。
+
+**定论**:`1w/1mon` iQuant 桥端**拉不到**,但 **TQ+通达信本身支持**(真机验过注入与自取等价)。故实盘 **不走桥 /quote**,session 启动时改走 `TQFormula.compute(period="1w"/"1mon")`(正常自取链路,让 TQ 从通达信拉数据算),14:30 与 1d 统一触发下单(→ live-flow-checklist C3 三段式模式 (C)、C6)。`VALID_PERIODS` 据此**扩到 8 个**`{1m,5m,15m,30m,1h,1d,1w,1mon}`。决策3"等开盘验过再加" → **验过,改走通达信放行**。
+
+### 相关代码位置
+
+- `main/core/api/strategies.py:20` — `VALID_PERIODS` 策略创建/更新校验白名单
+- `main/core/api/backtest.py:345` — `_MINUTE_PERIODS` 索引对齐判定集(含 1h)
+- `web/src/views/Portfolios.vue:31` — `PERIODS` 前端下拉选项
+- `web/src/api/index.ts:84,141,159` — `period` 字段注释
+- `main/core/engine/live_engine.py:199` — `_fill_signal_cache` 注入入口,period 来自 `ctx.period`
+- `main/core/tq/formula.py:30` — `compute_injected` 链路,`stock_period=period` 同时传 set_data 和 process_mul_zb
+- `main/scripts/verify_formula_inject.py` — 验证脚本(已扩 `--periods`,已改回测版路径)
+- `live/bridge/iquant_bridge.py:252` — `_fetch_quote` period 直接透传给 `xtdata.get_market_data_ex`
+
+---
+
 ## 模板
 
 新增问题时复制以下结构：

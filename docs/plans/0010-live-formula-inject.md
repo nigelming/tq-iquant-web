@@ -23,11 +23,13 @@
 
 链路：`get_market_data`（取 OHLCV）→ `formula_format_data`（转公式格式）→ `formula_set_data`（type=0 内存注入）→ `formula_process_mul_zb`（type=4 算公式）。**注入数据被公式引擎完全等价采用**，非虚假一致（两侧都有真实信号且分布相同）。
 
-### 1.3 关键决策：实盘复用回测版通达信，不用 live 版
+### 1.3 关键决策：实盘复用回测版通达信，不分 live 版
 
-用户决策：**内存注入不读写本地 `.lc1` 文件**，当初分 `new_tdx64`（回测版）/ `new_tdx64_live`（实盘版）是为了「实盘写本地 1m/5m 文件怕污染回测版」而隔离。现在内存注入替代了写文件，隔离理由消失——**实盘连回测版 `new_tdx64` 即可**，`tdx_live_path` 不用。
+用户决策：**内存注入不读写本地 `.lc1` 文件**，当初分 `new_tdx64`（回测版）/ `new_tdx64_live`（实盘版）是为了「实盘写本地 1m/5m 文件怕污染回测版」而隔离。现在内存注入替代了写文件，隔离理由消失——**实盘连回测版 `new_tdx64` 即可**。
 
-- 实盘 `LiveEngine` 主进程用 `get_tq()`（`tq/utils.py:48`，连回测版 `new_tdx64`）算公式
+> **2026-08-06 更新**：已彻底放弃 live 版，全系统只用回测版 `new_tdx64`。`config.yaml` 的 `tdx_live_path` 已删除，统一为 `tdx_path`；`get_tq()` 只连回测版目录。
+
+- 实盘 `LiveEngine` 主进程用 `get_tq()`（`tq/utils.py`，连回测版 `new_tdx64`）算公式
 - 回测同步在请求线程跑（`backtest.py:744`，**未用 ProcessPoolExecutor**，CLAUDE.md 描述过时），与实盘同进程
 - 两者共用 `get_tq()` 单例连接 + `get_tdx_lock()` 串行化（`tq/formula.py:13`），不并发冲突；单用户系统本就不会同时跑回测+实盘
 

@@ -1,10 +1,11 @@
 # 实盘引擎可行性验证结论
 
-> 验证脚本：[main/scripts/verify_live_engine.py](../../main/scripts/verify_live_engine.py)
 > 验证日期：2026-08-04（交易日 10:27-10:35 盘中）
 > 关联方案：[docs/plans/0008-live-engine-simulation-pipeline.md](0008-live-engine-simulation-pipeline.md)
 
 > ⚠️ **次期方案已变更（见 0009）**：本文档中关于「NATS 网关加行情通道」「miniQMT」的结论已被推翻——miniQMT 个人账户无交易权限，NATS 网关已废弃。最终采用「iQuant 客户端内 HTTP 桥」，行情用 `xtdata.get_market_data_ex` 拉取（非订阅）。以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) §12 为准。
+
+> ⚠️ **通达信分版已废弃（2026-08-06）**：本文档验证所用的「实盘版通达信 `D:\new_tdx64_live`」**已不再使用**。全系统统一用回测版 `D:\new_tdx64`。原验证脚本 `verify_live_engine.py`（基于已废弃的 subscribe_hq 推送方案）已删除。当前公式注入验证用 [verify_formula_inject.py](../../main/scripts/verify_formula_inject.py)。
 
 ## 验证目的
 

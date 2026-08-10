@@ -8,6 +8,8 @@
 
 > ⚠️ **次期方案已变更（见 0009）**：本计划原定「次期 `NatsDispatcher` + iQuant NATS 网关」**已废弃**，改为「iQuant 客户端内 HTTP 桥（`HttpBridgeDispatcher`）」。NATS 通信拓扑整体移除。下文凡涉及 `NatsDispatcher`/NATS 网关的内容仅作历史记录，以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) 为准。
 
+> ⚠️ **通达信分版已废弃（2026-08-06）**：本计划及验证记录中提到的「实盘版通达信 `D:\new_tdx64_live`」**已不再使用**。全系统统一用回测版 `D:\new_tdx64`，`tdx_live_path` 配置项已删除。下文凡涉及 `new_tdx64_live`/live 版/`tdx_live_path` 的内容仅作历史记录。
+
 ## 1. 目标
 
 打通「TQ 实时通知 → 主动拉数 → 内存注入公式 → 信号 → 风控 → 模拟撮合 → 落库 → SSE 推送 → 前端监控」实盘全链路。**首期成交用 `SimulatedDispatcher` 本地撮合**（与回测同），不接 iQuant 真实下单。一个会话跑多个组合（1:N），各组合虚拟持仓/虚拟现金隔离。落地后实盘具备「能跑能看能恢复」的产品级状态，与回测对称。
