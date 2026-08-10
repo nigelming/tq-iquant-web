@@ -1,21 +1,13 @@
 import sys
 import threading
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from core.config import load_config
 
 
 class TDXConnectionError(Exception):
     pass
-
-
-@dataclass
-class TQConfig:
-    backtest_path: str = ""
-    live_path: str = ""
-    mode: str = "backtest"
 
 
 _tdx_lock = threading.Lock()
@@ -27,10 +19,10 @@ def get_tdx_lock():
     return _tdx_lock
 
 
-def _tdx_backtest_path() -> str:
-    """从 config.yaml 读 tdx_backtest_path；缺失回退默认。"""
+def _tdx_path() -> str:
+    """从 config.yaml 读 tdx_path；缺失回退默认。"""
     cfg = load_config()
-    p = cfg.get("tdx_backtest_path", "") or "D:\\new_tdx64"
+    p = cfg.get("tdx_path", "") or "D:\\new_tdx64"
     return p
 
 
@@ -49,11 +41,11 @@ def get_tq():
     """获取 tqcenter.tq 单例，首次调用惰性 initialize 连接。
 
     连接标识用本文件路径（utils.py），唯一标识本进程。
-    需通达信回测版已启动并登录行情。
+    需通达信（回测版 new_tdx64）已启动并登录行情。
     """
     global _tq, _tq_initialized
     if _tq is None:
-        inject_tqcenter_path(_tdx_backtest_path())
+        inject_tqcenter_path(_tdx_path())
         from tqcenter import tq
         _tq = tq
     if not _tq_initialized:

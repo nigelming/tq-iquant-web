@@ -6,7 +6,7 @@
   (1) 正常调用 formula_process_mul_zb —— SDK 自取 .lc1 数据自算，记录结果；
   (2) 内存注入调用：get_market_data 取同样 OHLCV → formula_format_data
       → formula_set_data 注入 → formula_process_mul_zb 算，记录结果；
-  (3) 对比两者 1m / 5m 输出是否一致 → 判定内存注入是否可替代正常调用。
+  (3) 对比两者各周期(1m/5m/15m/30m/1h)输出是否一致 → 判定内存注入是否可替代正常调用。
 
 判定标准：
   逐变量逐条比对 Value，完全一致 = PASS（内存注入可行）；
@@ -18,13 +18,14 @@
   已落盘的日期范围即可公平对比（两条路径读同一份数据源），不受盘中实时
   缺数据干扰。盘中实时数据回填是下一切片（/deals + 实时 bar 注入）的范畴。
 
-用法（需通达信 live 版运行并登录）：
+用法（需通达信回测版运行并登录）：
   cd main
   uv run python scripts/verify_formula_inject.py
   uv run python scripts/verify_formula_inject.py --code 600000.SH --days 8 --count 200
+  uv run python scripts/verify_formula_inject.py --periods 1m,5m,15m,30m,1h
 
 注意：
-  - 连 live 版目录 D:/new_tdx64_live/PYPlugins（与实盘 BarPoller 同源）。
+  - 连回测版目录 D:/new_tdx64/PYPlugins（与实盘 BarPoller 同源）。
   - 占 run_id，跑完自动 tq.close()。
 """
 import argparse
@@ -34,10 +35,10 @@ from datetime import datetime, timedelta
 
 
 def _inject_paths():
-    """注入 live 版 tqcenter 路径到 sys.path。"""
-    live_pyplugins = "D:/new_tdx64_live/PYPlugins"
+    """注入回测版 tqcenter 路径到 sys.path。"""
+    pyplugins = "D:/new_tdx64/PYPlugins"
     for sub in ("sys", "user"):
-        p = live_pyplugins + "/" + sub
+        p = pyplugins + "/" + sub
         if p not in sys.path:
             sys.path.append(p)
 
@@ -254,6 +255,8 @@ def main():
     ap.add_argument("--days", type=int, default=8, help="回溯天数（用于定 end=昨收盘）")
     ap.add_argument("--count", type=int, default=200, help="公式 count 参数")
     ap.add_argument("--formula", default="MACROSSPRO", help="公式名")
+    ap.add_argument("--periods", default="1m,5m",
+                    help="逗号分隔的周期列表,如 1m,5m,15m,30m,50m,120m")
     args = ap.parse_args()
 
     code = args.code
@@ -268,7 +271,7 @@ def main():
         from tqcenter import tq
     except Exception as e:
         print("[FAIL] 无法 import tqcenter：", e)
-        print("       确认 D:/new_tdx64_live/PYPlugins 存在")
+        print("       确认 D:/new_tdx64/PYPlugins 存在")
         return 1
 
     conn_path = __file__.replace("\\", "/")
@@ -276,7 +279,7 @@ def main():
     # 误导诊断。这里直接调 dll.InitConnect 探查原始返回，定位真因。
     try:
         tq.initialize(conn_path)
-        print("[OK] tq.initialize 成功（live 目录）")
+        print("[OK] tq.initialize 成功（回测版目录）")
     except Exception as e:
         print("[FAIL] tq.initialize 抛异常（兜底消息可能误导）：%s" % e)
         print("       → 真因探查：直接调 dll.InitConnect 看原始返回...")
@@ -289,14 +292,14 @@ def main():
             ptr = _dll.InitConnect(fname, dpath, 0, get_python_version_number(), False)
             if not ptr or len(ptr) <= 0:
                 print("       [真因] InitConnect 返回空指针 → TPythClient 未响应")
-                print("       → 通达信 live 版 (D:/new_tdx64_live) 未启动 或 未登录行情")
+                print("       → 通达信回测版 (D:/new_tdx64) 未启动 或 未登录行情")
             else:
                 ret = ptr.decode("utf-8", "ignore")
                 print("       [真因] InitConnect 原始返回：%s" % ret[:300])
         except Exception as e2:
             print("       [探查失败] %s" % e2)
         print("\n排查清单：")
-        print("  1. 通达信 live 版 D:/new_tdx64_live 是否已启动并登录（看行情能否刷新）")
+        print("  1. 通达信回测版 D:/new_tdx64 是否已启动并登录（看行情能否刷新）")
         print("  2. 是否已有同名策略占用连接（关掉旧的再跑）")
         print("  3. TPythClient.dll 是否被通达信主进程加载（客户端须在跑）")
         return 1
@@ -308,7 +311,11 @@ def main():
     print("日期范围：%s ~ %s  count=%d" % (start_str, end_str, count))
 
     results = {}
-    for period in ("1m", "5m"):
+    periods = [p.strip() for p in args.periods.split(",") if p.strip()]
+    if not periods:
+        periods = ["1m", "5m"]
+    print("验证周期：%s" % ", ".join(periods))
+    for period in periods:
         _print_section("周期 %s — 正常调用" % period)
         normal, n_msg = _run_normal(tq, formula_name, code, period, start_str, end_str, count)
         print("  正常调用结果：%s" % n_msg)

@@ -217,7 +217,37 @@ def test_create_portfolio_invalid_period(client):
     db.close()
 
     payload = _create_payload()
-    payload["strategies"][0]["period"] = "15m"  # 文档无 15m
+    payload["strategies"][0]["period"] = "60m"  # 两端都不认（TQ periodstr error + xtdata 白名单是 1h）
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 400
+    assert "period" in body["message"]
+
+
+@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
+def test_create_portfolio_valid_period(client, period):
+    """6 个合法周期（open-questions Q4 交集）应放行。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["period"] = period
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+    assert body["data"]["strategies"][0]["period"] == period
+
+
+@pytest.mark.parametrize("period", ["60m", "1w", "1mon", "3m", "2h"])
+def test_create_portfolio_rejected_period(client, period):
+    """非法周期（含暂未放行的 1w/1mon）应在组合创建时被拒绝。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["period"] = period
     body = c.post("/api/portfolios", json=payload).json()
     assert body["code"] == 400
     assert "period" in body["message"]
@@ -494,8 +524,43 @@ def test_create_strategy_invalid_period(client):
     pid = _seed_portfolio(db, strategies=[])
     db.close()
 
-    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(period="15m")).json()
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(period="60m")).json()
     assert body["code"] == 400
+
+
+@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
+def test_create_strategy_valid_period(client, period):
+    """6 个合法周期（TQ 公式 ∩ iQuant 桥 xtdata 交集，open-questions Q4）应放行。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(
+        f"/api/portfolios/{pid}/strategies",
+        json=_strategy_payload(name=f"S_{period}", period=period),
+    ).json()
+    assert body["code"] == 0
+    assert body["data"]["period"] == period
+
+
+@pytest.mark.parametrize("period", ["60m", "1w", "1mon", "3m", "2h", "1q"])
+def test_create_strategy_rejected_period(client, period):
+    """非法周期应拒绝：
+    60m — 两端都不认（TQ periodstr error + xtdata 白名单是 1h）；
+    1w/1mon — TQ 支持但 iQuant 桥 xtdata 走远程分支未真机验，暂不放行；
+    3m/2h/1q — TQ 不支持。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(
+        f"/api/portfolios/{pid}/strategies",
+        json=_strategy_payload(period=period),
+    ).json()
+    assert body["code"] == 400
+    assert "period" in body["message"]
 
 
 def test_create_strategy_formula_not_found(client):

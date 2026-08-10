@@ -270,9 +270,9 @@ def test_convert_formula_output_error_id_nonzero():
 
 
 # ---------------------------------------------------------------------------
-# 分钟级对齐（5m/15m/30m/60m）：TQ 公式输出 Date 只标到日（丢时分），
+# 索引对齐（1m/5m/15m/30m/1h）：TQ 公式输出 Date 只标到日（丢时分），
 # 但输出条目按 bar 顺序排列。传 bar_times 时间轴时，按索引对齐：
-# 第 i 条输出 → bar_times[i] 的 datetime。日线不传 bar_times，走 Date 匹配。
+# 第 i 条输出 → bar_times[i] 的 datetime。1d 不传 bar_times，走 Date 匹配。
 # ---------------------------------------------------------------------------
 def test_convert_formula_output_minute_aligns_by_index():
     """5m：TQ 输出 96 条（Date 只有 2 个唯一日），传 96 根 bar 的 bar_times，
@@ -534,5 +534,69 @@ def test_build_signal_cache_minute_orchestration(db_session, monkeypatch):
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
     # 午夜 key 不应存在（那是对齐失败的旧表现）
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 0, 0)) not in cache
+
+
+# ---------------------------------------------------------------------------
+# _MINUTE_PERIODS：索引对齐判定集（open-questions Q4）
+# TQ 公式输出 Date 只标到日（丢时分），bar 时间带时分的周期无法按 Date 1:1 匹配，
+# 须按 bar_times 索引对齐。含 1m/5m/15m/30m/1h（1h bar 带时分）；
+# 1d bar 是日粒度，走 Date 匹配（1:1）。60m 已移除（两端都不认）。
+# ---------------------------------------------------------------------------
+def test_minute_periods_membership():
+    """_MINUTE_PERIODS 恰好是 5 个「带时分 bar」周期，含 1h，不含 60m/1d。"""
+    assert bt_api._MINUTE_PERIODS == {"1m", "5m", "15m", "30m", "1h"}
+    assert "60m" not in bt_api._MINUTE_PERIODS
+    assert "1d" not in bt_api._MINUTE_PERIODS
+
+
+def test_minute_periods_aligned_with_valid_periods():
+    """_MINUTE_PERIODS 应是 VALID_PERIODS 的「带时分 bar」子集（两处白名单不可漂移）。"""
+    from core.api.strategies import VALID_PERIODS
+    assert bt_api._MINUTE_PERIODS.issubset(VALID_PERIODS)
+    # VALID_PERIODS 的日粒度（1d）不在 _MINUTE_PERIODS，走 Date 匹配
+    non_minute = VALID_PERIODS - bt_api._MINUTE_PERIODS
+    assert non_minute == {"1d"}
+
+
+def test_build_signal_cache_1h_uses_index_align(db_session, monkeypatch):
+    """1h bar 时间带时分（10:00/11:00），TQ 输出 Date 只标到日，
+    须按 bar_times 索引对齐（同 5m），否则 cache key 落午夜 → 引擎逐 bar 查不到信号。"""
+    from core.models import Strategy
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Strategy).filter_by(id=strat.id).update({"period": "1h"})
+    db.commit()
+
+    klines = {"000001.SZ": {"1h": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29, 10, 0), datetime(2026, 7, 29, 11, 0)],
+        "Open": [Decimal("10"), Decimal("10.2")],
+        "High": [Decimal("10.3"), Decimal("10.5")],
+        "Low": [Decimal("9.9"), Decimal("8.9")],
+        "Close": [Decimal("10.2"), Decimal("9.0")],
+        "Volume": [1000, 1000],
+    })}}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        # TQ 真机：2 条输出，Date 都是 20260729（日粒度），Value 逐条变
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},   # → bar 10:00
+                    {"Date": "20260729", "Value": -1},  # → bar 11:00
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 关键：1h 走索引对齐，cache key 是带时分的 1h bar_time，不是午夜
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 10, 0)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 11, 0)) in cache
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 10, 0))] == [{"name": "open_sig", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 11, 0))] == [{"name": "open_sig", "value": -1}]
+    # 午夜 key 不应存在（那是 Date 匹配的产物，1h 不该走那条）
     assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 0, 0)) not in cache
 

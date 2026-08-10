@@ -81,7 +81,7 @@ export async function getPortfolios() {
 export interface StrategyItem {
   name: string
   formula_id: number
-  period: string  // 1m|5m|30m|60m|1d|1w
+  period: string  // 1m|5m|15m|30m|1h|1d
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 0=本批第N个；null=无
   capital_ratio: number
@@ -138,7 +138,7 @@ export interface StrategyDetail {
   id: number
   name: string
   formula_id: number
-  period: string  // 1m|5m|30m|60m|1d|1w
+  period: string  // 1m|5m|15m|30m|1h|1d
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
   capital_ratio: number
@@ -156,7 +156,7 @@ export interface StrategyDetail {
 export interface StrategyRequest {
   name: string
   formula_id: number
-  period: string  // 1m|5m|30m|60m|1d|1w
+  period: string  // 1m|5m|15m|30m|1h|1d
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
   capital_ratio: number

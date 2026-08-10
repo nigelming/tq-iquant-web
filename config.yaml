@@ -1,5 +1,4 @@
-tdx_backtest_path: D:\new_tdx64
-tdx_live_path: D:\new_tdx64_live
+tdx_path: D:\new_tdx64
 iquant_path: D:\iquant
 max_concurrent_backtest: 1
 

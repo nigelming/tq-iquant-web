@@ -20,12 +20,8 @@ async function save() {
 <template>
   <div class="card" style="padding:24px;max-width:520px">
     <div class="field">
-      <label>回测通达信目录</label>
-      <input v-model="config.tdx_backtest_path" placeholder="D:\new_tdx64" />
-    </div>
-    <div class="field">
-      <label>实盘通达信目录</label>
-      <input v-model="config.tdx_live_path" placeholder="D:\new_tdx64_live" />
+      <label>通达信目录</label>
+      <input v-model="config.tdx_path" placeholder="D:\new_tdx64" />
     </div>
     <div class="field">
       <label>iQuant 目录</label>

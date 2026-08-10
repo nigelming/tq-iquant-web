@@ -342,7 +342,11 @@ def _parse_date_str(d: str):
     return None
 
 
-_MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "60m"}
+# 索引对齐周期：TQ 公式输出 Date 只标到日（丢时分），但 bar 时间带时分，
+# 无法按 Date 1:1 匹配，须按 bar_times 索引对齐（第 i 条输出 → bar_times[i]）。
+# 含 1h（小时级 bar 时间带时分，与分钟级同需索引对齐）；1d bar 是日粒度走 Date 匹配。
+# 取值与 VALID_PERIODS 的「带时分 bar」子集一致（open-questions Q4）。
+_MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "1h"}
 
 
 def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:

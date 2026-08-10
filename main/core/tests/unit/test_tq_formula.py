@@ -120,3 +120,25 @@ def test_compute_injected_multi_stocks_all_set_before_process(fake_tq):
     # process 的 stock_list 含全部
     kwargs = fake_tq.formula_process_mul_zb.call_args.kwargs
     assert kwargs["stock_list"] == ["600000.SH", "000001.SZ"]
+
+
+@pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
+def test_compute_injected_passes_period_through(fake_tq, period):
+    """compute_injected 应把 period 原样透传给 set_data 与 process_mul_zb 的 stock_period。
+
+    6 个实盘可配周期（VALID_PERIODS，open-questions Q4）逐一断言，防止某周期在
+    注入链路被错误改写/归一化。真机注入等价性已由 verify_formula_inject.py 验过
+    （注入=自取全等），此单测验的是代码层 period 字符串透传无误。
+    """
+    with patch("core.tq.formula.get_tq", return_value=fake_tq), \
+         patch("core.tq.formula.get_tdx_lock"):
+        formula = TQFormula()
+        formula.compute_injected(
+            formula_name="MACROSSPRO", ohlcv_df=_ohlcv_df(),
+            stocks=["600000.SH"], period=period,
+        )
+
+    set_kwargs = fake_tq.formula_set_data.call_args.kwargs
+    proc_kwargs = fake_tq.formula_process_mul_zb.call_args.kwargs
+    assert set_kwargs["stock_period"] == period
+    assert proc_kwargs["stock_period"] == period

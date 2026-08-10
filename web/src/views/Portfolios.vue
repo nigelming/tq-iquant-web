@@ -28,7 +28,9 @@ const editingStrategyId = ref<number | null>(null)
 const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
-const PERIODS = ['1m', '5m', '30m', '60m', '1d', '1w']
+// 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 交集（open-questions Q4）：
+// 1m/5m/15m/30m/1h/1d 两端均已验证。1w/1mon 待桥端真机，暂不放行。60m 两端都不认。
+const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d']
 const ROLES = [
   { value: 'independent', label: '对立' },
   { value: 'master', label: '主策略' },
