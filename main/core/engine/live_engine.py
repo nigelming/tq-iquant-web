@@ -25,7 +25,7 @@ from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
 from .http_bridge_dispatcher import HttpBridgeDispatcher, BridgeUnavailableError
 from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
-from core.models import LiveOrder, LiveTrade
+from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -148,6 +148,10 @@ class LiveEngine:
         # F5：最近处理 bar 的强引用（多组合共享同一 bar 对象 → 每 bar 只刷一次桥可用
         # 持仓；强引用防对象 id 复用导致的漏刷）。None=尚未处理任何 bar。
         self._available_bar: Optional["BarEvent"] = None
+        # D4/H4：每组合已持久化的熔断计数（LiveSessionPortfolio.circuit_breaker_count）。
+        # recover 预置当前值；_persist_breaker_count 只在计数变化时落库（避免每 bar 写）。
+        # key=portfolio.portfolio_id。
+        self._breaker_count_written: Dict[int, int] = {}
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -369,6 +373,8 @@ class LiveEngine:
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
+        # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
+        self._persist_breaker_count(portfolio)
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
         # SELL 减仓上限用 m_nCanUseVolume（T+1 可用），供 cap_quantity 取数。
         if self._available_bar is not bar:
@@ -428,6 +434,40 @@ class LiveEngine:
         except Exception:
             db.rollback()
             raise
+        finally:
+            db.close()
+
+    def _persist_breaker_count(self, portfolio: Portfolio) -> None:
+        """H4：把组合 max_drawdown 累计触发次数持久化到 LiveSessionPortfolio.circuit_breaker_count。
+
+        每 bar update_peak 后比对：计数未变则不落库（避免每 bar 写）；变化（熔断触发 / 达 3 次
+        转手动）→ 写 count，达 3 次 status 转 circuit_broken（design §8.3）。找不到 link
+        （组合未关联本 session）→ 跳过。写库失败不阻断交易，记日志。
+        """
+        count = portfolio.risk_manager.consecutive_drawdown_triggers
+        if self._breaker_count_written.get(portfolio.portfolio_id) == count:
+            return
+        db = self._db_session_factory()
+        try:
+            link = (
+                db.query(LiveSessionPortfolio)
+                .filter_by(
+                    session_id=self.session_id,
+                    portfolio_strategy_id=portfolio.portfolio_id,
+                )
+                .first()
+            )
+            if link is None:
+                self._breaker_count_written[portfolio.portfolio_id] = count
+                return
+            link.circuit_breaker_count = count
+            if count >= 3:
+                link.status = "circuit_broken"
+            db.commit()
+            self._breaker_count_written[portfolio.portfolio_id] = count
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("persist breaker count error (portfolio %s)", portfolio.portfolio_id)
         finally:
             db.close()
 
@@ -1026,6 +1066,24 @@ class LiveEngine:
                 "recover: %d pending live orders to backfill (session %s)",
                 len(pending), self.session_id,
             )
+        # D4：读回熔断计数（LiveSessionPortfolio.circuit_breaker_count）——重启后累计次数不丢。
+        # 达 3 次 → 转手动恢复（manual_recovery + circuit_breaker_active=True 停新开仓等待人工，
+        # 同 status=circuit_broken 语义）；<3 次的单日熔断当天已恢复，重启不补挂（单一计数模型，
+        # 可接受）。预置 _breaker_count_written 避免首 bar 重复落库。
+        links = (
+            db.query(LiveSessionPortfolio)
+            .filter(LiveSessionPortfolio.session_id == self.session_id)
+            .all()
+        )
+        for link in links:
+            port = ports_by_id.get(link.portfolio_strategy_id)
+            if port is None or not link.circuit_breaker_count:
+                continue
+            port.risk_manager.consecutive_drawdown_triggers = link.circuit_breaker_count
+            self._breaker_count_written[link.portfolio_strategy_id] = link.circuit_breaker_count
+            if link.circuit_breaker_count >= 3:
+                port.risk_manager.manual_recovery = True
+                port.risk_manager.circuit_breaker_active = True
 
     @property
     def bridge_online(self) -> bool:

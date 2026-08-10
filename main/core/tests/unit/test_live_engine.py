@@ -25,7 +25,7 @@ from core.engine.portfolio import Portfolio
 from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
-from core.models import Base, LiveOrder, LiveTrade
+from core.models import Base, LiveOrder, LiveTrade, LiveSessionPortfolio
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -1546,4 +1546,150 @@ def test_dispatch_period_bar_uses_period_max_formula_count():
     quotes = _count_quote(rec)
     assert len(quotes) == 1
     assert "count=400" in str(quotes[0].url)  # 该周期公式最大 count=400
+
+
+# ---------------- D4/H4 熔断计数持久化/读回 ----------------
+def _breaker_engine(factory):
+    """带 LiveSessionPortfolio link 的引擎（session_id=1, portfolio_strategy_id=1）。"""
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    db = factory()
+    db.add(LiveSessionPortfolio(session_id=1, portfolio_strategy_id=1, circuit_breaker_count=0))
+    db.commit()
+    db.close()
+    return engine, port
+
+
+def _breaker_link(db, count):
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    assert link is not None
+    assert link.circuit_breaker_count == count
+    return link
+
+
+def test_persist_breaker_count_writes_on_change():
+    """H4：max_drawdown 触发计数变化 → 写 LiveSessionPortfolio.circuit_breaker_count。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+
+    port.risk_manager.consecutive_drawdown_triggers = 1
+    engine._persist_breaker_count(port)
+
+    db = factory()
+    link = _breaker_link(db, 1)
+    assert link.status == "active"  # <3 不转 circuit_broken
+    db.close()
+    assert engine._breaker_count_written[1] == 1  # 记录已写计数，避免重复落库
+
+
+def test_persist_breaker_count_unchanged_skips_write():
+    """H4：计数未变 → 直接跳过（不查询/不落库）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    engine._breaker_count_written[1] = 2
+    port.risk_manager.consecutive_drawdown_triggers = 2
+
+    engine._persist_breaker_count(port)  # 计数 == written → return，不写库
+
+    db = factory()
+    _breaker_link(db, 0)  # DB 仍是初始 0
+    db.close()
+
+
+def test_persist_breaker_count_three_sets_circuit_broken():
+    """H4：达 3 次 → status 转 circuit_broken（design §8.3）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+
+    port.risk_manager.consecutive_drawdown_triggers = 3
+    engine._persist_breaker_count(port)
+
+    db = factory()
+    link = _breaker_link(db, 3)
+    assert link.status == "circuit_broken"
+    db.close()
+
+
+def test_handle_bar_persists_breaker_count_on_drawdown_trigger():
+    """H4：_handle_bar 接 update_peak——max_drawdown 熔断触发（计数+1）→ circuit_breaker_count 落库。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 清风控比例：drawdown bar 不触发止损单，聚焦熔断计数断言
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    # 持仓 1000 股 + 现金 0：总市值随 bar close 波动
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    # bar1: close=100 → 总市值 100000 建峰（无熔断）
+    engine._handle_bar(port, _bar(stock, "100", datetime(2026, 8, 5, 10, 0)))
+    db = factory()
+    _breaker_link(db, 0)
+    db.close()
+
+    # bar2: close=70 → 回撤 30% > 20% → 熔断，计数+1 落库
+    engine._handle_bar(port, _bar(stock, "70", datetime(2026, 8, 5, 10, 1)))
+    db = factory()
+    link = _breaker_link(db, 1)
+    assert link.status == "active"
+    db.close()
+
+
+def test_recover_restores_breaker_count():
+    """D4：recover 读回 circuit_breaker_count → consecutive_drawdown_triggers（重启后不丢累计次数）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 2
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert port.risk_manager.consecutive_drawdown_triggers == 2
+    assert port.risk_manager.manual_recovery is False   # 2 < 3 未转手动
+    assert port.risk_manager.circuit_breaker_active is False
+    assert engine._breaker_count_written[1] == 2  # 预置，避免首 bar 重复写
+
+
+def test_recover_breaker_count_three_sets_manual_halt():
+    """D4：达 3 次 → recover 后转手动恢复：manual_recovery + circuit_breaker_active（停新开仓）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert port.risk_manager.consecutive_drawdown_triggers == 3
+    assert port.risk_manager.manual_recovery is True
+    assert port.risk_manager.circuit_breaker_active is True
+    assert port.risk_manager.is_trading_halted() is True
 
