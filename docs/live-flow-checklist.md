@@ -8,7 +8,7 @@
 > **用法**:逐行过,能定的把结论写进「确认结论」列并标 ✅;需真机的标 🔬 待开盘;需人定的标 🧠 等决策。
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
-> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README,均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/本提交),对应行已标 ✅。仍待办:B5 SSE(暂缓),🧠 决策已清零。
+> **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README、B5 SSE 事件流(signal/order/trade/position/risk 五类推送),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/本提交),对应行已标 ✅。🧠 决策已清零,🔲 待实现表已清空。
 
 ---
 
@@ -52,7 +52,7 @@
 | B2 | `POST /sessions/{id}/start` | ✅ | 📖 | `api/live.py:173`(→ design §1.2) | — |
 | B3 | `mode` 字段语义 + 模式匹配 | ✅ | 🧠 | Core 按 `mode` 连对应桥(实盘桥/模拟桥,见 A3)。**启动会话时先匹配模式**:读 `session.mode` → 连对应桥地址 → 再组装引擎。不再依赖单一 `DRY_RUN`。**配置需两套桥地址**(mode→bridge_url 映射,扩 `config.iquant_bridge` 段) | ✅ 启动先匹配模式→连对应桥 |
 | B4 | 前端实盘启动页 | ⏸ | 📖 | 前端页面暂不确定,后续再定。不阻塞 Core/桥的设计 | ⏸ 暂缓 |
-| B5 | SSE 成交/信号推送 | ⏸ | ✅ | `/stream` 当前只发 ping(→ design §1.5)。暂时不确定,后续再定,不阻塞主链路 | ⏸ 暂缓 |
+| B5 | SSE 成交/信号推送 | ✅已实现 | 📖 | `/stream` 当前只发 ping(→ design §1.5)。暂时不确定,后续再定,不阻塞主链路 | ✅ 已实现(2026-08-10,本提交):`LiveEngine._emit`/`stream_events` 广播五类事件(signal/order/trade/position/risk,均带 `portfolio_id`)+ `/stream` 端点运行中转发、空闲 30s ping、未运行 ping-only。前端消费留待 B4 实盘启动页 |
 | B6 | 多 session 并发限制 | ✅已实现 | 🧠 | **限制同一时刻全局只跑 1 个实盘 session**(2026-08-07 定)。简化隔离,避免多引擎争抢桥单线程 + 持仓归属混乱(Q1 未解)。**代码缺口**:`live.py:191` 现状 `if session_id in _ENGINES` 只防**同一 session 重复 start**(返回 running),**不防全局多个不同 session 并跑** → 待改成 `_ENGINES` 非空即拒绝任何新 start(返回错误提示已有 session 在跑) | ✅ 已实现(2026-08-10,3c826e8):`live.py:191` 同 session 重复 start 幂等返回 running;`_ENGINES` 非空即拒新 start(409 业务错误,提示已有 session 在跑) |
 
 ---
@@ -186,12 +186,7 @@
 | F10 | 落库 status 拆 submitted | eb4bc40 |
 | #27 | `Formula.formula_count` 字段+迁移+前端公式页(count 按公式配) | 3b74cbf |
 | #28 | C4 三维去重(拉取 `(code,period)` + 计算 `(code,period,formula)`) | 3b74cbf |
-
-### 🔲 待实现(明确要写,可休市做)
-
-| # | 细节 | 优先级 | 依赖 |
-|---|---|---|---|
-| B5 | SSE 成交/信号推送 | 低 | — |
+| B5 | SSE 事件流(`_emit` 五类事件 signal/order/trade/position/risk + `/stream` 端点转发,前端消费留待 B4 实盘启动页) | 本提交 |
 
 ### 🧠 设计决策(需人定,不阻塞读码)
 

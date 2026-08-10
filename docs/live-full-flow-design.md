@@ -485,21 +485,16 @@ submitted(受理未成交) → partial(部分成交) → filled(全部成交)
 | 公式信号注入 `_fill_signal_cache` | ✅ 已实现(0010) |
 | 单 bar 处理 `_handle_bar` | ✅ 已实现 |
 | 桥下单 `place_order` | ✅ 已实现(受理即成交近似) |
-| 落库 `_persist_trade` | ✅ 已实现(status=accepted) |
-| T+1 实盘处理 | ⚠️ 全量放行,待改 |
-| 熔断/日内亏损接线 | ❌ 未接 `risk_manager.update` |
-| 成交回报回填 `/deals` | ❌ 切片5 未做 |
-| 订单状态机 | ❌ 未做 |
-| 持仓对账 | ❌ 未做 |
-| SSE 成交推送 | ❌ 未做 |
-| 桥状态并入 session API | ❌ 切片5 未做 |
+| 落库 `_persist_trade` | ✅ 已实现(status=submitted,回填改 filled/partial) |
+| T+1 实盘处理 | ✅ 已实现(F5 桥 `m_nCanUseVolume` + F6 同 bar 递减记账) |
+| 熔断/日内亏损接线 | ✅ 已实现(E5/E6 `update_peak`/`update_daily` + D4/H4 计数持久化) |
+| 成交回报回填 `/deals` | ✅ 已实现(切片5,G2/G6 + G5 独立 5s 轮询) |
+| 订单状态机 | ✅ 已实现(切片5,G1/F10:submitted→filled/partial/rejected) |
+| 持仓对账 | ✅ 已实现(D3,recover 后虚拟 vs 桥 /positions 比对,仅告警不修正) |
+| SSE 成交推送 | ✅ 已实现(B5,`_emit` 五类事件 signal/order/trade/position/risk + `/stream` 转发) |
+| 桥状态并入 session API | ✅ 已实现(切片5 G7:`bridge_online`/`pending_orders`/`last_backfill_time`) |
 
-**下一步(切片5,等开盘)**:
-1. 验证桥 `/deals` + `/positions` 真实行为(订单匹配键 + `m_dAvailable`)
-2. 写 0011 切片5 计划
-3. 实现订单状态机 + `/deals` 回填 + 虚拟持仓修正
-4. 补熔断/日内亏损接线(可与切片5 并行或紧随)
-5. 全量回归
+**下一步**:实现进度见 [live-flow-checklist.md](live-flow-checklist.md)(已全 ✅ 清零);剩余真机验证项(桥 /deals 印花税字段、D3 对账聚合、/positions 字段拼接)开盘后跑脚本。
 
 ---
 
