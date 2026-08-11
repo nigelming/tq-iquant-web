@@ -62,7 +62,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 ## 实现状态（更新：2026-08-10）
 
 **已实现（较完整）**：
-- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ 6 个 Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count` 等后续迁移）
+- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ 7 个 Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束等后续迁移；head = `d4a5b6c7d8e9`）
 - 7 个 API 路由模块已注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status 全部可用（回测、实盘 CRUD + start/stop + SSE 流）
 - iQuant HTTP 桥 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
 - 引擎层全 TDD 实现：`BacktestEngine.run` 完整逐 bar 回测；`LiveEngine` 实盘主链路（订单状态机 + /deals 回填 + 三段式周期 1m 边界/1d 14:30/1w·1mon 通达信 + B5 SSE 五类事件流 + E5/E6 熔断 + D3 对账告警）已接线。`SignalEngine` 为未接线的冗余壳（信号走 `strategy_context` + `Portfolio.on_bar` 直接求值）

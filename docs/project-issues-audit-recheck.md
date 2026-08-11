@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）；#27/#28 已修（见"前端收尾"小节）；#33 已修（见"硬编码清理"小节）；#39/#40 已修（见"P3 低成本项"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 8 项（全为数据完整性/迁移项：#18 剩 1/#19/#20/#21/#22）、P3 5 项（#38/#39/#40/#43 已处理）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）；#27/#28 已修（见"前端收尾"小节）；#33 已修（见"硬编码清理"小节）；#39/#40 已修（见"P3 低成本项"小节）；#18(剩余 1)/#19/#20/#21/#22 已修（见"数据完整性迁移组"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、**P2 0 项（19/19 清零）**、P3 5 项（#37/#41/#42/#44/#45；#38/#39/#40/#43 已处理）。
 
 ---
 
@@ -295,3 +295,21 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 5. **#5** SSE 404 用 HTTPException —— 让前端 onerror 可见
 
 这 5 条都是低成本、高安全收益，适合先批量处理。
+
+---
+
+## 2026-08-11 数据完整性迁移组（#18 剩余/#19/#20/#21/#22）
+
+一条 Alembic 迁移链 `a5b351e0d6d7 → d4a5b6c7d8e9` + 9 个模型同步 + init_db 改造，P2 清零。
+
+| # | 状态 | 处理 |
+|---|------|------|
+| 18 | ✅ **已修**（剩余 1 处） | `strategies.master_strategy_id` 自引用 FK 补 `ondelete="RESTRICT"`（业务规则禁止 slave 无 master 孤儿行；delete_strategy app 层预检 + DB 层兜底）。迁移 drop/create FK + 模型 `strategy.py:16` |
+| 19 | ✅ **已修** | `stock_pools.code` 补 `UNIQUE`（`uq_stock_pools_code`）；dev.db 无重复 code，迁移安全。测试 `test_create_strategy_slave_master_wrong_portfolio` 的 `_seed_pool` 改幂等（同 code 复用，模拟"同一板块被多组合引用"）以符合新约束 |
+| 20 | ✅ **已修** | FK/查询列补索引 13 处：strategies×3、portfolio_strategies.stock_pool_id、live_orders×2（strategy_id/stock_code）、live_trades×2、backtest_records.portfolio_strategy_id、backtest_trades×2、formula_signals.formula_id。`backtest_trades`/live 系列无 ondelete FK 有意保留（改会破坏 `test_portfolio_api.py:675` 的 IntegrityError 预期） |
+| 21 | ✅ **已修** | 26 列补 `server_default` 并**一并收紧 NOT NULL**（用户确认）：strategy 10、portfolio_strategy 12、live_order.filled_quantity、backtest_record.progress、live_session_portfolio 2。`formula.formula_count` 已有 server_default 不动 |
+| 22 | ✅ **已修** | `init_db()`（`core/db.py`）改 `alembic command.upgrade(head)`，替代 `Base.metadata.create_all`，schema 变更全部走迁移链。**刻意不加载 alembic.ini**——env.py 的 fileConfig() 默认 disable_existing_loggers 会禁用 core.* 业务 logger，污染运行期日志与测试 caplog（曾导致 4 个顺序敏感测试全量失败）；改为无参 `Config()` + 绝对路径 `script_location` + 手动 `sys.path` 插入 |
+
+**迁移**：`main/alembic/versions/d4a5b6c7d8e9_add_data_integrity_constraints.py`（down_revision=`a5b351e0d6d7`，全 `op.batch_alter_table`）。`alembic check` 无差异；`uv run pytest -q` **376 全绿**；dev.db 迁移前已备份 `main/data/dev.db.bak`；server_default/unique 已实测（插入不带默认列 → 默认值落库；重复 code → IntegrityError）。
+
+**P2 当前结论**：#18(剩余 1)/#19/#20/#21/#22 全部已修，**P2 19/19 清零**。剩余 open 仅 P1 #9（service 层，暂不做）+ P3 #37/#41/#42/#44/#45。

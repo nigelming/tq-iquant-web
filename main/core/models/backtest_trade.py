@@ -9,8 +9,8 @@ class BacktestTrade(Base):
 
     id = Column(Integer, primary_key=True)
     backtest_record_id = Column(Integer, ForeignKey("backtest_records.id", ondelete="CASCADE"), nullable=False)
-    strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=False)
-    formula_signal_id = Column(Integer, ForeignKey("formula_signals.id"), nullable=True)
+    strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=False, index=True)
+    formula_signal_id = Column(Integer, ForeignKey("formula_signals.id"), nullable=True, index=True)
     signal_name = Column(String(50), nullable=False)
     signal_type = Column(String(15), nullable=False)
     stock_code = Column(String(20), nullable=False)

@@ -43,5 +43,6 @@ web/stdin.empty
 # SQLite databases (local runtime data)
 main/data/*.db
 main/data/*.db-journal
+main/data/*.db.bak
 main/data/*.sqlite
 main/data/*.sqlite3

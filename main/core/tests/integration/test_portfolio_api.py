@@ -61,7 +61,14 @@ def client(tmp_path):
 
 
 def _seed_pool(db, code="TQCS", name="tq自选"):
-    """建 StockPool（PortfolioStrategy FK 依赖）。"""
+    """建 StockPool（PortfolioStrategy FK 依赖）。
+
+    幂等：同 code 已存在则复用（#19 后 stock_pools.code 唯一）——
+    模拟"同一板块被多个组合引用"的真实场景，而非重复建板块。
+    """
+    existing = db.query(StockPool).filter(StockPool.code == code).first()
+    if existing:
+        return existing.id
     p = StockPool(code=code, name=name)
     db.add(p); db.flush(); db.commit()
     return p.id
