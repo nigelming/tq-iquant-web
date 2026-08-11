@@ -32,8 +32,19 @@ from tq_iquant_shared.constants import SignalType, TradeType
 
 # ---------------- 共用辅助 ----------------
 def _db_factory():
-    """内存 SQLite Session 工厂：返回 () -> Session，引擎每根 bar 取一个独立 Session。"""
-    engine = create_engine("sqlite:///:memory:")
+    """内存 SQLite Session 工厂：返回 () -> Session，引擎每根 bar 取一个独立 Session。
+
+    StaticPool + check_same_thread=False：审计 #3 后 _loop/_deals_loop 的 tick 在
+    单 worker 线程执行，_poll_deals 在 worker 线程访问 DB。默认 :memory: 每连接一个
+    独立库 → 跨线程新连接看不到建表；StaticPool 复用同一连接、check_same_thread=False
+    允许跨线程使用，让 worker 线程的 Session 见到同一份表数据。单线程测试行为不变。
+    """
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     # expire_on_commit=False：commit 后对象属性仍可访问（测试断言方便，不触发 refresh）
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -1817,7 +1828,12 @@ def test_deals_loop_polls_deals_at_own_interval():
 
     async def run_a_bit():
         await engine.start()
-        await asyncio.sleep(0.05)  # 0.01s 间隔 × 0.05s → 至少数轮
+        # 审计 #37：原固定 sleep(0.05) 断言 >=3 在调度抖动下偶发失败（_tick_deals 经
+        # 线程池派发，比直调多一次跨线程调度，时序更易抖）。改为有界等待：轮询 calls
+        # 直到达到阈值或超时——稳态后必达 3（0.01s 间隔 × 0.5s 窗口足够余量）。
+        deadline = asyncio.get_event_loop().time() + 0.5
+        while len(calls) < 3 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.005)
         await engine.stop()
 
     asyncio.run(run_a_bit())
@@ -2153,4 +2169,311 @@ def test_stream_events_ends_when_engine_not_running():
         assert engine._stream_subscribers == []
 
     asyncio.run(drive())
+
+
+# ===========================================================================
+# 审计 #3：异步循环内同步 I/O — _loop/_deals_loop 阻塞调用走线程池，事件循环不冻结
+# ===========================================================================
+# 现状（修复前）：_loop/_deals_loop 声明 async def，但内部直接调同步阻塞 I/O
+# （dispatcher.heartbeat / bar_poller.poll / _poll_deals，全用同步 httpx.Client）。
+# FastAPI 事件循环被这些阻塞调用占住期间，所有 HTTP 请求与 SSE 流冻结。
+#
+# 修复（方案 B）：整轮 tick 体通过 loop.run_in_executor 丢到线程池执行；
+# 单 worker executor 让 _loop 与 _deals_loop 的 tick 串行（共享 _pending_orders /
+# positions / signal_cache 无并发竞争）；_emit 跨线程用 call_soon_threadsafe
+# 回到事件线程 put_nowait（asyncio.Queue 非线程安全）。
+
+def test_loop_tick_runs_in_worker_thread_not_event_loop():
+    """#3：_loop 整轮 tick 在线程池 worker 执行，事件循环线程不被阻塞占用。
+
+    tick 内同步 I/O（heartbeat/poll）发生在 worker 线程；事件循环线程（drive 协程
+    所在线程）能并发推进 —— 两者线程 id 必不同。
+    """
+    import asyncio
+    import threading
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory, poll_interval=0.01,
+    )
+    tick_threads = set()
+
+    orig_heartbeat = disp.heartbeat
+
+    def spy_heartbeat():
+        tid = threading.get_ident()
+        tick_threads.add(tid)
+        return orig_heartbeat()
+
+    disp.heartbeat = spy_heartbeat
+
+    async def drive():
+        await engine.start()
+        await asyncio.sleep(0.06)  # 至少跑几轮 tick
+        await engine.stop()
+
+    loop_thread = threading.get_ident()
+    asyncio.run(drive())
+
+    assert tick_threads, "heartbeat 未被调用"
+    assert loop_thread not in tick_threads, (
+        "tick 在事件循环线程执行——同步 I/O 仍会冻结事件循环"
+    )
+
+
+def test_deals_loop_tick_runs_in_worker_thread():
+    """#3：_deals_loop 的 _poll_deals 也在 worker 线程执行（同 _loop，不阻塞事件循环）。"""
+    import asyncio
+    import threading
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory, deals_poll_interval=0.01,
+    )
+    poll_threads = set()
+
+    def spy_poll_deals():
+        poll_threads.add(threading.get_ident())
+        return None
+
+    engine._poll_deals = spy_poll_deals
+
+    async def drive():
+        await engine.start()
+        await asyncio.sleep(0.05)
+        await engine.stop()
+
+    loop_thread = threading.get_ident()
+    asyncio.run(drive())
+
+    assert poll_threads, "_poll_deals 未被调用"
+    assert loop_thread not in poll_threads, (
+        "_poll_deals 在事件循环线程执行——同步 I/O 仍会冻结事件循环"
+    )
+
+
+def test_loop_and_deals_loop_ticks_serialize_via_single_worker():
+    """#3：_loop 与 _deals_loop 共享单 worker 线程池 → tick 严格串行，无并发重叠。
+
+    用两个带 sleep 的 spy 制造重叠窗口：若并发执行，两者会同时持有旗标；
+    单 worker 串行 → 任一时刻最多一个在跑，never overlap。
+    """
+    import asyncio
+    import threading
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        poll_interval=0.005, deals_poll_interval=0.005,
+    )
+
+    active = {"n": 0, "max": 0, "lock": threading.Lock()}
+    import time
+
+    def _track(fn):
+        def _w():
+            with active["lock"]:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            try:
+                time.sleep(0.01)  # 制造重叠窗口
+                return fn() if fn is not None else None
+            finally:
+                with active["lock"]:
+                    active["n"] -= 1
+        return _w
+
+    engine._poll_deals = _track(None)
+    orig_heartbeat = disp.heartbeat
+    disp.heartbeat = _track(orig_heartbeat)
+
+    async def drive():
+        await engine.start()
+        await asyncio.sleep(0.1)  # 5ms × 100ms → 两循环各约 20 轮
+        await engine.stop()
+
+    asyncio.run(drive())
+
+    assert active["max"] <= 1, (
+        "_loop 与 _deals_loop tick 并发执行（max=%d）——共享状态竞争未消除"
+        % active["max"]
+    )
+
+
+def test_emit_from_worker_thread_lands_on_sse_queue():
+    """#3：worker 线程内 _emit 经 call_soon_threadsafe 回到事件线程 put_nowait。
+
+    _loop tick 在 worker 线程触发下单 → _emit 在 worker 线程被调；
+    SSE 队列由事件线程持有（asyncio.Queue 非线程安全），必须回事件线程投递。
+    直接在事件线程 await 一下让 scheduled 回调落地，再断言队列收到事件。
+    """
+    import asyncio
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)  # 完成的 bar stime = 10:00
+    # 状态化 /quote：每次拉取多返回一根 bar —— 轮1 [bar0] 建基线，轮2 [bar0,bar1]
+    # → bar0 退居第二 → 完成 → 触发 _on_bar(bar_time=10:00) → _handle_bar → _emit
+    all_bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, 0), datetime(2026, 8, 5, 10, 1)])
+    poll_count = {"n": 0}
+
+    def growing_quote(request):
+        path = request.url.path
+        if path == "/quote":
+            poll_count["n"] += 1
+            n = min(poll_count["n"], len(all_bars))
+            return httpx.Response(200, json={"ok": True, "data": {stock: all_bars[:n]}})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": []})
+        if path == "/deals":
+            return httpx.Response(200, json={"ok": True, "data": []})
+        return httpx.Response(404, json={"ok": False})
+
+    rec = _Recorder(respond=growing_quote)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory, poll_interval=0.01,
+    )
+    # 预置信号让 _handle_bar 在 worker 线程 emit signal+order
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    async def drive():
+        engine._stream_subscribers.append(asyncio.Queue(maxsize=200))
+        await engine.start()
+        # 多等几轮：建基线(轮1) → 完成bar触发(轮2+) → call_soon_threadsafe 调度落地
+        await asyncio.sleep(0.15)
+        await engine.stop()
+        q = engine._stream_subscribers[0]
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        return events
+
+    events = asyncio.run(drive())
+    types = [e["type"] for e in events]
+    assert "signal" in types, "worker 线程 _emit 未送达 SSE 队列（call_soon_threadsafe 缺失）"
+    assert "order" in types
+
+
+def test_emit_direct_call_still_synchronous_without_running_loop():
+    """#3 回归：无事件循环时直接调 _emit 仍同步入队（保留既有同步测试行为）。
+
+    test_emit_pushes_event_to_all_subscribers 等直接调 _emit 后立即 get_nowait；
+    call_soon_threadsafe 改造不得破坏此同步路径（无 loop captured → 直接 put_nowait）。
+    """
+    import asyncio
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    # 无 running loop、未 start（_loop_ref 为 None）→ 直接 put_nowait
+    engine._emit("signal", {"portfolio_id": 1, "strategy_id": 1})
+
+    assert q.get_nowait() == {"type": "signal", "portfolio_id": 1, "strategy_id": 1}
+
+
+def test_executor_single_worker():
+    """#3：LiveEngine 用单 worker 线程池（max_workers=1）串行两循环的 tick。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    assert engine._executor is not None
+    assert engine._executor._max_workers == 1
+
+
+def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
+    """#3 回归：tick 走线程池后 E8 离线→在线转场仍调 reset_baseline。"""
+    import asyncio
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+
+    class FlakyPing:
+        def __init__(self):
+            self.fail_remaining = 1
+
+        def handler(self, request):
+            path = request.url.path
+            if path == "/ping":
+                if self.fail_remaining > 0:
+                    self.fail_remaining -= 1
+                    raise httpx.ConnectError("connection refused")
+                return httpx.Response(200, json={"ok": True})
+            if path == "/quote":
+                return httpx.Response(200, json={"ok": True, "data": {}})
+            if path == "/order":
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404, json={"ok": False})
+
+    rec = FlakyPing()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    reset_calls = []
+    orig = poller.reset_baseline
+    poller.reset_baseline = lambda: (reset_calls.append(1), orig())[1]
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory, poll_interval=0.01,
+    )
+
+    async def run_a_bit():
+        await engine.start()
+        await asyncio.sleep(0.1)
+        await engine.stop()
+
+    asyncio.run(run_a_bit())
+
+    assert engine.bridge_online is True
+    assert len(reset_calls) == 1
 

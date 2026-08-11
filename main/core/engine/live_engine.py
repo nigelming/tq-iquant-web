@@ -12,6 +12,7 @@
 """
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
 from typing import AsyncIterator, Callable, Dict, List, Optional
@@ -140,6 +141,17 @@ class LiveEngine:
         self._task: Optional[asyncio.Task] = None
         # G5：/deals 回填轮询的独立任务（与主循环并行，见 _deals_loop）
         self._deals_task: Optional[asyncio.Task] = None
+        # 审计 #3：_loop/_deals_loop 的同步阻塞 I/O（heartbeat/poll/_poll_deals，全用同步
+        # httpx.Client）整轮丢到此单 worker 线程池执行——事件循环不再被阻塞 I/O 冻结。
+        # max_workers=1 让两循环的 tick 严格串行：共享 _pending_orders / positions /
+        # signal_cache 无并发竞争（沿用既有「同事件循环协作式」的串行语义，只是换到线程）。
+        # 单 worker 还保证 cancel 后已排队的 tick 不与下一轮重叠（asyncio.Lock 在 cancel
+        # 时会释放，无法保证；单 worker 天然排队）。
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+        # _emit 跨线程投递用：start() 时捕获运行中的事件循环；worker 线程内 _emit 经
+        # call_soon_threadsafe 回到事件线程 put_nowait（asyncio.Queue 非线程安全）。
+        # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
+        self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_online = True
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
         self._last_daily_date: Optional[date] = None
@@ -172,11 +184,33 @@ class LiveEngine:
     def _emit(self, event_type: str, payload: dict) -> None:
         """向所有 SSE 订阅队列广播 {type, **payload}（signal/order/trade/position/risk）。
 
-        同步上下文（_handle_bar/_backfill_order 等 bar 线程内）调 put_nowait 即可——
+        线程安全（审计 #3）：_emit 可能从事件线程（stream_events 消费侧、同步测试直调）
+        或 worker 线程（_loop/_deals_loop tick 内 _handle_bar/_backfill_order）被调。
+        asyncio.Queue.put_nowait 非线程安全 → worker 线程内经 call_soon_threadsafe
+        回到事件线程投递；事件线程内（或未 start、_loop_ref=None 的同步路径）直接
+        put_nowait（保留既有同步测试 get_nowait 立即可见的语义）。
         队列积压（订阅端消费慢）→ 丢弃该事件（EventSource 断线重连后见最新状态，
         design §5.6.10：浏览器自动重连，无需重放）。
         """
         ev = {"type": event_type, **payload}
+        loop = self._loop_ref
+        if loop is None:
+            # 未 start（同步测试 / start 前）：直接投递
+            self._emit_to_subscribers(ev)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            # 事件线程内：直接投递
+            self._emit_to_subscribers(ev)
+        else:
+            # worker 线程内：回到事件线程投递（asyncio.Queue 非线程安全）
+            loop.call_soon_threadsafe(self._emit_to_subscribers, ev)
+
+    def _emit_to_subscribers(self, ev: dict) -> None:
+        """实际向各订阅队列 put_nowait（仅在事件线程执行）。积压 → 丢弃不阻塞。"""
         for q in list(self._stream_subscribers):
             try:
                 q.put_nowait(ev)
@@ -210,6 +244,17 @@ class LiveEngine:
         if self._running:
             return
         self._running = True
+        # 审计 #3：捕获运行中的事件循环，供 _emit 跨线程 call_soon_threadsafe 回投。
+        self._loop_ref = asyncio.get_running_loop()
+        # 审计 #3：stop() 会 shutdown executor（释放非 daemon worker 线程，防进程退出
+        # 挂起）；若引擎被重启（同实例二次 start），旧 executor 已 shutdown → 重建一个。
+        # 每次 start 重建开销可忽略（1 线程，session 生命周期内仅一次）。
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        self._executor = ThreadPoolExecutor(max_workers=1)
         # C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路）。
         # 一次同步 TDX 计算（get_tdx_lock 串行），阻塞事件循环可接受（启动一次性）。
         self._inject_startup_periods(
@@ -241,59 +286,98 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("deals loop task ended with error on stop")
             self._deals_task = None
+        # 审计 #3：停止后清空 loop 引用——worker 线程已不再产生 _emit；
+        # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
+        self._loop_ref = None
+        # 审计 #3：释放单 worker 线程（ThreadPoolExecutor 默认非 daemon，不 shutdown 会
+        # 在进程退出时挂起 join）。wait=False：正在跑的 tick 是 loopback HTTP，瞬间完成，
+        # 不阻塞 stop；任务已 cancel，不会再提交新 tick。
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
 
     async def _loop(self) -> None:
         """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。
 
         /deals 成交回报回填不在本循环（G5）：独立 _deals_loop 5s 节拍处理，
         免得成交秒级回报被 30s 拉 bar 节拍拖慢。
+
+        审计 #3：同步阻塞 I/O（heartbeat/poll/_maybe_daily_*，全用同步 httpx.Client）
+        整轮丢到单 worker 线程池执行（_tick_main），事件循环只负责调度 + sleep——
+        不再被 30s 拉 bar / 桥超时阻塞，HTTP 请求与 SSE 流不再冻结。
         """
         while self._running:
             try:
-                # E8：心跳前的在线状态，用于离线→在线转场时重建基线
-                was_online = self._bridge_online
-                if not self._dispatcher.heartbeat():
-                    self._bridge_online = False
-                    logger.warning("bridge offline, pause trading (session %s)", self.session_id)
-                    await asyncio.sleep(self._poll_interval)
-                    continue
-                self._bridge_online = True
-                if not was_online:
-                    # E8：离线恢复 → 重建基线，跳过离线期间错过的 bar（不补触发）
-                    self._bar_poller.reset_baseline()
-                    logger.info(
-                        "bridge back online, reset poller baseline (session %s)",
-                        self.session_id,
-                    )
-                # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
-                self._bar_poller.poll()
-                # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
-                self._maybe_daily_close()
-                # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
-                self._maybe_daily_bars()
-            except BridgeUnavailableError as e:
-                self._bridge_online = False
-                logger.warning("bridge unavailable: %s, skip this round", e)
+                await asyncio.get_running_loop().run_in_executor(
+                    self._executor, self._tick_main
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
-                logger.exception("live loop unexpected error")
+                # _tick_main 内部已兜底各类异常并记日志；此处的 executor 层异常兜底防漏
+                logger.exception("live loop executor error")
             await asyncio.sleep(self._poll_interval)
+
+    def _tick_main(self) -> None:
+        """_loop 单轮同步体（在 worker 线程执行）：心跳 → poll → 日终。
+
+        异常在此捕获（非 CancelledError）——与原 _loop 行为一致：记日志不外抛，
+        下一轮继续。BridgeUnavailableError → 置离线，本轮跳过。
+        """
+        try:
+            # E8：心跳前的在线状态，用于离线→在线转场时重建基线
+            was_online = self._bridge_online
+            if not self._dispatcher.heartbeat():
+                self._bridge_online = False
+                logger.warning("bridge offline, pause trading (session %s)", self.session_id)
+                return
+            self._bridge_online = True
+            if not was_online:
+                # E8：离线恢复 → 重建基线，跳过离线期间错过的 bar（不补触发）
+                self._bar_poller.reset_baseline()
+                logger.info(
+                    "bridge back online, reset poller baseline (session %s)",
+                    self.session_id,
+                )
+            # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
+            self._bar_poller.poll()
+            # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
+            self._maybe_daily_close()
+            # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
+            self._maybe_daily_bars()
+        except BridgeUnavailableError as e:
+            self._bridge_online = False
+            logger.warning("bridge unavailable: %s, skip this round", e)
+        except Exception:  # noqa: BLE001
+            logger.exception("live loop unexpected error")
 
     async def _deals_loop(self) -> None:
         """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
 
         成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 30s 拉 bar。
-        与主循环同事件循环（无并发问题），_poll_deals 内部已兜底桥离线/查失败。
+        与主循环共用单 worker 线程池（审计 #3）：tick 串行，共享 _pending_orders /
+        positions 无并发竞争（沿用原「同事件循环协作式」串行语义）。_poll_deals 内部
+        已兜底桥离线/查失败。
         """
         while self._running:
             try:
-                self._poll_deals()
+                await asyncio.get_running_loop().run_in_executor(
+                    self._executor, self._tick_deals
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
-                logger.exception("deals loop unexpected error")
+                logger.exception("deals loop executor error")
             await asyncio.sleep(self._deals_poll_interval)
+
+    def _tick_deals(self) -> None:
+        """_deals_loop 单轮同步体（在 worker 线程执行）：查未完结单 → 回填 /deals。
+
+        异常在此捕获（非 CancelledError）——与原 _deals_loop 行为一致：记日志不外抛。
+        """
+        try:
+            self._poll_deals()
+        except Exception:  # noqa: BLE001
+            logger.exception("deals loop unexpected error")
 
     # ---------------- 日终（E5/E6）----------------
     def _maybe_daily_close(self) -> None:
