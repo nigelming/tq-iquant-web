@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from core.models import Base
 from core.main import app
+from core.db import get_db
 
 
 @pytest.fixture
@@ -21,5 +22,5 @@ def test_client(db_session):
     def override_get_db():
         yield db_session
 
-    app.dependency_overrides["get_db"] = override_get_db
+    app.dependency_overrides[get_db] = override_get_db
     return TestClient(app)

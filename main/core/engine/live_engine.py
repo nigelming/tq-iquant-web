@@ -12,6 +12,7 @@
 """
 import asyncio
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
@@ -81,7 +82,6 @@ def _to_int(val) -> int:
         return int(val)
     if isinstance(val, (int, float)):
         try:
-            import math
             if math.isnan(val):
                 return 0
         except (TypeError, ValueError):
@@ -892,6 +892,8 @@ class LiveEngine:
         """
         if not bars:
             return None
+        # pandas 在此函数内首次按需 import（非顶部）：pandas 较重，且本函数仅在
+        # 公式注入路径调用；避免模块导入期无条件加载（审计 #31：math 已提顶，pandas 刻意保留 lazy）。
         import pandas as pd
 
         times, o, h, l, c, v, a = [], [], [], [], [], [], []

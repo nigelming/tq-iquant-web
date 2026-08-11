@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层）**、P2 16 项（#23/#24/#29 已修）、P3 8 项（#43 关闭）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 15 项（#23/#24/#29/#36/#35 已修）、P3 7 项（#38/#43 已处理）。
 
 ---
 
@@ -141,6 +141,23 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 验证：后端测试 376 passed（`test_loop_offline_to_online_still_resets_baseline_after_thread_offload` 偶发 flaky，隔离运行通过，与响应格式无关）；grep `{"code": 0` 仅 `response.py`；grep `HTTPException` 仅 backtest 409 + live SSE 404 两处有意保留。
 
 **P1 最终结论**：9 项中 8 项已处理（#10/#11/#12/#13/#14/#15/#16/#17 + #42），**仅 #9 service 层仍 open**（架构重构，路由直接操作 ORM，单独立项）。**P1 open 4→1**。
+
+### 2026-08-11 P2/P3 低成本清理（#36/#35/#38/#31）
+
+#9 service 层经评估为单个体量最大的组织债（非故障债），用户决策暂不做（系统当前功能正确）。先扫一批零风险低成本项：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 36 | ✅ **已修** | `backtest.py:855` `datetime.utcnow()` → `datetime.now(timezone.utc).replace(tzinfo=None)`（naive UTC，与原 `utcnow()` 语义一致，消除 Python 3.13 弃用警告）。顶部 import 补 `timezone` |
+| 35 | ✅ **已修** | `status.py` 删 `iguant_gateway` 硬编码死块（NATS 网关已于架构调整废弃，`live/iguant_gateway/` 删除）。前端/测试 grep `iguant_gateway` 零引用 |
+| 38 | ✅ **已修** | `conftest.py:24` `app.dependency_overrides["get_db"]` 字符串 key → 函数对象 `get_db`（顶部补 `from core.db import get_db`）。注：`test_client` fixture 实际零引用（各集成测试自带 `client` fixture），`db_session` fixture 仍被 `test_backtest_data.py` 使用 |
+| 31 | ✅ **部分修** | `live_engine.py:84` 函数内 `import math` 提到模块顶部（stdlib 轻量无理由 lazy）；`:895` `import pandas as pd` **刻意保留 lazy** + 加注释——pandas 较重且仅公式注入路径调用，模块导入期无条件加载不划算。审计 #31 的精神是消除"无必要的"函数内 import，pandas 此处为有意的延迟加载 |
+
+附带勘察更正：审计 #18"8 个 FK 无 ondelete"现**多数已修**——grep `ondelete` 显示 `portfolio_strategy.stock_pool_id`/`strategy.portfolio_id+formula_id`/各 `*_record_id`/`live_session_id` 等 FK 均已带 `ondelete=CASCADE/RESTRICT`；**仅 `strategy.master_strategy_id`（自引用）仍无 ondelete**（#18 剩 1 处）。#19 `stock_pool.code` 仍无 `unique=True`（#19 仍 open，需迁移）。
+
+验证：后端测试 376 passed（utcnow 弃用警告同步消除）。
+
+**P2/P3 当前结论**：#36/#35 已修（P2 16→15，P3 #38 8→7）；#31 部分修（math 提顶，pandas 刻意保留）。**#9 service 层暂不做**（评估为最大组织债，单独立项窗口处理）。
 
 ---
 

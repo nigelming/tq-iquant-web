@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from decimal import Decimal
 from threading import Lock
 from typing import Dict, List, Optional
@@ -852,7 +852,7 @@ def _run_backtest_locked(req: BacktestRequest, db: Session, ps: PortfolioStrateg
 
         rec.status = "completed"
         rec.progress = 100
-        rec.completed_at = datetime.utcnow()
+        rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
         db.commit()
     except Exception as e:
         # 异常时把 record 标 failed 并落库。session 可能因异常处于脏状态，

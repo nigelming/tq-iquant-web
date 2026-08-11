@@ -19,9 +19,4 @@ def get_status():
             "version": "1.0",
             "uptime": f"{hours}h{minutes}m",
         },
-        "iguant_gateway": {
-            "online": False,
-            "version": "1.0",
-            "uptime": "0h0m",
-        },
     })
