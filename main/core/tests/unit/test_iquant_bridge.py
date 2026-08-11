@@ -34,7 +34,6 @@ def _resp(method, path, headers=None, body=b""):
 @pytest.fixture(autouse=True)
 def _reset_state():
     """每个测试前重置全局状态。"""
-    br.TOKEN = None
     br.ALLOWED_STOCKS = set()
     br.MAX_VOLUME = 10000
     br.RATE_LIMIT = 1000
@@ -61,27 +60,6 @@ def test_unknown_path_404():
     status, data = _resp("GET", "/nope")
     assert status == 404
     assert data["ok"] is False
-
-
-# ---------------- 鉴权 ----------------
-def test_auth_required_when_token_set():
-    br.TOKEN = "secret123"
-    status, data = _resp("GET", "/ping")                 # 无 token
-    assert status == 401
-    assert data["ok"] is False
-
-    status, data = _resp("GET", "/ping", {"x-auth-token": "wrong"})  # 错 token
-    assert status == 401
-
-    status, data = _resp("GET", "/ping", {"x-auth-token": "secret123"})  # 对 token
-    assert status == 200
-    assert data["ok"] is True
-
-
-def test_auth_passes_when_token_empty():
-    # TOKEN 未配置时不鉴权（开发模式）
-    status, data = _resp("GET", "/ping")
-    assert status == 200
 
 
 # ---------------- /order ----------------

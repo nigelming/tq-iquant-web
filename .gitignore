@@ -31,8 +31,8 @@ Thumbs.db
 .env
 .env.local
 
-# iQuant bridge secret (token file, never commit)
-live/bridge/.bridge_token
+# iQuant bridge (loopback, no auth token; account file stays local if used)
+live/bridge/.bridge_account
 
 # Runtime
 logs/

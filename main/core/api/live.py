@@ -32,12 +32,12 @@ _ENGINES: Dict[int, LiveEngine] = {}
 
 
 def _bridge_config() -> dict:
-    """读桥地址/token：config.iquant_bridge 段，缺省 127.0.0.1:8790。"""
+    """读桥地址：config.iquant_bridge 段，缺省 127.0.0.1:8790。桥绑 loopback，
+    单用户本机部署，不鉴权（token 已移除）。"""
     cfg = load_config()
     br = cfg.get("iquant_bridge", {}) if isinstance(cfg, dict) else {}
     return {
         "base_url": br.get("base_url", "http://127.0.0.1:8790"),
-        "token": br.get("token"),
     }
 
 
@@ -179,7 +179,7 @@ def _build_engine(session_id: int, db: Session) -> LiveEngine:
                     formula_count_by_name[f.name] = f.formula_count
 
     br = _bridge_config()
-    dispatcher = HttpBridgeDispatcher(base_url=br["base_url"], token=br["token"])
+    dispatcher = HttpBridgeDispatcher(base_url=br["base_url"])
     # 股票池为空时给一个占位，避免空列表；首期实盘一般有成分股
     poller = BarPoller(
         dispatcher, sorted(stock_codes) or ["000001.SZ"],

@@ -26,9 +26,11 @@
 #   GET  /deals?order_id=      deal query
 #   GET  /quote?code=&period=&count=   1m/5m/1d bars (cached)
 #
-# Security: X-Auth-Token header (token from env IQUANT_BRIDGE_TOKEN or
-# .bridge_token file next to this file), whitelist ALLOWED_STOCKS,
-# per-order limit MAX_VOLUME, rate limit RATE_LIMIT, audit log.
+# Security: bridge binds 127.0.0.1 only (loopback, single-user host), so no
+# auth token is required. Defense is at the machine boundary: only local
+# processes can reach port 8790. If the bridge is ever exposed off-loopback,
+# add auth then. Whitelist ALLOWED_STOCKS, per-order limit MAX_VOLUME, rate
+# limit RATE_LIMIT, audit log remain enforced.
 import json
 import os
 import socket
@@ -40,7 +42,6 @@ PORT = 8790
 ACCOUNT_DEFAULT = "110002348760"  # dev placeholder; override via env IQUANT_BRIDGE_ACCOUNT / .bridge_account file
 ACCOUNT = None                     # loaded by load_account() below
 DRY_RUN = False                    # safe default: only print, no real order. Flip to False when ready
-TOKEN = None                      # auth token, loaded by load_secret()
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
 MAX_VOLUME = 10000                # max shares per order
 RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW seconds
@@ -59,28 +60,12 @@ _quote_cache = {}                 # (code, period, count) -> (ts, bars)
 _downloaded = set()               # (code, period) already history-downloaded
 
 
-def load_secret():
-    """Auth token: env IQUANT_BRIDGE_TOKEN first, else .bridge_token file."""
-    tok = os.environ.get("IQUANT_BRIDGE_TOKEN", "")
-    if not tok:
-        try:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridge_token")
-            with open(p, "r") as f:
-                tok = f.read().strip()
-        except Exception:
-            pass
-    return tok or None
-
-
-TOKEN = load_secret()
-
-
 def load_account():
     """Account ID: env IQUANT_BRIDGE_ACCOUNT first, else .bridge_account file.
 
-    Same pattern as load_secret: the account is not hardcoded into the strategy
-    (switch accounts via env var or a local file; the file stays out of git and
-    is written at deploy time). Falls back to ACCOUNT_DEFAULT (dev placeholder).
+    The account is not hardcoded into the strategy (switch accounts via env var
+    or a local file; the file stays out of git and is written at deploy time).
+    Falls back to ACCOUNT_DEFAULT (dev placeholder).
     """
     acc = os.environ.get("IQUANT_BRIDGE_ACCOUNT", "")
     if not acc:
@@ -103,12 +88,6 @@ def _iq(name):
 
 
 # ---------------- auth / whitelist / rate limit ----------------
-def check_auth(headers):
-    if not TOKEN:
-        return True                # no token configured -> no auth (dev mode)
-    return headers.get("x-auth-token") == TOKEN
-
-
 def check_whitelist(code, volume):
     if not code:
         return False, "missing code"
@@ -422,10 +401,7 @@ def _parse_query(query):
 
 
 def _handle(method, path, headers, body):
-    """Entry: auth -> route -> respond."""
-    if not check_auth(headers):
-        return _json({"ok": False, "error": "auth failed"}, 401)
-
+    """Entry: route -> respond. No auth (loopback-only, single-user host)."""
     path, _, query = path.partition("?")
     path = path.rstrip("/")
     params = _parse_query(query)

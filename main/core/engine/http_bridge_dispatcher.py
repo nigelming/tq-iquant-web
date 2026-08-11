@@ -31,19 +31,15 @@ class BridgeUnavailableError(RuntimeError):
 
 class HttpBridgeDispatcher(OrderDispatcher):
     def __init__(self, base_url: str = "http://127.0.0.1:8790",
-                 token: Optional[str] = None, timeout: float = 10.0,
+                 timeout: float = 10.0,
                  client: Optional[httpx.Client] = None):
         self._base_url = base_url.rstrip("/")
-        self._token = token
         self._client = client or httpx.Client(base_url=self._base_url, timeout=timeout)
 
     # ---------------- 基础 ----------------
-    def _headers(self) -> dict:
-        return {"X-Auth-Token": self._token} if self._token else {}
-
     def heartbeat(self) -> bool:
         try:
-            r = self._client.get(self._base_url + "/ping", headers=self._headers())
+            r = self._client.get(self._base_url + "/ping")
             return r.status_code == 200
         except Exception:
             return False
@@ -77,7 +73,7 @@ class HttpBridgeDispatcher(OrderDispatcher):
             "pr_type": 14,
         }
         try:
-            r = self._client.post(self._base_url + "/order", json=payload, headers=self._headers())
+            r = self._client.post(self._base_url + "/order", json=payload)
         except Exception as e:
             raise BridgeUnavailableError("bridge request failed: %s" % e) from e
         if r.status_code != 200:
@@ -111,7 +107,7 @@ class HttpBridgeDispatcher(OrderDispatcher):
     # ---------------- 查询 ----------------
     def _get_json(self, path: str) -> list:
         try:
-            r = self._client.get(self._base_url + path, headers=self._headers())
+            r = self._client.get(self._base_url + path)
         except Exception as e:
             raise BridgeUnavailableError("bridge request failed: %s" % e) from e
         if r.status_code != 200:
@@ -148,7 +144,7 @@ class HttpBridgeDispatcher(OrderDispatcher):
         """
         path = "/quote?code=%s&period=%s&count=%s" % (code, period, count)
         try:
-            r = self._client.get(self._base_url + path, headers=self._headers())
+            r = self._client.get(self._base_url + path)
         except Exception as e:
             raise BridgeUnavailableError("bridge request failed: %s" % e) from e
         if r.status_code != 200:

@@ -110,9 +110,9 @@ def mock_bridge(monkeypatch):
 
     real_cls = live_api.HttpBridgeDispatcher
 
-    def fake_constructor(base_url="http://127.0.0.1:8790", token=None, **kw):
+    def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
         client = httpx.Client(transport=httpx.MockTransport(rec.handler))
-        return real_cls(base_url=base_url, token=token, client=client)
+        return real_cls(base_url=base_url, client=client)
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
     return rec
