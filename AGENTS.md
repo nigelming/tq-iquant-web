@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**Greenfield** — 仅存在设计文档 `docs/system-plan-draft.md`，无实际代码。所有实现均需从零开始。
+**已实现（脚手架 + 主链路已通）** — 14 个 SQLAlchemy 模型、17 个引擎文件、7 个 API 路由、6 个前端视图、6 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -15,7 +15,7 @@
 ```
 Core (main, Python 3.13) ──HTTP──→ iQuant 桥策略 (live/bridge, iQuant 客户端内 Python 3.6)
   └─ 同进程嵌入 TQ 模块（通达信，直接函数调用）
-Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
+Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 ```
 
 **关键约束**：两个独立的 uv 虚拟环境。`main/` 用 Python 3.13；`live/` 桥策略在 iQuant 客户端自带 Python 3.6.8 内运行（桥代码须兼容 3.6，纯标准库实现）。
@@ -72,9 +72,9 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 
 ## 并发模型
 
-- **回测**：`ProcessPoolExecutor` 提交子进程（CPU 密集），前端轮询获取状态。同一时刻最多 1 个回测运行。
-- **实盘**：TQ 回调线程 → `asyncio.run_coroutine_threadsafe` → 主事件循环处理信号。
-- FastAPI 主事件循环不能被 TQ 回调阻塞。
+- **回测**：同步内联执行（在请求处理线程内跑 `BacktestEngine.run`）+ 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个回测运行（并发启动返回 HTTP 409）。前端通过记录状态轮询获取进度。
+- **实盘**：`BarPoller` 同步轮询 iQuant 行情桥，`_loop`/`_deals_loop` 经单 worker `ThreadPoolExecutor` 转入主事件循环（非 `run_coroutine_threadsafe`——TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询）。
+- FastAPI 主事件循环不能被同步 I/O 阻塞（行情/订单轮询走线程池 worker）。
 
 ## 业务规则（容易遗漏）
 
@@ -93,7 +93,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 
 ## 模块复用
 
-引擎层约 97% 的代码回测/实盘共用（风控、信号排序、资金审批、持仓更新）。差异通过策略模式隔离：
+引擎层核心逻辑（风控、信号优先级排序、资金审批、持仓更新）回测/实盘共用，集中在 `portfolio.py`/`risk_manager.py`/`strategy_context.py`。实盘独有逻辑（对账告警、熔断次日恢复、SSE 事件流、周期边界 1m/1d 14:30/1w·1mon 处理）在 `live_engine.py`。差异通过策略模式隔离下单与 T+1 检查：
 
 | 接口 | 回测实现 | 实盘实现 |
 |------|----------|----------|
@@ -109,7 +109,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/WebSocket→ Core (FastAPI)
 | `main/core/main.py` | FastAPI 入口 |
 | `main/core/engine/` | 自研回测/交易框架（事件驱动，polars 核心） |
 | `main/core/tq/` | 通达信 TQ 模块（嵌入 Core 同进程） |
-| `live/iguant_gateway/` | 国信 iQuant 网关（Python 3.7） |
+| `live/bridge/` | 国信 iQuant HTTP 桥（iQuant 客户端内 Python 3.6 策略，`127.0.0.1:8790`） |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、iQuant 路径等） |
 

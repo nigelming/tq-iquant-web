@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）。当前实际仍 open：P1 6 项、P2 19 项、P3 9 项。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）。当前实际仍 open：P1 4 项（#9/#11/#12/#16）、P2 19 项、P3 8 项（#43 关闭）。
 
 ---
 
@@ -95,6 +95,24 @@
 验证：后端 371 passed、前端 87 passed、`npm run build` 通过（vue-tsc 零错误）。
 
 **P1 当前结论**：9 项中 4 项已处理（#13/#14/#42/#15），**#9/#10/#11/#12/#16/#17 仍存在**（6 项）。
+
+### 2026-08-11 死代码 + 文档清理（#10/#17/#34/#44 + #43 关闭）
+
+清理零引用死代码 + 修订 AGENTS.md 多处与现状相反的过时描述（AGENTS.md 在 CLAUDE.md 中被标为"权威业务规则文档"，过时描述会持续误导）：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 10 | ✅ **已修** | 删 `main/core/engine/signal_engine.py`（`SignalEngine` 零生产引用）、`event_bus.py`（`EventBus` 仅测试引用）、`test_event_bus.py`；`engine/__init__.py` 删两行导出。**关键**：`EventBus.process_signals` 的信号优先级逻辑是重复旧实现，`portfolio.py:12-35` 有实际使用的等价实现（`_signal_priority` 被 `Portfolio._process_strategy` 调用），删 EventBus 不丢业务逻辑 |
+| 17 | ✅ **已修** | AGENTS.md:75-76 并发模型重写：回测同步内联 + 全局锁 `_BACKTEST_LOCK`（并发 409，非 `ProcessPoolExecutor`）；实盘 `BarPoller` 同步轮询 + 单 worker `ThreadPoolExecutor` 转入（非 `run_coroutine_threadsafe`——生产代码 grep 零命中） |
+| 34 | ✅ **已修** | AGENTS.md:5 "Greenfield...无实际代码" → "已实现（脚手架+主链路已通）"，指向 CLAUDE.md 实现状态 |
+| 44 | ✅ **已修** | AGENTS.md:96 "约 97% 代码复用" → "核心逻辑共用 + 实盘独有对账/熔断/SSE/周期边界处理" |
+| 43 | ✅ **不再适用** | token 鉴权已于 `a0f0515` 整体移除，`iquant_bridge.py` 文件头写 "no auth token is required"，`check_auth`/`TOKEN`/`x-auth-token`/`compare_digest`/`hmac` 全零命中。时序侧信道前提消失，关闭 |
+
+附带清理（同在 AGENTS.md，一并修订）：L18 "WebSocket"→"SSE"（与 L60 自相矛盾）、L112 `live/iguant_gateway/`（已删除）→ `live/bridge/` iQuant HTTP 桥。
+
+验证：后端测试 369 passed（删 2 个 EventBus 测试，371→369）、grep `signal_engine|event_bus` 在 `main/core/` 零残留。
+
+**P1 最终结论**：9 项中 6 项已处理（#10/#13/#14/#15/#17 + #42），**#9/#11/#12/#16 仍存在**（4 项）。**P3**：9 项中 #43 关闭，剩 8 项。
 
 ---
 
