@@ -153,7 +153,7 @@ function valueClass(v: number | null | undefined): string {
 }
 
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
-function buildMetrics(m: BacktestEvaluationItem | null) {
+function buildMetrics(m: BacktestEvaluationItem | null | undefined) {
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
     ? m.annual_return / m.volatility : null
@@ -237,7 +237,7 @@ const benchmarkRaw = computed(() => (detail.value?.snapshots || []).map((s) => s
 const hasBenchmark = computed(() => benchmarkRaw.value.some((v) => v !== null && v !== undefined))
 const benchmarkCurve = computed(() => {
   const vals = benchmarkRaw.value
-  const base = vals.find((v) => v !== null && v !== undefined)
+  const base = vals.find((v) => v !== null && v !== undefined) ?? 0
   return vals.map((v) => {
     if (v === null || v === undefined) return null
     return base > 0 ? ((v - base) / base) * 100 : 0
