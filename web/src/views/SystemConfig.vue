@@ -1,18 +1,11 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import axios from 'axios'
+import { getSystemConfigs, updateSystemConfigs, type SystemConfig } from '../api'
 
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
 // iquant_bridge.base_url(实盘桥地址，绑 loopback 单用户，无 token)
-interface SystemConfig {
-  tdx_path: string
-  iquant_path: string
-  max_concurrent_backtest: number
-  database: { sqlite_path: string }
-  iquant_bridge: { base_url: string }
-}
-
+// SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
   tdx_path: '',
   iquant_path: '',
@@ -28,8 +21,7 @@ const errorMsg = ref('')
 
 onMounted(async () => {
   try {
-    const res = await axios.get('/api/system/configs')
-    const data = res.data?.data || {}
+    const data = await getSystemConfigs()
     config.value = {
       tdx_path: data.tdx_path ?? DEFAULTS.tdx_path,
       iquant_path: data.iquant_path ?? DEFAULTS.iquant_path,
@@ -48,7 +40,7 @@ async function save() {
   saved.value = false
   errorMsg.value = ''
   try {
-    await axios.put('/api/system/configs', config.value)
+    await updateSystemConfigs(config.value)
     saved.value = true
     setTimeout(() => saved.value = false, 2000)
   } catch (e) {

@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { getFormulas, createFormula, updateFormula, deleteFormula, type SignalItem, type FormulaItem } from '../api'
 
 const formulas = ref<FormulaItem[]>([])
+const loading = ref(true)
 const showForm = ref(false)
 const editingId = ref<number | null>(null)
 const errorMsg = ref('')
@@ -33,6 +34,8 @@ async function load() {
   } catch (e) {
     errorMsg.value = '加载失败：' + errMsg(e)
     formulas.value = []
+  } finally {
+    loading.value = false
   }
 }
 
@@ -101,7 +104,8 @@ onMounted(load)
     {{ errorMsg }}
   </div>
 
-  <div class="card table-wrap">
+  <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+  <div v-else class="card table-wrap">
     <table>
       <thead><tr><th>ID</th><th>名称</th><th>公式内容</th><th>count</th><th>信号</th><th>操作</th></tr></thead>
       <tbody>

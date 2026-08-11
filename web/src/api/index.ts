@@ -445,3 +445,68 @@ export async function getLivePositions(sessionId: number) {
   const res = await api.get<ApiResponse<LivePositionItem[]>>(`/live/sessions/${sessionId}/positions`)
   return res.data.data
 }
+
+// ---- #27: 实盘会话 CRUD/启停（LiveSessions.vue 曾原生 axios 直连）----
+// 列表对齐 live.py list_sessions serializer；启停/create 返回 {id, status}
+
+export interface LiveSessionItem {
+  id: number
+  name: string
+  mode: string  // simulation|live
+  status: string  // stopped|running
+  started_at: string | null
+  stopped_at: string | null
+  portfolio_ids: number[]
+}
+
+export interface LiveSessionCreate {
+  name: string
+  mode: string
+  portfolio_ids: number[]
+}
+
+export async function getLiveSessions() {
+  const res = await api.get<ApiResponse<LiveSessionItem[]>>('/live/sessions')
+  return res.data.data
+}
+
+export async function createLiveSession(req: LiveSessionCreate) {
+  const res = await api.post<ApiResponse<{ id: number; status: string }>>('/live/sessions', req)
+  return res.data.data
+}
+
+export async function startLiveSession(id: number) {
+  const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/start`)
+  return res.data.data
+}
+
+export async function stopLiveSession(id: number) {
+  const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/stop`)
+  return res.data.data
+}
+
+export async function deleteLiveSession(id: number) {
+  const res = await api.delete<ApiResponse<null>>(`/live/sessions/${id}`)
+  return res.data.data
+}
+
+// ---- #27: 系统配置（SystemConfig.vue 曾原生 axios 直连）----
+// 对齐 core/config.py _defaults()；GET 全量返回、PUT 全量覆盖写
+
+export interface SystemConfig {
+  tdx_path: string
+  iquant_path: string
+  max_concurrent_backtest: number
+  database: { sqlite_path: string }
+  iquant_bridge: { base_url: string }
+}
+
+export async function getSystemConfigs() {
+  const res = await api.get<ApiResponse<SystemConfig>>('/system/configs')
+  return res.data.data
+}
+
+export async function updateSystemConfigs(cfg: SystemConfig) {
+  const res = await api.put<ApiResponse<null>>('/system/configs', cfg)
+  return res.data.data
+}

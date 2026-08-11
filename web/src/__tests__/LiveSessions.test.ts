@@ -1,17 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
-// LiveSessions.vue 用原生 axios(未走 ../api 客户端),mock 掉避免真实请求
-const { axiosGet, axiosPost } = vi.hoisted(() => ({
-  axiosGet: vi.fn(),
-  axiosPost: vi.fn(),
+// 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession } = vi.hoisted(() => ({
+  mockGetLiveSessions: vi.fn(),
+  mockCreateLiveSession: vi.fn(),
+  mockStartLiveSession: vi.fn(),
+  mockStopLiveSession: vi.fn(),
 }))
-vi.mock('axios', () => ({
-  default: { get: axiosGet, post: axiosPost },
-}))
-
-// B4b 工作台历史查询 + 新建实盘选组合走 ../api 客户端（import 的即 mock 的 vi.fn）
 vi.mock('../api', () => ({
+  getLiveSessions: mockGetLiveSessions,
+  createLiveSession: mockCreateLiveSession,
+  startLiveSession: mockStartLiveSession,
+  stopLiveSession: mockStopLiveSession,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -43,16 +44,20 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLivePositions, getLiveOrders, getLiveTrades, getPortfolios } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getPortfolios } from '../api'
 
-const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running' }
-const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped' }
+const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
+const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
 
 beforeEach(() => {
   vi.clearAllMocks()
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
   // 历史查询/组合默认空
+  ;(getLiveSessions as any).mockResolvedValue([])
+  ;(createLiveSession as any).mockResolvedValue({ id: 99, status: 'stopped' })
+  ;(startLiveSession as any).mockResolvedValue({ id: 7, status: 'running' })
+  ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
   ;(getLivePositions as any).mockResolvedValue([])
   ;(getLiveOrders as any).mockResolvedValue([])
   ;(getLiveTrades as any).mockResolvedValue([])
@@ -65,7 +70,7 @@ afterEach(() => {
 
 describe('LiveSessions.vue SSE 事件日志面板', () => {
   it('存在运行中 session 时自动连接其 SSE 流', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession, stoppedSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, stoppedSession])
     const w = mount(LiveSessions)
     await flushPromises()
 
@@ -76,7 +81,7 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
   })
 
   it('signal/order/risk 事件渲染为可读日志,ping 跳过', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
@@ -96,10 +101,10 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
   })
 
   it('点停止 → 关闭事件流', async () => {
-    axiosGet.mockResolvedValueOnce({ data: { data: [runningSession] } })
-    axiosPost.mockResolvedValue({ data: { data: { id: 7, status: 'stopped' } } })
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
     // 停止后 load 返回 stopped,不再自动重连
-    axiosGet.mockResolvedValueOnce({ data: { data: [stoppedSession] } })
+    ;(getLiveSessions as any).mockResolvedValueOnce([stoppedSession])
     const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
@@ -108,14 +113,14 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
     await stopBtn.trigger('click')
     await flushPromises()
 
-    expect(axiosPost).toHaveBeenCalledWith('/api/live/sessions/7/stop')
+    expect(stopLiveSession).toHaveBeenCalledWith(7)
     expect(es.close).toHaveBeenCalled()
     expect(w.text()).toContain('未连接')
     w.unmount()
   })
 
   it('卸载时关闭事件流', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
@@ -127,7 +132,7 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
 
 describe('LiveSessions.vue 工作台(B4b)', () => {
   it('连接运行中 session → 加载三表历史', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
       { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 },
     ])
@@ -154,7 +159,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
   })
 
   it('持仓 tab 切到委托 → 显示委托历史;切到成交 → 显示成交历史', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLiveOrders as any).mockResolvedValue([
       { id: 3, stock_code: '000001.SZ', trade_type: 'SELL', status: 'submitted',
         quantity: 200, price: null, filled_quantity: 0, filled_price: null,
@@ -179,7 +184,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
   })
 
   it('SSE position 事件 → 持仓表 upsert(新 code 追加/同 code 替换)', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
@@ -197,7 +202,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
   })
 
   it('SSE order/trade 事件 → 委托/成交表顶部插入', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [runningSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
@@ -224,7 +229,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
   ]
 
   it('新建实盘弹窗可多选组合策略,提交带 portfolio_ids', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [stoppedSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
     const w = mount(LiveSessions)
     await flushPromises()
@@ -241,14 +246,14 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
     await flushPromises()
 
-    expect(axiosPost).toHaveBeenCalledWith('/api/live/sessions', expect.objectContaining({
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
       name: '', mode: 'simulation', portfolio_ids: [1, 2],
     }))
     w.unmount()
   })
 
   it('未选组合直接提交 → 提示且不发请求', async () => {
-    axiosGet.mockResolvedValue({ data: { data: [stoppedSession] } })
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
     vi.stubGlobal('alert', vi.fn())
     const w = mount(LiveSessions)
@@ -259,15 +264,15 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     await flushPromises()
 
     expect(alert).toHaveBeenCalled()
-    expect(axiosPost).not.toHaveBeenCalledWith('/api/live/sessions', expect.anything())
+    expect(createLiveSession).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
     w.unmount()
   })
 
   it('会话列表显示所选组合名称(由 portfolio_ids 解析)', async () => {
-    axiosGet.mockResolvedValue({
-      data: { data: [{ id: 9, name: '组合盘', mode: 'live', status: 'stopped', portfolio_ids: [1, 2] }] },
-    })
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 9, name: '组合盘', mode: 'live', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [1, 2] },
+    ])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
     const w = mount(LiveSessions)
     await flushPromises()

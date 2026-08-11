@@ -12,6 +12,7 @@ import {
 const portfolios = ref<PortfolioItem[]>([])
 const stockPools = ref<StockPoolItem[]>([])
 const formulas = ref<FormulaItem[]>([])
+const loading = ref(true)
 
 // 展开的组合 id 集合 + 各组合子策略缓存
 const expanded = ref<Set<number>>(new Set())
@@ -158,6 +159,8 @@ async function loadPortfolios() {
   } catch (e) {
     alert(`加载失败：${errMsg(e)}`)
     portfolios.value = []
+  } finally {
+    loading.value = false
   }
 }
 
@@ -385,7 +388,8 @@ onMounted(loadPortfolios)
       <button @click="openCreatePortfolio" class="btn btn-primary">+ 新建组合</button>
     </div>
 
-    <div class="card table-wrap">
+    <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+    <div v-else class="card table-wrap">
       <table>
         <thead><tr><th>ID</th><th>名称</th><th>股票池</th><th>子策略</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>

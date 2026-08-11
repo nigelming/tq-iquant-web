@@ -7,6 +7,7 @@ import {
 
 const pools = ref<TdxPoolItem[]>([])
 const localIdByCode = ref<Record<string, number>>({})  // 删除用：code → 本地池 id
+const loading = ref(true)
 const errorMsg = ref('')
 const showStocks = ref(false)
 const stocksList = ref<TdxPoolStockItem[]>([])
@@ -38,6 +39,8 @@ async function load() {
     // getTdxPools 失败（拦截器 reject 或 HTTP 错误）→ 提示，清空列表
     errorMsg.value = '加载失败：' + errMsg(e)
     pools.value = []
+  } finally {
+    loading.value = false
   }
 }
 
@@ -87,7 +90,8 @@ onMounted(load)
     {{ errorMsg }}
   </div>
 
-  <div class="card table-wrap">
+  <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+  <div v-else class="card table-wrap">
     <table>
       <thead><tr><th>名称</th><th>代码</th><th>状态</th><th>股票数</th><th>操作</th></tr></thead>
       <tbody>

@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 11 项（#23/#24/#29/#36/#35/#25/#30/#32/#26 已修）、P3 7 项（#38/#43 已处理）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）；#27/#28 已修（见"前端收尾"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 9 项（#23/#24/#29/#36/#35/#25/#30/#32/#26/#27/#28 已修）、P3 7 项（#38/#43 已处理）。
 
 ---
 
@@ -184,6 +184,19 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 验证：`npx vue-tsc --noEmit` 零错误；`npx vitest run` 87 passed（10 文件）。
 
 **P2 当前结论**：#26 已修（P2 12→11）。剩余 P2 以数据完整性项为主（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ #33 硬编码 + #22 init_db 走 Alembic。
+
+### 2026-08-11 前端收尾（#27/#28）
+
+#26 之后继续清前端一致性缺口——原生 axios 直连收敛到统一 API 客户端 + 5 视图补加载态：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 27 | ✅ **已修** | `api/index.ts` 追加实盘会话 CRUD/启停 + 系统配置封装（`getLiveSessions`/`createLiveSession`/`startLiveSession`/`stopLiveSession`/`deleteLiveSession`/`getSystemConfigs`/`updateSystemConfigs`，类型 `LiveSessionItem`/`LiveSessionCreate`/`SystemConfig` 对齐 live.py list_sessions serializer + core/config.py `_defaults()`）。`LiveSessions.vue` 删原生 `import axios`，会话查询/新建/启停改走客户端（load 补 try/catch 防 unhandled rejection）；`SystemConfig.vue` 删原生 axios，GET/PUT 改走客户端。**收益**：两视图统一走响应拦截器（code≠0 → reject），错误路径与其余视图一致。测试 mock 同步：LiveSessions.test.ts/SystemConfig.test.ts 从 `vi.mock('axios')` 改 mock `../api` 函数（`getLiveSessions` 等直接 resolved 数组，替代 `{data:{data}}` 包装） |
+| 28 | ✅ **已修** | 5 视图补 `loading` ref + 模板 gate（`v-if="loading"` 加载中条 / `v-else` 数据表）：Backtest.vue/Formulas.vue/LiveSessions.vue/Portfolios.vue/StockPools.vue。load 函数 `finally { loading = false }`（重载/刷新复用 load 时不闪加载态）。SystemConfig.vue 原本已有 loading，不动 |
+
+验证：`npx vue-tsc --noEmit` 零错误；`npx vitest run` 87 passed（10 文件，含两测试文件 mock 重写后全绿）。
+
+**P2 当前结论**：#27/#28 已修（P2 11→9）。剩余 P2 以数据完整性项为主（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ #33 硬编码 + #22 init_db 走 Alembic。
 
 ---
 

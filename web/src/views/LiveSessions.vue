@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import axios from 'axios'
 import { formatEvent, nextEventId, EVENT_TYPE_COLOR, TRADE_TYPE_LABEL, ORDER_STATUS_LABEL, type LiveEvent } from '../utils/liveEvents'
 import {
   orderEventToRow, orderHistoryToRows,
@@ -8,18 +7,14 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped,
   type OrderRow, type TradeRow, type PositionRow,
 } from '../utils/liveWorkbench'
-import { getLiveOrders, getLiveTrades, getLivePositions, getPortfolios, type PortfolioItem } from '../api'
-
-// 实盘会话列表项（本页用原始 axios 直连 /api/live/sessions，本地定义对齐 serializer 字段）
-interface LiveSessionItem {
-  id: number
-  name: string
-  portfolio_ids: number[]
-  mode: string  // simulation|live
-  status: string  // stopped|running
-}
+import {
+  getLiveOrders, getLiveTrades, getLivePositions, getPortfolios,
+  getLiveSessions, createLiveSession, startLiveSession, stopLiveSession,
+  type PortfolioItem, type LiveSessionItem,
+} from '../api'
 
 const sessions = ref<LiveSessionItem[]>([])
+const loading = ref(true)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
 const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] as number[] })
@@ -102,8 +97,13 @@ function closeEventStream() {
 }
 
 async function load() {
-  const res = await axios.get('/api/live/sessions')
-  sessions.value = res.data.data
+  try {
+    sessions.value = await getLiveSessions()
+  } catch {
+    sessions.value = []
+  } finally {
+    loading.value = false
+  }
   portfolios.value = await getPortfolios().catch(() => [])
   // B6 全局限 1 个运行 session,自动接它的流
   const running = sessions.value.find((s) => s.status === 'running')
@@ -120,20 +120,20 @@ async function create() {
     alert('请至少选择一个组合策略')
     return
   }
-  await axios.post('/api/live/sessions', form.value)
+  await createLiveSession(form.value)
   showCreate.value = false
   form.value = { name: '', mode: 'simulation', portfolio_ids: [] }
   load()
 }
 
 async function startSession(id: number) {
-  await axios.post(`/api/live/sessions/${id}/start`)
+  await startLiveSession(id)
   load() // load 内自动连接新运行 session 的流
 }
 
 async function stopSession(id: number) {
   closeEventStream()
-  await axios.post(`/api/live/sessions/${id}/stop`)
+  await stopLiveSession(id)
   load()
 }
 
@@ -146,7 +146,8 @@ onUnmounted(closeEventStream)
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </div>
 
-  <div class="card table-wrap">
+  <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+  <div v-else class="card table-wrap">
     <table>
       <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>

@@ -13,6 +13,7 @@ import type {
 // ===== 列表 =====
 const records = ref<BacktestRecordItem[]>([])
 const portfolios = ref<PortfolioItem[]>([])
+const loading = ref(true)
 
 // ===== 发起弹窗 =====
 const showForm = ref(false)
@@ -70,6 +71,8 @@ async function load() {
   } catch (e) {
     errorMsg.value = '加载失败：' + errMsg(e)
     records.value = []
+  } finally {
+    loading.value = false
   }
 }
 
@@ -403,7 +406,8 @@ onUnmounted(() => {
       {{ errorMsg }}
     </div>
 
-    <div class="card table-wrap">
+    <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+    <div v-else class="card table-wrap">
       <table>
         <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
         <tbody>
