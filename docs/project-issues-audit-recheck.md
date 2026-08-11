@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）；#27/#28 已修（见"前端收尾"小节）；#33 已修（见"硬编码清理"小节）；#39/#40 已修（见"P3 低成本项"小节）；#18(剩余 1)/#19/#20/#21/#22 已修（见"数据完整性迁移组"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、**P2 0 项（19/19 清零）**、P3 5 项（#37/#41/#42/#44/#45；#38/#39/#40/#43 已处理）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）；#27/#28 已修（见"前端收尾"小节）；#33 已修（见"硬编码清理"小节）；#39/#40 已修（见"P3 低成本项"小节）；#18(剩余 1)/#19/#20/#21/#22 已修（见"数据完整性迁移组"小节）；#37/#41/#44/#45 已处理 + #42 已修（见"P3 收尾组"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、**P2 0 项（19/19 清零）**、**P3 0 项（9/9 全部处理）**。
 
 ---
 
@@ -253,19 +253,19 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 
 ---
 
-## P3 — 低（9/9 仍存在）
+## P3 — 低（9/9 已处理）
 
 | # | 状态 | 位置 | 证据 |
 |---|------|------|------|
-| 37 | 🔴 | `test_live_engine.py` | `test_loop_offline_to_online_resets_baseline` 存在，为同步函数内嵌 `asyncio.run()`，无 `pytest.mark.asyncio` 标记 |
-| 38 | 🔴 | `conftest.py:24` | `app.dependency_overrides["get_db"]` 用字符串 key（应改为函数对象 `get_db`） |
-| 39 | 🔴 | 项目根 | 无 `README.md`（根目录仅 AGENTS.md/CLAUDE.md/config.yaml/docker-compose.yml/docs/main/shared/web） |
-| 40 | 🔴 | `web/src/stores/` | 空目录；`package.json` 含 `pinia ^4.0.2`；`web/src` grep `defineStore` 零命中 —— 已装未用 |
-| 41 | 🔴 | `web/src/views/` | 无 Dashboard/Home 视图；路由 `/` 仅 `redirect: '/stock-pools'` |
-| 42 | 🔴 | `api/index.ts:193` | `deleteStrategy` 返回 `res.data`（完整 ApiResponse）而非 `res.data.data`，与同文件其他函数不一致 |
-| 43 | 🔴 | `iquant_bridge.py:109` | `headers.get("x-auth-token") == TOKEN` 用 `==`（grep `compare_digest`/`hmac` 零命中），有时序侧信道风险 |
-| 44 | 🔴 | `AGENTS.md` | 模块复用段仍写"97% 代码复用"，未修订为"核心逻辑共用 + 引擎特有逻辑实盘独有" |
-| 45 | 🔴 | `main/core/models/` | 16 个模型文件 grep `relationship(` 零命中，全部仅 `Column(ForeignKey(...))` |
+| 37 | ✅ **已修** | `test_live_engine.py` | `test_loop_offline_to_online_resets_baseline`/`..._still_resets_baseline_after_thread_offload` 2 个离线→在线转场测试的固定 `sleep` 改有界轮询（沿用 `:1831-1839` 先例），消除跨线程调度抖动下的偶发失败 |
+| 38 | ✅ **已修** | `conftest.py:25` | `app.dependency_overrides[get_db]` 用函数对象 key（非字符串），见"P2/P3 低成本清理"小节 |
+| 39 | ✅ **已修** | 项目根 | `README.md` 已新增，见"P3 低成本项"小节 |
+| 40 | ✅ **已修** | `web/` | `pinia` 依赖已移除、空 `src/stores/` 删除，见"P3 低成本项"小节 |
+| 41 | ✅ **已修** | `web/src/views/Dashboard.vue` | 新增最小 Dashboard 首页（统计卡 + 最近回测 + 配置），路由 `/` 重定向 `/dashboard`，见"P3 收尾组"小节 |
+| 42 | ✅ **已修** | `api/index.ts:363-366` | `deleteStrategy` 已返回 `res.data.data`，与同文件其他 5 个 delete 一致，见"P1 一致性"小节 |
+| 43 | ✅ **不再适用** | `iquant_bridge.py` | token 鉴权整体移除（`a0f0515`），时序侧信道前提消失，见"死代码+文档清理"小节 |
+| 44 | ✅ **已修** | `AGENTS.md` | "97% 代码复用"已修订（`f6c6ff3`）；本组再修迁移数 6→7 与测试路径 `tests/`→`core/tests/`，见"P3 收尾组"小节 |
+| 45 | ✅ **非缺陷** | `main/core/models/` | 模型零 `relationship()` 是架构偏好非缺陷：FK + 外键约束 + 显式查询已满足完整性，加 relationship 仅省 ORM 级联读写。维持现状（用户确认），见"P3 收尾组"小节 |
 
 ---
 
@@ -312,4 +312,24 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 
 **迁移**：`main/alembic/versions/d4a5b6c7d8e9_add_data_integrity_constraints.py`（down_revision=`a5b351e0d6d7`，全 `op.batch_alter_table`）。`alembic check` 无差异；`uv run pytest -q` **376 全绿**；dev.db 迁移前已备份 `main/data/dev.db.bak`；server_default/unique 已实测（插入不带默认列 → 默认值落库；重复 code → IntegrityError）。
 
-**P2 当前结论**：#18(剩余 1)/#19/#20/#21/#22 全部已修，**P2 19/19 清零**。剩余 open 仅 P1 #9（service 层，暂不做）+ P3 #37/#41/#42/#44/#45。
+**P2 当前结论**：#18(剩余 1)/#19/#20/#21/#22 全部已修，**P2 19/19 清零**。剩余 open 仅 P1 #9（service 层，暂不做，见"P3 收尾组"）。
+
+---
+
+## 2026-08-11 P3 收尾组（#37/#41/#42/#44/#45）
+
+P3 最后 5 项收尾。其中 #42 代码已修（仅文档表同步）、#44 部分已修（补 3 处小不一致）、#45 评估为非缺陷（用户确认维持现状）；#37 为真实 flaky 缺陷、#41 为最小 Dashboard 功能新增：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 37 | ✅ **已修** | `test_live_engine.py` `test_loop_offline_to_online_resets_baseline`（`:1347-1396`）/`test_loop_offline_to_online_still_resets_baseline_after_thread_offload`（`:2478-2524`）的固定 `sleep(0.08/0.1)` 改有界轮询（`while len(reset_calls) < 1 and ... < deadline: await asyncio.sleep(0.005)`），沿用 `:1831-1839` 先例。断言不变（`bridge_online is True`、`len(reset_calls) == 1`）。文件重复跑 5 次无失败 |
+| 41 | ✅ **已修** | 新增 `web/src/views/Dashboard.vue`（metric-grid 统计卡：股票池/公式/组合/回测/实盘/系统状态 + 最近回测表 + 配置卡；`Promise.allSettled` 逐项兜底，任一失败不阻塞其余）；`web/src/api/index.ts` 加 `getSystemStatus()`（消费 `GET /api/status`）；路由 `/` → `/dashboard` + 新路由；`App.vue` 菜单/titles 加"🏠 首页"；新增 `web/src/__tests__/Dashboard.test.ts`（挂载渲染 7 getter 全调 + 单源失败不阻塞其余）。`npm run build` 通过、vitest 89 passed |
+| 42 | ✅ **已修** | `api/index.ts:363-366` `deleteStrategy` 已返回 `res.data.data`（提交 22227e5），本组仅同步 recheck.md 表 |
+| 44 | ✅ **已修** | `f6c6ff3` 已修"97% 复用"；本组补：`AGENTS.md:5` 迁移数 6→7（head `d4a5b6c7d8e9`）、`AGENTS.md:37-39` 测试路径 `tests/`→`core/tests/`（实际 `main/core/tests/`）、`CLAUDE.md:9` 删失效"Greenfield 已过时"交叉引用 |
+| 45 | ✅ **非缺陷** | 14 个模型零 `relationship()` 是架构偏好非缺陷：FK + 外键约束 + `PRAGMA foreign_keys=ON` + 显式查询已满足完整性，relationship 仅省 ORM 级联读写。**维持现状**（用户确认），记录结论，后续若做关系层重构另行立项 |
+
+验证：后端 `uv run pytest -q` **376 全绿**（含 2 个转场测试，文件级重复 5 次稳定）；前端 `npm run build`（vue-tsc -b）零错误 + `npx vitest run` **89 passed**（含新增 Dashboard.test.ts 2 例）。
+
+**P3 当前结论**：#37/#41/#42/#44/#45 全部处理，**P3 9/9 清零**。
+
+**整体收尾状态**：45 项审计中，**P0 8/8、P2 19/19、P3 9/9 全部处理**；P1 仅 #9 service 层经评估暂不做（最大组织债，单独立项窗口处理）。当前仍 open 唯一项 = **P1 #9**。

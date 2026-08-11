@@ -1387,7 +1387,11 @@ def test_loop_offline_to_online_resets_baseline():
 
     async def run_a_bit():
         await engine.start()
-        await asyncio.sleep(0.08)
+        # 审计 #37：原固定 sleep(0.08) 在调度抖动下偶发不足 1 次 reset_baseline。
+        # 改为有界轮询：轮询 reset_calls 直到离线→在线转场完成或超时（同 :1831-1839 先例）。
+        deadline = asyncio.get_event_loop().time() + 0.5
+        while len(reset_calls) < 1 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.005)
         await engine.stop()
 
     asyncio.run(run_a_bit())
@@ -2515,7 +2519,10 @@ def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
 
     async def run_a_bit():
         await engine.start()
-        await asyncio.sleep(0.1)
+        # 审计 #37：原固定 sleep(0.1) 偶发抖动，同 :1347 测试——改有界轮询等转场完成。
+        deadline = asyncio.get_event_loop().time() + 0.5
+        while len(reset_calls) < 1 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.005)
         await engine.stop()
 
     asyncio.run(run_a_bit())

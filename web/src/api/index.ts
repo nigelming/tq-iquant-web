@@ -501,6 +501,15 @@ export interface SystemConfig {
   iquant_bridge: { base_url: string }
 }
 
+export interface SystemStatus {
+  core: { online: boolean; version: string; uptime: string }
+}
+
+export async function getSystemStatus() {
+  const res = await api.get<ApiResponse<SystemStatus>>('/status')
+  return res.data.data
+}
+
 export async function getSystemConfigs() {
   const res = await api.get<ApiResponse<SystemConfig>>('/system/configs')
   return res.data.data

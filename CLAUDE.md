@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 创懿量化交易平台 — 桥接通达信(TDX)回测数据与国信 iQuant 实盘交易的单用户量化系统。无鉴权，所有接口直接可访问。
 
-**权威业务规则文档**：[AGENTS.md](AGENTS.md) 记录了完整的业务规则、API 规范、并发模型与数据库设计。**但其中"项目状态: Greenfield，无实际代码"一句已过时** — opencode 已完成脚手架搭建（模型、API 路由、引擎骨架、前端视图均已存在），见下方"实现状态"。
+**权威业务规则文档**：[AGENTS.md](AGENTS.md) 记录了完整的业务规则、API 规范、并发模型与数据库设计。当前实现状态（模型、API 路由、引擎骨架、前端视图均已落地）见下方"实现状态"。
 
 **完整设计文档**（实现时的依据）：
 - [docs/system-plan-draft.md](docs/system-plan-draft.md) — 系统总体设计（81KB，含 44 个接口定义、数据库 schema、依赖图）

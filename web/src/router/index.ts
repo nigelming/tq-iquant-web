@@ -3,7 +3,8 @@ import { createRouter, createWebHistory } from 'vue-router'
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: '/', redirect: '/stock-pools' },
+    { path: '/', redirect: '/dashboard' },
+    { path: '/dashboard', name: 'dashboard', component: () => import('../views/Dashboard.vue') },
     { path: '/stock-pools', name: 'stock-pools', component: () => import('../views/StockPools.vue') },
     { path: '/formulas', name: 'formulas', component: () => import('../views/Formulas.vue') },
     { path: '/portfolios', name: 'portfolios', component: () => import('../views/Portfolios.vue') },

@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 14 个 SQLAlchemy 模型、17 个引擎文件、7 个 API 路由、6 个前端视图、6 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 14 个 SQLAlchemy 模型、17 个引擎文件、7 个 API 路由、6 个前端视图、7 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -34,9 +34,9 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 | 命令 | 说明 |
 |---|---|
-| `uv run pytest tests/` | 后端测试（main 环境） |
-| `uv run pytest tests/unit/` | 仅单元测试 |
-| `uv run pytest tests/integration/` | 仅集成测试 |
+| `uv run pytest core/tests/` | 后端测试（main 环境） |
+| `uv run pytest core/tests/unit/` | 仅单元测试 |
+| `uv run pytest core/tests/integration/` | 仅集成测试 |
 | `npx vitest` | 前端测试（web/ 目录） |
 | `uv run uvicorn core.main:app --reload` | 启动后端 dev server |
 | `npm run dev` | 启动前端 dev server（web/ 目录） |
