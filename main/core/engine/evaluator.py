@@ -3,6 +3,9 @@ from collections import deque
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
+# 无风险年化利率，Sharpe/Sortino 计算用。提为常量消除魔法数字（审计 #33）。
+RISK_FREE_RATE = 0.02
+
 
 class Evaluator:
     def evaluate(
@@ -43,7 +46,7 @@ class Evaluator:
         variance = sum((r - mean_dr) ** 2 for r in daily_returns) / len(daily_returns)
         volatility = math.sqrt(variance * 252)
 
-        rf = 0.02
+        rf = RISK_FREE_RATE
         sharpe = (annual_return - rf) / volatility if volatility > 0 else 0
 
         neg_returns = [r for r in daily_returns if r < 0]

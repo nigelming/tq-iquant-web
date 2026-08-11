@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 # 不依赖本机时区（Core 部署 UTC 服务器时本机 14:30 ≠ 上海 14:30，日终会哑火）。
 _CST = timezone(timedelta(hours=8))
 
+# 实盘日终判定时点（E5/E6 update_daily + C6(B/C) 1d 快照/1w/1mon 注入共用）。
+# 上海 14:30 收盘后驱动。提为常量消除魔法数字（审计 #33）。
+_DAILY_CLOSE_TIME = (14, 30)
+
 
 def now_shanghai() -> datetime:
     """当前上海时间（naive，已剥时区）。实盘固有时点判定专用。
@@ -401,7 +405,7 @@ class LiveEngine:
         """
         if now is None:
             now = now_shanghai()
-        if (now.hour, now.minute) < (14, 30):
+        if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
             return
         today = now.date()
         if self._last_daily_date == today:
@@ -447,7 +451,7 @@ class LiveEngine:
         """
         if now is None:
             now = now_shanghai()
-        if (now.hour, now.minute) < (14, 30):
+        if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
             return
         today = now.date()
         if self._last_daily_bar_date == today:
