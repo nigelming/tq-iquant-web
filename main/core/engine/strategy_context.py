@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from .position import Position
 from .event import SignalEvent, BarEvent
+from .risk_manager import StrategyRiskManager
 from tq_iquant_shared.constants import SignalType
 
 
@@ -36,6 +37,8 @@ class StrategyContext:
         self.role = role
         self.master_strategy_id = master_strategy_id
         self.positions: Dict[str, Position] = {}
+        # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
+        self.strategy_risk: Optional[StrategyRiskManager] = None
         # 公式信号配置：[{"signal_name", "signal_type": SignalType, "trigger_value": int}]
         self.formula_signals: List[dict] = []
 

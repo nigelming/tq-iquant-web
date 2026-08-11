@@ -13,7 +13,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
@@ -31,6 +31,19 @@ from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
+
+# Asia/Shanghai 固定时区——实盘日终 (14:30) 判定/时间记录按上海时间，
+# 不依赖本机时区（Core 部署 UTC 服务器时本机 14:30 ≠ 上海 14:30，日终会哑火）。
+_CST = timezone(timedelta(hours=8))
+
+
+def now_shanghai() -> datetime:
+    """当前上海时间（naive，已剥时区）。实盘固有时点判定专用。
+
+    naive 与引擎内其余 datetime（均 naive）比较一致；aware 与 naive 比较会抛 TypeError。
+    """
+    return datetime.now(tz=_CST).replace(tzinfo=None)
+
 
 # TQ 公式输出中需跳过的非变量键（同 backtest._FORMULA_META_KEYS）
 _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
@@ -232,7 +245,7 @@ class LiveEngine:
                         q.get(), timeout=self._stream_ping_interval
                     )
                 except asyncio.TimeoutError:
-                    ev = {"type": "ping", "time": datetime.now().isoformat()}
+                    ev = {"type": "ping", "time": now_shanghai().isoformat()}
                 yield ev
         finally:
             if q in self._stream_subscribers:
@@ -258,7 +271,7 @@ class LiveEngine:
         # C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路）。
         # 一次同步 TDX 计算（get_tdx_lock 串行），阻塞事件循环可接受（启动一次性）。
         self._inject_startup_periods(
-            datetime.combine(datetime.now().date(), datetime.min.time())
+            datetime.combine(now_shanghai().date(), datetime.min.time())
         )
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
@@ -380,14 +393,15 @@ class LiveEngine:
             logger.exception("deals loop unexpected error")
 
     # ---------------- 日终（E5/E6）----------------
-    def _maybe_daily_close(self) -> None:
+    def _maybe_daily_close(self, now: Optional[datetime] = None) -> None:
         """本机时间 ≥ 14:30 且当日未算过 → 对每个组合调一次 update_daily。
 
         日终一次：日内盈亏 daily_pnl = 当前总市值 - prev_close（昨日收盘，update_peak 跨日刷新），
-        检测 daily_loss 暂停 + 次日恢复。用本机 Asia/Shanghai 时钟（实盘固有时点，同 C6 1d 快照时点）。
+        检测 daily_loss 暂停 + 次日恢复。用上海时间（实盘固有时点，同 C6 1d 快照时点）。
         幂等：_last_daily_date 记录当日已算，避免每轮循环重复触发。
         """
-        now = datetime.now()
+        if now is None:
+            now = now_shanghai()
         if (now.hour, now.minute) < (14, 30):
             return
         today = now.date()
@@ -433,7 +447,7 @@ class LiveEngine:
         cache miss）→ 通达信补注入。用本机 Asia/Shanghai 时钟（实盘固有时点，同 E5/E6）。
         """
         if now is None:
-            now = datetime.now()
+            now = now_shanghai()
         if (now.hour, now.minute) < (14, 30):
             return
         today = now.date()
@@ -1130,7 +1144,7 @@ class LiveEngine:
         live_order.filled_quantity = total_qty
         live_order.filled_price = avg_price
         live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
-        self._last_backfill_time = datetime.now()  # G7：记录最近一次回填时点
+        self._last_backfill_time = now_shanghai()  # G7：记录最近一次回填时点
         # B5：订单状态推送（filled/partial 都由成交回报回填推进）
         self._emit("order", {
             "portfolio_id": live_order.portfolio_strategy_id,
@@ -1204,7 +1218,7 @@ class LiveEngine:
                 return datetime.strptime(d + " " + t, "%Y%m%d %H:%M:%S")
         except (ValueError, TypeError):
             pass
-        return datetime.now()
+        return now_shanghai()
 
     def _apply_filled_trade(self, live_order: LiveOrder, price: Decimal,
                             qty: int, amount: Decimal, commission: Decimal) -> None:
@@ -1234,7 +1248,7 @@ class LiveEngine:
             amount=amount,
             commission=commission,
             stamp_duty=Decimal("0"),
-            trade_time=live_order.bar_time or datetime.now(),
+            trade_time=live_order.bar_time or now_shanghai(),
             signal_type=sig_type,
         )
         if pos is None and trade.trade_type == TradeType.BUY:

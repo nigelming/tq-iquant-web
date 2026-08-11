@@ -14,6 +14,7 @@
 桥侧按 order_id 去重，重复请求不重复下单。
 """
 import hashlib
+import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -23,6 +24,8 @@ import httpx
 from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
 from tq_iquant_shared.constants import TradeType
+
+logger = logging.getLogger(__name__)
 
 
 class BridgeUnavailableError(RuntimeError):
@@ -80,7 +83,12 @@ class HttpBridgeDispatcher(OrderDispatcher):
             raise BridgeUnavailableError("bridge returned HTTP %s" % r.status_code)
         try:
             data = r.json()
-        except Exception:
+        except Exception as e:
+            # #24：桥返回非 JSON（HTML 错误页/坏网关）不静默吞——原行为 data={} →
+            # 当业务拒绝，真实桥故障无痕迹。告警让"非 JSON"可见。
+            logger.warning(
+                "bridge /order returned non-JSON body, treated as rejection: %s", e
+            )
             data = {}
         if not data.get("ok"):
             # 桥业务拒绝（白名单/限额/重复）→ 不成交，不抛异常
@@ -114,7 +122,11 @@ class HttpBridgeDispatcher(OrderDispatcher):
             raise BridgeUnavailableError("bridge returned HTTP %s" % r.status_code)
         try:
             return (r.json() or {}).get("data", [])
-        except Exception:
+        except Exception as e:
+            # #24：非 JSON 不静默吞——返回 [] 会被上层当无持仓/无订单，掩盖桥故障。
+            logger.warning(
+                "bridge %s returned non-JSON body, returning empty list: %s", path, e
+            )
             return []
 
     def query_positions(self) -> list:
@@ -151,7 +163,12 @@ class HttpBridgeDispatcher(OrderDispatcher):
             raise BridgeUnavailableError("bridge returned HTTP %s" % r.status_code)
         try:
             body = r.json() or {}
-        except Exception:
+        except Exception as e:
+            # #24：非 JSON 不静默吞——返回 [] 会让 BarPoller 拉不到 bar 静默不触发。
+            logger.warning(
+                "bridge /quote returned non-JSON body for %s, returning empty list: %s",
+                code, e,
+            )
             return []
         if not body.get("ok"):
             return []

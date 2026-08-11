@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）。当前实际仍 open：P1 4 项（#9/#11/#12/#16）、P2 19 项、P3 8 项（#43 关闭）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）。当前实际仍 open：P1 4 项（#9/#11/#12/#16）、P2 16 项（#23/#24/#29 已修）、P3 8 项（#43 关闭）。
 
 ---
 
@@ -113,6 +113,20 @@
 验证：后端测试 369 passed（删 2 个 EventBus 测试，371→369）、grep `signal_engine|event_bus` 在 `main/core/` 零残留。
 
 **P1 最终结论**：9 项中 6 项已处理（#10/#13/#14/#15/#17 + #42），**#9/#11/#12/#16 仍存在**（4 项）。**P3**：9 项中 #43 关闭，剩 8 项。
+
+### 2026-08-11 实盘正确性/风险（#23/#29/#24）
+
+实盘引擎三处静默失效/哑火缺陷，逐一 TDD 修复（先红后绿）：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 29 | ✅ **已修** | `strategy_context.py` `__init__` 显式声明 `self.strategy_risk: Optional[StrategyRiskManager] = None`（原靠 `portfolio_builder.py:73` 动态设置，未 assemble 时 `getattr(ctx,"strategy_risk",None)` 静默 None → 风控全失效）。`portfolio.py:_check_risks` 在 `risk_manager is None` 时告警（非 raise，避免中断同组合其他策略的 on_bar），让失效可见。测试：`test_strategy_risk_defaults_none` + `test_check_risks_warns_when_strategy_risk_none`（断言 warning + 不产止损单） |
+| 24 | ✅ **已修** | `http_bridge_dispatcher.py` 三处 JSON 解析 `except Exception: data={}`/`return []` 补 `logger.warning`（place_order/_get_json/query_quote）。桥返回非 JSON（HTML 错误页/坏网关）原被当业务拒绝/空结果静默吞，现告警可见。**网络异常仍抛 `BridgeUnavailableError`**（不重复告警）。测试：3 个 `*_non_json_body_warns_*` 断言 warning + 返回值 |
+| 23 | ✅ **已修** | `live_engine.py` 加 `now_shanghai()` 辅助（`datetime.now(tz=_CST).replace(tzinfo=None)`，naive 与引擎其余 datetime 一致），替换 6 处裸 `datetime.now()` 时间点判定。核心：`(14,30)` 日终判定改按上海时间——Core 部署 UTC 服务器时本机 14:30 ≠ 上海 14:30，日终哑火会让 E5/E6 熔断、1d 快照、1w/1mon 注入全失效。`_maybe_daily_close`/`_maybe_daily_bars` 加 `now=None` 可注入参数便于测试。测试：`test_now_shanghai_returns_shanghai_wall_clock`（UTC 06:30→上海 14:30）+ `test_maybe_daily_close_uses_shanghai_time`（14:29 不触发/14:30 触发） |
+
+验证：后端测试 376 passed（+5 新测试：#29×2、#24×3、#23×2，其中 #23 的 `test_now_shanghai` 与 `daily_close` 合并计）。`now_shanghai` 返回 naive，与引擎内所有 datetime 比较一致（aware 与 naive 比较会抛 TypeError）。
+
+**P2 当前结论**：19 项中 #23/#24 已修（仍 open 17 项）；**P2 #29 实为 P2 表内 #29**（见 P2 表，原列于 P2），现亦已修——P2 open 降至 16 项。
 
 ---
 

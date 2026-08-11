@@ -191,3 +191,74 @@ def test_idempotent_order_id_passthrough():
     assert _last_json(rec, -1)["order_id"] != _last_json(rec, -2)["order_id"]
     # order_id 是确定性 hash 串
     assert len(_last_json(rec)["order_id"]) == 32
+
+
+# ---------------- #24：桥返回非 JSON 不静默吞 ----------------
+def test_place_order_non_json_body_warns_and_returns_none(caplog):
+    """#24：桥 /order 返回非 JSON（如 HTML 错误页/坏网关）→ 告警 + 返回 None。
+
+    原行为：r.json() 失败静默 data={} → data.get("ok") None → return None，
+    被当业务拒绝（券商拒单），真实桥故障无痕迹。加 warning 让"非 JSON"可见。
+    """
+    import logging
+
+    def respond(request):
+        if request.url.path == "/order":
+            return httpx.Response(
+                200, text="<html>502 Bad Gateway</html>",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    with caplog.at_level(logging.WARNING, logger="core.engine.http_bridge_dispatcher"):
+        trade = disp.place_order(_make_order())
+    assert trade is None
+    assert any("non-JSON" in r.message for r in caplog.records), \
+        "桥返回非 JSON 应触发 warning，不应静默"
+
+
+def test_query_positions_non_json_body_warns_and_returns_empty(caplog):
+    """#24：/positions 返回非 JSON → 告警 + 返回 []（不当无持仓）。
+
+    原行为：返回 [] 被上层当"无持仓"，掩盖桥故障。加 warning 可见。
+    """
+    import logging
+
+    def respond(request):
+        if request.url.path == "/positions":
+            return httpx.Response(
+                200, text="<html>error</html>",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    with caplog.at_level(logging.WARNING, logger="core.engine.http_bridge_dispatcher"):
+        rows = disp.query_positions()
+    assert rows == []
+    assert any("non-JSON" in r.message for r in caplog.records), \
+        "桥返回非 JSON 应触发 warning，不应静默"
+
+
+def test_query_quote_non_json_body_warns_and_returns_empty(caplog):
+    """#24：/quote 返回非 JSON → 告警 + 返回 []（不当无行情）。
+
+    原行为：返回 [] 让 BarPoller 拉不到 bar 静默不触发。加 warning 可见。
+    """
+    import logging
+
+    def respond(request):
+        if request.url.path == "/quote":
+            return httpx.Response(
+                200, text="<html>504 Gateway Timeout</html>",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    with caplog.at_level(logging.WARNING, logger="core.engine.http_bridge_dispatcher"):
+        rows = disp.query_quote("600000.SH")
+    assert rows == []
+    assert any("non-JSON" in r.message for r in caplog.records), \
+        "桥返回非 JSON 应触发 warning，不应静默"

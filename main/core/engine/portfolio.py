@@ -1,6 +1,7 @@
 from typing import List, Dict, Optional
 from decimal import Decimal
 from datetime import date
+import logging
 
 from .account import Account
 from .strategy_context import StrategyContext
@@ -8,6 +9,8 @@ from .position import Position
 from .risk_manager import PortfolioRiskManager
 from .event import BarEvent, SignalEvent, OrderEvent
 from tq_iquant_shared.constants import SignalType, TradeType
+
+logger = logging.getLogger(__name__)
 
 # 公式信号类型优先级（同策略内）：CLOSE > REDUCE > ADD > OPEN
 _FORMULA_PRIORITY = {
@@ -106,6 +109,12 @@ class Portfolio:
         """对策略持仓检查止损/止盈/移动止损，返回风控 SignalEvent。"""
         risk_manager = getattr(ctx, "strategy_risk", None)
         if risk_manager is None:
+            # #29：风控未注入不能静默跳过（止损/止盈/移动止损全失效无痕迹）。
+            # 告警让失效可见；不 raise 以免中断同组合其他策略的 on_bar。
+            logger.warning(
+                "strategy %s has no strategy_risk, risk checks skipped",
+                ctx.strategy_id,
+            )
             return []
         risks: List[SignalEvent] = []
         for stock_code, pos in ctx.positions.items():

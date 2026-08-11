@@ -482,6 +482,40 @@ def test_breaker_inactive_allows_buy():
     assert len(buy_orders) == 1
 
 
+def test_check_risks_warns_when_strategy_risk_none(caplog):
+    """#29：strategy_risk 未注入 → _check_risks 告警（非静默 return []）+ 不产止损单。
+
+    漏注入时风控静默失效比报错危险（止损/止盈/移动止损全跳过无痕迹）。
+    __init__ 声明默认 None + _check_risks None 时 logger.warning 让失效可见。
+    """
+    import logging
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=42, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    ctx.formula_signals = []  # 无公式信号 → 只有风控可能产单
+    # 故意不设 ctx.strategy_risk → 默认 None
+    port.strategies.append(ctx)
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+    # 收盘 9.0 跌 10%，若有 strategy_risk 会触发止损 SELL
+    bar = _bar("000001.SZ", "9.0", datetime(2026, 7, 30, 15, 0))
+
+    with caplog.at_level(logging.WARNING, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache={})
+
+    # 风控被跳过：无止损 SELL（formula_signals=[] 且风控 None → orders 空）
+    assert orders == []
+    # 告警可见：含 "has no strategy_risk" + strategy_id 42
+    assert any(
+        "has no strategy_risk" in r.message and "42" in r.message
+        for r in caplog.records
+    ), "strategy_risk 未注入应触发 warning，不应静默"
+
+
 def _buy(price, quantity, trade_time):
     from core.engine.event import TradeEvent
     return TradeEvent(

@@ -25,6 +25,18 @@ def _ctx(formula_signals=None):
     return ctx
 
 
+def test_strategy_risk_defaults_none():
+    """#29：新建 StrategyContext 的 strategy_risk 默认 None（待 assemble_portfolio 注入）。
+
+    __init__ 显式声明该属性，避免漏注入时 _check_risks 走 getattr 兜底静默跳过风控。
+    """
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    assert ctx.strategy_risk is None
+
+
 def test_get_signal_cache_hit_returns_prefilled():
     """cache 命中 → 直接返回预填信号，不调 TQ。"""
     ctx = _ctx([{"signal_name": "buy_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}])

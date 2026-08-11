@@ -6,7 +6,7 @@
 """
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -2116,6 +2116,52 @@ def test_maybe_daily_close_emits_risk_on_daily_loss(monkeypatch):
     assert ev["triggered"] is True
     assert ev["portfolio_id"] == 1
     assert port.risk_manager.daily_pause_active is True
+
+
+def test_now_shanghai_returns_shanghai_wall_clock(monkeypatch):
+    """#23：now_shanghai() 返回上海时间（naive），不依赖本机时区。
+
+    本机 datetime.now() 返回 UTC 06:30 时，now_shanghai() 应返回 14:30（+8）。
+    证明日终 (14:30) 判定按上海时间，而非本机时间——Core 部署 UTC 服务器时不哑火。
+    """
+    from core.engine.live_engine import now_shanghai, _CST
+    _fixed_utc = datetime(2026, 8, 10, 6, 30)  # 视为 UTC 06:30
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 模拟真实 datetime.now(tz=...) 语义：
+            # 传 tz → 返回该 UTC 瞬时在 tz 的墙上时间（aware）。
+            # _fixed_utc 视为 UTC，目标 tz 偏移 +8h → 上海 14:30。
+            if tz is not None:
+                return (_fixed_utc + tz.utcoffset(None)).replace(tzinfo=tz)
+            return _fixed_utc
+    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+
+    # UTC 06:30 → 上海 14:30（+8）；now_shanghai 剥 tz 后仍 14:30
+    assert now_shanghai() == datetime(2026, 8, 10, 14, 30)
+    # 顺带验证 _CST 是 +8
+    assert _CST.utcoffset(None) == timedelta(hours=8)
+
+
+def test_maybe_daily_close_uses_shanghai_time(monkeypatch):
+    """#23：_maybe_daily_close 日终判定按上海时间（14:30 阈值），可注入 now。
+
+    now=14:30 → 触发 update_daily（_last_daily_date 置当日）；
+    now=14:29 → 未触发（_last_daily_date 仍 None/初始）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+
+    # 14:29 → 不触发
+    engine._last_daily_date = None
+    engine._maybe_daily_close(now=datetime(2026, 8, 10, 14, 29))
+    assert engine._last_daily_date is None
+
+    # 14:30 → 触发
+    engine._maybe_daily_close(now=datetime(2026, 8, 10, 14, 30))
+    assert engine._last_daily_date == datetime(2026, 8, 10).date()
 
 
 def _ss_plain_engine(factory, ping_interval=0.05):
