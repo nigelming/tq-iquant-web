@@ -17,10 +17,10 @@
 
 1. 在 iQuant 客户端新建策略，把 `iquant_bridge.py` 内容粘进去（**文件为纯 ASCII，
    GBK 编辑器兼容**，勿加非 ASCII 字符）。
-2. 配置账号与鉴权（见下「配置」）。
+2. 配置账号（见下「配置」）。
 3. 以**实盘交易**模式运行策略。`init` 阻塞主循环启动 HTTP 服务（`init` 不返回），
    服务监听 `127.0.0.1:8790`。
-4. Core 侧 `config.yaml` 的 `iquant_bridge` 段指向同一地址/TOKEN。
+4. Core 侧 `config.yaml` 的 `iquant_bridge.base_url` 指向同一地址。
 5. 用 `live/scripts/` 下的验证脚本或直接 `curl /ping` 确认桥在线后再启动实盘 session。
 
 ## 配置
@@ -28,12 +28,15 @@
 | 项 | 说明 | 配置方式 |
 |---|---|---|
 | 账号 ID | `passorder`/查询用的券商账号 | 环境变量 `IQUANT_BRIDGE_ACCOUNT`，否则同目录 `.bridge_account` 文件（首行内容），否则回退 `ACCOUNT_DEFAULT`（开发占位） |
-| 鉴权 TOKEN | `/order` 等接口的 `X-Auth-Token` 校验 | 环境变量 `IQUANT_BRIDGE_TOKEN`，否则同目录 `.bridge_token` 文件（见 `load_secret`） |
 | 股票白名单 | `ALLOWED_STOCKS`（空 = 不限制） | 策略代码内配置（生产建议配齐） |
-| 试运行 | `DRY_RUN`（默认 False） | 策略代码内配置；True 只打印不发单 |
+| 试运行 | `DRY_RUN`（默认 False，真实下单） | 策略代码内配置；True 只打印不发单 |
 
-`IQUANT_BRIDGE_*` 环境变量与本地文件均在运行环境设置，**不进 git、不写死在策略代码**。
-`.bridge_token` / `.bridge_account` 文件放桥脚本同目录，部署时手动落盘。
+`IQUANT_BRIDGE_ACCOUNT` 环境变量与 `.bridge_account` 文件均在运行环境设置，**不进 git、
+不写死在策略代码**。`.bridge_account` 文件放桥脚本同目录，部署时手动落盘（已被
+`.gitignore` 忽略）。
+
+> 鉴权：桥绑 `127.0.0.1` loopback，单用户本机部署，不设 token 鉴权（防御在机器边界：
+> 仅本机进程可达 8790 端口）。白名单、单笔限额、频率限制、审计日志仍强制执行。
 
 ## 接口
 

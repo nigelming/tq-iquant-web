@@ -3,12 +3,14 @@ import { ref, onMounted } from 'vue'
 import axios from 'axios'
 
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
-// max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)
+// max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
+// iquant_bridge.base_url(实盘桥地址，绑 loopback 单用户，无 token)
 const DEFAULTS = {
   tdx_path: '',
   iquant_path: '',
   max_concurrent_backtest: 1,
   database: { sqlite_path: '' },
+  iquant_bridge: { base_url: '' },
 }
 
 const config = ref<any>(JSON.parse(JSON.stringify(DEFAULTS)))
@@ -25,6 +27,7 @@ onMounted(async () => {
       iquant_path: data.iquant_path ?? DEFAULTS.iquant_path,
       max_concurrent_backtest: data.max_concurrent_backtest ?? DEFAULTS.max_concurrent_backtest,
       database: { sqlite_path: data.database?.sqlite_path ?? DEFAULTS.database.sqlite_path },
+      iquant_bridge: { base_url: data.iquant_bridge?.base_url ?? DEFAULTS.iquant_bridge.base_url },
     }
   } catch (e: any) {
     errorMsg.value = '加载配置失败: ' + (e?.message || e)
@@ -73,6 +76,15 @@ async function save() {
         <input v-model="config.iquant_path" placeholder="D:\iquant" />
       </div>
 
+      <h3 style="margin:20px 0 4px">实盘桥</h3>
+      <p style="margin:0 0 12px;font-size:12px;color:#888">
+        iQuant 客户端内桥策略的 HTTP 地址，绑 loopback 单用户，无鉴权（token 已移除）
+      </p>
+      <div class="field">
+        <label>桥地址</label>
+        <input v-model="config.iquant_bridge.base_url" placeholder="http://127.0.0.1:8790" />
+      </div>
+
       <h3 style="margin:20px 0 4px">回测</h3>
       <p style="margin:0 0 12px;font-size:12px;color:#888">
         同一时刻最多允许运行的回测任务数，超出返回 HTTP 409
@@ -84,7 +96,7 @@ async function save() {
 
       <h3 style="margin:20px 0 4px">数据库</h3>
       <p style="margin:0 0 12px;font-size:12px;color:#888">
-        SQLite 数据库文件路径（相对 main/ 目录解析，生产期切 PostgreSQL 时改此段 + 环境变量 TQ_DB_PASSWORD）
+        SQLite 数据库文件路径（相对 main/ 目录解析，纯单用户本地工具）
       </p>
       <div class="field">
         <label>数据库文件路径</label>

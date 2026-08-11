@@ -18,6 +18,7 @@ const mockConfig = {
   iquant_path: 'D:\\iquant',
   max_concurrent_backtest: 1,
   database: { sqlite_path: 'data/dev.db' },
+  iquant_bridge: { base_url: 'http://127.0.0.1:8790' },
 }
 
 beforeEach(() => {
@@ -41,6 +42,7 @@ describe('SystemConfig.vue', () => {
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('tdx')))).toBe('D:\\new_tdx64')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('iquant')))).toBe('D:\\iquant')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('dev.db')))).toBe('data/dev.db')
+    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('8790')))).toBe('http://127.0.0.1:8790')
     expect(w.text()).toContain('最大并发回测')
     w.unmount()
   })
@@ -66,6 +68,7 @@ describe('SystemConfig.vue', () => {
       iquant_path: 'D:\\iquant',
       max_concurrent_backtest: 1,
       database: expect.objectContaining({ sqlite_path: 'data/dev.db' }),
+      iquant_bridge: expect.objectContaining({ base_url: 'http://127.0.0.1:8790' }),
     }))
     expect(w.text()).toContain('已保存')
     w.unmount()

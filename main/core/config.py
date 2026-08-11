@@ -19,6 +19,9 @@ def _defaults() -> dict:
         "database": {
             "sqlite_path": "data/dev.db",
         },
+        "iquant_bridge": {
+            "base_url": "http://127.0.0.1:8790",
+        },
     }
 
 
