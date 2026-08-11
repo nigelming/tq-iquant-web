@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
+from core.api.response import err, ok
 from core.config import load_config
 from core.db import SessionLocal, get_db
 from core.models import (
@@ -62,9 +63,7 @@ def list_sessions(db: Session = Depends(get_db)):
     by_session: Dict[int, list] = {}
     for l in links:
         by_session.setdefault(l.session_id, []).append(l.portfolio_strategy_id)
-    return {
-        "code": 0,
-        "data": [
+    return ok([
             {
                 "id": s.id,
                 "name": s.name,
@@ -75,8 +74,7 @@ def list_sessions(db: Session = Depends(get_db)):
                 "portfolio_ids": sorted(by_session.get(s.id, [])),
             }
             for s in sessions
-        ],
-    }
+        ])
 
 
 @router.post("/sessions")
@@ -92,14 +90,14 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         link = LiveSessionPortfolio(session_id=session.id, portfolio_strategy_id=pid)
         db.add(link)
     db.commit()
-    return {"code": 0, "data": {"id": session.id, "status": session.status}}
+    return ok({"id": session.id, "status": session.status})
 
 
 @router.get("/sessions/{session_id}")
 def get_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     portfolios = (
         db.query(LiveSessionPortfolio)
         .filter(LiveSessionPortfolio.session_id == session_id)
@@ -130,7 +128,7 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
         data["bridge_online"] = None
         data["pending_orders"] = 0
         data["last_backfill_time"] = None
-    return {"code": 0, "data": data}
+    return ok(data)
 
 
 def _build_engine(session_id: int, db: Session) -> LiveEngine:
@@ -202,14 +200,14 @@ def _build_engine(session_id: int, db: Session) -> LiveEngine:
 async def start_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     if session_id in _ENGINES:
-        return {"code": 0, "data": {"id": session.id, "status": "running"}}
+        return ok({"id": session.id, "status": "running"})
     if _ENGINES:
         # B6：全局限 1 个实盘 session（防多引擎争抢桥单线程 + 持仓归属混乱，Q1 未解）。
         # 任一 session 在跑即拒绝新 start（同 session 重复 start 已被上方幂等拦截）。
         running_id = next(iter(_ENGINES))
-        return {"code": 409, "message": "已有实盘会话 %d 运行中，全局限 1 个" % running_id}
+        return err(409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
 
     engine = _build_engine(session_id, db)
     # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金
@@ -221,14 +219,14 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     session.status = "running"
     session.started_at = datetime.now()
     db.commit()
-    return {"code": 0, "data": {"id": session.id, "status": "running"}}
+    return ok({"id": session.id, "status": "running"})
 
 
 @router.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     engine = _ENGINES.pop(session_id, None)
     if engine is not None:
         asyncio.create_task(engine.stop())
@@ -236,7 +234,7 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
     session.status = "stopped"
     session.stopped_at = datetime.now()
     db.commit()
-    return {"code": 0, "data": {"id": session.id, "status": "stopped"}}
+    return ok({"id": session.id, "status": "stopped"})
 
 
 @router.get("/sessions/{session_id}/bridge-status")
@@ -247,11 +245,11 @@ def bridge_status(session_id: int, db: Session = Depends(get_db)):
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     engine = _ENGINES.get(session_id)
     if engine is None:
-        return {"code": 0, "data": {"online": None, "status": "not_running"}}
-    return {"code": 0, "data": {"online": engine.dispatcher.heartbeat(), "status": session.status}}
+        return ok({"online": None, "status": "not_running"})
+    return ok({"online": engine.dispatcher.heartbeat(), "status": session.status})
 
 
 # ---- B4b: 历史查询端点（orders / trades / positions）----
@@ -371,12 +369,12 @@ def session_orders(session_id: int, status: Optional[str] = None, db: Session = 
     """B4b：委托历史。可选 ?status= 过滤（submitted/filled/partial/rejected/canceled）。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     q = db.query(LiveOrder).filter(LiveOrder.live_session_id == session_id)
     if status:
         q = q.filter(LiveOrder.status == status)
     rows = q.order_by(LiveOrder.created_at.desc(), LiveOrder.id.desc()).all()
-    return {"code": 0, "data": [_serialize_order(o) for o in rows]}
+    return ok([_serialize_order(o) for o in rows])
 
 
 @router.get("/sessions/{session_id}/trades")
@@ -384,14 +382,14 @@ def session_trades(session_id: int, db: Session = Depends(get_db)):
     """B4b：成交历史，按 trade_time 倒序。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     rows = (
         db.query(LiveTrade)
         .filter(LiveTrade.live_session_id == session_id)
         .order_by(LiveTrade.trade_time.desc(), LiveTrade.id.desc())
         .all()
     )
-    return {"code": 0, "data": [_serialize_trade(t) for t in rows]}
+    return ok([_serialize_trade(t) for t in rows])
 
 
 @router.get("/sessions/{session_id}/positions")
@@ -400,7 +398,7 @@ def session_positions(session_id: int, db: Session = Depends(get_db)):
     重放聚合（与 recover 同口径：BUY 加、SELL 减，均价加权）。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     engine = _ENGINES.get(session_id)
     if engine is not None:
         positions = _engine_virtual_positions(engine)
@@ -412,20 +410,20 @@ def session_positions(session_id: int, db: Session = Depends(get_db)):
             .all()
         )
         positions = _aggregate_positions_from_trades(trades)
-    return {"code": 0, "data": positions}
+    return ok(positions)
 
 
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        return err(404, "资源不存在")
     db.query(LiveSessionPortfolio).filter(
         LiveSessionPortfolio.session_id == session_id
     ).delete()
     db.delete(session)
     db.commit()
-    return {"code": 0}
+    return ok()
 
 
 def _sse_line(ev: dict) -> str:

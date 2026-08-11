@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from core.api.response import err, ok
 from core.db import get_db
 from core.models import PortfolioStrategy, Strategy, StockPool, Formula
 
@@ -204,22 +205,22 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list[Strategy
 @router.get("")
 def list_portfolios(db: Session = Depends(get_db)):
     items = db.query(PortfolioStrategy).order_by(PortfolioStrategy.id).all()
-    return {"code": 0, "data": [_serialize_portfolio(db, p) for p in items]}
+    return ok([_serialize_portfolio(db, p) for p in items])
 
 
 @router.get("/{pid}")
 def get_portfolio(pid: int, db: Session = Depends(get_db)):
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if not p:
-        return {"code": 404, "message": "组合策略不存在"}
-    return {"code": 0, "data": _serialize_portfolio(db, p)}
+        return err(404, "组合策略不存在")
+    return ok(_serialize_portfolio(db, p))
 
 
 @router.post("")
 def create_portfolio(req: PortfolioCreate, db: Session = Depends(get_db)):
-    err = _validate_portfolio(req, db)
-    if err:
-        return {"code": 400, "message": err}
+    err_msg = _validate_portfolio(req, db)
+    if err_msg:
+        return err(400, err_msg)
     p = PortfolioStrategy()
     _apply_portfolio_fields(p, req)
     db.add(p)
@@ -227,38 +228,38 @@ def create_portfolio(req: PortfolioCreate, db: Session = Depends(get_db)):
     _create_strategies_two_step(db, p.id, req.strategies)
     db.commit()
     db.refresh(p)
-    return {"code": 0, "data": _serialize_portfolio(db, p)}
+    return ok(_serialize_portfolio(db, p))
 
 
 @router.put("/{pid}")
 def update_portfolio(pid: int, req: PortfolioCreate, db: Session = Depends(get_db)):
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if not p:
-        return {"code": 404, "message": "组合策略不存在"}
-    err = _validate_portfolio(req, db)
-    if err:
-        return {"code": 400, "message": err}
+        return err(404, "组合策略不存在")
+    err_msg = _validate_portfolio(req, db)
+    if err_msg:
+        return err(400, err_msg)
     _apply_portfolio_fields(p, req)
     # 子表全量替换（同 formulas.py 模式）：删旧建新
     db.query(Strategy).filter(Strategy.portfolio_id == pid).delete()
     _create_strategies_two_step(db, pid, req.strategies)
     db.commit()
     db.refresh(p)
-    return {"code": 0, "data": _serialize_portfolio(db, p)}
+    return ok(_serialize_portfolio(db, p))
 
 
 @router.delete("/{pid}")
 def delete_portfolio(pid: int, db: Session = Depends(get_db)):
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if not p:
-        return {"code": 404, "message": "组合策略不存在"}
+        return err(404, "组合策略不存在")
     try:
         db.delete(p)  # Strategy 随 ondelete=CASCADE 删
         db.commit()
     except IntegrityError:
         db.rollback()
-        return {"code": 409, "message": "该组合策略被回测记录或实盘 session 引用，无法删除"}
-    return {"code": 0, "data": None}
+        return err(409, "该组合策略被回测记录或实盘 session 引用，无法删除")
+    return ok()
 
 
 # ===========================================================================
@@ -332,50 +333,50 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
 @router.get("/{pid}/strategies")
 def list_strategies(pid: int, db: Session = Depends(get_db)):
     if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
-        return {"code": 404, "message": "组合策略不存在"}
+        return err(404, "组合策略不存在")
     items = db.query(Strategy).filter(Strategy.portfolio_id == pid).order_by(Strategy.id).all()
-    return {"code": 0, "data": [_serialize_strategy(s) for s in items]}
+    return ok([_serialize_strategy(s) for s in items])
 
 
 @router.post("/{pid}/strategies")
 def create_strategy(pid: int, req: StrategyCreate, db: Session = Depends(get_db)):
     if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
-        return {"code": 404, "message": "组合策略不存在"}
-    err = _validate_strategy(req, db, pid)
-    if err:
-        return {"code": 400, "message": err}
+        return err(404, "组合策略不存在")
+    err_msg = _validate_strategy(req, db, pid)
+    if err_msg:
+        return err(400, err_msg)
     s = Strategy(portfolio_id=pid)
     _apply_strategy_fields(s, req)
     db.add(s)
     db.commit()
     db.refresh(s)
-    return {"code": 0, "data": _serialize_strategy(s)}
+    return ok(_serialize_strategy(s))
 
 
 @router.put("/{pid}/strategies/{sid}")
 def update_strategy(pid: int, sid: int, req: StrategyCreate, db: Session = Depends(get_db)):
     s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
     if not s:
-        return {"code": 404, "message": "子策略不存在"}
-    err = _validate_strategy(req, db, pid)
-    if err:
-        return {"code": 400, "message": err}
+        return err(404, "子策略不存在")
+    err_msg = _validate_strategy(req, db, pid)
+    if err_msg:
+        return err(400, err_msg)
     _apply_strategy_fields(s, req)
     db.commit()
     db.refresh(s)
-    return {"code": 0, "data": _serialize_strategy(s)}
+    return ok(_serialize_strategy(s))
 
 
 @router.delete("/{pid}/strategies/{sid}")
 def delete_strategy(pid: int, sid: int, db: Session = Depends(get_db)):
     s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
     if not s:
-        return {"code": 404, "message": "子策略不存在"}
+        return err(404, "子策略不存在")
     # 删 master 前 check 无 slave 引用
     if s.role == "master":
         slave_count = db.query(Strategy).filter(Strategy.master_strategy_id == sid).count()
         if slave_count > 0:
-            return {"code": 400, "message": "该主策略被从策略引用，无法删除"}
+            return err(400, "该主策略被从策略引用，无法删除")
     # 子策略可能被 backtest_trades / live_trades / live_orders 引用（历史交易记录，
     # strategy_id FK 默认 RESTRICT）。直删触发 IntegrityError → 拦截返回可读错误，
     # 不破坏历史数据；用户需先删相关回测/实盘记录才能删该子策略。
@@ -384,8 +385,8 @@ def delete_strategy(pid: int, sid: int, db: Session = Depends(get_db)):
         db.commit()
     except IntegrityError:
         db.rollback()
-        return {
-            "code": 400,
-            "message": "该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。",
-        }
-    return {"code": 0, "data": None}
+        return err(
+            400,
+            "该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。",
+        )
+    return ok()

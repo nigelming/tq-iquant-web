@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）。当前实际仍 open：P1 4 项（#9/#11/#12/#16）、P2 16 项（#23/#24/#29 已修）、P3 8 项（#43 关闭）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层）**、P2 16 项（#23/#24/#29 已修）、P3 8 项（#43 关闭）。
 
 ---
 
@@ -127,6 +127,20 @@
 验证：后端测试 376 passed（+5 新测试：#29×2、#24×3、#23×2，其中 #23 的 `test_now_shanghai` 与 `daily_close` 合并计）。`now_shanghai` 返回 naive，与引擎内所有 datetime 比较一致（aware 与 naive 比较会抛 TypeError）。
 
 **P2 当前结论**：19 项中 #23/#24 已修（仍 open 17 项）；**P2 #29 实为 P2 表内 #29**（见 P2 表，原列于 P2），现亦已修——P2 open 降至 16 项。
+
+### 2026-08-11 API 一致性（#11/#12/#16）
+
+P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端点偏差标注。纯重构 + 文档，无 schema 迁移、无业务逻辑变更：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 11 | ✅ **已修** | 新增 `main/core/api/response.py`：`ok(data=None,message="ok")` / `err(code,message,data=None)` 强制三键齐全。7 个路由文件（formulas/strategies/live/backtest/stock_pools/status/system）手工 `return {"code":0,"data":...}` / `{"code":4xx,"message":...}` 全替换为 `ok()`/`err()`。grep `{"code": 0` 在 `main/core/api/` 仅剩 `response.py` 内部。3 个空列表测试断言 `== {"code":0,"data":[]}` 更新为含 `message:"ok"`（test_formula/test_portfolio/test_stock_pool_api）。**前端无破坏**：拦截器按 `code!==0` reject，`undefined`→`null` 微变各调用方均当 falsy 处理 |
+| 12 | ✅ **已修** | `backtest.py:761` `raise HTTPException(404,"portfolio strategy not found")` 收敛为 `return err(404,"组合策略不存在")`（body-code 模式 A）。**两处有意保留**：`backtest.py:769` `HTTPException(409,...)` 并发锁——CLAUDE.md 约定"并发启动返回 HTTP 409"+ 测试断言 `status_code==409`，加注释标明刻意例外；`live.py:461` SSE 404——EventSource 需真实 HTTP 错误码触发 onerror（#5 已定）。grep `HTTPException` 在 `main/core/api/` 仅剩这 2 处 |
+| 16 | ✅ **已标文档（不补端点）** | 用户决策：仅标设计文档，暂不补 12 个未实现端点。`docs/system-plan-draft.md` §5.6.3/5.6.4/5.6.7/5.6.8 各加"实现状态"blockquote：标注哪些已并入现有端点（回测 trades/snapshots/results #7-9 已并入 `GET /records/{id}` 内嵌详情；公式信号 #2-5 已并入公式 CRUD 全量保存）、哪些未实现（股票池详情/公式试运行/单组合启停/编辑会话）、路径偏差（`{id}/sync`→`/sync`、`{id}/stocks`→`/tdx/{code}/stocks`）、额外端点（`DELETE /stock-pools/{id}`、`DELETE /records/{id}`、`positions`、`bridge-status`）。后续若需单组合启停/公式试运行，单独立项 |
+
+验证：后端测试 376 passed（`test_loop_offline_to_online_still_resets_baseline_after_thread_offload` 偶发 flaky，隔离运行通过，与响应格式无关）；grep `{"code": 0` 仅 `response.py`；grep `HTTPException` 仅 backtest 409 + live SSE 404 两处有意保留。
+
+**P1 最终结论**：9 项中 8 项已处理（#10/#11/#12/#13/#14/#15/#16/#17 + #42），**仅 #9 service 层仍 open**（架构重构，路由直接操作 ORM，单独立项）。**P1 open 4→1**。
 
 ---
 

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from core.api.response import err, ok
 from core.db import get_db
 from core.models import (
     PortfolioStrategy, Strategy, Formula, FormulaSignal, StockPoolStock,
@@ -649,14 +650,14 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
 @router.get("/records")
 def list_records(db: Session = Depends(get_db)):
     recs = db.query(BacktestRecord).order_by(BacktestRecord.created_at.desc()).all()
-    return {"code": 0, "data": [_serialize_record(r) for r in recs]}
+    return ok([_serialize_record(r) for r in recs])
 
 
 @router.get("/records/{record_id}")
 def get_record(record_id: int, db: Session = Depends(get_db)):
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
-        return {"code": 404, "message": "回测记录不存在"}
+        return err(404, "回测记录不存在")
     snaps = (
         db.query(BacktestDailySnapshot)
         .filter_by(backtest_record_id=record_id, target_type="portfolio")
@@ -711,17 +712,14 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
         for sid, curve in curves_by_sid.items()
     ]
 
-    return {
-        "code": 0,
-        "data": {
-            "record": _serialize_record(rec),
-            "snapshots": [_serialize_snapshot(s) for s in snaps],
-            "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
-            "evaluations": _serialize_evaluation(evals) if evals else None,
-            "strategy_evaluations": strategy_evaluations,
-            "strategy_snapshots": strategy_snapshots,
-        },
-    }
+    return ok({
+        "record": _serialize_record(rec),
+        "snapshots": [_serialize_snapshot(s) for s in snaps],
+        "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
+        "evaluations": _serialize_evaluation(evals) if evals else None,
+        "strategy_evaluations": strategy_evaluations,
+        "strategy_snapshots": strategy_snapshots,
+    })
 
 
 @router.delete("/records/{record_id}")
@@ -730,13 +728,13 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
     子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。"""
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
-        return {"code": 404, "message": "回测记录不存在"}
+        return err(404, "回测记录不存在")
     db.query(BacktestTrade).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).delete()
     db.delete(rec)
     db.commit()
-    return {"code": 0, "data": None}
+    return ok()
 
 
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
@@ -758,13 +756,16 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     """
     ps = db.get(PortfolioStrategy, req.portfolio_strategy_id)
     if ps is None:
-        raise HTTPException(status_code=404, detail="portfolio strategy not found")
+        return err(404, "组合策略不存在")
 
-    err = _validate_backtest_request(req)
-    if err:
-        return {"code": 400, "message": err}
+    err_msg = _validate_backtest_request(req)
+    if err_msg:
+        return err(400, err_msg)
 
     if not _BACKTEST_LOCK.acquire(blocking=False):
+        # 有意保留真实 HTTP 409（非 body-code）：并发契约 + 测试断言 status_code==409
+        # （test_post_backtest_409_when_already_running）。body-code 会破坏前端对并发冲突
+        # 的 HTTP 状态码判断。与统一 envelope 的模式 A 不同——此为刻意的模式 B 例外。
         raise HTTPException(
             status_code=409,
             detail="回测正在进行中，请等待当前回测完成后再启动（同一时刻仅允许 1 个回测）",
@@ -829,12 +830,8 @@ def _run_backtest_locked(req: BacktestRequest, db: Session, ps: PortfolioStrateg
                 f"股票池 id={ps.stock_pool_id}。请检查日期区间与股票池成分。"
             )
             db.commit()
-            return {
-                "code": 0,
-                "message": "ok",
-                "data": {"record_id": record_id, "trades_count": 0,
-                         "snapshots_count": 0, "evaluations": {}},
-            }
+            return ok({"record_id": record_id, "trades_count": 0,
+                       "snapshots_count": 0, "evaluations": {}})
 
         t6 = datetime.now()
         engine = BacktestEngine()
@@ -868,13 +865,9 @@ def _run_backtest_locked(req: BacktestRequest, db: Session, ps: PortfolioStrateg
             db.commit()
         raise
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "record_id": record_id,
-            "trades_count": len(result["trades"]),
-            "snapshots_count": len(result["snapshots"]),
-            "evaluations": result.get("evaluations") or {},
-        },
-    }
+    return ok({
+        "record_id": record_id,
+        "trades_count": len(result["trades"]),
+        "snapshots_count": len(result["snapshots"]),
+        "evaluations": result.get("evaluations") or {},
+    })

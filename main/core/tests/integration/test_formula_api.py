@@ -106,7 +106,7 @@ def test_list_formulas_empty(client):
     c, Session = client
     resp = c.get("/api/formulas")
     assert resp.status_code == 200
-    assert resp.json() == {"code": 0, "data": []}
+    assert resp.json() == {"code": 0, "message": "ok", "data": []}
 
 
 # ---------------------------------------------------------------------------

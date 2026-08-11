@@ -102,7 +102,7 @@ def _seed_portfolio(db, name="PS1", strategies=None):
 # ---------------------------------------------------------------------------
 def test_list_portfolios_empty(client):
     c, Session = client
-    assert c.get("/api/portfolios").json() == {"code": 0, "data": []}
+    assert c.get("/api/portfolios").json() == {"code": 0, "message": "ok", "data": []}
 
 
 def test_list_portfolios_returns_seeded_with_strategies(client):

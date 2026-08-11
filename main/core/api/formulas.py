@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from core.api.response import err, ok
 from core.db import get_db
 from core.models import Formula, FormulaSignal
 
@@ -66,24 +67,24 @@ def _validate_signals(signals: list[SignalItem]) -> str | None:
 @router.get("")
 def list_formulas(db: Session = Depends(get_db)):
     formulas = db.query(Formula).order_by(Formula.id).all()
-    return {"code": 0, "data": [_serialize_formula(db, f) for f in formulas]}
+    return ok([_serialize_formula(db, f) for f in formulas])
 
 
 @router.get("/{formula_id}")
 def get_formula(formula_id: int, db: Session = Depends(get_db)):
     f = db.query(Formula).filter(Formula.id == formula_id).first()
     if not f:
-        return {"code": 404, "message": "公式不存在"}
-    return {"code": 0, "data": _serialize_formula(db, f)}
+        return err(404, "公式不存在")
+    return ok(_serialize_formula(db, f))
 
 
 @router.post("")
 def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
-    err = _validate_signals(req.signals)
-    if err:
-        return {"code": 400, "message": err}
+    err_msg = _validate_signals(req.signals)
+    if err_msg:
+        return err(400, err_msg)
     if req.formula_count < 1:
-        return {"code": 400, "message": "formula_count 必须 ≥ 1"}
+        return err(400, "formula_count 必须 ≥ 1")
     f = Formula(name=req.name, content=req.content, formula_count=req.formula_count)
     db.add(f)
     db.flush()
@@ -94,19 +95,19 @@ def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
         ))
     db.commit()
     db.refresh(f)
-    return {"code": 0, "data": _serialize_formula(db, f)}
+    return ok(_serialize_formula(db, f))
 
 
 @router.put("/{formula_id}")
 def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(get_db)):
     f = db.query(Formula).filter(Formula.id == formula_id).first()
     if not f:
-        return {"code": 404, "message": "公式不存在"}
-    err = _validate_signals(req.signals)
-    if err:
-        return {"code": 400, "message": err}
+        return err(404, "公式不存在")
+    err_msg = _validate_signals(req.signals)
+    if err_msg:
+        return err(400, err_msg)
     if req.formula_count < 1:
-        return {"code": 400, "message": "formula_count 必须 ≥ 1"}
+        return err(400, "formula_count 必须 ≥ 1")
     f.name = req.name
     f.content = req.content
     f.formula_count = req.formula_count
@@ -119,18 +120,18 @@ def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(ge
         ))
     db.commit()
     db.refresh(f)
-    return {"code": 0, "data": _serialize_formula(db, f)}
+    return ok(_serialize_formula(db, f))
 
 
 @router.delete("/{formula_id}")
 def delete_formula(formula_id: int, db: Session = Depends(get_db)):
     f = db.query(Formula).filter(Formula.id == formula_id).first()
     if not f:
-        return {"code": 404, "message": "公式不存在"}
+        return err(404, "公式不存在")
     try:
         db.delete(f)  # FormulaSignal 随 ondelete=CASCADE 删
         db.commit()
     except IntegrityError:
         db.rollback()
-        return {"code": 409, "message": "该公式被策略引用，无法删除"}
-    return {"code": 0, "data": None}
+        return err(409, "该公式被策略引用，无法删除")
+    return ok()

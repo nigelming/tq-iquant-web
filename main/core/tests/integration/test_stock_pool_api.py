@@ -319,7 +319,7 @@ def test_list_local_pools_empty(client):
     """无本地池 → 空列表。"""
     c, Session = client
     resp = c.get("/api/stock-pools")
-    assert resp.json() == {"code": 0, "data": []}
+    assert resp.json() == {"code": 0, "message": "ok", "data": []}
 
 
 # ---------------------------------------------------------------------------

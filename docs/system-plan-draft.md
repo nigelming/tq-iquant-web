@@ -998,6 +998,12 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ```
 
 #### 5.6.3 股票池
+
+> **实现状态（2026-08-11 复核，审计 #16）**：下表端点与 `main/core/api/stock_pools.py` 对照——
+> - `GET /api/stock-pools/{id}`（详情）**未实现**；列表 `_serialize_pool` 已含 id/code/name/synced_at/stock_count，详情字段无增量，按需可复用列表项。
+> - **路径偏差**：`POST /{id}/sync` → 实现为 `POST /api/stock-pools/sync`（body `{code}`，按板块 code 而非池 id 同步）；`GET /{id}/stocks` → 实现为 `GET /api/stock-pools/tdx/{code}/stocks`（按通达信板块 code 取实时成分股）。
+> - **额外端点**（设计无但已实现）：`DELETE /api/stock-pools/{id}`（删本地池，CASCADE 删成分股）。
+
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/stock-pools` | 获取股票池列表 |
@@ -1021,6 +1027,11 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ```
 
 #### 5.6.4 公式管理
+
+> **实现状态（2026-08-11 复核，审计 #16）**：下表端点与 `main/core/api/formulas.py` 对照——
+> - 信号映射 CRUD（`GET/POST/PUT/DELETE /api/formulas/{id}/signals[/{signal_id}]`）**未单独实现**；已并入公式 CRUD 全量保存——`_serialize_formula` 内嵌 signals 子列表，`POST/PUT /api/formulas` 请求体含 `signals: list[SignalItem]`，后端全量替换（删旧建新），等价覆盖增删改。
+> - `POST /api/formulas/{id}/test-run`（公式试运行）**未实现**（涉及 TQ 调用，按需单独立项）。
+
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/formulas` | 公式列表 |
@@ -1095,6 +1106,11 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ```
 
 #### 5.6.7 回测管理
+
+> **实现状态（2026-08-11 复核，审计 #16）**：下表端点与 `main/core/api/backtest.py` 对照——
+> - `GET /api/backtest/records/{id}/trades`、`GET /records/{id}/snapshots`、`GET /records/{id}/results`（#7/#8/#9）**未单独实现**；已并入 `GET /api/backtest/records/{id}` 内嵌详情——一次返回 record + snapshots + trades + evaluations + strategy_*，前端无需再发 3 个子请求。
+> - **额外端点**（设计无但已实现）：`DELETE /api/backtest/records/{id}`（删回测记录 + CASCADE 删子表）。
+
 | 方法 | URL | 说明 |
 |------|-----|------|
 | POST | `/api/backtest` | 启动回测（非阻塞，子进程执行） |
@@ -1139,6 +1155,12 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 ```
 
 #### 5.6.8 实盘交易
+
+> **实现状态（2026-08-11 复核，审计 #16）**：下表端点与 `main/core/api/live.py` 对照——
+> - 单组合启停 `POST /api/live/sessions/{id}/portfolios/{pid}/start|stop`（#10/#11）**未实现**；现为整 session 启停（`POST /sessions/{id}/start`、`POST /sessions/{id}/stop`），按需单独立项（涉及 LiveEngine 多组合调度改造）。
+> - `PUT /api/live/sessions/{id}`（#12 编辑会话）**未实现**；现为创建后不可编辑（仅可删后重建）。
+> - **额外端点**（设计无但已实现）：`GET /api/live/sessions/{id}/positions`（实时持仓快照）、`GET /api/live/sessions/{id}/bridge-status`（iQuant 桥连接/心跳状态）。
+
 | 方法 | URL | 说明 |
 |------|-----|------|
 | GET | `/api/live/sessions` | 实盘列表 |
