@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 12 项（#23/#24/#29/#36/#35/#25/#30/#32 已修）、P3 7 项（#38/#43 已处理）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）；#26 已修（见"前端 any 类型清理"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 11 项（#23/#24/#29/#36/#35/#25/#30/#32/#26 已修）、P3 7 项（#38/#43 已处理）。
 
 ---
 
@@ -171,7 +171,19 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 
 验证：后端测试 376 passed；`iquant_bridge.py` GBK 解析通过；grep 跨类私有访问零残留。
 
-**P2/P3 当前结论**：#25/#30/#32 已修（P2 15→12）。剩余 P2 多为数据完整性项（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ 前端 #26 any 类型（61 处 10 文件，机械但需逐调用方核对字段，单独立项）+ #33 硬编码 + #22 init_db 走 Alembic。
+**P2/P3 当前结论**：#25/#30/#32 已修（P2 15→12）。剩余 P2 多为数据完整性项（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ 前端 #26 any 类型（见下小节，已修）+ #33 硬编码 + #22 init_db 走 Alembic。
+
+### 2026-08-11 前端 any 类型清理（#26）
+
+跨 6 视图 + API 客户端清除业务对象 any，纯类型改动（vue-tsc 可验证，不碰运行时）：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 26 | ✅ **已修** | `api/index.ts` 14 个 `any` 泛型全替换为 13 个类型化响应接口（StockPoolItem/TdxPoolItem/TdxPoolStockItem/FormulaSignalItem/FormulaItem/PortfolioItem/BacktestRecordItem/BacktestSnapshotItem/BacktestTradeItem/BacktestEvaluationItem/BacktestStrategyEvaluationItem/BacktestStrategySnapshotItem/BacktestDetailItem，字段对齐各路由 serializer，`StrategyDetail` 补 `portfolio_id`）。6 视图清业务对象 any：Backtest.vue（4 refs 类型化 + pct/num/valueClass/buildMetrics 参数 + 删 `as any[]`）、Portfolios.vue（3 refs 类型化 + toPercent/fromPercent 参数 + toggleExpand/openEditPortfolio 参数 + 2 处 `const out: any` → `Record<string,unknown>`）、Formulas.vue（formulas ref + openEdit 参数 + signals map 走推断）、LiveSessions.vue（本地 LiveSessionItem 接口 + portfolios ref<PortfolioItem> + TAB_LABEL 键类型化删 `key as any`）、SystemConfig.vue（SystemConfig 接口 + config ref 类型化 + catch `e: any` → instanceof 收敛）、StockPools.vue（删本地重复 TdxPool 接口改用共享 TdxPoolItem + stocksList ref<TdxPoolStockItem>）。**合理 any 保留**：`errMsg(e: any)`（外部 axios 错误结构）、echarts `series: any[]`/`params: any`（第三方回调签名）、测试文件 `(fn as any).mock`（vitest mock 惯用法） |
+
+验证：`npx vue-tsc --noEmit` 零错误；`npx vitest run` 87 passed（10 文件）。
+
+**P2 当前结论**：#26 已修（P2 12→11）。剩余 P2 以数据完整性项为主（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ #33 硬编码 + #22 init_db 走 Alembic。
 
 ---
 

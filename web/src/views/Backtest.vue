@@ -5,10 +5,14 @@ import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord,
 } from '../api'
+import type {
+  BacktestRecordItem, BacktestDetailItem, PortfolioItem,
+  BacktestEvaluationItem,
+} from '../api'
 
 // ===== 列表 =====
-const records = ref<any[]>([])
-const portfolios = ref<any[]>([])
+const records = ref<BacktestRecordItem[]>([])
+const portfolios = ref<PortfolioItem[]>([])
 
 // ===== 发起弹窗 =====
 const showForm = ref(false)
@@ -16,8 +20,8 @@ const submitting = ref(false)
 const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '' })
 
 // ===== 详情视图 =====
-const currentRecord = ref<any | null>(null)
-const detail = ref<any | null>(null)
+const currentRecord = ref<BacktestRecordItem | null>(null)
+const detail = ref<BacktestDetailItem | null>(null)
 const errorMsg = ref('')
 
 // echarts 实例（净值 + 回撤）
@@ -61,8 +65,8 @@ async function load() {
       getBacktestRecords(),
       getPortfolios().catch(() => []),
     ])
-    records.value = recs as any[]
-    portfolios.value = ps as any[]
+    records.value = recs
+    portfolios.value = ps
   } catch (e) {
     errorMsg.value = '加载失败：' + errMsg(e)
     records.value = []
@@ -131,22 +135,22 @@ function backToList() {
 }
 
 // ===== 格式化 =====
-function pct(v: any): string {
+function pct(v: number | null | undefined): string {
   if (v === null || v === undefined) return '—'
   return `${(Number(v) * 100).toFixed(2)}%`
 }
-function num(v: any, digits = 4): string {
+function num(v: number | null | undefined, digits = 4): string {
   if (v === null || v === undefined) return '—'
   return Number(v).toFixed(digits)
 }
 // 按值正负着色
-function valueClass(v: any): string {
+function valueClass(v: number | null | undefined): string {
   if (v === null || v === undefined) return ''
   return Number(v) >= 0 ? 'text-green' : 'text-red'
 }
 
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
-function buildMetrics(m: any) {
+function buildMetrics(m: BacktestEvaluationItem | null) {
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
     ? m.annual_return / m.volatility : null
@@ -178,7 +182,7 @@ const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
 // 策略对比卡片
 const strategyCards = computed(() => {
   const evals = detail.value?.strategy_evaluations || []
-  return evals.map((s: any) => ({
+  return evals.map((s) => ({
     strategy_id: s.strategy_id,
     strategy_name: s.strategy_name,
     metrics: buildMetrics(s),
@@ -221,17 +225,17 @@ const subtitle = computed(() => {
 })
 
 // ===== 净值 / 回撤曲线数据 =====
-const equityDates = computed(() => (detail.value?.snapshots || []).map((s: any) => s.snap_date))
-const portfolioCurve = computed(() => (detail.value?.snapshots || []).map((s: any) => Number(s.total_value)))
+const equityDates = computed(() => (detail.value?.snapshots || []).map((s) => s.snap_date))
+const portfolioCurve = computed(() => (detail.value?.snapshots || []).map((s) => Number(s.total_value)))
 
 // 基准指数曲线（归一化为累计收益率%，与组合/策略同轴）。
 // benchmark_value 缺失（旧记录/未配置）→ hasBenchmark=false，前端隐藏基准线。
-const benchmarkRaw = computed(() => (detail.value?.snapshots || []).map((s: any) => s.benchmark_value))
-const hasBenchmark = computed(() => benchmarkRaw.value.some((v: any) => v !== null && v !== undefined))
+const benchmarkRaw = computed(() => (detail.value?.snapshots || []).map((s) => s.benchmark_value))
+const hasBenchmark = computed(() => benchmarkRaw.value.some((v) => v !== null && v !== undefined))
 const benchmarkCurve = computed(() => {
   const vals = benchmarkRaw.value
-  const base = vals.find((v: any) => v !== null && v !== undefined)
-  return vals.map((v: any) => {
+  const base = vals.find((v) => v !== null && v !== undefined)
+  return vals.map((v) => {
     if (v === null || v === undefined) return null
     return base > 0 ? ((v - base) / base) * 100 : 0
   })
@@ -241,7 +245,7 @@ const benchmarkCurve = computed(() => {
 const drawdownCurve = computed(() => {
   const vals = portfolioCurve.value
   let peak = vals[0] ?? 0
-  return vals.map((v: any) => {
+  return vals.map((v) => {
     if (v > peak) peak = v
     // 用百分比表示回撤（负值）
     return peak > 0 ? -((peak - v) / peak) * 100 : 0
@@ -251,14 +255,14 @@ const drawdownCurve = computed(() => {
 // 策略净值曲线（归一化到百分比收益率，便于与组合同轴比较）
 const strategyCurves = computed(() => {
   const sSnaps = detail.value?.strategy_snapshots || []
-  return sSnaps.map((s: any) => {
+  return sSnaps.map((s) => {
     const curve = s.curve || []
     // 用首日为基准算累计收益率%
     const base = Number(curve[0]?.total_value) || 0
     return {
       name: s.strategy_name,
-      data: curve.map((p: any) => base > 0 ? ((Number(p.total_value) - base) / base) * 100 : 0),
-      dates: curve.map((p: any) => p.snap_date),
+      data: curve.map((p) => base > 0 ? ((Number(p.total_value) - base) / base) * 100 : 0),
+      dates: curve.map((p) => p.snap_date),
     }
   })
 })
@@ -267,7 +271,7 @@ const strategyCurves = computed(() => {
 const portfolioReturnPct = computed(() => {
   const vals = portfolioCurve.value
   const base = vals[0] ?? 0
-  return vals.map((v: any) => base > 0 ? ((v - base) / base) * 100 : 0)
+  return vals.map((v) => base > 0 ? ((v - base) / base) * 100 : 0)
 })
 
 // ===== 交易明细分页 =====
@@ -324,7 +328,7 @@ function initEquityChart() {
     })
   }
 
-  const legendData = ['组合', ...strategyCurves.value.map((s: any) => s.name)]
+  const legendData = ['组合', ...strategyCurves.value.map((s) => s.name)]
   if (hasBenchmark.value) legendData.push('基准')
 
   equityChart.setOption({

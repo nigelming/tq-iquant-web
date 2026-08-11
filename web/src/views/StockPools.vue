@@ -2,28 +2,21 @@
 import { ref, onMounted } from 'vue'
 import {
   getTdxPools, getTdxPoolStocks, syncStockPool, getStockPools, deleteStockPool,
+  type TdxPoolItem, type TdxPoolStockItem,
 } from '../api'
 
-interface TdxPool {
-  code: string
-  name: string
-  synced: boolean
-  exists_in_tdx: boolean
-  stock_count: number
-}
-
-const pools = ref<TdxPool[]>([])
+const pools = ref<TdxPoolItem[]>([])
 const localIdByCode = ref<Record<string, number>>({})  // 删除用：code → 本地池 id
 const errorMsg = ref('')
 const showStocks = ref(false)
-const stocksList = ref<any[]>([])
+const stocksList = ref<TdxPoolStockItem[]>([])
 const stocksPoolName = ref('')
 
 // 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
 function errMsg(e: any): string {
   const d = e?.response?.data
   if (d?.message) return d.message
-  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (Array.isArray(d?.detail)) return d.detail.map((x: { loc?: unknown[]; msg?: string }) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
   if (typeof d?.detail === 'string') return d.detail
   return e?.message || '请求失败'
 }
@@ -36,9 +29,9 @@ async function load() {
       getTdxPools(),
       getStockPools().catch(() => []),  // 本地列表失败不阻塞
     ])
-    pools.value = tdxRes as TdxPool[]
+    pools.value = tdxRes
     localIdByCode.value = {}
-    for (const p of localRes as any[]) {
+    for (const p of localRes) {
       localIdByCode.value[p.code] = p.id
     }
   } catch (e) {
@@ -48,7 +41,7 @@ async function load() {
   }
 }
 
-async function viewStocks(p: TdxPool) {
+async function viewStocks(p: TdxPoolItem) {
   try {
     stocksPoolName.value = p.name
     stocksList.value = await getTdxPoolStocks(p.code)
@@ -58,7 +51,7 @@ async function viewStocks(p: TdxPool) {
   }
 }
 
-async function syncPool(p: TdxPool) {
+async function syncPool(p: TdxPoolItem) {
   if (!confirm(`确认从通达信同步「${p.name}」的股票清单？将全量替换现有股票。`)) return
   try {
     await syncStockPool({ code: p.code })
@@ -69,7 +62,7 @@ async function syncPool(p: TdxPool) {
   load()
 }
 
-async function remove(p: TdxPool) {
+async function remove(p: TdxPoolItem) {
   const id = localIdByCode.value[p.code]
   if (!id) return
   if (!confirm(`确认删除股票池「${p.name}」？`)) return

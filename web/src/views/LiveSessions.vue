@@ -8,10 +8,19 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped,
   type OrderRow, type TradeRow, type PositionRow,
 } from '../utils/liveWorkbench'
-import { getLiveOrders, getLiveTrades, getLivePositions, getPortfolios } from '../api'
+import { getLiveOrders, getLiveTrades, getLivePositions, getPortfolios, type PortfolioItem } from '../api'
 
-const sessions = ref<any[]>([])
-const portfolios = ref<any[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
+// 实盘会话列表项（本页用原始 axios 直连 /api/live/sessions，本地定义对齐 serializer 字段）
+interface LiveSessionItem {
+  id: number
+  name: string
+  portfolio_ids: number[]
+  mode: string  // simulation|live
+  status: string  // stopped|running
+}
+
+const sessions = ref<LiveSessionItem[]>([])
+const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
 const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] as number[] })
 
@@ -34,7 +43,7 @@ const positions = ref<PositionRow[]>([])
 const orders = ref<OrderRow[]>([])
 const trades = ref<TradeRow[]>([])
 const wbTab = ref<'positions' | 'orders' | 'trades'>('positions')
-const TAB_LABEL: Record<string, string> = { positions: '持仓', orders: '委托', trades: '成交' }
+const TAB_LABEL: Record<'positions' | 'orders' | 'trades', string> = { positions: '持仓', orders: '委托', trades: '成交' }
 
 const nowTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false })
 
@@ -97,7 +106,7 @@ async function load() {
   sessions.value = res.data.data
   portfolios.value = await getPortfolios().catch(() => [])
   // B6 全局限 1 个运行 session,自动接它的流
-  const running = sessions.value.find((s: any) => s.status === 'running')
+  const running = sessions.value.find((s) => s.status === 'running')
   if (running) startEventStream(running.id)
 }
 
@@ -165,7 +174,7 @@ onUnmounted(closeEventStream)
         <button
           v-for="(label, key) in TAB_LABEL" :key="key"
           class="btn btn-sm" :class="wbTab === key ? 'btn-primary' : ''"
-          @click="wbTab = key as any"
+          @click="wbTab = key"
         >{{ label }}</button>
       </div>
     </div>

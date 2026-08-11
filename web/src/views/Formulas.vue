@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { getFormulas, createFormula, updateFormula, deleteFormula, type SignalItem } from '../api'
+import { getFormulas, createFormula, updateFormula, deleteFormula, type SignalItem, type FormulaItem } from '../api'
 
-const formulas = ref<any[]>([])
+const formulas = ref<FormulaItem[]>([])
 const showForm = ref(false)
 const editingId = ref<number | null>(null)
 const errorMsg = ref('')
@@ -11,7 +11,7 @@ const errorMsg = ref('')
 function errMsg(e: any): string {
   const d = e?.response?.data
   if (d?.message) return d.message
-  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (Array.isArray(d?.detail)) return d.detail.map((x: { loc?: unknown[]; msg?: string }) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
   if (typeof d?.detail === 'string') return d.detail
   return e?.message || '请求失败'
 }
@@ -42,14 +42,14 @@ function openCreate() {
   showForm.value = true
 }
 
-function openEdit(f: any) {
+function openEdit(f: FormulaItem) {
   editingId.value = f.id
   form.value = {
     name: f.name,
     content: f.content,
     formula_count: f.formula_count ?? 200,
     signals: f.signals.length
-      ? f.signals.map((s: any) => ({ signal_name: s.signal_name, signal_type: s.signal_type, trigger_value: s.trigger_value }))
+      ? f.signals.map((s) => ({ signal_name: s.signal_name, signal_type: s.signal_type, trigger_value: s.trigger_value }))
       : [{ signal_name: '', signal_type: 'OPEN', trigger_value: 1 }],
   }
   showForm.value = true

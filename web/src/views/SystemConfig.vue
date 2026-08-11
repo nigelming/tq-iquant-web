@@ -5,7 +5,15 @@ import axios from 'axios'
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
 // iquant_bridge.base_url(实盘桥地址，绑 loopback 单用户，无 token)
-const DEFAULTS = {
+interface SystemConfig {
+  tdx_path: string
+  iquant_path: string
+  max_concurrent_backtest: number
+  database: { sqlite_path: string }
+  iquant_bridge: { base_url: string }
+}
+
+const DEFAULTS: SystemConfig = {
   tdx_path: '',
   iquant_path: '',
   max_concurrent_backtest: 1,
@@ -13,7 +21,7 @@ const DEFAULTS = {
   iquant_bridge: { base_url: '' },
 }
 
-const config = ref<any>(JSON.parse(JSON.stringify(DEFAULTS)))
+const config = ref<SystemConfig>(JSON.parse(JSON.stringify(DEFAULTS)))
 const loading = ref(true)
 const saved = ref(false)
 const errorMsg = ref('')
@@ -29,8 +37,8 @@ onMounted(async () => {
       database: { sqlite_path: data.database?.sqlite_path ?? DEFAULTS.database.sqlite_path },
       iquant_bridge: { base_url: data.iquant_bridge?.base_url ?? DEFAULTS.iquant_bridge.base_url },
     }
-  } catch (e: any) {
-    errorMsg.value = '加载配置失败: ' + (e?.message || e)
+  } catch (e) {
+    errorMsg.value = '加载配置失败: ' + (e instanceof Error ? e.message : String(e))
   } finally {
     loading.value = false
   }
@@ -43,8 +51,8 @@ async function save() {
     await axios.put('/api/system/configs', config.value)
     saved.value = true
     setTimeout(() => saved.value = false, 2000)
-  } catch (e: any) {
-    errorMsg.value = '保存失败: ' + (e?.message || e)
+  } catch (e) {
+    errorMsg.value = '保存失败: ' + (e instanceof Error ? e.message : String(e))
   }
 }
 </script>

@@ -5,12 +5,13 @@ import {
   getStockPools, getFormulas,
   getStrategies, createStrategy, updateStrategy, deleteStrategy,
   type PortfolioRequest, type StrategyRequest, type StrategyDetail,
+  type PortfolioItem, type StockPoolItem, type FormulaItem,
 } from '../api'
 
 // ===== 数据 =====
-const portfolios = ref<any[]>([])
-const stockPools = ref<any[]>([])
-const formulas = ref<any[]>([])
+const portfolios = ref<PortfolioItem[]>([])
+const stockPools = ref<StockPoolItem[]>([])
+const formulas = ref<FormulaItem[]>([])
 
 // 展开的组合 id 集合 + 各组合子策略缓存
 const expanded = ref<Set<number>>(new Set())
@@ -130,11 +131,11 @@ function emptyPortfolioForm(): Record<string, any> {
 
 // ===== 百分比 ↔ 小数转换 =====
 // 仅对 ratio 字段做 ×100 / ÷100；其他字段原值透传。文本字段保持字符串。
-function toPercent(v: any, isRatio: boolean): any {
+function toPercent(v: string | number | null | undefined, isRatio: boolean) {
   if (!isRatio || v === null || v === undefined || v === '') return v
   return Number(v) * 100
 }
-function fromPercent(v: any, fld: { type: string; key: string }): any {
+function fromPercent(v: string | number | null | undefined, fld: { type: string; key: string }) {
   // select 字段（trading_session/period/role/stock_pool_id 等）原值透传，
   // 不做 Number() —— 字符串值如 'full' 会被转成 NaN 致后端 422。
   if (fld.type !== 'number' && fld.type !== 'percent') return v
@@ -151,16 +152,16 @@ async function loadPortfolios() {
       getStockPools().catch(() => []),
       getFormulas().catch(() => []),
     ])
-    portfolios.value = ps as any[]
-    stockPools.value = pools as any[]
-    formulas.value = fs as any[]
+    portfolios.value = ps
+    stockPools.value = pools
+    formulas.value = fs
   } catch (e) {
     alert(`加载失败：${errMsg(e)}`)
     portfolios.value = []
   }
 }
 
-async function toggleExpand(p: any) {
+async function toggleExpand(p: PortfolioItem) {
   if (expanded.value.has(p.id)) {
     expanded.value.delete(p.id)
   } else {
@@ -191,25 +192,25 @@ function masterOptions(pid: number) {
 // 提交组合表单：比例字段从百分比转回小数
 function buildPortfolioPayload(): PortfolioRequest {
   const f = portfolioForm.value
-  const out: any = { strategies: [] }
+  const out: Record<string, unknown> = { strategies: [] }
   for (const g of PORTFOLIO_GROUPS) for (const fld of g.fields) {
     out[fld.key] = fromPercent(f[fld.key], fld)
   }
   out.status = f.status
-  return out as PortfolioRequest
+  return out as unknown as PortfolioRequest
 }
 
 // 提交子策略表单：比例字段从百分比转回小数
 function buildStrategyPayload(): StrategyRequest {
   const f = strategyForm.value
-  const out: any = {}
+  const out: Record<string, unknown> = {}
   for (const g of STRATEGY_GROUPS) for (const fld of g.fields) {
     if (fld.showIf && f.role !== fld.showIf) continue
     out[fld.key] = fromPercent(f[fld.key], fld)
   }
   // showIf 跳过 master_strategy_id 时，独立/主策略置 null
   if (f.role !== 'slave') out.master_strategy_id = null
-  return out as StrategyRequest
+  return out as unknown as StrategyRequest
 }
 
 // ===== 组合 CRUD =====
@@ -223,9 +224,9 @@ function openCreatePortfolio() {
   showPortfolioForm.value = true
 }
 
-async function openEditPortfolio(p: any) {
+async function openEditPortfolio(p: PortfolioItem) {
   editingPortfolioId.value = p.id
-  let detail: any
+  let detail: PortfolioItem
   try {
     detail = await getPortfolioDetail(p.id)
   } catch (e) {
@@ -256,7 +257,7 @@ async function openEditPortfolio(p: any) {
 function errMsg(e: any): string {
   const d = e?.response?.data
   if (d?.message) return d.message
-  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (Array.isArray(d?.detail)) return d.detail.map((x: { loc?: unknown[]; msg?: string }) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
   if (typeof d?.detail === 'string') return d.detail
   return e?.message || '请求失败'
 }
@@ -358,7 +359,7 @@ async function removeStrategy(pid: number, s: StrategyDetail) {
 }
 
 // 表单字段是否显示（showIf 条件）
-function fieldVisible(fld: any, form: Record<string, any>): boolean {
+function fieldVisible(fld: { showIf?: string }, form: Record<string, any>): boolean {
   if (!fld.showIf) return true
   return form.role === fld.showIf
 }
