@@ -145,14 +145,19 @@ function fromPercent(v: any, fld: { type: string; key: string }): any {
 
 // ===== 加载 =====
 async function loadPortfolios() {
-  const [ps, pools, fs] = await Promise.all([
-    getPortfolios(),
-    getStockPools().catch(() => []),
-    getFormulas().catch(() => []),
-  ])
-  portfolios.value = ps as any[]
-  stockPools.value = pools as any[]
-  formulas.value = fs as any[]
+  try {
+    const [ps, pools, fs] = await Promise.all([
+      getPortfolios(),
+      getStockPools().catch(() => []),
+      getFormulas().catch(() => []),
+    ])
+    portfolios.value = ps as any[]
+    stockPools.value = pools as any[]
+    formulas.value = fs as any[]
+  } catch (e) {
+    alert(`加载失败：${errMsg(e)}`)
+    portfolios.value = []
+  }
 }
 
 async function toggleExpand(p: any) {
@@ -161,7 +166,11 @@ async function toggleExpand(p: any) {
   } else {
     expanded.value.add(p.id)
     if (!strategyCache.value[p.id]) {
-      strategyCache.value[p.id] = await getStrategies(p.id)
+      try {
+        strategyCache.value[p.id] = await getStrategies(p.id)
+      } catch (e) {
+        alert(`加载子策略失败：${errMsg(e)}`)
+      }
     }
   }
 }
@@ -216,7 +225,13 @@ function openCreatePortfolio() {
 
 async function openEditPortfolio(p: any) {
   editingPortfolioId.value = p.id
-  const detail = await getPortfolioDetail(p.id)
+  let detail: any
+  try {
+    detail = await getPortfolioDetail(p.id)
+  } catch (e) {
+    alert(`加载组合详情失败：${errMsg(e)}`)
+    return
+  }
   portfolioForm.value = {
     name: detail.name, stock_pool_id: detail.stock_pool_id,
     benchmark_index: detail.benchmark_index || '000300.SH',
@@ -264,7 +279,12 @@ async function submitPortfolio() {
 
 async function removePortfolio(id: number) {
   if (!confirm('确认删除该组合策略？子策略将一并删除。')) return
-  await deletePortfolio(id)
+  try {
+    await deletePortfolio(id)
+  } catch (e) {
+    alert(`删除失败：${errMsg(e)}`)
+    return
+  }
   expanded.value.delete(id)
   delete strategyCache.value[id]
   loadPortfolios()
@@ -313,23 +333,28 @@ async function submitStrategy() {
     return  // 弹窗保持打开，供用户修正
   }
   showStrategyForm.value = false
-  strategyCache.value[pid] = await getStrategies(pid)
+  try {
+    strategyCache.value[pid] = await getStrategies(pid)
+  } catch (e) {
+    // 刷新失败不阻塞主操作（保存已成功），清缓存让下次展开重新拉
+    delete strategyCache.value[pid]
+  }
 }
 
 async function removeStrategy(pid: number, s: StrategyDetail) {
   if (!confirm(`确认删除子策略「${s.name}」？`)) return
   try {
-    const res = await deleteStrategy(pid, s.id)
-    // 后端业务错误（如被回测交易引用）返回 HTTP 200 + code≠0，不触发 axios catch
-    if (res.code !== 0) {
-      alert(`删除失败：${res.message || '未知错误'}`)
-      return
-    }
+    await deleteStrategy(pid, s.id)
   } catch (e) {
+    // 业务错误（如被回测交易引用）经拦截器 reject 或 HTTP 错误 → 统一 alert
     alert(`删除失败：${errMsg(e)}`)
     return
   }
-  strategyCache.value[pid] = await getStrategies(pid)
+  try {
+    strategyCache.value[pid] = await getStrategies(pid)
+  } catch (e) {
+    delete strategyCache.value[pid]
+  }
 }
 
 // 表单字段是否显示（showIf 条件）

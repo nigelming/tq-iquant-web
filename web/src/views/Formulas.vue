@@ -5,6 +5,16 @@ import { getFormulas, createFormula, updateFormula, deleteFormula, type SignalIt
 const formulas = ref<any[]>([])
 const showForm = ref(false)
 const editingId = ref<number | null>(null)
+const errorMsg = ref('')
+
+// 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
+function errMsg(e: any): string {
+  const d = e?.response?.data
+  if (d?.message) return d.message
+  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (typeof d?.detail === 'string') return d.detail
+  return e?.message || '请求失败'
+}
 
 const SIGNAL_TYPES = [
   { value: 'OPEN', label: '开仓' },
@@ -17,7 +27,13 @@ const emptyForm = () => ({ name: '', content: '', formula_count: 200, signals: [
 const form = ref(emptyForm())
 
 async function load() {
-  formulas.value = await getFormulas()
+  errorMsg.value = ''
+  try {
+    formulas.value = await getFormulas()
+  } catch (e) {
+    errorMsg.value = '加载失败：' + errMsg(e)
+    formulas.value = []
+  }
 }
 
 function openCreate() {
@@ -48,10 +64,15 @@ function removeSignal(idx: number) {
 }
 
 async function submit() {
-  if (editingId.value === null) {
-    await createFormula(form.value)
-  } else {
-    await updateFormula(editingId.value, form.value)
+  try {
+    if (editingId.value === null) {
+      await createFormula(form.value)
+    } else {
+      await updateFormula(editingId.value, form.value)
+    }
+  } catch (e) {
+    alert(`保存失败：${errMsg(e)}`)
+    return  // 弹窗保持打开，供用户修正
   }
   showForm.value = false
   load()
@@ -59,7 +80,12 @@ async function submit() {
 
 async function remove(id: number) {
   if (!confirm('确认删除该公式？')) return
-  await deleteFormula(id)
+  try {
+    await deleteFormula(id)
+  } catch (e) {
+    alert(`删除失败：${errMsg(e)}`)
+    return
+  }
   load()
 }
 
@@ -69,6 +95,10 @@ onMounted(load)
 <template>
   <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
     <button @click="openCreate" class="btn btn-primary">+ 新建公式</button>
+  </div>
+
+  <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+    {{ errorMsg }}
   </div>
 
   <div class="card table-wrap">

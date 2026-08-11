@@ -141,4 +141,33 @@ describe('StockPools.vue', () => {
     // id 来自 getStockPools 本地列表（mock 未设 getStockPools，组件应能处理）
     vi.unstubAllGlobals()
   })
+
+  it('load 失败（通达信连接失败）→ 显示错误条，列表清空', async () => {
+    ;(getTdxPools as any).mockRejectedValue({ response: { data: { message: '通达信未启动' } } })
+    const w = mount(StockPools)
+    await flushPromises()
+
+    expect(w.text()).toContain('加载失败')
+    expect(w.text()).toContain('通达信未启动')
+    expect(w.findAll('tbody tr').length).toBe(0)
+    w.unmount()
+  })
+
+  it('删除失败 → alert 提示，不崩', async () => {
+    ;(deleteStockPool as any).mockRejectedValue({ response: { data: { message: '被引用，无法删除' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('confirm', () => true)
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(StockPools)
+    await flushPromises()
+
+    const rows = w.findAll('tbody tr')
+    const delBtn = rows[2].findAll('button').find(b => b.text().includes('删除'))!
+    await delBtn.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('被引用，无法删除')
+    vi.unstubAllGlobals()
+  })
 })

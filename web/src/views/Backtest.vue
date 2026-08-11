@@ -18,6 +18,7 @@ const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date:
 // ===== 详情视图 =====
 const currentRecord = ref<any | null>(null)
 const detail = ref<any | null>(null)
+const errorMsg = ref('')
 
 // echarts 实例（净值 + 回撤）
 const equityChartEl = ref<HTMLDivElement | null>(null)
@@ -54,12 +55,18 @@ function poolName(id: number) {
 }
 
 async function load() {
-  const [recs, ps] = await Promise.all([
-    getBacktestRecords(),
-    getPortfolios().catch(() => []),
-  ])
-  records.value = recs as any[]
-  portfolios.value = ps as any[]
+  errorMsg.value = ''
+  try {
+    const [recs, ps] = await Promise.all([
+      getBacktestRecords(),
+      getPortfolios().catch(() => []),
+    ])
+    records.value = recs as any[]
+    portfolios.value = ps as any[]
+  } catch (e) {
+    errorMsg.value = '加载失败：' + errMsg(e)
+    records.value = []
+  }
 }
 
 function openForm() {
@@ -92,7 +99,12 @@ async function submit() {
 }
 
 async function openDetail(id: number) {
-  detail.value = await getBacktestDetail(id)
+  try {
+    detail.value = await getBacktestDetail(id)
+  } catch (e) {
+    alert(`加载详情失败：${errMsg(e)}`)
+    return
+  }
   currentRecord.value = detail.value?.record || null
   currentPage.value = 1
   // 等 DOM 渲染后初始化图表
@@ -381,6 +393,10 @@ onUnmounted(() => {
   <div v-if="!currentRecord">
     <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
+    </div>
+
+    <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+      {{ errorMsg }}
     </div>
 
     <div class="card table-wrap">

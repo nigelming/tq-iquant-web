@@ -19,34 +19,53 @@ const showStocks = ref(false)
 const stocksList = ref<any[]>([])
 const stocksPoolName = ref('')
 
+// 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
+function errMsg(e: any): string {
+  const d = e?.response?.data
+  if (d?.message) return d.message
+  if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+  if (typeof d?.detail === 'string') return d.detail
+  return e?.message || '请求失败'
+}
+
 async function load() {
   errorMsg.value = ''
-  // 并行拉通达信板块 + 本地已同步池（取 id 供删除）
-  const [tdxRes, localRes] = await Promise.all([
-    getTdxPools(),
-    getStockPools().catch(() => []),  // 本地列表失败不阻塞
-  ])
-  if ((tdxRes as any)?.code !== undefined && (tdxRes as any).code !== 0) {
-    errorMsg.value = (tdxRes as any).message || '通达信连接失败'
+  try {
+    // 并行拉通达信板块 + 本地已同步池（取 id 供删除）
+    const [tdxRes, localRes] = await Promise.all([
+      getTdxPools(),
+      getStockPools().catch(() => []),  // 本地列表失败不阻塞
+    ])
+    pools.value = tdxRes as TdxPool[]
+    localIdByCode.value = {}
+    for (const p of localRes as any[]) {
+      localIdByCode.value[p.code] = p.id
+    }
+  } catch (e) {
+    // getTdxPools 失败（拦截器 reject 或 HTTP 错误）→ 提示，清空列表
+    errorMsg.value = '加载失败：' + errMsg(e)
     pools.value = []
-    return
-  }
-  pools.value = tdxRes as TdxPool[]
-  localIdByCode.value = {}
-  for (const p of localRes as any[]) {
-    localIdByCode.value[p.code] = p.id
   }
 }
 
 async function viewStocks(p: TdxPool) {
-  stocksPoolName.value = p.name
-  stocksList.value = await getTdxPoolStocks(p.code)
-  showStocks.value = true
+  try {
+    stocksPoolName.value = p.name
+    stocksList.value = await getTdxPoolStocks(p.code)
+    showStocks.value = true
+  } catch (e) {
+    alert(`查看成分股失败：${errMsg(e)}`)
+  }
 }
 
 async function syncPool(p: TdxPool) {
   if (!confirm(`确认从通达信同步「${p.name}」的股票清单？将全量替换现有股票。`)) return
-  await syncStockPool({ code: p.code })
+  try {
+    await syncStockPool({ code: p.code })
+  } catch (e) {
+    alert(`同步失败：${errMsg(e)}`)
+    return
+  }
   load()
 }
 
@@ -54,7 +73,12 @@ async function remove(p: TdxPool) {
   const id = localIdByCode.value[p.code]
   if (!id) return
   if (!confirm(`确认删除股票池「${p.name}」？`)) return
-  await deleteStockPool(id)
+  try {
+    await deleteStockPool(id)
+  } catch (e) {
+    alert(`删除失败：${errMsg(e)}`)
+    return
+  }
   load()
 }
 

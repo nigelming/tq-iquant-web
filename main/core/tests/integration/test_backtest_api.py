@@ -426,6 +426,11 @@ def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
     # raise_server_exceptions 在 TestClient 构造时已关，异常转成 500 响应
     resp = c.post("/api/backtest", json=payload)
     assert resp.status_code == 500  # 异常上抛
+    # #13：全局 Exception 处理器 → 统一 envelope（非 FastAPI 默认 {"detail":...}）
+    body = resp.json()
+    assert body["code"] == 500
+    assert body["data"] is None
+    assert "message" in body and body["message"]
 
     # 从 DB 直接查（异常上抛后端点未返回 record_id，但 record 已建）
     db = Session()
@@ -494,6 +499,8 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
 
     resp = c.post("/api/backtest", json=payload)
     assert resp.status_code == 500  # 异常上抛
+    # #13：500 响应体为统一 envelope
+    assert resp.json()["code"] == 500
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
     monkeypatch.setattr(bt_api, "build_klines", lambda ps, start, end, db=None: _mock_klines())

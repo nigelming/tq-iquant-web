@@ -358,6 +358,19 @@ def test_stream_endpoint_relays_engine_events_when_running(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
+def test_stream_endpoint_404_when_session_missing(client):
+    """#13/#5：session 不存在 → HTTP 404（HTTPException pass-through，非 body-code）。
+
+    EventSource 需真实 HTTP 错误码才触发 onerror，body-code+200 会让前端静默失败。
+    全局 Exception 处理器不拦截 HTTPException，此行为保持。
+    """
+    c, _ = client
+    resp = c.get("/api/live/sessions/9999/stream")
+    assert resp.status_code == 404
+    # HTTPException pass-through：响应体是 {"detail":...}，非统一 envelope
+    assert "session" in resp.json()["detail"]
+
+
 def test_build_engine_fills_formula_mapping(client, mock_bridge):
     """_build_engine 后 LiveEngine 持有 _formula_by_strategy（strategy_id → formula_name）。"""
     c, Session = client

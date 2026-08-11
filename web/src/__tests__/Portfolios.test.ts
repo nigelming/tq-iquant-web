@@ -361,8 +361,12 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     vi.unstubAllGlobals()
   })
 
-  it('删除被引用子策略 → 后端返回 code≠0，前端 alert 提示且不刷新列表', async () => {
-    ;(deleteStrategy as any).mockResolvedValue({ code: 400, message: '该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。' })
+  it('删除被引用子策略 → 拦截器/HTTP 错误 reject，前端 alert 提示且不刷新列表', async () => {
+    // #42 + 拦截器后：deleteStrategy 返回 res.data.data（成功）或 reject（业务/HTTP 错误）。
+    // 模拟后端 code:400 → 拦截器 reject 一个带 response.data.message 的错误。
+    const err: any = new Error('请求失败')
+    err.response = { data: { code: 400, message: '该子策略被回测或实盘交易记录引用，无法删除。请先删除相关的回测记录或实盘会话。' } }
+    ;(deleteStrategy as any).mockRejectedValue(err)
     const alertMock = vi.fn()
     vi.stubGlobal('confirm', () => true)
     vi.stubGlobal('alert', alertMock)

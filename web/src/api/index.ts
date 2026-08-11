@@ -1,6 +1,21 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api' })
+export const api = axios.create({ baseURL: '/api' })
+
+// #14：响应拦截器 — 业务错误（HTTP 200 但 body.code !== 0）转 reject。
+// 后端统一响应 {code,message,data}，code=0 成功；非 0 是业务错误，但 HTTP 仍 200，
+// axios 当成功 resolve → 调用方误处理（静默 bug）。此处统一拦下，reject 一个带
+// response.data 的错误（让 errMsg 能读 message）。HTTP 错误（404/409/500）由
+// axios 自动 reject，不动。
+api.interceptors.response.use((response) => {
+  const body = response.data as ApiResponse<unknown>
+  if (body && typeof body.code === 'number' && body.code !== 0) {
+    const err: any = new Error(body.message || '请求失败')
+    err.response = response
+    return Promise.reject(err)
+  }
+  return response
+})
 
 export interface ApiResponse<T> {
   code: number
@@ -190,7 +205,7 @@ export async function updateStrategy(pid: number, sid: number, req: StrategyRequ
 
 export async function deleteStrategy(pid: number, sid: number) {
   const res = await api.delete<ApiResponse<any>>(`/portfolios/${pid}/strategies/${sid}`)
-  return res.data
+  return res.data.data
 }
 
 export async function getBacktestRecords() {

@@ -157,4 +157,32 @@ describe('Formulas.vue', () => {
     expect((deleteFormula as any).mock.calls[0][0]).toBe(1)
     vi.unstubAllGlobals()
   })
+
+  it('load 失败 → 显示错误条，列表清空，页面不崩', async () => {
+    ;(getFormulas as any).mockRejectedValue({ response: { data: { message: '数据库不可用' } } })
+    const w = mount(Formulas)
+    await flushPromises()
+
+    expect(w.text()).toContain('加载失败')
+    expect(w.text()).toContain('数据库不可用')
+    expect(w.findAll('tbody tr').length).toBe(0)
+    w.unmount()
+  })
+
+  it('删除失败 → alert 提示，不崩', async () => {
+    ;(deleteFormula as any).mockRejectedValue({ response: { data: { message: '被引用，无法删除' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('confirm', () => true)
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+
+    const delBtn = w.findAll('button.btn-danger').find(b => b.text().includes('删除'))!
+    await delBtn.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('被引用，无法删除')
+    vi.unstubAllGlobals()
+  })
 })

@@ -123,6 +123,35 @@ describe('Backtest.vue — 列表视图', () => {
     expect(deleteBacktestRecord).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
+
+  it('load 失败 → 显示错误条，列表清空，页面不崩', async () => {
+    ;(getBacktestRecords as any).mockRejectedValue({ response: { data: { message: '网络中断' } } })
+    const w = mount(Backtest)
+    await flushPromises()
+
+    expect(w.text()).toContain('加载失败')
+    expect(w.text()).toContain('网络中断')
+    expect(w.findAll('tbody tr').length).toBe(0)
+    w.unmount()
+  })
+
+  it('查看详情失败 → alert 提示，不进详情视图', async () => {
+    ;(getBacktestDetail as any).mockRejectedValue({ response: { data: { message: '记录不存在' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Backtest)
+    await flushPromises()
+
+    const viewBtn = w.findAll('button').filter(b => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('加载详情失败')
+    // 仍在列表视图（未切到详情报告页）
+    expect(w.find('.report-page').exists()).toBe(false)
+    vi.unstubAllGlobals()
+  })
 })
 
 describe('Backtest.vue — 发起回测', () => {
