@@ -3,7 +3,6 @@ from datetime import datetime, date
 from decimal import Decimal
 
 from .portfolio import Portfolio
-from .strategy_context import StrategyContext
 from .position import Position
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
 from .evaluator import Evaluator
@@ -48,7 +47,7 @@ class BacktestEngine:
                 for order in pending_orders:
                     # 成交日 = 当前 bar 时间 t（T+1 据此判断）
                     order.bar_time = t
-                    ctx = self._find_strategy(portfolio, order.strategy_id)
+                    ctx = portfolio.find_strategy(order.strategy_id)
                     if ctx is None:
                         continue
                     # BUY 首次建仓：确保 Position 存在于 ctx.positions
@@ -68,7 +67,7 @@ class BacktestEngine:
             pending_orders = portfolio.on_bar(bar, signal_cache=signal_cache)
 
             # 4. 日终快照（日线：每根 bar 即一日）
-            total_value = self._total_value(portfolio, bar)
+            total_value = portfolio.total_value(bar)
             snap = portfolio.snapshot(t.date(), total_value, bar)
             # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
             # 缺失则沿用上一已知值（基准停牌/非交易日），全无则 None。
@@ -166,25 +165,6 @@ class BacktestEngine:
     def _build_bar(self, price_index: dict, t: datetime) -> BarEvent:
         """O(1) 查表取时间 t 的 OHLCV 构造 BarEvent。"""
         return BarEvent(stocks=price_index.get(t, {}), bar_time=t)
-
-    def _find_strategy(
-        self, portfolio: Portfolio, strategy_id: int
-    ) -> Optional[StrategyContext]:
-        for ctx in portfolio.strategies:
-            if ctx.strategy_id == strategy_id:
-                return ctx
-        return None
-
-    def _total_value(self, portfolio: Portfolio, bar: BarEvent) -> Decimal:
-        """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值。"""
-        total = portfolio.account.cash
-        for ctx in portfolio.strategies:
-            for stock_code, pos in ctx.positions.items():
-                if pos.quantity == 0 or stock_code not in bar.stocks:
-                    continue
-                close = bar.stocks[stock_code]["close"]
-                total += close * pos.quantity
-        return total
 
     def _strategy_snapshots(
         self, portfolio: Portfolio, bar: BarEvent, snap_date: date

@@ -181,6 +181,11 @@ class BarPoller:
         self.on_bar: Callable[[BarEvent], None] = lambda bar: None
 
     @property
+    def stock_codes(self) -> List[str]:
+        """订阅股票代码列表（只读视图，供 LiveEngine 行情订阅范围查询，审计 #30）。"""
+        return self._stock_codes
+
+    @property
     def last_completed_stime(self) -> Optional[datetime]:
         """所有 code 中最高的完成 bar 时间(观测值,供测试/监控;判定逻辑用 per-code)。"""
         vals = [t for t in self._last_completed.values() if t is not None]

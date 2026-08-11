@@ -49,7 +49,7 @@ class HttpBridgeDispatcher(OrderDispatcher):
 
     # ---------------- 下单 ----------------
     @staticmethod
-    def _order_id(order: OrderEvent) -> str:
+    def order_id(order: OrderEvent) -> str:
         """确定性订单 ID：同订单（含数量/价格）重试生成相同 ID，桥侧幂等去重。
 
         数量/价格必须参与：同策略/股票/信号但数量变化的重新触发是不同订单。
@@ -65,7 +65,7 @@ class HttpBridgeDispatcher(OrderDispatcher):
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         payload = {
-            "order_id": self._order_id(order),
+            "order_id": self.order_id(order),
             "code": order.stock_code,
             "op": "buy" if order.trade_type.value == "BUY" else "sell",
             "volume": order.quantity,

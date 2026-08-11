@@ -35,6 +35,7 @@ import json
 import os
 import socket
 import time
+from collections import OrderedDict
 
 # ================= config =================
 HOST = "127.0.0.1"
@@ -49,11 +50,12 @@ RATE_WINDOW = 10                  # rate-limit window (seconds)
 QUOTE_CACHE_TTL = 1               # quote cache refresh interval (seconds)
 QUOTE_COUNT = 10                  # default bar count for /quote
 HISTORY_DAYS = 30                 # history depth to download before pulling bars
+PLACED_MAX = 5000                 # _placed idempotency cache cap; oldest evicted past this (audit #32)
 # ==========================================
 
 _CTX = None
 _listen_sock = None
-_placed = {}                      # order_id -> result (idempotency)
+_placed = OrderedDict()            # order_id -> result (idempotency), capped at PLACED_MAX (audit #32)
 _placing = set()                  # in-flight order_ids
 _requests = []                    # rate-limit timestamps
 _quote_cache = {}                 # (code, period, count) -> (ts, bars)
@@ -125,6 +127,10 @@ def place_order(params):
     try:
         result = _do_place(params)
         _placed[oid] = result
+        # audit #32: cap _placed to PLACED_MAX; evict oldest (insertion-ordered) to bound memory.
+        # Idempotency only matters for near-term retries; a months-old order_id won't be re-sent.
+        while len(_placed) > PLACED_MAX:
+            _placed.popitem(last=False)
         return result
     finally:
         _placing.discard(oid)

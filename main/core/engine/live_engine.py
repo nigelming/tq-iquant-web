@@ -21,7 +21,6 @@ from typing import AsyncIterator, Callable, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from .portfolio import Portfolio
-from .strategy_context import StrategyContext
 from .position import Position
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
@@ -456,7 +455,7 @@ class LiveEngine:
         # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）；count = 1d 周期最大 formula_count
         bars_by_code: Dict[str, list] = {}
         count = self._period_count.get("1d", self._formula_count)
-        for code in self._bar_poller._stock_codes:
+        for code in self._bar_poller.stock_codes:
             try:
                 bars = self._dispatcher.query_quote(
                     code, period="1d", count=count
@@ -558,7 +557,7 @@ class LiveEngine:
         E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测）。
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
-        portfolio.risk_manager.update_peak(self._total_value(portfolio, bar), bar.bar_time.date())
+        portfolio.risk_manager.update_peak(portfolio.total_value(bar), bar.bar_time.date())
         # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
         self._persist_breaker_count(portfolio)
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
@@ -577,7 +576,7 @@ class LiveEngine:
         db = self._db_session_factory()
         try:
             for order in orders:
-                ctx = self._find_strategy(portfolio, order.strategy_id)
+                ctx = portfolio.find_strategy(order.strategy_id)
                 if ctx is None:
                     continue
                 # B5：信号触发推送（在下单前——被 cap/拒单的信号也可见）
@@ -649,7 +648,7 @@ class LiveEngine:
                     db.commit()
                     continue
                 # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
-                live_order.bridge_order_id = self._dispatcher._order_id(order)
+                live_order.bridge_order_id = self._dispatcher.order_id(order)
                 self._try_match_order_ref(live_order)
                 # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
                 # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
@@ -718,7 +717,7 @@ class LiveEngine:
         stocks: Dict[str, dict] = {}
         # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
         count = self._period_count.get(period, self._formula_count)
-        for code in self._bar_poller._stock_codes:
+        for code in self._bar_poller.stock_codes:
             bars = self._dispatcher.query_quote(
                 code, period=period, count=count
             )
@@ -739,25 +738,6 @@ class LiveEngine:
                 portfolio, bar_event, bars_by_code=bars_by_code,
                 df_cache=df_cache, raw_cache=raw_cache,
             )
-
-    @staticmethod
-    def _total_value(portfolio: Portfolio, bar: BarEvent) -> Decimal:
-        """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值。同回测 _total_value。"""
-        total = portfolio.account.cash
-        for ctx in portfolio.strategies:
-            for stock_code, pos in ctx.positions.items():
-                if pos.quantity == 0 or stock_code not in bar.stocks:
-                    continue
-                close = bar.stocks[stock_code]["close"]
-                total += close * pos.quantity
-        return total
-
-    @staticmethod
-    def _find_strategy(portfolio: Portfolio, strategy_id: int) -> Optional[StrategyContext]:
-        for ctx in portfolio.strategies:
-            if ctx.strategy_id == strategy_id:
-                return ctx
-        return None
 
     # ---------------- F5：桥可用持仓（SELL 减仓上限）----------------
     def _refresh_available_map(self) -> None:
@@ -971,7 +951,7 @@ class LiveEngine:
         """
         if self._tq_formula is None or not self._formula_by_strategy:
             return
-        codes = list(self._bar_poller._stock_codes)
+        codes = list(self._bar_poller.stock_codes)
         for portfolio in self.portfolios:
             for ctx in portfolio.strategies:
                 if ctx.period not in _STARTUP_ONLY_PERIODS:
@@ -1002,7 +982,7 @@ class LiveEngine:
             for ctx in portfolio.strategies:
                 if ctx.period not in _STARTUP_ONLY_PERIODS:
                     continue
-                for code in self._bar_poller._stock_codes:
+                for code in self._bar_poller.stock_codes:
                     if (ctx.strategy_id, code, daily_time) not in self.signal_cache:
                         return True
         return False
@@ -1235,7 +1215,7 @@ class LiveEngine:
         )
         if portfolio is None:
             return
-        ctx = self._find_strategy(portfolio, live_order.strategy_id)
+        ctx = portfolio.find_strategy(live_order.strategy_id)
         if ctx is None:
             return
         pos = ctx.positions.get(live_order.stock_code)
@@ -1294,7 +1274,7 @@ class LiveEngine:
             port = ports_by_id.get(tr.portfolio_strategy_id)
             if port is None:
                 continue
-            ctx = self._find_strategy(port, tr.strategy_id)
+            ctx = port.find_strategy(tr.strategy_id)
             if ctx is None:
                 continue
             sig_type_str = sig_type_by_order.get(tr.live_order_id)

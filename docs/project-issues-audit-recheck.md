@@ -17,7 +17,7 @@
 
 **结论**：审计后无任何条目被修复；仅 #15 描述过宽（实为 5 视图中 3 个已补 try/catch，2 个仍缺）。其余 44 条与审计描述一致，全部仍存在。
 
-> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 15 项（#23/#24/#29/#36/#35 已修）、P3 7 项（#38/#43 已处理）。
+> **2026-08-11 更新**：P0 8/8 已处理（见下方"提交后状态"）；P1 #13/#14/#42/#15(剩余) 已修（见 P1 提交后状态小节）；#10/#17/#34/#44 已修 + #43 N/A（见"死代码+文档清理"小节）；#23/#24/#29 已修（见"实盘正确性/风险"小节）；#11/#12/#16 已修（见"API 一致性"小节）；#36/#35/#38/#31 已修或部分修（见"P2/P3 低成本清理"小节）；#25/#30/#32 已修（见"引擎/桥去重+封装"小节）。当前实际仍 open：**P1 1 项（仅 #9 service 层，经评估暂不做）**、P2 12 项（#23/#24/#29/#36/#35/#25/#30/#32 已修）、P3 7 项（#38/#43 已处理）。
 
 ---
 
@@ -158,6 +158,20 @@ P1 收尾三联项——统一响应 envelope + 错误模式收敛 + 设计端�
 验证：后端测试 376 passed（utcnow 弃用警告同步消除）。
 
 **P2/P3 当前结论**：#36/#35 已修（P2 16→15，P3 #38 8→7）；#31 部分修（math 提顶，pandas 刻意保留）。**#9 service 层暂不做**（评估为最大组织债，单独立项窗口处理）。
+
+### 2026-08-11 引擎/桥去重 + 封装（#25/#30/#32）
+
+继续扫 P2/P3 低风险项，聚焦引擎层重复 + 跨类私有访问 + 桥内存无界：
+
+| # | 提交后现状 | 证据 |
+|---|------|------|
+| 25 | ✅ **已修** | `_total_value` + `_find_strategy` 在 `backtest_engine.py` 与 `live_engine.py` **字节级重复**。下沉到 `Portfolio` 作公共方法 `total_value(bar)` / `find_strategy(sid)`（与已有 `_find_strategy_by_id`/`snapshot` 同域）。两引擎 6 处调用点改 `portfolio.total_value(bar)` / `portfolio.find_strategy(sid)`，删 4 处重复定义。连带清理两引擎各自因去重而悬空的 `StrategyContext` import |
+| 30 | ✅ **已修** | `live_engine.py` 5 处 `self._bar_poller._stock_codes` + 1 处 `self._dispatcher._order_id(order)` 跨类访问私有。`BarPoller` 加只读 `stock_codes` property（与已有 `last_completed_stime` property 同模式）；`HttpBridgeDispatcher._order_id` staticmethod 改公共 `order_id`（纯函数无状态，本就该 public）。6 处调用点改公共访问，grep `\._bar_poller\._\|\._dispatcher\._order_id` 零残留 |
+| 32 | ✅ **已修** | `iquant_bridge.py` `_placed = {}` 幂等缓存无 TTL/上限，长期运行内存无界增长。改 `OrderedDict` + `PLACED_MAX=5000` 上限，插入后超限 `popitem(last=False)` 淘汰最旧（idempotency 只对近期重试有意义，月级 order_id 不会被重发）。`OrderedDict` 是 dict 子类，`oid in`/`[oid]`/赋值语义不变，向后兼容。桥纯 ASCII/GBK/Py3.6 兼容（`collections.OrderedDict` 标准库） |
+
+验证：后端测试 376 passed；`iquant_bridge.py` GBK 解析通过；grep 跨类私有访问零残留。
+
+**P2/P3 当前结论**：#25/#30/#32 已修（P2 15→12）。剩余 P2 多为数据完整性项（#18 剩 1 处/#19 unique/#20 索引/#21 server_default，需 Alembic 迁移，单用户有数据有风险）+ 前端 #26 any 类型（61 处 10 文件，机械但需逐调用方核对字段，单独立项）+ #33 硬编码 + #22 init_db 走 Alembic。
 
 ---
 

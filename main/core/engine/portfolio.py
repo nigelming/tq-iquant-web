@@ -221,6 +221,26 @@ class Portfolio:
     def check_circuit_breaker(self) -> bool:
         return self.risk_manager.circuit_breaker_active
 
+    def find_strategy(self, strategy_id: int) -> Optional[StrategyContext]:
+        """按 strategy_id 在本组合策略列表中找上下文（回测/实盘共用，审计 #25 去重）。
+
+        与 _find_strategy_by_id 同义；后者保留供主从联动内部调用，此为对外公共方法。
+        """
+        for ctx in self.strategies:
+            if ctx.strategy_id == strategy_id:
+                return ctx
+        return None
+
+    def total_value(self, bar: BarEvent) -> Decimal:
+        """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值（回测/实盘共用，审计 #25 去重）。"""
+        total = self.account.cash
+        for ctx in self.strategies:
+            for stock_code, pos in ctx.positions.items():
+                if pos.quantity == 0 or stock_code not in bar.stocks:
+                    continue
+                total += bar.stocks[stock_code]["close"] * pos.quantity
+        return total
+
     def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
         """按 strategy_id 在本组合策略列表中找上下文。"""
         if strategy_id is None:
