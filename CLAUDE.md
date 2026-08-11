@@ -54,7 +54,8 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 | `npx vitest` | 前端测试（在 `web/`，测试位于 `src/__tests__/`） |
 | `npm run build` | 构建前端到 `web/dist/`（生产期由 FastAPI 托管） |
 | `./manage.ps1 start` / `stop` / `restart` / `status` | 一键管理前后端（后端 8000，前端 5173） |
-| `docker compose up` | 启动 PostgreSQL（生产依赖；开发期用 SQLite） |
+
+> 数据库：纯单用户本地工具，统一用 SQLite（`main/data/dev.db`），零配置，不切 PostgreSQL。
 
 > 测试路径注意：AGENTS.md 写的是 `tests/`，实际位于 `main/core/tests/`。
 
@@ -72,7 +73,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - F9 印花税仍 0（`/deals` 印花税字段待真机验证）；D3 对账自动校准待真机跑顺放开
 - 首页仪表盘前端页、监控/告警骨架、conftest `dependency_overrides` 字符串 key、`data_feed.py`（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖）
 
-**配置链（已修复）**：[main/core/db.py](main/core/db.py) 与 [main/alembic/env.py](main/alembic/env.py) 均从 [core.config.load_config()](main/core/config.py) 读 `database.sqlite_path`（默认 `data/dev.db`，相对 `main/` 解析为 `main/data/dev.db`），与 `config.yaml` 一致。db.py 逐连接开启 `PRAGMA foreign_keys=ON` 让 ondelete 生效。切换 PostgreSQL 时改 `config.yaml` 的 `database` 段并补 `TQ_DB_PASSWORD` 环境变量。
+**配置链（已修复）**：[main/core/db.py](main/core/db.py) 与 [main/alembic/env.py](main/alembic/env.py) 均从 [core.config.load_config()](main/core/config.py) 读 `database.sqlite_path`（默认 `data/dev.db`，相对 `main/` 解析为 `main/data/dev.db`），与 `config.yaml` 一致。db.py 逐连接开启 `PRAGMA foreign_keys=ON` 让 ondelete 生效。纯单用户本地工具，数据库就 SQLite 一条路，不切 PostgreSQL。
 
 ## 关键约定（非显而易见，易遗漏）
 
@@ -85,7 +86,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - **资金模型**：策略资金占比是持仓上限（非预分），多策略上限之和可超 100%
 - **熔断**：max_drawdown 触发次日恢复（累计 3 次转手动）；daily_loss_limit 当日暂停次日恢复。熔断期间不清仓，仅暂停新开仓
 - **主从策略**：从策略只能买入主策略当前持有的同一只股票；主策略清仓（含该股）后从策略不可新开仓但存量可自行卖出
-- **数据库迁移**：用 Alembic，禁止手动改表结构。`config.yaml` 不存密码（从环境变量 `TQ_DB_PASSWORD` 读取）
+- **数据库迁移**：用 Alembic，禁止手动改表结构。
 - **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘全局限 1 个 session（`_ENGINES` 非空即拒，B6）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程经 `asyncio.run_coroutine_threadsafe` 转入主事件循环，主循环不可被 TQ 回调阻塞
 
 ## 开发范式
