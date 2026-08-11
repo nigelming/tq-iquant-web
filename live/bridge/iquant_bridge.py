@@ -41,7 +41,7 @@ HOST = "127.0.0.1"
 PORT = 8790
 ACCOUNT_DEFAULT = "110002348760"  # dev placeholder; override via env IQUANT_BRIDGE_ACCOUNT / .bridge_account file
 ACCOUNT = None                     # loaded by load_account() below
-DRY_RUN = False                    # safe default: only print, no real order. Flip to False when ready
+DRY_RUN = False                    # real order mode. Flip to True for dry run (print only, no passorder)
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
 MAX_VOLUME = 10000                # max shares per order
 RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW seconds

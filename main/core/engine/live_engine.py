@@ -1005,10 +1005,10 @@ class LiveEngine:
             db.commit()
             # 3. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected 自然移除）
             self._sync_pending_orders(db)
-        except Exception:
-            db.rollback()
-            logger.exception("_poll_deals error")
         finally:
+            # 异常向上抛到 _deals_loop 统一记日志（不再此处静默吞），
+            # rollback 清理未提交事务，close 归还连接。
+            db.rollback()
             db.close()
 
     def _sync_pending_orders(self, db: Session) -> None:

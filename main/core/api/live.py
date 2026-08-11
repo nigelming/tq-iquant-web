@@ -458,7 +458,9 @@ async def session_stream(session_id: int, request: Request, db: Session = Depend
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        return {"code": 404, "message": "资源不存在"}
+        # 用 HTTPException(404) 而非 body-code:EventSource 需真实 HTTP 错误码才触发 onerror,
+        # body-code + HTTP 200 会让 EventSource 静默失败无提示。
+        raise HTTPException(status_code=404, detail="session 不存在")
 
     engine = _ENGINES.get(session_id)
 
