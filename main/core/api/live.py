@@ -246,6 +246,15 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         return err(409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
 
     engine = _build_engine(session_id, db, session.mode)
+    # 启动前探测桥在线：桥未起（iQuant 客户端未运行/策略未加载）直接拒绝，
+    # 不建引擎、不置 running，避免「一点就成功、桥离线却无告警」。
+    # heartbeat() 同步 httpx 调 /ping，本地 loopback 连接被拒瞬时失败，不阻塞事件循环。
+    if not engine.dispatcher.heartbeat():
+        mode_label = "实盘" if session.mode == "live" else "仿真"
+        br = _bridge_config()
+        base_url = br.get(session.mode, br["simulation"])
+        return err(503, "桥未启动：%s（%s）— 请先在 iQuant 客户端加载并运行对应桥策略"
+                         % (mode_label, base_url))
     # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金
     engine.recover(db)
     # 起 asyncio 循环任务（async 端点内直接在 FastAPI 事件循环建任务）

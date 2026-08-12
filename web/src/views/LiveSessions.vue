@@ -127,8 +127,13 @@ async function create() {
 }
 
 async function startSession(id: number) {
-  await startLiveSession(id)
-  load() // load 内自动连接新运行 session 的流
+  try {
+    await startLiveSession(id)
+    load() // load 内自动连接新运行 session 的流
+  } catch (e: any) {
+    // 桥未启动等业务错误：后端返回 code!==0，拦截器 reject 带 message。
+    alert(e?.message || '启动失败')
+  }
 }
 
 async function stopSession(id: number) {

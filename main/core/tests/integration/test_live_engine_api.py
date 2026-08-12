@@ -637,3 +637,33 @@ def test_create_session_rejects_invalid_mode(client, mock_bridge):
     assert body["code"] != 0
     assert "mode" in body["message"]
 
+
+def test_start_session_rejected_when_bridge_offline(client, monkeypatch):
+    """桥未启动时 /start 返回 503 业务错误，不建引擎、不置 running。
+
+    防回归：「一点启动就成功、桥离线却无告警」——启动前必须探测桥在线。
+    """
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    real_cls = live_api.HttpBridgeDispatcher
+
+    def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
+        # /ping 走 MockTransport 但返回 503 → heartbeat() 见 status_code != 200 返回 False
+        client_ = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(503)))
+        return real_cls(base_url=base_url, client=client_)
+
+    monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation")
+    resp = c.post("/api/live/sessions/%d/start" % sid)
+    body = resp.json()
+    assert body["code"] == 503
+    assert "桥未启动" in body["message"]
+    # 未建引擎、session 仍非 running
+    assert sid not in live_api._ENGINES
+    detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert detail["status"] != "running"
+

@@ -303,4 +303,22 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     expect(w.text()).toContain('进取组合')
     w.unmount()
   })
+
+  it('启动失败(桥未启动) → alert 告警且不连接流', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(startLiveSession as any).mockRejectedValue(new Error('桥未启动：仿真（http://127.0.0.1:8790）— 请先在 iQuant 客户端加载并运行对应桥策略'))
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('启动'))!.trigger('click')
+    await flushPromises()
+
+    expect(startLiveSession).toHaveBeenCalledWith(stoppedSession.id)
+    expect(alert).toHaveBeenCalledWith(expect.stringContaining('桥未启动'))
+    // 失败不连流
+    expect(FakeEventSource.instances.length).toBe(0)
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
 })
