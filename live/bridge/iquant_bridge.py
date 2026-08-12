@@ -80,12 +80,26 @@ _placing = set()                  # in-flight order_ids
 _requests = []                    # rate-limit timestamps
 _quote_cache = {}                 # (code, period, count) -> (ts, bars)
 _downloaded = set()               # (code, period) already history-downloaded
+_last_log = {}                    # (kind, code, period) -> ts, throttle repeated diagnostics
 
 
 # ---------------- iQuant API access (isolated for test mocks) ----------------
 def _iq(name):
     """iQuant injects passorder/get_trade_detail_data/get_market_data_ex into globals()."""
     return globals().get(name)
+
+
+def _throttled_log(key, msg, interval=300):
+    """Print msg at most once per interval seconds per key (steady-state log control).
+
+    The success path prints nothing; failures/empties surface but not every poll --
+    a full trading day otherwise logs thousands of quote lines for ~17 codes x 4 periods.
+    """
+    now = time.time()
+    if now - _last_log.get(key, 0) < interval:
+        return
+    _last_log[key] = now
+    print(msg)
 
 
 # ---------------- auth / whitelist / rate limit ----------------
@@ -291,11 +305,13 @@ def _fetch_quote(code, period, count):
         res = xtdata.get_market_data_ex([], [code], period=period, count=count)
         df = (res or {}).get(code)
         if df is not None and len(df) > 0:
-            print("[BRIDGE] xtdata ok %s %s count=%d got=%d" % (code, period, count, len(df)))
+            # success: silent steady state -- every fetch otherwise logs ~5k lines/day
             return df
-        print("[BRIDGE] xtdata empty %s %s count=%d" % (code, period, count))
+        _throttled_log(("empty", code, period),
+                       "[BRIDGE] xtdata empty %s %s count=%d" % (code, period, count))
     except Exception as e:
-        print("[BRIDGE] xtdata FAIL %s %s: %s" % (code, period, e))
+        _throttled_log(("fail", code, period),
+                       "[BRIDGE] xtdata FAIL %s %s: %s" % (code, period, e))
     # 2) fallback: ContextInfo (depends on current symbol context)
     fn = _iq("get_market_data_ex")
     if fn is None:
@@ -304,7 +320,8 @@ def _fetch_quote(code, period, count):
         res = fn([], [code], period=period, count=count, dividend_type="none")
         return (res or {}).get(code)
     except Exception as e:
-        print("[BRIDGE] ContextInfo FAIL %s %s: %s" % (code, period, e))
+        _throttled_log(("ctx", code, period),
+                       "[BRIDGE] ContextInfo FAIL %s %s: %s" % (code, period, e))
         return None
 
 
@@ -487,7 +504,7 @@ def init(ContextInfo):
                 pass
             clients.pop(conn, None)
         # quote cache is on-demand only (get_quote fills + TTL expires); no
-        # background refresh -- the Core polls every ~30s, a 1s TTL means each
+        # background refresh -- the Core polls every ~60s, a 1s TTL means each
         # poll re-fetches, which is far cheaper than refreshing all keys every
         # second unconditionally (and avoids spinning after a session stops).
         time.sleep(0.01)
