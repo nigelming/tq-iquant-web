@@ -749,6 +749,32 @@ class LiveEngine:
                 if capped is None:
                     continue
                 order.quantity = capped
+                # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
+                # 根因：14:30 后页面停止/再启动 = Core 重启 = 新 LiveEngine = 实例内存丢失，
+                # 1d/1w/1mon 会被重新驱动到同一 bar_time，且 order_id=live_order.id（自增 PK）
+                # 每次重启都新号，桥侧 _placed 幂等无效 → 重复下单。
+                # 按 (策略+股票+bar_time+方向) 去重：分钟策略不同 bar（10:00 vs 10:05）不被误杀、
+                # 同组合多策略同 bar 同股各自开仓不被误拦，仅「同策略重驱到同 bar 同方向」才拦。
+                # BUY/SELL 对称去重：重复 SELL 危害不亚于重复 BUY（已卖完再卖 → 超卖/桥拒单噪音）。
+                # 分钟策略不同 bar 的合法平仓不受影响（bar_time 不同即不拦）。
+                if order.bar_time is not None:
+                    op = "buy" if order.trade_type == TradeType.BUY else "sell"
+                    dup = db.query(LiveOrder).filter(
+                        LiveOrder.live_session_id == self.session_id,
+                        LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                        LiveOrder.strategy_id == order.strategy_id,
+                        LiveOrder.stock_code == order.stock_code,
+                        LiveOrder.bar_time == order.bar_time,
+                        LiveOrder.trade_type == op,
+                        LiveOrder.status.in_(["submitted", "partial", "filled"]),
+                    ).first()
+                    if dup is not None:
+                        logger.info(
+                            "skip dup %s %s %s bar=%s already placed (order %s)",
+                            op.upper(), order.stock_code, order.signal_name,
+                            order.bar_time, dup.id,
+                        )
+                        continue
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
                 self._pending_orders[live_order.id] = live_order

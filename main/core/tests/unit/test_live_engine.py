@@ -967,6 +967,269 @@ def test_handle_bar_tracks_pending_orders():
     db.close()
 
 
+# ---------------- 跨重启去重门（D6：BUY 同 bar_time 已有未完结单则跳过）----------------
+def _seed_buy_submitted(db, bar_time, status="submitted", portfolio_strategy_id=1, strategy_id=1, trade_type="buy"):
+    """预置一笔 LiveOrder（模拟重启前同一 bar 已下过的单）。trade_type 可 buy/sell。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=portfolio_strategy_id, strategy_id=strategy_id,
+        stock_code="600000.SH", trade_type=trade_type, order_type="limit",
+        price=Decimal("9.3"), quantity=600, filled_quantity=0,
+        filled_price=None, status=status, signal_name="open_sig",
+        signal_type="OPEN", bar_time=bar_time,
+    )
+    db.add(lo)
+    db.flush()
+    return lo
+
+
+def test_handle_bar_dup_buy_same_bar_time_skipped():
+    """D6：BUY 在同一 bar_time 已有 submitted LiveOrder → 重启后重驱到同一 bar 不重复下单。
+
+    根因：页面停止/再启动 = Core 重启 = 新 LiveEngine 实例内存丢失，1d/1w/1mon
+    被重新驱动到同一 daily_time，且 order_id=live_order.id（自增 PK）每次新号，
+    桥侧 _placed 幂等无效。按 (组合/股票/bar_time/buy) 去重 → 重启不重复。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：重启前该 bar 已下过 BUY（submitted）
+    db = factory()
+    _seed_buy_submitted(db, bar_time, status="submitted")
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    # 仍只有预置的那一笔，未新增
+    assert db.query(LiveOrder).count() == 1
+    # 桥未收到新的 /order 请求
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 0
+    db.close()
+
+
+def test_handle_bar_dup_buy_different_bar_time_allowed():
+    """D6 安全侧：BUY 在不同 bar_time 不被误杀——分钟策略日内多 bar 多次下单正常。
+
+    bar_time 是去重粒度：10:00 的单不拦 10:05 的单（不同 bar = 不同信号时点）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    bar_time_first = datetime(2026, 8, 5, 10, 0)
+    bar_time_next = datetime(2026, 8, 5, 10, 5)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：10:00 已下过 BUY
+    db = factory()
+    _seed_buy_submitted(db, bar_time_first, status="submitted")
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    # 10:05 的信号（不同 bar_time）
+    engine.signal_cache = {(1, stock, bar_time_next): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time_next)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    # 预置 1 笔 + 新增 1 笔 = 2 笔
+    assert db.query(LiveOrder).count() == 2
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 1  # 桥收到新单
+    db.close()
+
+
+def test_handle_bar_sell_not_blocked_by_existing_buy():
+    """D6 跨方向：SELL 不被同 bar 的 BUY 单拦截——方向是去重键的一部分。
+
+    同 bar 已有 BUY 单不影响同 bar 的 SELL（不同 trade_type 不匹配）。
+    平仓与开仓各自独立去重，互不干扰。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": -1},
+    ]
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    # 虚拟持仓 600（可卖）
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(600, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": 600, "volume": 600,
+                 "yesterday_volume": 600, "on_road_volume": 0},
+            ]})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：同 bar 已有一笔 BUY submitted（不该拦住 SELL——方向不同）
+    db = factory()
+    _seed_buy_submitted(db, bar_time, status="submitted")
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "close_sig", "value": -1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    # 预置 1 笔 BUY + 新增 1 笔 SELL
+    assert len(orders) == 2
+    sell_orders = [o for o in orders if o.trade_type == "sell"]
+    assert len(sell_orders) == 1
+    assert sell_orders[0].status == "submitted"
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 1  # SELL 单发到桥
+    db.close()
+
+
+def test_handle_bar_dup_sell_same_bar_time_skipped():
+    """D6 对称：SELL 在同一 bar_time 已有未完结单 → 重启后重驱到同一 bar 不重复卖。
+
+    重复 SELL 危害不亚于重复 BUY：已卖完再卖 → 桥超卖拒单噪音 / 持仓误判。
+    BUY/SELL 对称去重，按 (策略+股票+bar_time+方向) 拦同方向重驱。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": -1},
+    ]
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    # 虚拟持仓 600（可卖）
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(600, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": 600, "volume": 600,
+                 "yesterday_volume": 600, "on_road_volume": 0},
+            ]})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：重启前该 bar 已下过 SELL（submitted）
+    db = factory()
+    _seed_buy_submitted(db, bar_time, status="submitted", trade_type="sell")
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "close_sig", "value": -1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    # 仍只有预置的那一笔 SELL，未新增
+    assert db.query(LiveOrder).count() == 1
+    # 桥未收到新的 /order 请求
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 0
+    db.close()
+
+
+def test_handle_bar_dup_buy_different_strategy_same_bar_allowed():
+    """D6 安全侧：同组合/同股票/同 bar，不同策略各自下单不被误杀。
+
+    去重键含 strategy_id：主从策略 / 多周期策略可能同 bar 同股各自开仓，
+    仅 (组合+股票+bar) 去重会误拦第二个策略。必须加 strategy_id 才精确到
+    「同一策略重驱到同一 bar」这一真正的重复场景。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "1m"))  # 同组合两策略，均 1m
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：策略 1 该 bar 已下过 BUY
+    db = factory()
+    _seed_buy_submitted(db, bar_time, status="submitted", strategy_id=1)
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    # 两个策略同 bar 都触发信号
+    engine.signal_cache = {
+        (1, stock, bar_time): [{"name": "open_sig", "value": 1}],
+        (2, stock, bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    bar = _bar(stock, "9.3", bar_time)  # period=None → 两策略都处理
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    # 预置 1 笔（策略1）+ 新增 1 笔（策略2）；策略1 重复被跳过，策略2 放行
+    assert sorted(o.strategy_id for o in orders) == [1, 2]
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 1  # 仅策略2 发单
+    db.close()
+
+
 def test_poll_deals_syncs_pending_orders_from_db():
     """未成交的单：_poll_deals 后仍在 pending（计数 1），last_backfill_time 为空。"""
     factory, _ = _db_factory()
