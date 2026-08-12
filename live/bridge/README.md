@@ -22,7 +22,7 @@
 | `iquant_bridge.py` | 8790 | 仿真账号（虚拟资金） | `simulation` |
 | `iquant_bridge_live.py` | 8791 | 实盘账号（真实资金） | `live` |
 
-> **两文件是独立自包含拷贝**：iQuant 通过把文件内容粘进客户端策略编辑器加载（非文件路径 import），故两桥不能 import 共享模块——`DRY_RUN`/白名单/限额/HTTP 层逻辑在两份文件中各有一份，**逻辑改动须手动同步两处**。差异仅在顶部 config 区（`PORT` / `ACCOUNT_DEFAULT`）。
+> **两文件是独立自包含拷贝**：iQuant 通过把文件内容粘进客户端策略编辑器加载（非文件路径 import），故两桥不能 import 共享模块——`DRY_RUN`/白名单/限额/HTTP 层逻辑在两份文件中各有一份，**逻辑改动须手动同步两处**。差异仅在顶部 config 区（`PORT` / `ACCOUNT`）。
 
 ## ⚠️ 模拟/实盘由 iQuant 启动按钮控制（与桥无关）
 
@@ -50,18 +50,17 @@
 
 | 项 | 桥 | 说明 | 配置方式 |
 |---|---|---|---|
-| 账号 ID | 仿真桥 | `passorder`/查询用的仿真券商账号（虚拟资金） | 环境变量 `IQUANT_BRIDGE_ACCOUNT`，否则同目录 `.bridge_account` 文件（首行），否则回退 `ACCOUNT_DEFAULT` |
-| 账号 ID | 实盘桥 | `passorder`/查询用的真实券商账号（真实资金） | 同上（实盘桥文件内的 `ACCOUNT_DEFAULT` 应为真实账号） |
+| 账号 ID | 仿真桥 | `passorder`/查询用的仿真券商账号（虚拟资金） | 文件顶部 `ACCOUNT` 常量，换账号改这一行 |
+| 账号 ID | 实盘桥 | `passorder`/查询用的真实券商账号（真实资金） | 文件顶部 `ACCOUNT` 常量，换账号改这一行 |
 | 股票白名单 | 两桥 | `ALLOWED_STOCKS`（空 = 不限制） | 策略代码内配置（生产建议配齐） |
 | 试运行 | 两桥 | `DRY_RUN`（默认 False） | 策略代码内配置；True 只打印不发单（**开发开关，非模拟/实盘控制**） |
 | 端口 | 仿真桥 | `PORT = 8790` | 写死在文件顶部 config 区 |
 | 端口 | 实盘桥 | `PORT = 8791` | 写死在文件顶部 config 区 |
 
-`IQUANT_BRIDGE_ACCOUNT` 环境变量与 `.bridge_account` 文件均可覆盖文件内写死的 `ACCOUNT_DEFAULT`，
-便于换账号时不改代码。`.bridge_account` 文件放桥脚本同目录，部署时手动落盘（已被 `.gitignore` 忽略）。
-
-> 账号写死在桥文件是为双桥文件自包含、避免移植路径问题（iQuant 粘贴加载，无环境变量/路径机制）。
-> 仍保留 `load_account()` 覆盖能力，默认值仅为双桥各自自包含。
+> **账号为何写死在桥文件**：iQuant 客户端内运行无环境变量、无外部文件路径机制，且 `ContextInfo`
+> 只有 `set_account`（写入），没有读取当前登录账号的 API——`passorder`/`get_trade_detail_data`
+> 均需显式传账号。故账号只能作为常量写进桥文件。换账号时直接编辑 `ACCOUNT` 那一行即可，
+> 两桥各改一处。`GET /ping` 返回的 `account` 字段可用于部署后核对各自绑定的账号。
 
 > 鉴权：两桥均绑 `127.0.0.1` loopback，单用户本机部署，不设 token 鉴权（防御在机器边界：
 > 仅本机进程可达端口）。白名单、单笔限额、频率限制、审计日志仍强制执行。

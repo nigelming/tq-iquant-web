@@ -196,7 +196,7 @@
 
 | # | 细节 | 依赖 |
 |---|---|---|
-| ✅已改 | `ACCOUNT` 硬编码改配置 | ✅ 2026-08-10:env `IQUANT_BRIDGE_ACCOUNT` 优先,否则 `.bridge_account` 文件,回退 `ACCOUNT_DEFAULT`(同 `load_secret` 模式);纯 ASCII,`py_compile` 过 |
+| ✅已改 | `ACCOUNT` 硬编码常量 | ✅ 2026-08-12:iQuant 无读取登录账号 API(`ContextInfo` 仅 `set_account`),账号作常量写进桥文件顶部,换账号改这一行;双桥 `iquant_bridge.py`(仿真 8790)/`iquant_bridge_live.py`(实盘 8791)各自一处;纯 ASCII,`py_compile` 过 |
 | ✅已改 | `query_deals`/`query_orders`/`query_positions` 字段已补全(`m_strOrderRef`/`m_nCanUseVolume` 等,见 G4/D3/F5 行) | ✅ 2026-08-10 |
 | ✅已改 | `_do_place` 支持 `pr_type`(0 限价/14 对手价)——已恢复硬编码 14(对手价) | ✅ 2026-08-10 |
 | ✅已写 | **桥部署 README + 「实盘交易」模式要求**——`live/bridge/README.md` 部署/账号/TOKEN/白名单配置说明,注明必须以实盘交易模式运行(模拟模式 passorder 不发委托,真机验证) | ✅ 2026-08-10 |

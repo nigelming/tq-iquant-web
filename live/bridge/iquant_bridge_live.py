@@ -11,7 +11,7 @@
 # INDEPENDENT SELF-CONTAINED COPIES -- iQuant loads a strategy by pasting file
 # content into its editor (not by file-path import), so the two bridges CANNOT
 # share an imported module. ANY logic change MUST be applied to BOTH files by
-# hand. Only the config block below (PORT / ACCOUNT_DEFAULT) differs.
+# hand. Only the config block below (PORT / ACCOUNT) differs.
 #
 # Mode model (two independent dimensions):
 #   - simulation vs live (THIS dimension, by account/bridge): which account the
@@ -50,7 +50,6 @@
 # add auth then. Whitelist ALLOWED_STOCKS, per-order limit MAX_VOLUME, rate
 # limit RATE_LIMIT, audit log remain enforced.
 import json
-import os
 import socket
 import time
 from collections import OrderedDict
@@ -58,10 +57,11 @@ from collections import OrderedDict
 # ================= config =================
 HOST = "127.0.0.1"
 PORT = 8791
-# Real account (real funds). Override via env IQUANT_BRIDGE_ACCOUNT /
-# .bridge_account file if you switch accounts without editing code.
-ACCOUNT_DEFAULT = "110002348760"  # LIVE account; replace with the real funded account at deploy
-ACCOUNT = None                     # loaded by load_account() below
+# Real account (real funds). iQuant has no API to read the logged-in account
+# (ContextInfo only has set_account; passorder/get_trade_detail_data require an
+# account argument), so the account is a hardcoded constant here. To switch
+# accounts, edit this one line. This is the LIVE bridge.
+ACCOUNT = "110002348760"  # LIVE account; replace with the real funded account at deploy
 DRY_RUN = False                    # dev-only print switch (NOT the signal/real-order control -- that is the iQuant start button)
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
 MAX_VOLUME = 10000                # max shares per order
@@ -80,27 +80,6 @@ _placing = set()                  # in-flight order_ids
 _requests = []                    # rate-limit timestamps
 _quote_cache = {}                 # (code, period, count) -> (ts, bars)
 _downloaded = set()               # (code, period) already history-downloaded
-
-
-def load_account():
-    """Account ID: env IQUANT_BRIDGE_ACCOUNT first, else .bridge_account file.
-
-    The account is not hardcoded into the strategy (switch accounts via env var
-    or a local file; the file stays out of git and is written at deploy time).
-    Falls back to ACCOUNT_DEFAULT (real account placeholder).
-    """
-    acc = os.environ.get("IQUANT_BRIDGE_ACCOUNT", "")
-    if not acc:
-        try:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridge_account")
-            with open(p, "r") as f:
-                acc = f.read().strip()
-        except Exception:
-            pass
-    return acc or ACCOUNT_DEFAULT
-
-
-ACCOUNT = load_account()
 
 
 # ---------------- iQuant API access (isolated for test mocks) ----------------
@@ -362,22 +341,6 @@ def get_quote(params):
     return {"ok": True, "data": {code: bars}, "cached": False}
 
 
-def _refresh_quote_cache():
-    """Event-loop timer: keep default-count entries warm.
-
-    Only refreshes cache keys whose count == QUOTE_COUNT (the bar-completion
-    polling count). Non-default counts (e.g. large history pulls for formula
-    injection) are fetched on demand by get_quote and left to expire on their
-    own, so they are never silently replaced by a 10-bar refresh."""
-    for key in list(_quote_cache.keys()):
-        code, period, count = key
-        if count != QUOTE_COUNT:
-            continue
-        df = _fetch_quote(code, period, count)
-        if df is not None:
-            _quote_cache[key] = (time.time(), _df_to_bars(df))
-
-
 # ---------------- HTTP ----------------
 def _json(obj, status=200):
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -478,14 +441,13 @@ def init(ContextInfo):
         s.listen(32)
         s.setblocking(False)
         _listen_sock = s
-        print("[BRIDGE-LIVE] bridge listening on %s:%d  (dry_run=%s)"
-              % (HOST, PORT, DRY_RUN))
+        print("[BRIDGE-LIVE] bridge listening on %s:%d  account=%s  (dry_run=%s)"
+              % (HOST, PORT, ACCOUNT, DRY_RUN))
     except Exception as e:
         print("[BRIDGE-LIVE] socket bind/listen FAILED: %s" % e)
         return
 
     clients = {}
-    last_quote = 0
     while True:
         # 1. accept new connections (non-blocking)
         try:
@@ -524,11 +486,10 @@ def init(ContextInfo):
             except Exception:
                 pass
             clients.pop(conn, None)
-        # 3. periodic quote cache refresh
-        now = time.time()
-        if now - last_quote >= QUOTE_CACHE_TTL:
-            _refresh_quote_cache()
-            last_quote = now
+        # quote cache is on-demand only (get_quote fills + TTL expires); no
+        # background refresh -- the Core polls every ~30s, a 1s TTL means each
+        # poll re-fetches, which is far cheaper than refreshing all keys every
+        # second unconditionally (and avoids spinning after a session stops).
         time.sleep(0.01)
 
 
