@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 from decimal import Decimal
 
 from .position import Position
@@ -22,6 +22,7 @@ class StrategyContext:
         reduce_position_ratio: Decimal = Decimal("0.3"),
         role: str = "independent",
         master_strategy_id: Optional[int] = None,
+        stock_pool: Optional[Set[str]] = None,
     ):
         self.strategy_id = strategy_id
         self.period = period
@@ -36,6 +37,8 @@ class StrategyContext:
         # 主从角色（independent/master/slave）
         self.role = role
         self.master_strategy_id = master_strategy_id
+        # 本策略可交易股票池（组合的 stock_pool_id 对应成分；None=不限，回测单池/旧调用）
+        self.stock_pool: Optional[Set[str]] = stock_pool
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
         self.strategy_risk: Optional[StrategyRiskManager] = None
@@ -57,6 +60,10 @@ class StrategyContext:
         signal_cache = signal_cache if signal_cache is not None else {}
         signals: List[SignalEvent] = []
         for stock_code in bar.stocks:
+            # 股票池过滤：非池内股票不产生公式信号（实盘多组合共享行情 bar，杜绝跨池下单）。
+            # 风控信号不受限（_check_risks 走持仓，已有持仓必须可卖）。
+            if self.stock_pool is not None and stock_code not in self.stock_pool:
+                continue
             key = (self.strategy_id, stock_code, bar.bar_time)
             if key in signal_cache:
                 outputs = signal_cache[key]

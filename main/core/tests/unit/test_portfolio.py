@@ -72,6 +72,34 @@ def test_on_bar_open_signal_produces_buy_order():
     assert orders[0].stock_code == "000001.SZ"
 
 
+def test_on_bar_pool_filter_blocks_cross_pool_order():
+    """#3：股票池过滤——池外股票的 OPEN 信号不产生订单（组合2 不会买组合1 池的票）。
+
+    多组合共享行情 bar（bar.stocks 含全局股票）→ 每策略只应交易自己池内股票。
+    """
+    port, ctx = _portfolio_with_strategy(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    ctx.stock_pool = {"000001.SZ"}  # 本策略池内只有 000001.SZ
+    bar = BarEvent(
+        stocks={
+            "000001.SZ": {"open": Decimal("10"), "high": Decimal("11"), "low": Decimal("9"), "close": Decimal("10"), "volume": 100},
+            "600000.SH": {"open": Decimal("20"), "high": Decimal("21"), "low": Decimal("19"), "close": Decimal("20"), "volume": 200},
+        },
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    # 两只股票 cache 都有 OPEN 信号 → 只应产出池内的 000001.SZ 订单
+    cache = {
+        (1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}],
+        (1, "600000.SH", bar.bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    assert len(orders) == 1
+    assert orders[0].stock_code == "000001.SZ"
+
+
 def test_on_bar_zero_close_skips_order():
     """停牌/无数据 bar 收盘价=0（TQ NaN 规整而来）→ 不下单（避免 DivisionByZero）。
     真机 5m 场景：停牌 bar OHLC 为 NaN，转换层规整为 0，公式可能仍输出信号，

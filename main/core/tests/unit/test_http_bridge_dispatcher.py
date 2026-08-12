@@ -14,6 +14,7 @@ from core.engine.event import OrderEvent, TradeEvent
 from core.engine.execution_engine import OrderDispatcher
 from core.engine.http_bridge_dispatcher import (
     BridgeUnavailableError,
+    BridgeOrderRejected,
     HttpBridgeDispatcher,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -194,6 +195,35 @@ def test_idempotent_order_id_passthrough():
 
 
 # ---------------- #24：桥返回非 JSON 不静默吞 ----------------
+# ---------------- #4：桥业务拒单回显 ----------------
+def test_place_order_bridge_rejection_raises_with_error():
+    """#4：桥 {ok:false, error:...}（白名单/限额/重复）→ 抛 BridgeOrderRejected 回显原因。
+
+    原行为：返回 None 被上层当笼统拒单，真实原因（如 volume 超限）丢在桥里查不到。
+    """
+    def respond(request):
+        if request.url.path == "/order":
+            return httpx.Response(200, json={
+                "ok": False, "error": "volume 33900 exceeds max 100000",
+            })
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    with pytest.raises(BridgeOrderRejected, match="volume 33900 exceeds max 100000"):
+        disp.place_order(_make_order())
+
+
+def test_place_order_ok_false_no_error_returns_none():
+    """桥 {ok:false} 但无 error（异常路径）→ 维持返回 None（#24 非 JSON 语义，不当业务拒单）。"""
+    def respond(request):
+        if request.url.path == "/order":
+            return httpx.Response(200, json={"ok": False})
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    assert disp.place_order(_make_order()) is None
+
+
 def test_place_order_non_json_body_warns_and_returns_none(caplog):
     """#24：桥 /order 返回非 JSON（如 HTML 错误页/坏网关）→ 告警 + 返回 None。
 

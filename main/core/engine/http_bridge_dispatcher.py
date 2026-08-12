@@ -7,7 +7,9 @@
   - place_order 桥「受理成功」（passorder 返回 0）即构造 TradeEvent 返回。
     成交价格首期用请求价（order.price = bar.close 近似）；prType=14 对手价实际
     成交价是盘口一档价（≠ close），真实成交回报轮询在切片5 /deals 回填。
-  - 桥业务拒绝（白名单/限额/重复）→ 返回 None（不成交）。
+  - 桥业务拒绝（白名单/限额/重复）→ 抛 BridgeOrderRejected（带桥侧 error 文案），
+    上层标 rejected 并回显原因；桥返回 {ok:false} 但无 error（非 JSON 故障路径）
+    → 返回 None（#24 语义，不静默吞）。
   - 桥网络不可用（iQuant 客户端离线）→ 抛 BridgeUnavailableError，上层暂停交易。
 
 幂等：同一 OrderEvent 生成确定性 order_id（策略/组合/股票/方向/信号/时间 的 MD5），
@@ -30,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 class BridgeUnavailableError(RuntimeError):
     """桥不可用（iQuant 客户端离线 / 未启动 / 网络异常）。"""
+
+
+class BridgeOrderRejected(RuntimeError):
+    """桥业务拒绝下单（白名单/限额/重复），message 带桥侧真实原因。
+
+    与 BridgeUnavailableError 的区别：桥在线、正常受理请求，但业务上拒单
+    （如 volume 超限、股票不在白名单、重复单）。上层据此标 rejected 并回显原因，
+    而不是笼统的 "approval failed"。
+    """
 
 
 class HttpBridgeDispatcher(OrderDispatcher):
@@ -91,7 +102,11 @@ class HttpBridgeDispatcher(OrderDispatcher):
             )
             data = {}
         if not data.get("ok"):
-            # 桥业务拒绝（白名单/限额/重复）→ 不成交，不抛异常
+            # 桥业务拒绝（白名单/限额/重复）→ 抛 BridgeOrderRejected，上层回显真实原因。
+            # data={}（非 JSON 路径）无 error → 维持返回 None（#24 语义：桥故障非拒单）。
+            error = data.get("error")
+            if error:
+                raise BridgeOrderRejected(str(error))
             return None
 
         # 首期简化：桥受理成功即视为成交，成交价用请求价（真实回报轮询后续切片）

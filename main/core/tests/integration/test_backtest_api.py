@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from core.main import app
 from core.db import get_db
 from core.models import (
-    Base, StockPool, Formula, FormulaSignal,
+    Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, BacktestRecord,
     BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
 )
@@ -45,10 +45,15 @@ def client(tmp_path):
 
 
 def _seed(db):
-    """建最小依赖链：StockPool → Formula → FormulaSignal → PortfolioStrategy → Strategy。"""
+    """建最小依赖链：StockPool(+成分) → Formula → FormulaSignal → PortfolioStrategy → Strategy。
+
+    成分股必须落 stock_pool_stocks：assemble_portfolio 按池解析 stock_pool 过滤信号
+    （#3 跨池下单防护），回测 bar 只覆盖池内股票（_pool_stocks 决定 klines 范围）。
+    """
     pool = StockPool(code="TEST", name="test_pool")
     db.add(pool)
     db.flush()
+    db.add(StockPoolStock(pool_id=pool.id, stock_code="000001.SZ", stock_name="平安银行"))
     formula = Formula(name="open_formula", content="REF(CLOSE,1)")
     db.add(formula)
     db.flush()

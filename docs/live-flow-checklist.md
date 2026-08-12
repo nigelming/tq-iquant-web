@@ -215,3 +215,93 @@
 8. **✅ 已完成:D3 对账(仅告警不修正)**——recover 末尾按 code 聚合虚拟持仓 vs 桥 /positions,差异记 `_reconcile_mismatches`+告警日志,不自动改账;桥离线跳过不崩。
 9. **✅ 已完成:桥部署 README + A2 账号改配置** — `live/bridge/README.md` 部署/账号/TOKEN/白名单说明 + 实盘交易模式硬要求;`ACCOUNT` 改 env/文件配置(同 `load_secret` 模式)。
 10. **🧠 决策项** — 当前无待定决策(F6/G5/D3/A2 已定);随时可过。
+
+---
+
+## 真机日志核对(2026-08-12,sec 实例)
+
+> 实例 `sec`(LiveSession id=2,mode=simulation→8790 仿真桥)启动后桥日志核对。
+> 目的:验证预热缓存+增量拼接优化(commit 5704778)在真机按预期生效,并记录池配置对账方法。
+
+### 配置侧(sec 绑定)
+
+- 绑定 2 个组合:**组合1「测试」**(股票池 `etf` id=5,17 只 ETF)+ **组合2「第二」**(股票池 `第二股票` id=2,9 只 ETF)。
+- **两组合不同池**(`etf` 17 只 ⊃ `第二股票` 9 只),非共享池。组合2 的 9 只是组合1 的子集。
+- 公式统一 `MACROSSPRO`(formula_id=1,formula_count=30)。
+- 周期分布:组合1 = {1d, 5m, 1m};组合2 = {1d, 5m, 30m}。
+  - 1m 策略仅组合1 → 预热只覆盖 etf 池 17 只
+  - 5m 策略两组合都有 → 预热覆盖并集 17 只(9⊂17)
+  - 30m 策略仅组合2 → 预热只覆盖第二股票池 9 只
+  - 1d 在预热跳过名单(走日终 14:30 `_maybe_daily_bars`),不预热
+
+### 日志对账结论
+
+| 日志阶段(桥端 `xtdata ok ... count=N got=N`) | 对应引擎路径 | 是否符合预期 |
+|---|---|---|
+| 启动一次性 5m/1m/30m × count=30 拉取 | `_preheat()` 按 `_code_period_count` 只拉有策略的 (code,period) | ✅ count=30=formula_count(非兜底 200);只数=该周期有策略的股票数 |
+| 跳过 1d/1w/1mon 预热 | `_preheat` 内 `if period in ("1d","1w","1mon"): continue` | ✅ 日志无 1d 预热 |
+| 每 ~30s 一拨 1m count=10 × 全池 | `BarPoller.poll()` 完成检测(self._count=10,只用 stime 判完成) | ✅ 固定 count=10,不走预热 |
+| 每个分钟边界后多一拨 1m count=10 | `_on_bar→_fill_signal_cache→_get_bars_with_increment` **增量拉**(INCREMENT_COUNT=10) | ✅ 关键证据:count=10 而非 count=30,说明命中预热缓存走增量,未每分钟重拉 30 根 |
+| 5m 边界(14:05)一拨 5m count=10 | `_dispatch_period_bar("5m")` 走增量 | ✅ count=10 增量,非 count=30 全量 |
+
+### 优化效果量化
+
+对比优化前(每边界全量拉 count=30):
+- 1m 公式注入:18×30 → 18×10 根/分钟(**-67%**)
+- 5m 边界:18×30 → 18×10 根/5 分钟(**-67%**)
+- 30m 边界:9×30 → 9×10 根/30 分钟(**-67%**)
+- 请求数不变(仍一 code 一请求),**每请求传输 bar 数降到 1/3**,正是 commit 5704778「降桥 /quote 拉取量」目标。
+
+### 发现的配置侧问题(非引擎 bug,已闭环)
+
+1. **159058.SZ 全程 `xtdata empty`**:该券在两个池中桥端均无数据(疑似退市/本地从未下载)。引擎按启动时池快照拉取,因预热 `if not bars: continue` 未缓存,之后每周期走"缓存未命中→全量补"路径,持续空拉浪费。**用户已从池中删除该券**,下次启动不再拉取,自愈。
+2. **日志时间(14:00:24)早于 sec 当前 started_at(14:10:43)**:核对确认该日志是**删除 159058 之前**那次启动留下,引擎按当时池快照(含 159058)拉取,行为正确;当前 DB 池已不含 159058。
+
+### 核对方法(可复用)
+
+1. `LiveSession` 按 name 查 → 取 id/mode/started_at;`LiveSessionPortfolio` 取绑定 portfolio_strategy_id 列表。
+2. 每个 `PortfolioStrategy` 取 `stock_pool_id` → `StockPoolStock` 取成分股(注意:不同组合可能绑不同池,不能假设全共享)。
+3. `Strategy` 取 portfolio_id 下各策略 period + formula_id → `Formula` 取 formula_count。
+4. 据此推算 `_code_period_count` 的预期 key 数与 count,与桥日志的预热阶段(code×period×count)逐项对账。
+5. 日志 `count=N` 预热阶段应 = formula_count(或跨公式取 max);运行期增量阶段应 = INCREMENT_COUNT(10);全量补(缓存未命中,如 empty 券)会回到 count=全量。
+
+---
+
+## 真机日志核对 2(2026-08-12 14:18–14:35,sec 实例第二轮)
+
+> 第一轮(14:00–14:05)验证了预热优化。第二轮更长日志(14:18–14:35)跨过 **14:30 日终**,首次出现真实下单(4 笔,全被桥拒),挖出 3 个引擎问题 + 1 个桥配置问题。四个问题已全部修复(2026-08-12):① 15m 空拉、② 同根 bar 二次驱动、③ 组合2 跨池下单、④ MAX_VOLUME 拒单 + 错误回显,见下方各发现 ✅。
+
+### 14:30 日终时段完整拉取时序(桥日志逐行)
+
+```
+14:30:00-01  1m ×17 count=10     BarPoller.poll(30s 节拍)
+14:30:02-03  5m ×17 count=10     _on_bar 边界分发(14:30 是 5m 边界)
+14:30:05-06  15m ×17 count=200   _dispatch_period_bar("15m")  ← 实例无 15m 策略,白拉
+14:30:06-07  30m ×17(9 只 count=10 + 8 只 count=30)   _dispatch_period_bar("30m")
+14:30:08-09  1d ×17 count=30     _maybe_daily_bars(14:30 日终,只拉 1d/1w/1mon)
+14:30:09     4 × POST /order     两组合 1d 策略同根 1d bar 触发 OPEN
+14:30:40     1m ×17 count=10     下一轮 poll
+14:30:48-49  15m ×17 count=10    再次 _dispatch_period_bar("15m") ← 同根 bar 二次驱动
+```
+
+### 四个发现(按严重度)
+
+1. **实例无 15m 策略,14:30 却拉 15m**:`periods_on_boundary` 是纯算术(`minute%15==0`→15m),不查实例有无该周期策略。`_dispatch_period_bar` 对全 stock_codes 拉,15m 不在 `_code_period_count`/`_period_count` → 兜底 count=200,白拉 17 只后 period 过滤全跳过。
+   **✅ 已修复**:`live_engine.py` `_dispatch_period_bar` 入口加 `if period not in self._strategy_periods: return`;`__init__` 加 `_strategy_periods`(所有策略周期集合,含无公式策略,防误伤无公式策略的风控单)。15m 从此不拉。带回归测试 `test_dispatch_period_bar_skips_period_no_strategy_uses`。
+
+2. **同一根 14:30 的 1m bar 被两轮 poll 重复驱动**(14:30:05 与 14:30:48 都分发 15m/5m/30m):`BarPoller.poll` 完成检测按 **per-code** `last` 判"新完成"(`bar_poller.py:233` `new_times = [t for t in completed if t > last]`),快股票第一轮把 14:30 bar 标完成触发,慢股票第二轮才完成又触发同一 stime。**无跨 code 全局 stime 去重** → 5m/15m/30m 边界在该 bar 重复分发(全局重拉 + 周期策略二次求值)、`update_peak`/风控重复跑。订单靠 order_id 幂等 + cap_quantity 挡了重下,但重算是真浪费。
+   **✅ 已修复(2026-08-12)**:`live_engine.py` `_on_bar` 边界分发加 `_dispatched_boundaries` 集合——同 bar_time 只分发一次(分发成功后才记账,桥异常中断留口可重试)。**在 `_on_bar` 层而非 `BarPoller.poll` 层做去重**:后者会把慢股票的 1m 求值也吞掉(慢股票数据到位后永远不再触发);前者只挡"重复周期分发",1m 策略仍按当轮 `bar.stocks` 逐股求值(每轮 bar 只含当轮新完成股票,快股票只在第一轮、慢股票在其完成那轮各求值一次)。带回归测试 `test_on_bar_dispatches_boundary_once_for_same_bar_time`。
+   顺带:主循环拉 bar 节拍 30s→60s(`poll_interval` 默认值,降一半桥 /quote 拉取量)。14:30 边界分发由 14:30:00 那轮 poll 触发,60s 节拍不改变其时序;二次触发若发生,从 14:30:48 挪到下一轮 poll(~14:31),仍被 `_dispatched_boundaries` 挡住。
+
+3. **组合2 跨池下单**:order 3/4 是 strat=4(组合2,1d)在 `159066.SZ` 触发 OPEN,但 159066 **不在组合2 池**(`第二股票` 9 只=159048–159057),只在组合1 etf 池。根因:引擎层**无按组合 stock_pool_id 过滤**——`_build_engine` 把各组合池并成全局 `stock_codes`,`_fill_signal_cache`/`on_bar` 按 bar.stocks 全量注入/驱动,池成员资格只用来拼拉取范围、不约束"哪组合能交易哪只股"。
+   **✅ 已修复(2026-08-12)**:`StrategyContext` 加 `stock_pool`(组合池成分 set),`assemble_portfolio`(回测/实盘共用)从 `stock_pool_stocks` 按 `ps.stock_pool_id` 解析注入;`get_signal` 池外股票不产公式信号(风控信号不受限——持仓必须可卖),`_fill_signal_cache` 池外跳过不拉公式。回测 bar 本就只覆盖池内股票(`_pool_stocks` 定 klines 范围),过滤对其为 no-op,仅实盘多组合共享全局 bar 时才生效。带回归测试 `test_get_signal_pool_filter_excludes_out_of_pool`/`test_on_bar_pool_filter_blocks_cross_pool_order`。
+
+4. **4 笔下单全被桥拒,err 统一写成 `approval failed or bridge rejected`**:订单量 22600/21500/33900/32300 **全超桥 `MAX_VOLUME=10000`**(`iquant_bridge.py:67`),`check_whitelist`(`:97`) `volume > MAX_VOLUME` 返回 `ok:false`。dispatcher 见 ok=false 返 None,`_handle_bar` 落 rejected。**桥真实拒因(超量)被笼统文案吞了**——日志侧表现:`[AUDIT] POST /order` 有、`[BRIDGE] order` 无(超量拒单不进 `_do_place`)。
+   **✅ 已修复(2026-08-12)**:两桥 `MAX_VOLUME` 10000→**100000**(`iquant_bridge.py`/`iquant_bridge_live.py`,低价 ETF 单笔 ~3.4 万股,3x 余量);dispatcher 加 `BridgeOrderRejected`,`ok=false` 且有 `error` 时抛出回显桥侧真实原因(`ok=false` 无 error / 非 JSON 路径维持返回 None,#24 语义);`_handle_bar` 捕它标 rejected + `error_message=桥 error 文案`,`trade is None` 兜底文案收紧为 `approval failed`。带回归测试 `test_place_order_bridge_rejection_raises_with_error`/`test_handle_bar_bridge_business_reject_surfaces_error`。
+
+### 配置核对(与第一轮一致,无变化)
+
+- 组合1「测试」etf 17 只(159048–159067 去掉 159054、159058——159058 用户已删)→ {1d,5m,1m}
+- 组合2「第二」第二股票 9 只(159048–159057)→ {1d,5m,30m}
+- 公式全 MACROSSPRO formula_count=30
+- sec 启动 14:18:04 停止 14:35:40;跨过 14:30 → 1d 策略首次触发(第一轮 10:54–13:48 未到 14:30,零下单)

@@ -1565,6 +1565,91 @@ def test_dispatch_period_bar_uses_period_max_formula_count():
     assert "count=400" in str(quotes[0].url)  # 该周期公式最大 count=400
 
 
+def test_dispatch_period_bar_skips_period_no_strategy_uses():
+    """边界 guard：实例无 15m 策略时 _dispatch_period_bar('15m') 直接 return，不拉桥、不下单。
+
+    periods_on_boundary 是纯算术（minute%15==0 → '15m'），不查实例有无 15m 策略。
+    真机日志：实例只有 1m/5m/30m，14:30 却白拉 17 只 15m count=200（拉完 period 过滤全跳过）。
+    guard 按 _strategy_periods 过滤——实例无该周期策略 → 0 次 /quote、0 订单。
+    """
+    factory, _ = _db_factory()
+    # 实例周期 = 1m/5m/30m（对齐真机 sec 实例，无 15m）
+    port, _ = _portfolio_two(periods=("1m", "5m"))
+    # 再加一个 30m 策略 ctx，确保 _strategy_periods = {1m,5m,30m}，15m 仍不在内
+    pm = port.risk_manager
+    ctx30 = StrategyContext(
+        strategy_id=3, period="30m",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+        single_open_ratio=Decimal("0.1"),
+    )
+    ctx30.formula_signals = []
+    ctx30.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"),
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx30)
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 12, 14, 30)  # 14:30 → periods_on_boundary 含 15m
+    bars_15m = [
+        {"stime": "20260812140000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260812141500", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260812143000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, bars_15m))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS", 3: "MA_CROSS"})
+
+    engine._dispatch_period_bar("15m", boundary)
+
+    # guard 拦截：未拉任何 15m quote、未产生订单
+    assert _count_quote(rec) == []
+    db = factory()
+    assert db.query(LiveOrder).all() == []
+    db.close()
+
+
+def test_on_bar_dispatches_boundary_once_for_same_bar_time():
+    """边界去重：同根 1m bar（14:30）被两轮 poll 触发时，周期边界只分发一次。
+
+    BarPoller 按 code 独立判定完成——慢股票在下一轮 poll 才完成同一 stime
+    （真机日志：14:30 的 15m 白拉两次，第二次即此重复分发）。_dispatched_boundaries
+    挡掉第二次 _on_bar（同 bar_time）→ 不再拉周期 quote、不再重复求值周期策略。
+    1m 策略按当轮 bar.stocks 逐股求值，不受此 guard 影响（测试单股票简化，不断言 1m 路径）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("1m", "5m"))  # 14:30 边界 → 5m 分发（15m/30m 被周期 guard 挡）
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 12, 14, 30)
+    bars_5m = [
+        {"stime": "20260812142500", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260812143000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
+    engine._tq_formula.compute_injected = lambda **kw: {
+        "ErrorId": "0", stock: {"open_sig": [{"Date": "20260812", "Value": 1}]},
+    }
+
+    def _period_quotes(p):
+        return [r for r in rec.requests if r.url.path == "/quote" and "period=%s" % p in str(r.url)]
+
+    # bar.period="1m" → _fill_signal_cache 只注入 1m 策略，5m quote 全部来自边界分发
+    # （否则 period=None 放行所有策略，1m bar 也注入 5m 公式数据，污染计数）。
+    bar1 = _bar(stock, "9.3", boundary)
+    bar1.period = "1m"
+    engine._on_bar(bar1)  # 第一轮 poll：快股票完成 14:30 → 5m 边界分发一次
+    five_after_first = len(_period_quotes("5m"))
+    assert five_after_first == 1
+
+    # 第二轮 poll：慢股票再次完成 14:30（同 bar_time）→ 边界不再重复分发
+    bar2 = _bar(stock, "9.3", boundary)
+    bar2.period = "1m"
+    engine._on_bar(bar2)
+    assert len(_period_quotes("5m")) == five_after_first
+
+
 # ---------------- 预热 + 增量拼接（拉取优化）----------------
 def test_preheat_pulls_each_code_period_once_with_code_period_count():
     """预热：遍历 _code_period_count，每 (code,period) 拉一次 code_period_count 根，
@@ -2196,6 +2281,46 @@ def test_handle_bar_bridge_reject_emits_order_rejected():
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert events[2]["order_id"] == events[1]["order_id"]
     assert "error_message" in events[2]
+    assert q.empty()
+
+
+def test_handle_bar_bridge_business_reject_surfaces_error():
+    """#4：桥业务拒单（白名单/限额，{ok:false,error:...}）→ order(rejected) 回显桥侧真实原因。
+
+    此前 dispatcher 把桥 error 吞成 None → error_message 笼统 "approval failed or bridge rejected"，
+    真机查不了拒单原因。现抛 BridgeOrderRejected → 回显 volume 超限文案。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+
+    def respond(request):
+        if request.url.path == "/order":
+            return httpx.Response(200, json={
+                "ok": False, "error": "volume 33900 exceeds max 100000",
+            })
+        return httpx.Response(200, json={"ok": True})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    events = [q.get_nowait(), q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "signal"
+    assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
+    assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
+    assert events[2]["error_message"] == "volume 33900 exceeds max 100000"
     assert q.empty()
 
 

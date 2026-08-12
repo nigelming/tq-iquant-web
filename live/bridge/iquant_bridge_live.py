@@ -64,7 +64,7 @@ PORT = 8791
 ACCOUNT = "110002348760"  # LIVE account; replace with the real funded account at deploy
 DRY_RUN = False                    # dev-only print switch (NOT the signal/real-order control -- that is the iQuant start button)
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
-MAX_VOLUME = 10000                # max shares per order
+MAX_VOLUME = 100000               # max shares per order (100k: low-priced ETF orders can reach ~34k shares)
 RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW seconds
 RATE_WINDOW = 10                  # rate-limit window (seconds)
 QUOTE_CACHE_TTL = 1               # quote cache refresh interval (seconds)

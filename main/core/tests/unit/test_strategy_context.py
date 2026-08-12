@@ -106,3 +106,43 @@ def test_get_signal_multiple_stocks_multiple_signals():
     assert len(signals) == 2
     codes = {s.stock_code for s in signals}
     assert codes == {"000001.SZ", "600000.SH"}
+
+
+def test_get_signal_pool_filter_excludes_out_of_pool():
+    """#3：股票池过滤——bar 里池外股票不产生信号（多组合共享行情 bar 时杜绝跨池下单）。"""
+    ctx = _ctx([{"signal_name": "buy_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}])
+    ctx.stock_pool = {"000001.SZ"}  # 池内只有 000001.SZ
+    bar = BarEvent(
+        stocks={
+            "000001.SZ": {"open": Decimal("10"), "high": Decimal("11"), "low": Decimal("9"), "close": Decimal("10"), "volume": 100},
+            "600000.SH": {"open": Decimal("20"), "high": Decimal("21"), "low": Decimal("19"), "close": Decimal("20"), "volume": 200},
+        },
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    # 两只股票 cache 都有信号（模拟共享行情 bar）→ 池外的 600000.SH 必须被滤掉
+    cache = {
+        (1, "000001.SZ", bar.bar_time): [{"name": "buy_sig", "value": 1}],
+        (1, "600000.SH", bar.bar_time): [{"name": "buy_sig", "value": 1}],
+    }
+    signals = ctx.get_signal(bar, signal_cache=cache)
+    assert len(signals) == 1
+    assert signals[0].stock_code == "000001.SZ"
+
+
+def test_get_signal_pool_none_allows_all():
+    """stock_pool=None（旧调用/回测单池）→ 不设限，池过滤不生效。"""
+    ctx = _ctx([{"signal_name": "buy_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}])
+    assert ctx.stock_pool is None
+    bar = BarEvent(
+        stocks={
+            "000001.SZ": {"open": Decimal("10"), "high": Decimal("11"), "low": Decimal("9"), "close": Decimal("10"), "volume": 100},
+            "600000.SH": {"open": Decimal("20"), "high": Decimal("21"), "low": Decimal("19"), "close": Decimal("20"), "volume": 200},
+        },
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    cache = {
+        (1, "000001.SZ", bar.bar_time): [{"name": "buy_sig", "value": 1}],
+        (1, "600000.SH", bar.bar_time): [{"name": "buy_sig", "value": 1}],
+    }
+    signals = ctx.get_signal(bar, signal_cache=cache)
+    assert len(signals) == 2

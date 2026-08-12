@@ -24,7 +24,11 @@ from .portfolio import Portfolio
 from .position import Position
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
-from .http_bridge_dispatcher import HttpBridgeDispatcher, BridgeUnavailableError
+from .http_bridge_dispatcher import (
+    HttpBridgeDispatcher,
+    BridgeUnavailableError,
+    BridgeOrderRejected,
+)
 from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
 from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
 from core.tq.formula import TQFormula
@@ -104,7 +108,7 @@ class LiveEngine:
         dispatcher: HttpBridgeDispatcher,
         bar_poller: BarPoller,
         db_session_factory: Callable[[], Session],
-        poll_interval: float = 30.0,
+        poll_interval: float = 60.0,
         deals_poll_interval: float = 5.0,
         stream_ping_interval: float = 30.0,
         tq_formula: Optional[TQFormula] = None,
@@ -119,7 +123,7 @@ class LiveEngine:
         self._bar_poller = bar_poller
         self._db_session_factory = db_session_factory
         self._poll_interval = poll_interval
-        # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 30s 更短）——成交秒级回报，
+        # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
         # 实盘执行引擎：复用回测 ExecutionEngine，注入桥 dispatcher + 实盘 T+1 检查
@@ -139,14 +143,28 @@ class LiveEngine:
         # 每周期预拉最大 count：该周期策略所用公式的最大 formula_count——边界/日终分发
         # 预拉的 bars 够该周期最长公式（count 不够时注入会缺历史，信号 NaN 静默失效）。
         self._period_count: Dict[str, int] = {}
+        # 实例所有策略的周期集合（含无公式策略，含 1d/1w/1mon）——_dispatch_period_bar
+        # 边界分发 guard 用：只拉实例确有策略的周期，挡掉 periods_on_boundary 纯算术
+        # 带出但实例无人用的周期（如 14:30 的 15m——minute%15==0 触发，却无 15m 策略，
+        # 白拉 17 只 count=200 后 period 过滤全跳过）。比 _period_count 更宽：后者只收
+        # 有公式映射的策略周期，无公式的 30m 策略靠此集合保住风控单的边界驱动。
+        self._strategy_periods: set = set()
         for _p in portfolios:
             for _ctx in _p.strategies:
+                self._strategy_periods.add(_ctx.period)
                 _name = self._formula_by_strategy.get(_ctx.strategy_id)
                 if not _name:
                     continue
                 _cnt = self._formula_count_by_name.get(_name, self._formula_count)
                 if _cnt > self._period_count.get(_ctx.period, 0):
                     self._period_count[_ctx.period] = _cnt
+
+        # 已分发过周期边界的 1m stime 集合——同根 bar 二次触发时挡掉重复周期分发。
+        # BarPoller 按 code 独立判定完成：慢股票在下一轮 poll 才完成同一 stime
+        # （真机 14:30 被二次驱动，15m 二次白拉）。周期分发全局重拉全 stock_codes +
+        # 周期策略二次求值 = 白拉；1m 策略不受影响（每轮 bar.stocks 只含当轮新完成
+        # 股票，慢股票仍在其完成那轮被驱动求值）。stime 含日期，跨日无碰撞。
+        self._dispatched_boundaries: set = set()
 
         # 按 (code, period) 的预热/分发最大 count：该股票该周期所有公式 formula_count 最大值
         # （跨组合跨策略，由 _build_engine 算好传入）。比 _period_count（全局按周期）更细：
@@ -382,7 +400,7 @@ class LiveEngine:
         self._preheat()
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
-        # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 30s 拉 bar 一起）
+        # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 60s 拉 bar 一起）
         self._deals_task = asyncio.create_task(self._deals_loop())
 
     async def stop(self) -> None:
@@ -419,11 +437,11 @@ class LiveEngine:
         """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。
 
         /deals 成交回报回填不在本循环（G5）：独立 _deals_loop 5s 节拍处理，
-        免得成交秒级回报被 30s 拉 bar 节拍拖慢。
+        免得成交秒级回报被 60s 拉 bar 节拍拖慢。
 
         审计 #3：同步阻塞 I/O（heartbeat/poll/_maybe_daily_*，全用同步 httpx.Client）
         整轮丢到单 worker 线程池执行（_tick_main），事件循环只负责调度 + sleep——
-        不再被 30s 拉 bar / 桥超时阻塞，HTTP 请求与 SSE 流不再冻结。
+        不再被 60s 拉 bar / 桥超时阻塞，HTTP 请求与 SSE 流不再冻结。
         """
         while self._running:
             try:
@@ -477,7 +495,7 @@ class LiveEngine:
     async def _deals_loop(self) -> None:
         """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
 
-        成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 30s 拉 bar。
+        成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 60s 拉 bar。
         与主循环共用单 worker 线程池（审计 #3）：tick 串行，共享 _pending_orders /
         positions 无并发竞争（沿用原「同事件循环协作式」串行语义）。_poll_deals 内部
         已兜底桥离线/查失败。
@@ -638,18 +656,23 @@ class LiveEngine:
                     "handle_bar error (portfolio %s, bar %s)",
                     portfolio.portfolio_id, bar.bar_time,
                 )
-        # C6(A)：1m bar 边界 → 分发 5m/15m/30m/1h（可累积）
-        for period in periods_on_boundary(bar.bar_time):
-            try:
-                self._dispatch_period_bar(period, bar.bar_time)
-            except BridgeUnavailableError as e:
-                self._bridge_online = False
-                logger.warning(
-                    "bridge unavailable on %s boundary %s: %s", period, bar.bar_time, e
-                )
-                return
-            except Exception:  # noqa: BLE001
-                logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
+        # C6(A)：1m bar 边界 → 分发 5m/15m/30m/1h（可累积）。
+        # 同根 bar 只分发一次：慢股票下一轮 poll 才完成同一 stime（14:30 二次驱动），
+        # 重复分发 = 周期全局重拉全股票 + 周期策略二次求值白费。分发成功后才记账
+        # （桥异常中断时留口，慢股票再触发可重试）。
+        if bar.bar_time not in self._dispatched_boundaries:
+            for period in periods_on_boundary(bar.bar_time):
+                try:
+                    self._dispatch_period_bar(period, bar.bar_time)
+                except BridgeUnavailableError as e:
+                    self._bridge_online = False
+                    logger.warning(
+                        "bridge unavailable on %s boundary %s: %s", period, bar.bar_time, e
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
+            self._dispatched_boundaries.add(bar.bar_time)
 
     def _handle_bar(
         self,
@@ -745,10 +768,26 @@ class LiveEngine:
                     })
                     db.commit()
                     continue
-                if trade is None:
-                    # 审批不过 / 桥业务拒绝 → rejected（不成交，不 apply）
+                except BridgeOrderRejected as e:
+                    # 桥业务拒单（白名单/限额/重复）→ rejected，回显桥侧真实原因
+                    # （此前被吞成笼统 "approval failed"，真机查不了原因）。
                     live_order.status = "rejected"
-                    live_order.error_message = "approval failed or bridge rejected"
+                    live_order.error_message = str(e)
+                    self._pending_orders.pop(live_order.id, None)
+                    self._emit("order", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "order_id": live_order.id,
+                        "status": "rejected",
+                        "stock_code": live_order.stock_code,
+                        "error_message": live_order.error_message,
+                    })
+                    db.commit()
+                    continue
+                if trade is None:
+                    # 兜底：execute 内部审批不过（前置 cap 与 execute 间账户变化）
+                    # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
+                    live_order.status = "rejected"
+                    live_order.error_message = "approval failed"
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -824,7 +863,13 @@ class LiveEngine:
         取每 code「最新已完成 bar」（stime < 本批 latest）的 OHLCV 构造 BarEvent
         （bar_time=boundary_time，与 1m 节拍对齐）——不用 forming 最新一根（未来函数）。
         桥拉取抛 BridgeUnavailableError → 向上传播由 _on_bar 置离线。无完成 bar 的 code 跳过。
+
+        周期 guard：periods_on_boundary 是纯算术（minute%15==0 等），不查实例有无该周期策略，
+        会带出实例无人用的周期（如 14:30 的 15m）。此处按 _strategy_periods 过滤——实例无该
+        周期策略直接 return，避免白拉（拉完 period 过滤全跳过，不出单纯浪费）。
         """
+        if period not in self._strategy_periods:
+            return
         bars_by_code: Dict[str, list] = {}
         stocks: Dict[str, dict] = {}
         # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
@@ -921,6 +966,9 @@ class LiveEngine:
             # #27→#28：注入 count 来自 Formula.formula_count（公式级），非全局 200
             count = self._formula_count_by_name.get(formula_name, self._formula_count)
             for code in bar.stocks:
+                # 股票池过滤：池外股票不拉公式（多组合共享行情 bar，各策略只算自己池内）
+                if ctx.stock_pool is not None and code not in ctx.stock_pool:
+                    continue
                 try:
                     bars = self._fetch_cached_bars(
                         df_cache, bars_by_code, code, period, count

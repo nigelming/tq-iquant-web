@@ -8,7 +8,7 @@ from typing import List
 
 from sqlalchemy.orm import Session
 
-from core.models import PortfolioStrategy, Strategy, FormulaSignal
+from core.models import PortfolioStrategy, Strategy, FormulaSignal, StockPoolStock
 from core.engine.portfolio import Portfolio
 from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
@@ -46,6 +46,11 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             "slippage": Decimal(str(ps.slippage)),
         },
     )
+    # 股票池成分（组合级，各策略共享）：非池内股票不产生公式信号，杜绝跨池下单。
+    pool_codes = {
+        row.stock_code
+        for row in db.query(StockPoolStock).filter_by(pool_id=ps.stock_pool_id).all()
+    }
     for strat in strategies:
         ctx = StrategyContext(
             strategy_id=strat.id,
@@ -59,6 +64,7 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             reduce_position_ratio=Decimal(str(strat.reduce_position_ratio)),
             role=strat.role,
             master_strategy_id=strat.master_strategy_id,
+            stock_pool=pool_codes,
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()
