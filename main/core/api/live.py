@@ -157,6 +157,14 @@ def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> Liv
     stock_codes: set = set()
     formula_ids: set = set()
     strategy_formula: Dict[int, int] = {}  # strategy_id -> formula_id
+    # 预热/分发按 (code, period) 取该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
+    # 无公式兜底 DEFAULT_COUNT(200)。预热只拉实际有策略的 (code,period)，按需不浪费。
+    # 在此同一循环累加（已查 ps/strategies/股票池，不二次遍历）。
+    DEFAULT_COUNT = 200
+    code_period_count: Dict[tuple, int] = {}
+    # 注：formula_map 在循环后批量查，此处先记 strategy_id -> period，待 formula_map 就绪再算 max。
+    # 简化：先记 (code, period) -> [formula_id...]，formula_map 就绪后取 max(formula_count)。
+    code_period_formula_ids: Dict[tuple, set] = {}
     for link in links:
         ps = db.query(PortfolioStrategy).filter_by(id=link.portfolio_strategy_id).first()
         if ps is None:
@@ -164,16 +172,22 @@ def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> Liv
         strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).all()
         port = assemble_portfolio(ps, strategies, db)
         portfolios.append(port)
-        stock_codes.update(_resolve_stock_codes(db, ps.id))
+        pool_codes = _resolve_stock_codes(db, ps.id)
+        stock_codes.update(pool_codes)
         for strat in strategies:
             if strat.formula_id is not None:
                 formula_ids.add(strat.formula_id)
                 strategy_formula[strat.id] = strat.formula_id
+            # 累加 (code, period) -> formula_id（跨组合跨策略，同 key 收集所有公式）
+            for code in pool_codes:
+                code_period_formula_ids.setdefault((code, strat.period), set()).add(strat.formula_id)
 
     # 批量查 Formula，建 {strategy_id: formula_name} + {formula_name: formula_count}
     # formula_count（Q4 决策4）为公式级注入根数：实盘注入 count 来自该字段，非全局 200。
     formula_by_strategy: Dict[int, str] = {}
     formula_count_by_name: Dict[str, int] = {}
+    # formula_id -> formula_count（供 code_period_count 取 max）
+    formula_count_by_id: Dict[int, int] = {}
     if formula_ids:
         formula_map = {
             f.id: f
@@ -185,6 +199,14 @@ def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> Liv
                 formula_by_strategy[sid] = f.name
                 if f.formula_count:
                     formula_count_by_name[f.name] = f.formula_count
+                    formula_count_by_id[fid] = f.formula_count
+
+    # (code, period) -> 该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
+    # formula_id 为 None 的策略（无公式）兜底 DEFAULT_COUNT。预热/分发按此拉，按需不浪费。
+    for (code, period), fids in code_period_formula_ids.items():
+        counts = [formula_count_by_id.get(fid, DEFAULT_COUNT) for fid in fids if fid is not None]
+        # 无任何带公式的策略 → 兜底；有则取 max
+        code_period_count[(code, period)] = max(counts) if counts else DEFAULT_COUNT
 
     br = _bridge_config()
     # 按 session.mode 选桥：simulation→仿真桥(8790/虚拟资金)，live→实盘桥(8791/真实资金)。
@@ -206,6 +228,7 @@ def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> Liv
         formula_by_strategy=formula_by_strategy,
         formula_count=200,
         formula_count_by_name=formula_count_by_name,
+        code_period_count=code_period_count,
     )
 
 

@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.engine.account import Account
+from core.engine.bar_poller import parse_bar_time
 from core.engine.event import BarEvent, OrderEvent, TradeEvent
 from core.engine.execution_engine import LiveT1Checker
 from core.engine.http_bridge_dispatcher import (
@@ -1564,7 +1565,189 @@ def test_dispatch_period_bar_uses_period_max_formula_count():
     assert "count=400" in str(quotes[0].url)  # 该周期公式最大 count=400
 
 
-# ---------------- D4/H4 熔断计数持久化/读回 ----------------
+# ---------------- 预热 + 增量拼接（拉取优化）----------------
+def test_preheat_pulls_each_code_period_once_with_code_period_count():
+    """预热：遍历 _code_period_count，每 (code,period) 拉一次 code_period_count 根，
+    跳过 1d/1w/1mon。按需不浪费——只拉实际有策略的 (code,period)。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_two(periods=("5m", "5m"))  # 两 5m 策略
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A", 2: "FORM_B"}, formula_count=200,
+        formula_count_by_name={"FORM_A": 200, "FORM_B": 250},
+    )
+    # 模拟 _build_engine 算好的 (code,period)->max：600000.SH·5m = max(200,250)=250
+    engine._code_period_count = {("600000.SH", "5m"): 250}
+
+    engine._preheat()
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1                      # 该 (code,period) 只拉一次
+    assert "count=250" in str(quotes[0].url)     # 取两公式最大值 250
+    assert ("600000.SH", "5m") in engine._preheat_cache
+    entry = engine._preheat_cache[("600000.SH", "5m")]
+    assert entry["count"] == 250
+    assert entry["last_stime"] == datetime(2026, 8, 5, 10, 4)  # 最新 bar stime
+
+
+def test_preheat_skips_1d_1w_1mon():
+    """预热跳过 1d/1w/1mon（1d 走日终、1w/1mon 走通达信），不拉桥。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5) - timedelta(days=i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    engine._code_period_count = {("600000.SH", "1d"): 200, ("600000.SH", "1w"): 200}
+
+    engine._preheat()
+
+    assert len(_count_quote(rec)) == 0           # 1d/1w 都跳过，零拉取
+    assert engine._preheat_cache == {}
+
+
+def test_preheat_single_code_failure_does_not_block_others():
+    """预热单 (code,period) 失败不阻断——其余正常入缓存，失败 key 运行期自愈。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder(fail_paths={"/quote"})  # /quote 连接失败
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    engine._code_period_count = {("600000.SH", "5m"): 200}
+
+    engine._preheat()  # 不抛异常
+
+    assert engine._preheat_cache == {}           # 失败 → 未入缓存，运行期走全量补
+
+
+def test_get_bars_with_increment_miss_full_pull_and_backfill():
+    """缓存未命中：全量拉 count 根 + 回填缓存（异常/首次路径）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    assert engine._preheat_cache == {}           # 未预热
+
+    out = engine._get_bars_with_increment("600000.SH", "5m", 200)
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1
+    assert "count=200" in str(quotes[0].url)     # 全量拉 200
+    assert ("600000.SH", "5m") in engine._preheat_cache  # 回填
+    assert len(out) == 5
+
+
+def test_get_bars_with_increment_hit_no_new_bar_returns_cache():
+    """缓存命中 + 增量拉无新 bar：直接返缓存，不拼接（最省）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)  # 增量拉也返同样 5 根（无新 bar）
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    engine._preheat_cache[("600000.SH", "5m")] = engine._make_cache_entry(bars, 200)
+
+    out = engine._get_bars_with_increment("600000.SH", "5m", 200)
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1                      # 仅增量拉一次（count=10）
+    assert "count=10" in str(quotes[0].url)
+    assert len(out) == 5                         # 无新 bar，缓存原样返回
+
+
+def test_get_bars_with_increment_hit_new_bar_merge_and_cap():
+    """缓存命中 + 增量有新 bar：拼到末尾，截断保持 count 长。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    # 缓存已有 10:00~10:04，增量拉返回 10:03~10:06（含 10:05/10:06 两根新）
+    cached_bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    new_bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(3, 7)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", new_bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    engine._preheat_cache[("600000.SH", "5m")] = engine._make_cache_entry(cached_bars, 6)
+
+    out = engine._get_bars_with_increment("600000.SH", "5m", 6)
+
+    stimes = [parse_bar_time(b) for b in out]
+    assert stimes == sorted(stimes)              # 升序
+    assert len(out) == 6                         # 截断到 count=6
+    assert parse_bar_time(out[-1]) == datetime(2026, 8, 5, 10, 6)  # 末尾是最新 10:06
+    # 合并后 7 根（10:00~10:06），截断到 count=6 丢弃最旧的 10:00，保留 10:01~10:06
+    assert parse_bar_time(out[0]) == datetime(2026, 8, 5, 10, 1)
+    assert engine._preheat_cache[("600000.SH", "5m")]["last_stime"] == datetime(2026, 8, 5, 10, 6)
+
+
+def test_get_bars_with_increment_upgrade_when_count_exceeds_cache():
+    """缓存存在但请求 count > 缓存 count：升级全量拉（够长公式窗口，不增量）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    # 缓存只有 200 根，请求 500 → 升级全量拉 500
+    engine._preheat_cache[("600000.SH", "5m")] = engine._make_cache_entry(bars, 200)
+
+    engine._get_bars_with_increment("600000.SH", "5m", 500)
+
+    quotes = _count_quote(rec)
+    assert len(quotes) == 1
+    assert "count=500" in str(quotes[0].url)     # 升级全量 500，非增量 10
+    assert engine._preheat_cache[("600000.SH", "5m")]["count"] == 500  # 缓存升级
+
+
+def test_offline_recovery_clears_preheat_cache():
+    """E8 离线恢复：_tick_main 清预热缓存，下次走全量重建。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars("600000.SH", [datetime(2026, 8, 5, 10, i) for i in range(5)])
+    _mock_dispatcher_with_quote(rec, "600000.SH", bars)
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "FORM_A"}, formula_count=200,
+    )
+    engine._preheat_cache[("600000.SH", "5m")] = engine._make_cache_entry(bars, 200)
+    assert engine._preheat_cache != {}
+
+    # 模拟离线→在线转场：was_online=False + heartbeat 成功
+    engine._bridge_online = False
+    rec2 = _Recorder(respond=_respond_quote_bars("600000.SH", bars))
+    disp2, _ = _make_dispatcher(rec2)
+    engine._dispatcher = disp2  # 在线桥
+    engine._bar_poller._dispatcher = disp2
+
+    # _tick_main 需在 worker 线程跑（run_in_executor），这里直接调同步体
+    engine._tick_main()
+
+    # 离线恢复清了预热缓存
+    assert engine._preheat_cache == {}
+
+
+
 def _breaker_engine(factory):
     """带 LiveSessionPortfolio link 的引擎（session_id=1, portfolio_strategy_id=1）。"""
     port, _ = _portfolio_single()

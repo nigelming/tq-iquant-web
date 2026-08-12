@@ -111,6 +111,7 @@ class LiveEngine:
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
         formula_count_by_name: Optional[Dict[str, int]] = None,
+        code_period_count: Optional[Dict[tuple, int]] = None,
     ):
         self.session_id = session_id
         self.portfolios = portfolios
@@ -146,6 +147,18 @@ class LiveEngine:
                 _cnt = self._formula_count_by_name.get(_name, self._formula_count)
                 if _cnt > self._period_count.get(_ctx.period, 0):
                     self._period_count[_ctx.period] = _cnt
+
+        # 按 (code, period) 的预热/分发最大 count：该股票该周期所有公式 formula_count 最大值
+        # （跨组合跨策略，由 _build_engine 算好传入）。比 _period_count（全局按周期）更细：
+        # 不同股票该周期所需根数可能不同（如 C 只需 100、A 需 200），按需拉不浪费。
+        # _period_count 保留作"只知 period 不知 code"的兜底。无公式兜底 formula_count(200)。
+        self._code_period_count: Dict[tuple, int] = code_period_count or {}
+
+        # 预热缓存：(code, period) -> {"bars": [...], "last_stime": datetime, "count": int}
+        # 启动 _preheat() 填充（拉 code_period_count[(code,period)] 根历史）；
+        # 运行期 _get_bars_with_increment 读它 + 增量拉新 bar 拼接（省去每 bar 全量重拉）；
+        # 离线恢复 _tick_main 清空 → 下次走全量重建。跨 bar 生命周期（不像 df_cache 每 bar 重建）。
+        self._preheat_cache: Dict[tuple, dict] = {}
 
         # 信号缓存：(strategy_id, stock_code, bar_time) -> [{"name": str, "value": int}]
         # 风控信号（止损/止盈/移动止损）由 Portfolio._check_risks 直接生成，无需缓存；
@@ -254,6 +267,92 @@ class LiveEngine:
             if q in self._stream_subscribers:
                 self._stream_subscribers.remove(q)
 
+    # ---------------- 预热 + 增量拼接（拉取优化）----------------
+    def _preheat(self) -> None:
+        """启动预热：对每个 (code, period) 拉 code_period_count 根历史存 _preheat_cache。
+
+        只预热 _code_period_count 里的 (code,period)（实例真实有策略的，按需不浪费），
+        跳过 1d/1w/1mon（1d 不预热走日终 _maybe_daily_bars；1w/1mon 走通达信 _inject_startup_periods）。
+        单 (code,period) 拉取失败不阻断启动（log warn，运行期该 key 走 _get_bars_with_increment
+        的"缓存未命中全量补"自愈）。启动一次性同步调用，在 start() 里 _inject_startup_periods 之后。
+        """
+        for (code, period), count in self._code_period_count.items():
+            if period in ("1d", "1w", "1mon"):
+                continue
+            try:
+                bars = self._dispatcher.query_quote(code, period=period, count=count)
+            except BridgeUnavailableError:
+                logger.warning("preheat failed (bridge unavailable) %s %s", code, period)
+                continue
+            except Exception:  # noqa: BLE001
+                logger.exception("preheat failed %s %s", code, period)
+                continue
+            if not bars:
+                continue
+            self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
+
+    def _make_cache_entry(self, bars: list, count: int) -> dict:
+        """bars → 排序截断到 count 根 + 算 last_stime，构造 _preheat_cache 条目。"""
+        bars = self._sort_and_cap(bars, count)
+        return {"bars": bars, "last_stime": self._max_stime(bars), "count": count}
+
+    def _get_bars_with_increment(self, code: str, period: str, count: int) -> list:
+        """读预热缓存历史 + 增量拉新 bar 拼接，返回 count 根窗口（拉取优化核心）。
+
+        1) 缓存命中：增量拉 query_quote(count=INCREMENT_COUNT) 筛 stime > cache.last_stime
+           的新 bar，拼到 cache.bars 末尾，排序截断保持 count 长；无新 bar 直接返缓存（最省）。
+        2) 缓存未命中（预热失败/离线清缓存后）：全量拉 count 根回填缓存（异常/首次路径，
+           不背正常增量的负担）。
+        桥拉取抛 BridgeUnavailableError 向上传播（交 _on_bar/_dispatch_period_bar 置离线）。
+        """
+        INCREMENT_COUNT = 10  # 增量拉取根数，够覆盖正常单边界增量（1-2 根）；离线恢复走清缓存全量重建
+        cache = self._preheat_cache.get((code, period))
+        if cache is None:
+            bars = self._dispatcher.query_quote(code, period=period, count=count)
+            if bars:
+                self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
+            return bars
+        # 缓存存在但请求 count > 缓存 count：缓存历史不够长公式的窗口 → 升级全量拉 count 根
+        # （同 _fetch_cached_bars 升级语义：count 不够会缺历史，长均线 NaN 静默失效）。
+        if count > cache["count"]:
+            bars = self._dispatcher.query_quote(code, period=period, count=count)
+            if bars:
+                self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
+            return bars
+        new_bars = self._dispatcher.query_quote(code, period=period, count=INCREMENT_COUNT)
+        last = cache["last_stime"]
+        fresh = [b for b in new_bars if self._bar_stime(b) is not None
+                 and (last is None or self._bar_stime(b) > last)]
+        if not fresh:
+            return cache["bars"]
+        merged = self._sort_and_cap(cache["bars"] + fresh, count)
+        cache["bars"] = merged
+        cache["last_stime"] = self._max_stime(merged)
+        return merged
+
+    @staticmethod
+    def _bar_stime(bar: dict) -> Optional[datetime]:
+        """bar → 结束时间 datetime（复用 parse_bar_time，兼容 stime/time/index）。"""
+        return parse_bar_time(bar)
+
+    @staticmethod
+    def _sort_and_cap(bars: list, count: int) -> list:
+        """按 bar stime 升序排序，截断保留最新 count 根（去重同 stime）。"""
+        timed = [(parse_bar_time(b), b) for b in bars]
+        seen: Dict[datetime, dict] = {}
+        for bt, b in timed:
+            if bt is not None and bt not in seen:
+                seen[bt] = b
+        ordered = [b for _, b in sorted(seen.items())]
+        return ordered[-count:] if count > 0 else ordered
+
+    @staticmethod
+    def _max_stime(bars: list) -> Optional[datetime]:
+        """bars 中最新 bar 的 stime（空 → None）。"""
+        stimes = [parse_bar_time(b) for b in bars]
+        stimes = [t for t in stimes if t is not None]
+        return max(stimes) if stimes else None
+
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
         """起 asyncio 循环任务，绑定 BarPoller.on_bar 回调。"""
@@ -276,6 +375,11 @@ class LiveEngine:
         self._inject_startup_periods(
             datetime.combine(now_shanghai().date(), datetime.min.time())
         )
+        # 预热 1m/5m/15m/30m/1h 历史 bar 到 _preheat_cache（启动一次性同步拉取）。
+        # 运行期 _get_bars_with_increment 读缓存 + 增量拼接，省去每 bar/每边界全量重拉。
+        # 必须在 _loop 起来前完成（否则首个 bar 触发时缓存未就绪）；与 _inject_startup_periods
+        # 同为启动一次性，并列。单 (code,period) 失败不阻断，运行期自愈。
+        self._preheat()
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
         # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 30s 拉 bar 一起）
@@ -350,8 +454,12 @@ class LiveEngine:
             if not was_online:
                 # E8：离线恢复 → 重建基线，跳过离线期间错过的 bar（不补触发）
                 self._bar_poller.reset_baseline()
+                # 清预热缓存：离线期间缓存 last_stime 已过期，增量拉 10 根可能接不上
+                # （断档超 10 根）。清空后下次 _get_bars_with_increment 走"缓存未命中"
+                # 全量拉 code_period_count 根重建——异常路径自愈，不污染正常增量路径。
+                self._preheat_cache.clear()
                 logger.info(
-                    "bridge back online, reset poller baseline (session %s)",
+                    "bridge back online, reset poller baseline + preheat cache (session %s)",
                     self.session_id,
                 )
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
@@ -722,9 +830,10 @@ class LiveEngine:
         # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
         count = self._period_count.get(period, self._formula_count)
         for code in self._bar_poller.stock_codes:
-            bars = self._dispatcher.query_quote(
-                code, period=period, count=count
-            )
+            # 按 (code, period) 取该股票该周期所需根数（比全局 _period_count 更细，按需）。
+            # 走预热缓存 + 增量拼接（省去每边界全量重拉 count 根）。
+            cp_count = self._code_period_count.get((code, period), count)
+            bars = self._get_bars_with_increment(code, period, cp_count)
             if not bars:
                 continue
             bars_by_code[code] = bars
@@ -842,11 +951,13 @@ class LiveEngine:
         period: str,
         count: int,
     ) -> list:
-        """拉取去重：df_cache[(code, period)] 同 key 只 query_quote 一次。
+        """拉取去重：df_cache[(code, period)] 同 key 只实际拉取一次（单 bar 生命周期）。
 
         缓存值 (bars, used_count)。同 code+period 的公式 count 更大 → 升级重拉（过小会缺
         历史，公式长均线 NaN 静默失效）；bars_by_code 已按该周期最大 count 预拉 → 直接复用，
-        记 used=period 最大 count，避免无谓升级重拉。
+        记 used=(code,period) 最大 count，避免无谓升级重拉。
+        底层实际拉取走 _get_bars_with_increment（预热缓存 + 增量拼接），不再直接 query_quote
+        全量——1m 算公式（bars_by_code=None）与升级重拉都受益。
         """
         key = (code, period)
         cached = df_cache.get(key)
@@ -854,14 +965,15 @@ class LiveEngine:
             bars, used = cached
             if count <= used:
                 return bars
-            bars = self._dispatcher.query_quote(code, period=period, count=count)
+            bars = self._get_bars_with_increment(code, period, count)
             df_cache[key] = (bars, count)
             return bars
         if bars_by_code is not None and code in bars_by_code:
             bars = bars_by_code[code]
-            df_cache[key] = (bars, max(count, self._period_count.get(period, 0)))
+            df_cache[key] = (bars, max(count, self._code_period_count.get((code, period),
+                                                                          self._formula_count)))
             return bars
-        bars = self._dispatcher.query_quote(code, period=period, count=count)
+        bars = self._get_bars_with_increment(code, period, count)
         df_cache[key] = (bars, count)
         return bars
 
