@@ -118,8 +118,8 @@ def mock_bridge(monkeypatch):
     return rec
 
 
-def _create_session(c, name="live-test", portfolio_ids=(1,)):
-    resp = c.post("/api/live/sessions", json={"name": name, "portfolio_ids": list(portfolio_ids)})
+def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation"):
+    resp = c.post("/api/live/sessions", json={"name": name, "portfolio_ids": list(portfolio_ids), "mode": mode})
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
@@ -546,4 +546,94 @@ def test_query_positions_uses_engine_when_running(client, mock_bridge):
         assert row["avg_cost"] == 10.5
     finally:
         c.post("/api/live/sessions/%d/stop" % sid)
+
+
+# ---- 双桥：_bridge_config 返回双址；_build_engine 按 session.mode 选桥 ----
+
+def test_bridge_config_returns_dual_urls():
+    """_bridge_config() 返回 simulation/live 两个 base_url（对齐 config.yaml 双桥结构）。"""
+    br = live_api._bridge_config()
+    assert br["simulation"] == "http://127.0.0.1:8790"
+    assert br["live"] == "http://127.0.0.1:8791"
+
+
+def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
+    """_build_engine(mode) 按 mode 选桥址：simulation→8790，live→8791，
+    未知 mode 兜底仿真桥(8790，防误传走到真实资金桥)。
+
+    simulation/live 用真实创建对应 mode 的 session；unknown mode 不会被
+    create_session 接受（白名单），故用 simulation session 直接调 _build_engine
+    传 unknown，验证兜底分支。
+    """
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    captured = {}
+
+    real_cls = live_api.HttpBridgeDispatcher
+
+    def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
+        captured["base_url"] = base_url
+        # 复用 mock_bridge 的 MockTransport 思路，给一个能 /ping 的 client
+        client_ = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"ok": True})))
+        return real_cls(base_url=base_url, client=client_)
+
+    monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+
+    # simulation / live：创建对应 mode 的 session 后直接调 _build_engine
+    for mode, expected in [("simulation", "http://127.0.0.1:8790"),
+                           ("live", "http://127.0.0.1:8791")]:
+        sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode)
+        db2 = Session()
+        try:
+            live_api._build_engine(sid, db2, mode)
+        finally:
+            db2.close()
+        assert captured["base_url"] == expected, "mode=%s 应选 %s，实际 %s" % (mode, expected, captured["base_url"])
+
+    # unknown：create_session 白名单会拒，用已存在的 simulation session 直接调 _build_engine
+    # 传 unknown mode，验证兜底走仿真桥（防误传走到真实资金桥）。
+    sim_sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation")
+    db3 = Session()
+    try:
+        live_api._build_engine(sim_sid, db3, "unknown")
+    finally:
+        db3.close()
+    assert captured["base_url"] == "http://127.0.0.1:8790", "unknown mode 应兜底仿真桥，实际 %s" % captured["base_url"]
+
+
+def test_start_session_routes_engine_to_live_bridge(client, monkeypatch):
+    """start_session 传 session.mode 给 _build_engine → 实盘 session 走 8791 桥。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    captured = {}
+    real_cls = live_api.HttpBridgeDispatcher
+
+    def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
+        captured["base_url"] = base_url
+        client_ = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"ok": True})))
+        return real_cls(base_url=base_url, client=client_)
+
+    monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="live")
+    resp = c.post("/api/live/sessions/%d/start" % sid)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert captured["base_url"] == "http://127.0.0.1:8791"
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+
+def test_create_session_rejects_invalid_mode(client, mock_bridge):
+    """create_session 对非法 mode 返回业务错误（白名单 simulation|live）。"""
+    c, _ = client
+    resp = c.post("/api/live/sessions", json={"name": "bad", "portfolio_ids": [], "mode": "real"})
+    body = resp.json()
+    assert body["code"] != 0
+    assert "mode" in body["message"]
 

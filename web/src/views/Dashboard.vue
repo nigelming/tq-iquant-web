@@ -123,7 +123,8 @@ onMounted(load)
       <p v-if="cfg" style="margin:0;color:var(--text-secondary)">
         通达信路径：{{ cfg.tdx_path }}<br>
         iQuant 路径：{{ cfg.iquant_path }}<br>
-        桥地址：{{ cfg.iquant_bridge.base_url }}
+        仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>
+        实盘桥：{{ cfg.iquant_bridge.live.base_url }}
       </p>
       <p v-else style="margin:0;color:var(--text-secondary)">配置加载失败</p>
     </div>

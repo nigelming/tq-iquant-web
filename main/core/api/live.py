@@ -33,12 +33,19 @@ _ENGINES: Dict[int, LiveEngine] = {}
 
 
 def _bridge_config() -> dict:
-    """读桥地址：config.iquant_bridge 段，缺省 127.0.0.1:8790。桥绑 loopback，
-    单用户本机部署，不鉴权（token 已移除）。"""
+    """读双桥地址：config.iquant_bridge 段，simulation(仿真/虚拟资金)/live(实盘/真实资金)
+    各一个 base_url。桥绑 loopback，单用户本机部署，不鉴权（token 已移除）。
+
+    session.mode = simulation|live 决定走哪个桥（账号差异，见 live/bridge/README.md）。
+    模拟/实盘（信号 vs 真实下单）不由 Core 控制，由 iQuant 客户端启动按钮决定。
+    """
     cfg = load_config()
     br = cfg.get("iquant_bridge", {}) if isinstance(cfg, dict) else {}
+    sim = br.get("simulation", {}) if isinstance(br, dict) else {}
+    liv = br.get("live", {}) if isinstance(br, dict) else {}
     return {
-        "base_url": br.get("base_url", "http://127.0.0.1:8790"),
+        "simulation": sim.get("base_url", "http://127.0.0.1:8790"),
+        "live": liv.get("base_url", "http://127.0.0.1:8791"),
     }
 
 
@@ -79,9 +86,12 @@ def list_sessions(db: Session = Depends(get_db)):
 
 @router.post("/sessions")
 def create_session(data: dict, db: Session = Depends(get_db)):
+    mode = data.get("mode", "simulation")
+    if mode not in ("simulation", "live"):
+        return err(400, "mode 非法，仅支持 simulation(仿真) / live(实盘)")
     session = LiveSession(
         name=data["name"],
-        mode=data.get("mode", "simulation"),
+        mode=mode,
         status="stopped",
     )
     db.add(session)
@@ -131,7 +141,7 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
-def _build_engine(session_id: int, db: Session) -> LiveEngine:
+def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> LiveEngine:
     """组装一个 session 的 LiveEngine：各组合 Portfolio + 桥 dispatcher + BarPoller。
 
     公式注入（0010）：遍历各组合策略，按 Strategy.formula_id → Formula.name 预加载
@@ -177,7 +187,10 @@ def _build_engine(session_id: int, db: Session) -> LiveEngine:
                     formula_count_by_name[f.name] = f.formula_count
 
     br = _bridge_config()
-    dispatcher = HttpBridgeDispatcher(base_url=br["base_url"])
+    # 按 session.mode 选桥：simulation→仿真桥(8790/虚拟资金)，live→实盘桥(8791/真实资金)。
+    # 未知 mode 兜底仿真桥（防误传走到真实资金桥）。
+    base_url = br.get(mode, br["simulation"])
+    dispatcher = HttpBridgeDispatcher(base_url=base_url)
     # 股票池为空时给一个占位，避免空列表；首期实盘一般有成分股
     poller = BarPoller(
         dispatcher, sorted(stock_codes) or ["000001.SZ"],
@@ -209,7 +222,7 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         running_id = next(iter(_ENGINES))
         return err(409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
 
-    engine = _build_engine(session_id, db)
+    engine = _build_engine(session_id, db, session.mode)
     # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金
     engine.recover(db)
     # 起 asyncio 循环任务（async 端点内直接在 FastAPI 事件循环建任务）

@@ -155,7 +155,7 @@ onUnmounted(closeEventStream)
           <td style="color:#888">#{{ s.id }}</td>
           <td>{{ s.name }}</td>
           <td style="color:#666">{{ portfolioNames(s.portfolio_ids) }}</td>
-          <td>{{ s.mode === 'simulation' ? '模拟' : '实盘' }}</td>
+          <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
             <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
@@ -249,7 +249,8 @@ onUnmounted(closeEventStream)
     <div class="modal-content">
       <h3>新建实盘</h3>
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
-      <label>模式</label><select v-model="form.mode"><option value="simulation">模拟</option><option value="live">实盘</option></select>
+      <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
+      <p style="font-size:12px;color:#999;margin:2px 0 12px">仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。模拟/实盘下单由 iQuant 客户端启动按钮控制，此处仅选账号环境。</p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">

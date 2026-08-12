@@ -4,14 +4,17 @@ import { getSystemConfigs, updateSystemConfigs, type SystemConfig } from '../api
 
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
-// iquant_bridge.base_url(实盘桥地址，绑 loopback 单用户，无 token)
+// iquant_bridge.simulation/live.base_url(双桥地址：仿真8790/实盘8791，按 session 模式选桥)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
   tdx_path: '',
   iquant_path: '',
   max_concurrent_backtest: 1,
   database: { sqlite_path: '' },
-  iquant_bridge: { base_url: '' },
+  iquant_bridge: {
+    simulation: { base_url: '' },
+    live: { base_url: '' },
+  },
 }
 
 const config = ref<SystemConfig>(JSON.parse(JSON.stringify(DEFAULTS)))
@@ -27,7 +30,10 @@ onMounted(async () => {
       iquant_path: data.iquant_path ?? DEFAULTS.iquant_path,
       max_concurrent_backtest: data.max_concurrent_backtest ?? DEFAULTS.max_concurrent_backtest,
       database: { sqlite_path: data.database?.sqlite_path ?? DEFAULTS.database.sqlite_path },
-      iquant_bridge: { base_url: data.iquant_bridge?.base_url ?? DEFAULTS.iquant_bridge.base_url },
+      iquant_bridge: {
+        simulation: { base_url: data.iquant_bridge?.simulation?.base_url ?? DEFAULTS.iquant_bridge.simulation.base_url },
+        live: { base_url: data.iquant_bridge?.live?.base_url ?? DEFAULTS.iquant_bridge.live.base_url },
+      },
     }
   } catch (e) {
     errorMsg.value = '加载配置失败: ' + (e instanceof Error ? e.message : String(e))
@@ -69,7 +75,7 @@ async function save() {
 
       <h3 style="margin:20px 0 4px">iQuant</h3>
       <p style="margin:0 0 12px;font-size:12px;color:#888">
-        iQuant 客户端安装目录，实盘桥策略所在（HTTP 桥 127.0.0.1:8790）
+        iQuant 客户端安装目录，实盘桥策略所在（HTTP 桥 8790 仿真 / 8791 实盘）
       </p>
       <div class="field">
         <label>iQuant 目录</label>
@@ -78,11 +84,15 @@ async function save() {
 
       <h3 style="margin:20px 0 4px">实盘桥</h3>
       <p style="margin:0 0 12px;font-size:12px;color:#888">
-        iQuant 客户端内桥策略的 HTTP 地址，绑 loopback 单用户，无鉴权（token 已移除）
+        iQuant 客户端内两个桥策略的 HTTP 地址，按 session 模式选桥（仿真→仿真桥，实盘→实盘桥），绑 loopback 单用户，无鉴权
       </p>
       <div class="field">
-        <label>桥地址</label>
-        <input v-model="config.iquant_bridge.base_url" placeholder="http://127.0.0.1:8790" />
+        <label>仿真桥地址（虚拟资金）</label>
+        <input v-model="config.iquant_bridge.simulation.base_url" placeholder="http://127.0.0.1:8790" />
+      </div>
+      <div class="field">
+        <label>实盘桥地址（真实资金）</label>
+        <input v-model="config.iquant_bridge.live.base_url" placeholder="http://127.0.0.1:8791" />
       </div>
 
       <h3 style="margin:20px 0 4px">回测</h3>

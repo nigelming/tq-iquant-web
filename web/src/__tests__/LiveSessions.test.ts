@@ -252,6 +252,28 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     w.unmount()
   })
 
+  it('选实盘模式提交 → 带 mode: live', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    // 切到实盘 option
+    const modeSelect = w.find('select')
+    await modeSelect.setValue('live')
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'live', portfolio_ids: [1],
+    }))
+    w.unmount()
+  })
+
   it('未选组合直接提交 → 提示且不发请求', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)

@@ -498,7 +498,10 @@ export interface SystemConfig {
   iquant_path: string
   max_concurrent_backtest: number
   database: { sqlite_path: string }
-  iquant_bridge: { base_url: string }
+  iquant_bridge: {
+    simulation: { base_url: string }
+    live: { base_url: string }
+  }
 }
 
 export interface SystemStatus {

@@ -32,7 +32,10 @@ const mockCfg = {
   iquant_path: 'D:\\iquant',
   max_concurrent_backtest: 1,
   database: { sqlite_path: 'data/dev.db' },
-  iquant_bridge: { base_url: 'http://127.0.0.1:8790' },
+  iquant_bridge: {
+    simulation: { base_url: 'http://127.0.0.1:8790' },
+    live: { base_url: 'http://127.0.0.1:8791' },
+  },
 }
 
 beforeEach(() => {

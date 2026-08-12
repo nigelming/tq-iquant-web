@@ -1,22 +1,22 @@
 # -*- coding: gbk -*-
-# iQuant in-client trading bridge -- SIMULATION bridge (0009 slice 1)
+# iQuant in-client trading bridge -- LIVE bridge (0009 slice 1)
 # =================================================================
 # Runs as a Python strategy inside the iQuant client and exposes a local HTTP
-# server on 127.0.0.1:8790 so the Core (main/) can place real orders and pull
+# server on 127.0.0.1:8791 so the Core (main/) can place real orders and pull
 # 1m/5m bars through iQuant.
 #
 # *** DUAL-BRIDGE MIRROR ***
-# This is the SIMULATION bridge (port 8790, simulation account = virtual funds).
-# The LIVE bridge (real account, real funds) is iquant_bridge_live.py (port 8791).
-# The two files are INDEPENDENT SELF-CONTAINED COPIES -- iQuant loads a strategy
-# by pasting file content into its editor (not by file-path import), so the two
-# bridges CANNOT share an imported module. ANY logic change MUST be applied to
-# BOTH files by hand. Only the config block below (PORT / ACCOUNT_DEFAULT) differs.
+# This is the LIVE bridge (port 8791, real account = real funds). The SIMULATION
+# bridge (virtual funds) is iquant_bridge.py (port 8790). The two files are
+# INDEPENDENT SELF-CONTAINED COPIES -- iQuant loads a strategy by pasting file
+# content into its editor (not by file-path import), so the two bridges CANNOT
+# share an imported module. ANY logic change MUST be applied to BOTH files by
+# hand. Only the config block below (PORT / ACCOUNT_DEFAULT) differs.
 #
 # Mode model (two independent dimensions):
 #   - simulation vs live (THIS dimension, by account/bridge): which account the
-#     order goes to. Core routes by session.mode -> this bridge (simulation) or
-#     the live bridge.
+#     order goes to. Core routes by session.mode -> this bridge (live) or the
+#     simulation bridge.
 #   - signal-only vs real-order (the OTHER dimension): controlled by the iQuant
 #     client's "live trade / simulation" START BUTTON, NOT by this bridge and
 #     NOT by DRY_RUN. Even with DRY_RUN=False, starting the strategy in iQuant's
@@ -46,7 +46,7 @@
 #
 # Security: bridge binds 127.0.0.1 only (loopback, single-user host), so no
 # auth token is required. Defense is at the machine boundary: only local
-# processes can reach port 8790. If the bridge is ever exposed off-loopback,
+# processes can reach port 8791. If the bridge is ever exposed off-loopback,
 # add auth then. Whitelist ALLOWED_STOCKS, per-order limit MAX_VOLUME, rate
 # limit RATE_LIMIT, audit log remain enforced.
 import json
@@ -57,10 +57,10 @@ from collections import OrderedDict
 
 # ================= config =================
 HOST = "127.0.0.1"
-PORT = 8790
-# Simulation account (virtual funds). Override via env IQUANT_BRIDGE_ACCOUNT /
+PORT = 8791
+# Real account (real funds). Override via env IQUANT_BRIDGE_ACCOUNT /
 # .bridge_account file if you switch accounts without editing code.
-ACCOUNT_DEFAULT = "110002348760"  # simulation account; replace with real sim account at deploy
+ACCOUNT_DEFAULT = "110002348760"  # LIVE account; replace with the real funded account at deploy
 ACCOUNT = None                     # loaded by load_account() below
 DRY_RUN = False                    # dev-only print switch (NOT the signal/real-order control -- that is the iQuant start button)
 ALLOWED_STOCKS = set()            # whitelist (empty = no restriction; configure in production)
@@ -87,7 +87,7 @@ def load_account():
 
     The account is not hardcoded into the strategy (switch accounts via env var
     or a local file; the file stays out of git and is written at deploy time).
-    Falls back to ACCOUNT_DEFAULT (dev placeholder).
+    Falls back to ACCOUNT_DEFAULT (real account placeholder).
     """
     acc = os.environ.get("IQUANT_BRIDGE_ACCOUNT", "")
     if not acc:
@@ -170,7 +170,7 @@ def _do_place(params):
     #   price param has no effect for prType!=11; pass 0 as placeholder.
     #   Real fill price is backfilled from /deals in a later slice.
     pr_type = 14
-    print("[BRIDGE] order %s %s prType=%s vol=%s price=%s acct=%s"
+    print("[BRIDGE-LIVE] order %s %s prType=%s vol=%s price=%s acct=%s"
           % (op, code, pr_type, volume, price, account))
 
     if DRY_RUN:
@@ -188,7 +188,7 @@ def _do_place(params):
         # orderType=1101 = single-stock/single-account/normal/by-share
         #   (official single-stock standard value; old 0 was non-standard).
         result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
-                    "iquant_bridge", 2, _CTX)
+                    "iquant_bridge_live", 2, _CTX)
         return {"ok": True, "passorder_result": str(result)}
     except Exception as e:
         return {"ok": False, "error": "passorder raised: %s" % e}
@@ -312,11 +312,11 @@ def _fetch_quote(code, period, count):
         res = xtdata.get_market_data_ex([], [code], period=period, count=count)
         df = (res or {}).get(code)
         if df is not None and len(df) > 0:
-            print("[BRIDGE] xtdata ok %s %s count=%d got=%d" % (code, period, count, len(df)))
+            print("[BRIDGE-LIVE] xtdata ok %s %s count=%d got=%d" % (code, period, count, len(df)))
             return df
-        print("[BRIDGE] xtdata empty %s %s count=%d" % (code, period, count))
+        print("[BRIDGE-LIVE] xtdata empty %s %s count=%d" % (code, period, count))
     except Exception as e:
-        print("[BRIDGE] xtdata FAIL %s %s: %s" % (code, period, e))
+        print("[BRIDGE-LIVE] xtdata FAIL %s %s: %s" % (code, period, e))
     # 2) fallback: ContextInfo (depends on current symbol context)
     fn = _iq("get_market_data_ex")
     if fn is None:
@@ -325,7 +325,7 @@ def _fetch_quote(code, period, count):
         res = fn([], [code], period=period, count=count, dividend_type="none")
         return (res or {}).get(code)
     except Exception as e:
-        print("[BRIDGE] ContextInfo FAIL %s %s: %s" % (code, period, e))
+        print("[BRIDGE-LIVE] ContextInfo FAIL %s %s: %s" % (code, period, e))
         return None
 
 
@@ -433,7 +433,7 @@ def _handle(method, path, headers, body):
     params = _parse_query(query)
 
     if method == "GET" and path == "/ping":
-        return _json({"ok": True, "service": "iquant-bridge",
+        return _json({"ok": True, "service": "iquant-bridge-live",
                       "port": PORT, "account": ACCOUNT, "dry_run": DRY_RUN})
 
     if method == "POST" and path == "/order":
@@ -441,7 +441,7 @@ def _handle(method, path, headers, body):
             p = json.loads(body.decode("utf-8"))
         except Exception as e:
             return _json({"ok": False, "error": "bad body: %s" % e}, 400)
-        print("[AUDIT] POST /order %s" % json.dumps(p, ensure_ascii=False))
+        print("[AUDIT-LIVE] POST /order %s" % json.dumps(p, ensure_ascii=False))
         return _json(place_order(p))
 
     if method == "GET" and path == "/positions":
@@ -467,7 +467,7 @@ def init(ContextInfo):
     try:
         ContextInfo.set_account(ACCOUNT)
     except Exception as e:
-        print("[BRIDGE] set_account failed: %s" % e)
+        print("[BRIDGE-LIVE] set_account failed: %s" % e)
     ContextInfo.accID = ACCOUNT
 
     s = None
@@ -478,10 +478,10 @@ def init(ContextInfo):
         s.listen(32)
         s.setblocking(False)
         _listen_sock = s
-        print("[BRIDGE] bridge listening on %s:%d  (dry_run=%s)"
+        print("[BRIDGE-LIVE] bridge listening on %s:%d  (dry_run=%s)"
               % (HOST, PORT, DRY_RUN))
     except Exception as e:
-        print("[BRIDGE] socket bind/listen FAILED: %s" % e)
+        print("[BRIDGE-LIVE] socket bind/listen FAILED: %s" % e)
         return
 
     clients = {}
