@@ -46,3 +46,6 @@ main/data/*.db-journal
 main/data/*.db.bak
 main/data/*.sqlite
 main/data/*.sqlite3
+
+# Draft docs (local working notes, not for commit)
+docs/draft/
