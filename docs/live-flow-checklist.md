@@ -284,6 +284,17 @@
 14:30:48-49  15m ×17 count=10    再次 _dispatch_period_bar("15m") ← 同根 bar 二次驱动
 ```
 
+### 14:30 数据源 + 去重/长度规则定案(2026-08-12 明确)
+
+`_maybe_daily_bars` 驱动 1d/1w/1mon 三周期,数据源与去重/长度规则**同启动**:
+
+| 周期 | 数据源 | 去重/长度规则(同启动) |
+|---|---|---|
+| **1d** | **iQuant 桥** `/quote?period=1d`(forming 1d bar OHLCV 快照) | 长度 `_code_period_count[(code,"1d")]`(该股 1d 公式最大 formula_count,兜底 `_period_count`/全局);去重 `_sort_and_cap`(stime 去重 + 截断)——同 `_preheat` |
+| **1w/1mon** | **通达信** `TQFormula.compute`(桥端 xtdata 拉不到 1w/1mon,仅此通路) | 走与 `start()` 相同的 `_inject_startup_periods`(count=-1 全量 + 取最新信号);日切 cache miss → 补注入——同启动注入 |
+
+幂等:`_last_daily_bar_date` 当日只驱动一次;1w/1mon 按 `(sid, code, daily_time)` 信号键判 cache miss 补注入。
+
 ### 四个发现(按严重度)
 
 1. **实例无 15m 策略,14:30 却拉 15m**:`periods_on_boundary` 是纯算术(`minute%15==0`→15m),不查实例有无该周期策略。`_dispatch_period_bar` 对全 stock_codes 拉,15m 不在 `_code_period_count`/`_period_count` → 兜底 count=200,白拉 17 只后 period 过滤全跳过。

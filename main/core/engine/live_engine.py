@@ -568,10 +568,18 @@ class LiveEngine:
     def _maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
         """C6(B/C)：日终（≥14:30 当日一次）1d 快照 bar + 1w/1mon 通达信注入驱动。
 
-        C6(B) 1d：拉桥 /quote?period=1d 最新 forming 1d bar → 构造 BarEvent(period="1d")
+        **14:30 数据源定案**：
+          - 1d    → **iQuant 桥** /quote?period=1d（最新 forming 1d bar 的 OHLCV 快照）
+          - 1w/1mon → **通达信 TQFormula.compute**（桥端 xtdata 拉不到 1w/1mon，仅此通路）
+        与启动的去重/长度规则**一致**：
+          - 1d 长度按 _code_period_count[(code,"1d")]（该股 1d 公式最大 formula_count，
+            兜底 _period_count/全局），去重按 _sort_and_cap（stime 去重 + 截断）——同 _preheat；
+          - 1w/1mon 走与 start() 相同的 _inject_startup_periods（count=-1 全量 + 取最新信号），
+            日切 cache miss 时补注入——同启动注入。
+
+        C6(B) 1d：拉桥 /quote?period=1d → _sort_and_cap → 构造 BarEvent(period="1d")
           → _fill_signal_cache 注入（period="1d"）→ on_bar 驱动 1d 策略。
-        C6(C) 1w/1mon：走 TQFormula.compute 通达信自取（桥端 xtdata 拉不到），信号预填
-          signal_cache[(sid, code, daily_time)]，此处驱动命中预填信号。
+        C6(C) 1w/1mon：信号预填 signal_cache[(sid, code, daily_time)]，此处驱动命中预填信号。
         幂等：_last_daily_bar_date 记录当日已触发。日切时（新 daily_time 的 1w/1mon
         cache miss）→ 通达信补注入。用本机 Asia/Shanghai 时钟（实盘固有时点，同 E5/E6）。
         """
@@ -582,10 +590,17 @@ class LiveEngine:
         today = now.date()
         if self._last_daily_bar_date == today:
             return
-        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）；count = 1d 周期最大 formula_count
+        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）。数据源 **iQuant 桥**
+        # （1w/1mon 桥端 xtdata 拉不到，走通达信 _inject_startup_periods，见下 C6(C)）。
+        # 长度/去重规则 **同启动预热（_preheat）**：
+        #   长度 = 该股该周期最大 formula_count（_code_period_count[(code,"1d")]，
+        #     兜底周期级 _period_count/全局 _formula_count）——非周期级统一值；
+        #   去重 = _sort_and_cap 按 stime 排序 + 同 stime 去重 + 截断到 count 根。
         bars_by_code: Dict[str, list] = {}
-        count = self._period_count.get("1d", self._formula_count)
         for code in self._bar_poller.stock_codes:
+            count = self._code_period_count.get(
+                (code, "1d"), self._period_count.get("1d", self._formula_count)
+            )
             try:
                 bars = self._dispatcher.query_quote(
                     code, period="1d", count=count
@@ -595,7 +610,7 @@ class LiveEngine:
                 logger.warning("bridge offline on daily bars (session %s)", self.session_id)
                 return
             if bars:
-                bars_by_code[code] = bars
+                bars_by_code[code] = self._sort_and_cap(bars, count)
         if not bars_by_code:
             return
         # daily_time = 任一 code 最新 1d bar 的 stime（交易日 00:00）；解析失败用今日零点兜底

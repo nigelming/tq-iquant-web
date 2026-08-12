@@ -1243,6 +1243,52 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
     db.close()
 
 
+def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
+    """C6(B)：日终 1d 拉取规则同启动预热——长度按 (code,'1d') 的 _code_period_count、去重按 stime。
+
+    桥端可能返回同 stime 重复 bar（历史/拼接重叠）；_sort_and_cap 去重 + 截断后
+    注入公式的窗口 = count 根唯一 bar，而非原样塞进公式（同 _preheat 语义）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    # 4 根含 1 根重复 stime；_code_period_count[(code,'1d')]=3 → 去重后截断为 3 根唯一 bar
+    daily_bars = [
+        {"stime": "20260806000000", "open": 9.0, "high": 9.2, "low": 8.9, "close": 9.1, "volume": 10000, "amount": 91000.0},
+        {"stime": "20260807000000", "open": 9.1, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260807000000", "open": 9.0, "high": 9.2, "low": 8.9, "close": 9.0, "volume": 10000, "amount": 90000.0},  # dup stime
+        {"stime": "20260810000000", "open": 9.2, "high": 9.5, "low": 9.1, "close": 9.4, "volume": 10000, "amount": 94000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    from core.tq.formula import TQFormula
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        tq_formula=TQFormula(), formula_by_strategy={1: "MA_CROSS"},
+        formula_count=200, formula_count_by_name={"MA_CROSS": 3},
+        code_period_count={(stock, "1d"): 3},
+    )
+    captured = {}
+
+    def spy(**kw):
+        captured["df"] = kw.get("ohlcv_df")
+        return {stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}}
+
+    engine._tq_formula.compute_injected = spy
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+
+    # 长度规则：/quote 按 (code,'1d') 的 _code_period_count=3 拉（非周期级 _period_count/全局 200）
+    assert any("period=1d" in str(r.url) and "count=3" in str(r.url) for r in rec.requests), \
+        "日终 1d 拉取 count 应取该股该周期 _code_period_count"
+    # 去重规则：注入公式的 df 行数 = 3 根唯一 bar（4 根去 1 重复 stime 再截断到 3）
+    df = captured.get("df")
+    assert df is not None and len(df["Close"]) == 3
+
+
 def test_maybe_daily_bars_before_1430_no_trigger():
     """C6(B)：未到 14:30 不触发（不拉快照、不驱动、不记幂等标记）。"""
     factory, _ = _db_factory()
