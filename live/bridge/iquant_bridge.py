@@ -81,6 +81,12 @@ _requests = []                    # rate-limit timestamps
 _quote_cache = {}                 # (code, period, count) -> (ts, bars)
 _downloaded = set()               # (code, period) already history-downloaded
 _last_log = {}                    # (kind, code, period) -> ts, throttle repeated diagnostics
+# quote fetch summary window: count successes per period, flush one summary line
+# per SUMMARY_INTERVAL instead of one line per fetch (a poll over 17 codes x N
+# periods otherwise prints ~80 lines every 60s, ~30k+/day).
+_quote_summary = {}               # period -> [ok_count, got_total, got_min, got_max]
+_summary_since = 0.0              # ts the current summary window started
+SUMMARY_INTERVAL = 60             # seconds between quote-summary flushes
 
 
 # ---------------- iQuant API access (isolated for test mocks) ----------------
@@ -92,14 +98,56 @@ def _iq(name):
 def _throttled_log(key, msg, interval=300):
     """Print msg at most once per interval seconds per key (steady-state log control).
 
-    The success path prints nothing; failures/empties surface but not every poll --
-    a full trading day otherwise logs thousands of quote lines for ~17 codes x 4 periods.
+    Failures/empties surface but not every poll -- a full trading day otherwise
+    logs thousands of quote lines for ~17 codes x 4 periods.
     """
     now = time.time()
     if now - _last_log.get(key, 0) < interval:
         return
     _last_log[key] = now
     print(msg)
+
+
+def _record_quote_ok(period, got):
+    """Count a successful quote fetch into the rolling summary window.
+
+    Successes stay silent per-fetch; the window flushes one line every
+    SUMMARY_INTERVAL so the bridge emits a heartbeat without flooding.
+    """
+    global _summary_since
+    now = time.time()
+    if _summary_since == 0.0:
+        _summary_since = now
+    rec = _quote_summary.get(period)
+    if rec is None:
+        rec = [0, 0, got, got]
+        _quote_summary[period] = rec
+    rec[0] += 1
+    rec[1] += got
+    if got < rec[2]:
+        rec[2] = got
+    if got > rec[3]:
+        rec[3] = got
+    if now - _summary_since >= SUMMARY_INTERVAL:
+        _flush_quote_summary()
+
+
+def _flush_quote_summary():
+    """Emit one line summarising fetches since the last flush, then reset."""
+    global _summary_since
+    if not _quote_summary:
+        _summary_since = time.time()
+        return
+    parts = []
+    total = 0
+    for period in sorted(_quote_summary):
+        ok, got_total, got_min, got_max = _quote_summary[period]
+        total += ok
+        rng = str(got_min) if got_min == got_max else "%d-%d" % (got_min, got_max)
+        parts.append("%s:%d(%s)" % (period, ok, rng))
+    _quote_summary.clear()
+    _summary_since = time.time()
+    print("[BRIDGE] quote %d fetches ok  %s" % (total, "  ".join(parts)))
 
 
 # ---------------- auth / whitelist / rate limit ----------------
@@ -125,28 +173,56 @@ def check_rate_limit():
 # ---------------- order (idempotent) ----------------
 def place_order(params):
     oid = params.get("order_id")
+    code = params.get("code")
+    op = params.get("op", "buy")
+    volume = params.get("volume", 100)
     if not oid:
         return {"ok": False, "error": "missing order_id"}
     if oid in _placed:
+        _log_order(oid, op, code, volume, _placed[oid], dup=True)
         return _placed[oid]                       # already accepted -> return original result
     if oid in _placing:
-        return {"ok": False, "error": "duplicate in-flight"}
-    ok, err = check_whitelist(params.get("code"), params.get("volume", 100))
-    if not ok:
-        return {"ok": False, "error": err}
-    if not check_rate_limit():
-        return {"ok": False, "error": "rate limited"}
-    _placing.add(oid)
-    try:
-        result = _do_place(params)
-        _placed[oid] = result
-        # audit #32: cap _placed to PLACED_MAX; evict oldest (insertion-ordered) to bound memory.
-        # Idempotency only matters for near-term retries; a months-old order_id won't be re-sent.
-        while len(_placed) > PLACED_MAX:
-            _placed.popitem(last=False)
-        return result
-    finally:
-        _placing.discard(oid)
+        result = {"ok": False, "error": "duplicate in-flight"}
+    else:
+        ok, err = check_whitelist(code, volume)
+        if not ok:
+            result = {"ok": False, "error": err}
+        elif not check_rate_limit():
+            result = {"ok": False, "error": "rate limited"}
+        else:
+            _placing.add(oid)
+            try:
+                result = _do_place(params)
+                _placed[oid] = result
+                # audit #32: cap _placed to PLACED_MAX; evict oldest (insertion-ordered) to bound memory.
+                # Idempotency only matters for near-term retries; a months-old order_id won't be re-sent.
+                while len(_placed) > PLACED_MAX:
+                    _placed.popitem(last=False)
+            finally:
+                _placing.discard(oid)
+    _log_order(oid, op, code, volume, result)
+    return result
+
+
+def _log_order(oid, op, code, volume, result, dup=False):
+    """One concise audit line per order attempt with its outcome.
+
+    Replaces the old two-line output (a pre-passorder [BRIDGE] order line plus a
+    raw [AUDIT] JSON dump) with a single line: oid + direction + code + size +
+    result. prType/price/account are omitted: prType is fixed at 14, price is
+    ignored for opposite-best orders, account is fixed at startup.
+    """
+    if result.get("ok"):
+        if result.get("dry_run"):
+            tail = "dry-run"
+        else:
+            tail = "ok result=%s" % result.get("passorder_result")
+    else:
+        tail = "REJECT: %s" % result.get("error")
+    if dup:
+        tail = "dup " + tail
+    print("[BRIDGE] ORDER %s %s %s x%s %s"
+          % (oid, str(op).upper(), code, volume, tail))
 
 
 def _do_place(params):
@@ -163,8 +239,6 @@ def _do_place(params):
     #   price param has no effect for prType!=11; pass 0 as placeholder.
     #   Real fill price is backfilled from /deals in a later slice.
     pr_type = 14
-    print("[BRIDGE] order %s %s prType=%s vol=%s price=%s acct=%s"
-          % (op, code, pr_type, volume, price, account))
 
     if DRY_RUN:
         return {"ok": True, "dry_run": True,
@@ -305,7 +379,9 @@ def _fetch_quote(code, period, count):
         res = xtdata.get_market_data_ex([], [code], period=period, count=count)
         df = (res or {}).get(code)
         if df is not None and len(df) > 0:
-            # success: silent steady state -- every fetch otherwise logs ~5k lines/day
+            # success: counted into the rolling 60s summary, not printed per-fetch
+            # (per-fetch otherwise floods ~80 lines per 60s poll, ~30k+/day).
+            _record_quote_ok(period, len(df))
             return df
         _throttled_log(("empty", code, period),
                        "[BRIDGE] xtdata empty %s %s count=%d" % (code, period, count))
@@ -318,7 +394,10 @@ def _fetch_quote(code, period, count):
         return None
     try:
         res = fn([], [code], period=period, count=count, dividend_type="none")
-        return (res or {}).get(code)
+        df = (res or {}).get(code)
+        if df is not None and len(df) > 0:
+            _record_quote_ok(period, len(df))
+        return df
     except Exception as e:
         _throttled_log(("ctx", code, period),
                        "[BRIDGE] ContextInfo FAIL %s %s: %s" % (code, period, e))
@@ -421,7 +500,6 @@ def _handle(method, path, headers, body):
             p = json.loads(body.decode("utf-8"))
         except Exception as e:
             return _json({"ok": False, "error": "bad body: %s" % e}, 400)
-        print("[AUDIT] POST /order %s" % json.dumps(p, ensure_ascii=False))
         return _json(place_order(p))
 
     if method == "GET" and path == "/positions":
@@ -507,6 +585,12 @@ def init(ContextInfo):
         # background refresh -- the Core polls every ~60s, a 1s TTL means each
         # poll re-fetches, which is far cheaper than refreshing all keys every
         # second unconditionally (and avoids spinning after a session stops).
+        # flush the 60s quote-summary window from the main loop tick (not from
+        # _record_quote_ok): a poll is a burst of ~80 fetches in ~5s then idle
+        # ~55s, so flush-on-next-fetch would lag a whole poll cycle and could
+        # miss entirely if no second poll arrives in the observation window.
+        if _summary_since and time.time() - _summary_since >= SUMMARY_INTERVAL:
+            _flush_quote_summary()
         time.sleep(0.01)
 
 
