@@ -231,6 +231,12 @@ def _do_place(params):
     volume = params.get("volume", 100)
     price = params.get("price", 0)                # 0=latest price, >0=limit price
     account = params.get("account", ACCOUNT)
+    # userOrderId -> m_strRemark: Core's deterministic order_id prefix (ASCII hex).
+    # Lets Core match the returned order/deal back to exactly this order (precise
+    # remark match), instead of fuzzy code+direction+volume which can collide with
+    # leftover orders from a prior session. m_strRemark length varies by client;
+    # 20 ASCII chars is safely within limits. Truncate defensively.
+    remark = str(params.get("remark") or "")[:20]
 
     op_type = 23 if op == "buy" else 24           # passorder opType: 23 buy, 24 sell
     # prType=14 = opposite best price (client-side orderbook-price limit order):
@@ -243,19 +249,21 @@ def _do_place(params):
     if DRY_RUN:
         return {"ok": True, "dry_run": True,
                 "params": {"code": code, "op": op, "volume": volume,
-                           "price": price, "pr_type": pr_type}}
+                           "price": price, "pr_type": pr_type, "remark": remark}}
 
     fn = _iq("passorder")
     if fn is None:
         return {"ok": False, "error": "passorder not found in strategy namespace"}
     try:
-        # iQuant real C++ signature (10-arg variant, verified returns 0 = accepted):
+        # iQuant real C++ signature (11-arg variant, verified returns 0 = accepted):
         # passorder(opType, orderType, accountID, orderCode, prType, price,
-        #           volume, strategyName, quickTrade, ContextInfo)
+        #           volume, strategyName, quickTrade, userOrderId, ContextInfo)
+        # userOrderId (remark) writes m_strRemark on the resulting order/deal so
+        # Core can precisely claim this order. quickTrade=2 = immediate dispatch.
         # orderType=1101 = single-stock/single-account/normal/by-share
         #   (official single-stock standard value; old 0 was non-standard).
         result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
-                    "iquant_bridge", 2, _CTX)
+                    "iquant_bridge", 2, remark, _CTX)
         # 0 = accepted (verified on real client). Any other value means the
         # broker/client rejected the order -- must report ok=False so Core marks
         # it rejected instead of holding a submitted order whose order_ref never
@@ -336,6 +344,7 @@ def query_orders(params):
                 "insert_time": getattr(o, "m_strInsertTime", None),
                 "insert_date": getattr(o, "m_strInsertDate", None),
                 "cancel_amount": getattr(o, "m_dCancelAmount", None),
+                "remark": getattr(o, "m_strRemark", None),           # = passorder userOrderId
             })
         return {"ok": True, "data": rows}
     except Exception as e:
@@ -365,6 +374,7 @@ def query_deals(params):
                 "trade_date": getattr(o, "m_strTradeDate", None),
                 "source": getattr(o, "m_strSource", None),           # BRIDGE / GUI
                 "order_type": getattr(o, "m_strOrderStrategyType", None),
+                "remark": getattr(o, "m_strRemark", None),           # = passorder userOrderId
             })
         return {"ok": True, "data": rows}
     except Exception as e:

@@ -103,6 +103,22 @@ def test_place_order_sends_prtype_14():
     assert _last_json(rec)["pr_type"] == 14
 
 
+def test_place_order_sends_remark_oid_prefix():
+    """remark = order_id(order) 前 20 位，桥作为 passorder userOrderId 写 m_strRemark。
+
+    这是 Core↔桥订单精确匹配的根基：回填时 Core 按 remark 全局唯一认领本单，
+    避免 代码+方向+数量 模糊匹配撞到跨会话遗留的同代码同向同量旧单。
+    """
+    disp, rec = _make_dispatcher(_Recorder())
+    order = _make_order()
+    disp.place_order(order)
+    oid = HttpBridgeDispatcher.order_id(order)
+    assert len(oid) == 32
+    payload = _last_json(rec)
+    assert payload["remark"] == oid[:20]
+    assert len(payload["remark"]) == 20
+
+
 def test_place_order_price_none_sends_zero():
     disp, rec = _make_dispatcher(_Recorder())
     order = _make_order(price=None)

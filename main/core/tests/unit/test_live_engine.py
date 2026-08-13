@@ -714,14 +714,24 @@ def _make_engine(disp, factory, port):
     )
 
 
-def _submitted_order(db, quantity=600, status="submitted"):
-    """预置一笔 submitted 状态的 LiveOrder（模拟 _handle_bar 已发单）。"""
+# 测试用确定性 oid（模拟 Core 下发的 bridge_order_id，前 20 位 = m_strRemark）。
+_TEST_OID = "a" * 32
+_TEST_REMARK = _TEST_OID[:20]
+
+
+def _submitted_order(db, quantity=600, status="submitted", bridge_order_id=_TEST_OID):
+    """预置一笔 submitted 状态的 LiveOrder（模拟 _handle_bar 已发单）。
+
+    bridge_order_id 默认 _TEST_OID：真实链路下单后必回写 oid，匹配器据此走 remark
+    精确匹配。测遗留/模糊路径时显式传 None。
+    """
     lo = LiveOrder(
         live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
         stock_code="600000.SH", trade_type="buy", order_type="limit",
         price=Decimal("9.3"), quantity=quantity, filled_quantity=0,
         filled_price=None, status=status, signal_name="open_sig",
         signal_type="OPEN", bar_time=datetime(2026, 8, 5, 10, 0),
+        bridge_order_id=bridge_order_id,
     )
     db.add(lo)
     db.flush()
@@ -766,6 +776,7 @@ def test_order_status_transitions_submitted_to_filled():
     _mock_orders_deals(rec, orders=[{
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": 48, "volume": 600, "order_ref": "ref-abc-123",
+        "remark": _TEST_REMARK,
     }], deals=[{
         "order_ref": "ref-abc-123", "price": 9.25, "volume": 600,
         "amount": 5550.0, "commission": 1.39, "trade_time": "150001",
@@ -807,6 +818,7 @@ def test_order_status_transitions_partial_fill():
     _mock_orders_deals(rec, orders=[{
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": 48, "volume": 600, "order_ref": "ref-partial",
+        "remark": _TEST_REMARK,
     }], deals=[{
         "order_ref": "ref-partial", "price": 9.25, "volume": 300,
         "amount": 2775.0, "commission": 0.69, "trade_time": "150001",
@@ -866,6 +878,7 @@ def test_try_match_order_ref_finds_bridge_order():
     _mock_orders_deals(rec, orders=[{
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": 48, "volume": 600, "order_ref": "ref-found",
+        "remark": _TEST_REMARK,
     }])
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
@@ -890,20 +903,24 @@ def test_try_match_order_ref_does_not_collide_same_code_dir_volume():
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     rec = _Recorder()
-    # 两笔同代码同向同量的 BRIDGE 委托，insert_time 不同，order_ref 各异
+    # 两笔同代码同向同量的 BRIDGE 委托，但 remark（= 各单 oid 前缀）不同：
+    # remark 精确匹配天然把两单各认各的，不可能撞同一个 order_ref。
+    oid1, oid2 = "b" * 32, "c" * 32
     _mock_orders_deals(rec, orders=[
         {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
          "direction": 48, "volume": 600, "order_ref": "ref-old",
+         "remark": oid1[:20],
          "insert_date": "20260805", "insert_time": "095200"},
         {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
          "direction": 48, "volume": 600, "order_ref": "ref-new",
+         "remark": oid2[:20],
          "insert_date": "20260805", "insert_time": "095300"},
     ])
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
     db = factory()
-    lo1 = _submitted_order(db, quantity=600)
-    lo2 = _submitted_order(db, quantity=600)
+    lo1 = _submitted_order(db, quantity=600, bridge_order_id=oid1)
+    lo2 = _submitted_order(db, quantity=600, bridge_order_id=oid2)
     db.commit()
 
     # 经 _poll_deals 一轮匹配（无成交，仅回写 order_ref）
@@ -915,6 +932,117 @@ def test_try_match_order_ref_does_not_collide_same_code_dir_volume():
     assert lo2.order_ref is not None
     assert lo1.order_ref != lo2.order_ref, "两笔在途单不得共用同一 order_ref"
     assert {lo1.order_ref, lo2.order_ref} == {"ref-old", "ref-new"}
+    db.close()
+
+
+def test_match_remark_exact_ignores_legacy_same_code_dir_volume():
+    """真机回归（2026-08-13）：新单不得匹配到跨会话遗留的同代码同向同量旧单。
+
+    场景：本单 11:21（bridge_order_id 已回写 → 走 remark 精确匹配），桥 /orders 里
+    有一笔上个会话 09:55 的遗留单（同代码同向同量、无 remark）。旧逻辑按 code+dir+vol
+    模糊匹配 + “取最新”，在真单尚未可查时把新单绑到旧单 → 回填错误成交、真单丢失。
+    修复：remark 精确匹配只认 m_strRemark == oid 前缀的委托；无 remark 的遗留单被忽略。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        # 上个会话遗留单：同代码同向同量、无 remark，时间早于本单
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-legacy",
+         "insert_date": "20260813", "insert_time": "095500"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)  # bridge_order_id=_TEST_OID
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None  # 遗留单无 remark，绝不绑定
+    db.close()
+
+
+def test_match_remark_exact_binds_correct_order_among_similar():
+    """remark 精确匹配在多笔相似委托中认领到本单（即便委托量不同也能认到）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        # 别的单的委托（带它自己的 remark），代码方向相同但量不同
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 999, "order_ref": "ref-other",
+         "remark": "z" * 20},
+        # 本单的委托：remark 命中
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-mine",
+         "remark": _TEST_REMARK},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-mine"
+    db.close()
+
+
+def test_match_legacy_fuzzy_excludes_candidate_before_creation():
+    """遗留单（无 bridge_order_id）走模糊匹配，但 insert 早于本单创建的候选必须排除。
+
+    真机 bug 的等价场景：新单 11:21 创建时，/orders 里只有上个会话 09:55 的同代码同向
+    同量遗留单（真单尚未可查）。旧逻辑“取最新匹配项”会把新单绑到这笔旧单。时间窗要求
+    候选 insert >= 本单 created_at（容差），故此时 order_ref 留 None，下轮真单出现再绑。
+    insert_date/time 是 Asia/Shanghai 本地时间，created_at 是 UTC naive，匹配器内部换算。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        # 太早：本地 09:55（= UTC 01:55）< 本单 UTC 03:21 → 排除，不绑定
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-too-old",
+         "insert_date": "20260813", "insert_time": "095500"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)  # 遗留单，无 remark
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None  # 早于本单的遗留单绝不绑定
+    db.close()
+
+
+def test_match_legacy_fuzzy_binds_recent_candidate():
+    """遗留单模糊匹配：insert 晚于本单创建（容差内）的候选正常绑定。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        # 本地 11:22（= UTC 03:22）>= 本单 UTC 03:21 - 容差 → 命中
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-recent",
+         "insert_date": "20260813", "insert_time": "112200"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-recent"
     db.close()
 
 
@@ -966,6 +1094,7 @@ def test_poll_deals_bridge_offline_skips():
     orders_data = [{
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": 48, "volume": 600, "order_ref": "ref-offline",
+        "remark": _TEST_REMARK,
     }]
 
     def respond(request):
@@ -1336,6 +1465,7 @@ def test_backfill_updates_last_backfill_time_and_clears_pending():
     _mock_orders_deals(rec, orders=[{
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": 48, "volume": 600, "order_ref": "ref-abc-123",
+        "remark": _TEST_REMARK,
     }], deals=[{
         "order_ref": "ref-abc-123", "price": 9.25, "volume": 600,
         "amount": 5550.0, "commission": 1.39, "trade_time": "150001",

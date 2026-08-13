@@ -75,8 +75,9 @@ class HttpBridgeDispatcher(OrderDispatcher):
         return hashlib.md5(key.encode("utf-8")).hexdigest()
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
+        oid = self.order_id(order)
         payload = {
-            "order_id": self.order_id(order),
+            "order_id": oid,
             "code": order.stock_code,
             "op": "buy" if order.trade_type.value == "BUY" else "sell",
             "volume": order.quantity,
@@ -85,6 +86,10 @@ class HttpBridgeDispatcher(OrderDispatcher):
             # 桥 _do_place 据此调 passorder(op, 1101, acct, code, 14, 0, vol, ...)。
             # price 对 prType!=11 无效,传 close 仅作记录/切片5 回填参考。
             "pr_type": 14,
+            # remark = oid 前 20 位:桥作为 passorder 的 userOrderId 写入委托/成交的
+            # m_strRemark，回填时 Core 按 remark 精确认领本单（见 LiveEngine._try_match_order_ref），
+            # 避免 代码+方向+数量 模糊匹配撞到跨会话遗留的同代码同向同量旧单。
+            "remark": oid[:20],
         }
         try:
             r = self._client.post(self._base_url + "/order", json=payload)

@@ -92,6 +92,29 @@ def test_order_real_calls_passorder():
     assert isinstance(calls[0][4], int)
 
 
+def test_order_passes_remark_as_user_order_id():
+    """Core oid 经 remark 透传为 passorder 的 userOrderId（写入 m_strRemark）。
+
+    这是订单精确匹配的根基：Core 用确定性 oid（bridge_order_id），桥把它前 20 位
+    作为 userOrderId 传给 passorder，柜台回填到委托/成交的 m_strRemark，Core 再按
+    remark 精确认领本单，彻底告别 代码+方向+数量 模糊匹配撞到跨会话遗留单。
+    passorder 11 参形式：...strategyName, quickTrade, userOrderId, ContextInfo。
+    """
+    br.DRY_RUN = False
+    calls = []
+    br.passorder = lambda *a, **k: calls.append(a) or 0
+    body = json.dumps({"order_id": "oid-remark-1234567890abcdef",
+                       "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 0,
+                       "remark": "oid-remark-1234567890"}).encode()
+    _resp("POST", "/order", {}, body)
+    assert len(calls) == 1
+    # 第 9 参(index 9)= userOrderId；第 10 参(index 10)= ContextInfo。
+    # 桥防御性截断到 20 字符（m_strRemark 长度有限），Core 下发的也正是 oid[:20]。
+    assert calls[0][9] == "oid-remark-123456789"  # 21 字符入参 → 截断为 20
+    assert calls[0][10] is br._CTX
+
+
 def test_order_rejected_when_passorder_returns_nonzero():
     """回归：passorder 返回非 0（被券商/客户端拒绝）时桥必须返回 ok=False。
 
@@ -219,6 +242,58 @@ def test_positions_calls_trade_detail():
     assert status == 200
     assert data["ok"] is True
     assert data["data"][0]["instrument"] == "600000.SH"
+
+
+def test_query_orders_includes_remark():
+    """/orders 每行回带 m_strRemark（= 下单时传的 userOrderId），供 Core 按 remark 精确认领。"""
+    class FakeOrder:
+        m_strOrderRef = "ref-1"
+        m_strOrderSysID = "sys-1"
+        m_strInstrumentID = "600000"
+        m_strExchangeID = "SH"
+        m_nDirection = 48
+        m_dLimitPrice = 9.3
+        m_dTradedPrice = 9.3
+        m_nVolumeTotalOriginal = 600
+        m_nVolumeTraded = 600
+        m_nOrderStatus = 56
+        m_strSource = "BRIDGE"
+        m_strOrderStrategyType = ""
+        m_strInsertTime = "100000"
+        m_strInsertDate = "20260813"
+        m_dCancelAmount = 0
+        m_strRemark = "abc123def456ghij7890"
+    br.get_trade_detail_data = lambda acc, typ, dt: [FakeOrder()]
+    status, data = _resp("GET", "/orders", {}, b"")
+    assert status == 200
+    assert data["ok"] is True
+    assert data["data"][0]["remark"] == "abc123def456ghij7890"
+    assert data["data"][0]["order_ref"] == "ref-1"
+
+
+def test_query_deals_includes_remark():
+    """/deals 每行回带 m_strRemark，Core 按 order_ref（聚合键）回填，但 remark 可用于核对。"""
+    class FakeDeal:
+        m_strOrderRef = "ref-1"
+        m_strOrderSysID = "sys-1"
+        m_strTradeID = "trade-1"
+        m_strInstrumentID = "600000"
+        m_strExchangeID = "SH"
+        m_nDirection = 48
+        m_dPrice = 9.25
+        m_nVolume = 600
+        m_dTradeAmount = 5550.0
+        m_dCommission = 1.39
+        m_strTradeTime = "100001"
+        m_strTradeDate = "20260813"
+        m_strSource = "BRIDGE"
+        m_strOrderStrategyType = ""
+        m_strRemark = "abc123def456ghij7890"
+    br.get_trade_detail_data = lambda acc, typ, dt: [FakeDeal()]
+    status, data = _resp("GET", "/deals", {}, b"")
+    assert status == 200
+    assert data["ok"] is True
+    assert data["data"][0]["remark"] == "abc123def456ghij7890"
 
 
 # ---------------- /quote 行情缓存 ----------------

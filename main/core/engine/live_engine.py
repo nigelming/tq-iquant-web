@@ -48,6 +48,27 @@ _DAILY_CLOSE_TIME = (14, 30)
 # passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
 # 超过此时长判定失效，避免无限轮询陈旧单（含跨重启遗留单）。
 _ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
+# 模糊匹配（仅用于无 bridge_order_id 的遗留单）的时间窗：候选委托的柜台插入时间
+# 不得早于本单 created_at 超过此时长。挡住跨会话遗留的同代码同向同量旧单（真机 bug：
+# 新单 11:21 创建时真单尚未可查，被匹配到 09:55 的遗留单 → 回填错成交、真单丢失）。
+_ORDER_INSERT_TOLERANCE = timedelta(seconds=120)
+
+
+def _parse_insert_utc(insert_date, insert_time):
+    """桥 /orders 的 insert_date(YYYYMMDD)+insert_time(HHMMSS，上海本地) → UTC naive。
+
+    无法解析返回 None。桥 insert 时间是 Asia/Shanghai 本地 naive，Core created_at 是
+    UTC naive，比较前需换算。取前 6 位（兼容 HHMMSSsss 毫秒后缀）。
+    """
+    ds = str(insert_date or "").strip()
+    ts = str(insert_time or "").strip()
+    if len(ds) != 8 or len(ts) < 6:
+        return None
+    try:
+        local_naive = datetime.strptime(ds + ts[:6], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return local_naive - timedelta(hours=8)  # Asia/Shanghai → UTC
 
 
 def now_shanghai() -> datetime:
@@ -1227,26 +1248,82 @@ class LiveEngine:
     def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None) -> None:
         """轮询桥 /orders 定位本单的 m_strOrderRef 回写（G3 匹配键）。
 
-        passorder 返回 0 无法预知 OrderRef，故按组合键从桥 /orders 列表定位：
-        source=BRIDGE（排除 GUI 手动单）+ instrument/exchange 拼接 = 股票代码
-        + direction（48买/49卖）+ volume（委托量）。
+        passorder 返回 0 无法预知 OrderRef，需从桥 /orders 列表定位本单。两层策略：
 
-        同代码同向同量可能有多笔在途单（1m 电平信号连续发 OPEN），不能取第一个匹配项，
-        否则多笔 LiveOrder 共用同一 order_ref → 同一成交回填多次 → 虚拟持仓虚高。故：
-        候选按 insert_date+insert_time 降序取最新，且跳过 claimed_refs 中已被本 session
-        其他单占用的 order_ref（_poll_deals 把 session 内所有已回写 ref 传入并累加）。
-        找不到 → order_ref 留 None，下轮 _poll_deals 再找。
+        1. **remark 精确认领（主路径）**：下单时 Core 把确定性 bridge_order_id 前 20 位
+           作为 userOrderId 传给 passorder，柜台写回委托的 m_strRemark。本单已记录
+           bridge_order_id（正常路径下单成功即写）时，按 remark 全局唯一精确定位——
+           不依赖代码/方向/数量，彻底杜绝同代码同向同量旧单误绑（真机 bug 见下）。
+        2. **模糊+时间窗（遗留兜底）**：重启恢复的历史单可能无 bridge_order_id，退回
+           source=BRIDGE + 代码 + direction(48买/49卖) + volume 组合键。两个加固：
+           (a) **跳过带 remark 的候选**——它们属于已被 bridge_order_id 跟踪的单，不能
+               被遗留单冒领；
+           (b) **时间窗**：候选柜台插入时间(上海本地)换算 UTC 后不得早于本单
+               created_at 超过 _ORDER_INSERT_TOLERANCE，挡住跨会话遗留的同代码同向同量
+               旧单（真机 bug：新单 11:21 创建时真单尚未可查，被匹配到 09:55 遗留单 →
+               回填错成交 1.041、真单 1.037 丢失）。
+
+        同代码同向同量可能有多笔在途单，候选按 insert_date+insert_time 降序取最新，且
+        跳过 claimed_refs 中已被本 session 其他单占用的 order_ref。找不到 → 留 None，
+        下轮 _poll_deals 再找。
         """
         try:
             orders = self._dispatcher.query_orders()
         except BridgeUnavailableError:
             return  # 桥离线，下轮再找
         claimed = claimed_refs if claimed_refs is not None else set()
-        code = live_order.stock_code
-        op_dir = 48 if live_order.trade_type == "buy" else 49
+        bridge_oid = live_order.bridge_order_id
+        if bridge_oid:
+            ref = self._match_by_remark(orders, bridge_oid[:20], claimed)
+        else:
+            ref = self._match_legacy_fuzzy(live_order, orders, claimed)
+        if ref is not None:
+            live_order.order_ref = ref
+
+    @staticmethod
+    def _match_by_remark(orders, expected_remark, claimed):
+        """主路径：按 m_strRemark 全局唯一精确认领本单的 order_ref。"""
         candidates = []
         for o in orders or []:
             if o.get("source") != "BRIDGE":
+                continue
+            if o.get("remark") != expected_remark:
+                continue
+            ref = o.get("order_ref")
+            if ref is None or ref in claimed:
+                continue
+            candidates.append(o)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda o: (
+                str(o.get("insert_date") or ""),
+                str(o.get("insert_time") or ""),
+            ),
+            reverse=True,
+        )
+        return candidates[0].get("order_ref")
+
+    @staticmethod
+    def _match_legacy_fuzzy(live_order, orders, claimed):
+        """遗留兜底：无 bridge_order_id 的重启单用代码+方向+数量模糊匹配。
+
+        仅认无 remark 的候选（带 remark 的属于已跟踪单），且柜台插入时间须落在本单
+        created_at 的时间窗内，挡住跨会话遗留旧单。
+        """
+        code = live_order.stock_code
+        op_dir = 48 if live_order.trade_type == "buy" else 49
+        created_utc = live_order.created_at
+        # created_at 为 UTC naive；缺失则无法做时间窗校验，保守不绑定（避免重蹈误绑）。
+        if created_utc is None:
+            return None
+        earliest = created_utc - _ORDER_INSERT_TOLERANCE
+        candidates = []
+        for o in orders or []:
+            if o.get("source") != "BRIDGE":
+                continue
+            # 带 remark 的候选属于有 bridge_order_id 的在跟踪单，遗留单不得冒领。
+            if o.get("remark"):
                 continue
             inst = o.get("instrument") or ""
             exch = o.get("exchange") or ""
@@ -1259,11 +1336,12 @@ class LiveEngine:
             ref = o.get("order_ref")
             if ref is None or ref in claimed:
                 continue
+            insert_utc = _parse_insert_utc(o.get("insert_date"), o.get("insert_time"))
+            if insert_utc is None or insert_utc < earliest:
+                continue  # 无法解析时间或早于创建窗口 → 视为遗留旧单，排除
             candidates.append(o)
         if not candidates:
-            return
-        # 最新委托在前：insert_date/insert_time 为定宽字符串（YYYYMMDD / HHMMSS），
-        # 缺项（None/""）视为最旧排末尾。
+            return None
         candidates.sort(
             key=lambda o: (
                 str(o.get("insert_date") or ""),
@@ -1271,7 +1349,7 @@ class LiveEngine:
             ),
             reverse=True,
         )
-        live_order.order_ref = candidates[0].get("order_ref")
+        return candidates[0].get("order_ref")
 
     def _poll_deals(self) -> None:
         """主循环每轮：查未完结 LiveOrder → 定位 OrderRef → 轮询桥 /deals → 回填（G2）。
