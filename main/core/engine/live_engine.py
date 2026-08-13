@@ -807,6 +807,32 @@ class LiveEngine:
                             order.bar_time, dup.id,
                         )
                         continue
+                # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
+                # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
+                # 持仓未更新，连续 bar 的 OPEN/CLOSE 信号看持仓是旧的 → 同股同向重复
+                # 买单/卖单（真机 2026-08-13：159888/159929/159936 两根连续 bar 两次 OPEN）。
+                # 按「同向」拦：在途 BUY 不拦 SELL、在途 SELL 不拦 BUY——风控止损/平仓
+                # 卖出不被未确认的买入挡住。bar_time 不是放行理由（不同 bar 只是两次
+                # 信号时点，上一单未确认就再下同向单仍是重复）。回填确认（filled）后由
+                # portfolio.py 持仓守卫接管；rejected 释放门（被拒不会成交，必须允许重试）。
+                # 边界：无 cancelled 状态，纯撤单无成交的单会一直 submitted → 该股被门挡住；
+                # 比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
+                op = "buy" if order.trade_type == TradeType.BUY else "sell"
+                inflight = db.query(LiveOrder).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                    LiveOrder.strategy_id == order.strategy_id,
+                    LiveOrder.stock_code == order.stock_code,
+                    LiveOrder.trade_type == op,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                ).first()
+                if inflight is not None:
+                    logger.info(
+                        "skip inflight %s %s %s bar=%s (order %s still %s)",
+                        op.upper(), order.stock_code, order.signal_name,
+                        order.bar_time, inflight.id, inflight.status,
+                    )
+                    continue
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
                 self._pending_orders[live_order.id] = live_order
