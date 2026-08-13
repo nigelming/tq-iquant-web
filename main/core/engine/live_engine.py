@@ -44,6 +44,11 @@ _CST = timezone(timedelta(hours=8))
 # 上海 14:30 收盘后驱动。提为常量消除魔法数字（审计 #33）。
 _DAILY_CLOSE_TIME = (14, 30)
 
+# submitted 但始终匹配不到桥 order_ref 的单的失效阈值（秒）。
+# passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
+# 超过此时长判定失效，避免无限轮询陈旧单（含跨重启遗留单）。
+_ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
+
 
 def now_shanghai() -> datetime:
     """当前上海时间（naive，已剥时区）。实盘固有时点判定专用。
@@ -1219,21 +1224,27 @@ class LiveEngine:
         db.flush()  # 取 live_order.id
         return live_order
 
-    def _try_match_order_ref(self, live_order: LiveOrder) -> None:
+    def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None) -> None:
         """轮询桥 /orders 定位本单的 m_strOrderRef 回写（G3 匹配键）。
 
         passorder 返回 0 无法预知 OrderRef，故按组合键从桥 /orders 列表定位：
         source=BRIDGE（排除 GUI 手动单）+ instrument/exchange 拼接 = 股票代码
-        + direction（48买/49卖）+ volume（委托量）。全局限 1 session 串行，
-        同股票同向同量的在途单唯一，不会撞单。
+        + direction（48买/49卖）+ volume（委托量）。
+
+        同代码同向同量可能有多笔在途单（1m 电平信号连续发 OPEN），不能取第一个匹配项，
+        否则多笔 LiveOrder 共用同一 order_ref → 同一成交回填多次 → 虚拟持仓虚高。故：
+        候选按 insert_date+insert_time 降序取最新，且跳过 claimed_refs 中已被本 session
+        其他单占用的 order_ref（_poll_deals 把 session 内所有已回写 ref 传入并累加）。
         找不到 → order_ref 留 None，下轮 _poll_deals 再找。
         """
         try:
             orders = self._dispatcher.query_orders()
         except BridgeUnavailableError:
             return  # 桥离线，下轮再找
+        claimed = claimed_refs if claimed_refs is not None else set()
         code = live_order.stock_code
         op_dir = 48 if live_order.trade_type == "buy" else 49
+        candidates = []
         for o in orders or []:
             if o.get("source") != "BRIDGE":
                 continue
@@ -1245,8 +1256,22 @@ class LiveEngine:
                 continue
             if o.get("volume") != live_order.quantity:
                 continue
-            live_order.order_ref = o.get("order_ref")
+            ref = o.get("order_ref")
+            if ref is None or ref in claimed:
+                continue
+            candidates.append(o)
+        if not candidates:
             return
+        # 最新委托在前：insert_date/insert_time 为定宽字符串（YYYYMMDD / HHMMSS），
+        # 缺项（None/""）视为最旧排末尾。
+        candidates.sort(
+            key=lambda o: (
+                str(o.get("insert_date") or ""),
+                str(o.get("insert_time") or ""),
+            ),
+            reverse=True,
+        )
+        live_order.order_ref = candidates[0].get("order_ref")
 
     def _poll_deals(self) -> None:
         """主循环每轮：查未完结 LiveOrder → 定位 OrderRef → 轮询桥 /deals → 回填（G2）。
@@ -1268,10 +1293,44 @@ class LiveEngine:
             if not pending:
                 self._sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
                 return
-            # 1. 未回填 order_ref 的单：尝试定位
+            # 1. 未回填 order_ref 的单：尝试定位。
+            # claimed_refs = 本 session 所有已占用 order_ref（历史已回填 + 本轮刚分配），
+            # 防止同代码同向同量的多笔在途单撞同一个 ref（重复回填 → 虚拟持仓虚高）。
+            claimed_refs = set(
+                r[0] for r in db.query(LiveOrder.order_ref).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.order_ref.isnot(None),
+                ).all()
+            )
             for lo in pending:
                 if lo.order_ref is None:
-                    self._try_match_order_ref(lo)
+                    self._try_match_order_ref(lo, claimed_refs)
+                    if lo.order_ref is not None:
+                        claimed_refs.add(lo.order_ref)
+            # 1b. 陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
+            # created_at 为 UTC（SQLite CURRENT_TIMESTAMP），用 utcnow 比较；
+            # created_at 缺失（异常数据）不过期，留给后续轮次。
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            for lo in pending:
+                if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
+                    continue
+                if lo.created_at is None:
+                    continue
+                age = now_utc - lo.created_at
+                if age >= _ORDER_REF_MATCH_TIMEOUT:
+                    lo.status = "rejected"
+                    lo.error_message = (
+                        "order match timeout: no bridge order_ref within %ds"
+                        % int(age.total_seconds())
+                    )
+                    self._pending_orders.pop(lo.id, None)
+                    self._emit("order", {
+                        "portfolio_id": lo.portfolio_strategy_id,
+                        "order_id": lo.id,
+                        "status": "rejected",
+                        "stock_code": lo.stock_code,
+                        "error_message": lo.error_message,
+                    })
             db.commit()
             # 2. 有 order_ref 的单：查 /deals 回填
             need_ref = [lo for lo in pending if lo.order_ref is not None]

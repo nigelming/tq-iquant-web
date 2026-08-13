@@ -92,6 +92,22 @@ def test_order_real_calls_passorder():
     assert isinstance(calls[0][4], int)
 
 
+def test_order_rejected_when_passorder_returns_nonzero():
+    """回归：passorder 返回非 0（被券商/客户端拒绝）时桥必须返回 ok=False。
+
+    旧逻辑无视返回值恒返回 ok=True，导致 Core 端把已被拒的单当受理，order_ref
+    永远匹配不到、却一直挂 submitted。0=已受理（真机验证），其余一律视为拒绝。
+    """
+    br.DRY_RUN = False
+    br.passorder = lambda *a, **k: -1
+    body = json.dumps({"order_id": "oid-rej", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 0}).encode()
+    status, data = _resp("POST", "/order", {}, body)
+    assert status == 200
+    assert data["ok"] is False
+    assert "passorder" in data["error"]
+
+
 def test_do_place_uses_prtype_14_and_ordertype_1101():
     """0009 切片4：_do_place 固定 prType=14(对手价) + orderType=1101(单股标准)。"""
     br.DRY_RUN = False

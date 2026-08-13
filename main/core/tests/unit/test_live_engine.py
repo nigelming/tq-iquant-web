@@ -6,7 +6,7 @@
 """
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -876,6 +876,84 @@ def test_try_match_order_ref_finds_bridge_order():
     engine._try_match_order_ref(lo)
 
     assert lo.order_ref == "ref-found"
+    db.close()
+
+
+def test_try_match_order_ref_does_not_collide_same_code_dir_volume():
+    """回归：同股票同向同量的多笔在途单，order_ref 匹配不得撞同一个 ref。
+
+    实盘根因：1m 公式持续发 OPEN，连续多笔买单代码/方向/委托量完全相同，
+    _try_match_order_ref 取第一个匹配项 → 多笔 LiveOrder 共用同一 order_ref →
+    同一笔成交回填到所有单 → apply_trade 重复执行 → 虚拟持仓虚高。
+    修复：候选按 insert_date+insert_time 取最新，且排除已被本 session 其他单占用的 ref。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    # 两笔同代码同向同量的 BRIDGE 委托，insert_time 不同，order_ref 各异
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-old",
+         "insert_date": "20260805", "insert_time": "095200"},
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-new",
+         "insert_date": "20260805", "insert_time": "095300"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo1 = _submitted_order(db, quantity=600)
+    lo2 = _submitted_order(db, quantity=600)
+    db.commit()
+
+    # 经 _poll_deals 一轮匹配（无成交，仅回写 order_ref）
+    engine._poll_deals()
+
+    db.refresh(lo1)
+    db.refresh(lo2)
+    assert lo1.order_ref is not None
+    assert lo2.order_ref is not None
+    assert lo1.order_ref != lo2.order_ref, "两笔在途单不得共用同一 order_ref"
+    assert {lo1.order_ref, lo2.order_ref} == {"ref-old", "ref-new"}
+    db.close()
+
+
+def test_poll_deals_expires_stale_order_without_order_ref():
+    """order_ref 始终匹配不到（桥 /orders 无此单）的陈旧 submitted 单 → 超时置 rejected。
+
+    回归：passorder 受理后桥侧从未出现该委托（被 iQuant 静默丢弃/拒单），Core 端
+    order_ref 永远为 None，旧逻辑无限轮询。超过阈值（默认 180s）判定失效，置 rejected
+    + error_message 并移出 pending。fresh 单（未超时）保持 submitted 不动。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 桥侧无任何匹配委托
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    fresh = _submitted_order(db, quantity=700)
+    fresh.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    stale2 = db.get(LiveOrder, stale.id)
+    fresh2 = db.get(LiveOrder, fresh.id)
+    assert stale2.status == "rejected"
+    assert stale2.order_ref is None
+    assert stale2.error_message  # 有失效原因
+    assert fresh2.status == "submitted"  # 未超时不动
+    # 陈旧单已移出在途集合
+    pending = db.query(LiveOrder).filter(
+        LiveOrder.live_session_id == 1,
+        LiveOrder.status.in_(["submitted", "partial"]),
+    ).all()
+    assert [o.id for o in pending] == [fresh.id]
     db.close()
 
 

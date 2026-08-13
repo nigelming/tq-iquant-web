@@ -183,6 +183,11 @@ class Portfolio:
                 return None
             trade_type = TradeType.SELL
         elif sig.signal_type == SignalType.OPEN:
+            # OPEN = 开新仓（买入一只当前不持有的股票）。本票已持仓 → 忽略：
+            # 加仓是 ADD 的职责（需满足回撤阈值 + max_add_count）。否则公式持续发
+            # OPEN（电平信号）会对同一只票每根 bar 加仓一次（实盘 1m 刷屏下单根因）。
+            if pos is not None and pos.quantity > 0:
+                return None
             # 受 max_positions 约束：已达上限不开新仓
             held = sum(1 for p in ctx.positions.values() if p.quantity > 0)
             if held >= ctx.max_positions:

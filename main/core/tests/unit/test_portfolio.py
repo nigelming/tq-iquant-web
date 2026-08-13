@@ -334,6 +334,27 @@ def test_open_signal_respects_max_positions():
     assert orders == []
 
 
+def test_open_signal_ignored_when_stock_already_held():
+    """OPEN 信号对本票已持仓时忽略——加仓是 ADD 的职责，OPEN 只开新仓。
+
+    回归：1m 策略公式持续发 OPEN（电平信号），原逻辑只数持仓只数 < max_positions 就放行，
+    导致同一只票每分钟加仓一次。本票已持仓时 OPEN 必须直接跳过。
+    """
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+        max_positions=5,
+    )
+    # 目标股票已持仓（仅 1 只，< max_positions=5，但本票已持有）
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert orders == []
+
+
 # ===========================================================================
 # 主从策略联动（§89）：从策略 OPEN 只能买主策略当前持有的同一只股票；主策略
 # 清仓（含该股）后从策略不可新开仓但存量可卖。ADD/REDUCE/全平类不受 master

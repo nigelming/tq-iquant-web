@@ -256,6 +256,12 @@ def _do_place(params):
         #   (official single-stock standard value; old 0 was non-standard).
         result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
                     "iquant_bridge", 2, _CTX)
+        # 0 = accepted (verified on real client). Any other value means the
+        # broker/client rejected the order -- must report ok=False so Core marks
+        # it rejected instead of holding a submitted order whose order_ref never
+        # appears.
+        if result != 0:
+            return {"ok": False, "error": "passorder rejected (code=%s)" % result}
         return {"ok": True, "passorder_result": str(result)}
     except Exception as e:
         return {"ok": False, "error": "passorder raised: %s" % e}
