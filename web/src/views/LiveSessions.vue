@@ -9,7 +9,7 @@ import {
 } from '../utils/liveWorkbench'
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getPortfolios,
-  getLiveSessions, createLiveSession, startLiveSession, stopLiveSession,
+  getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   type PortfolioItem, type LiveSessionItem,
 } from '../api'
 
@@ -142,6 +142,16 @@ async function stopSession(id: number) {
   load()
 }
 
+async function deleteSession(s: LiveSessionItem) {
+  if (!confirm(`确定删除实盘 session「${s.name}」？该 session 的历史委托/成交将一并清除，且不可恢复。`)) return
+  try {
+    await deleteLiveSession(s.id)
+    load()
+  } catch (e: any) {
+    alert(e?.message || '删除失败')
+  }
+}
+
 onMounted(load)
 onUnmounted(closeEventStream)
 </script>
@@ -165,6 +175,7 @@ onUnmounted(closeEventStream)
           <td>
             <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
+            <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
           </td>
         </tr>
       </tbody>

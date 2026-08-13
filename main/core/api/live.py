@@ -463,6 +463,8 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return err(404, "资源不存在")
+    if session.status == "running" or session_id in _ENGINES:
+        return err(409, "session 运行中，请先停止再删除")
     db.query(LiveSessionPortfolio).filter(
         LiveSessionPortfolio.session_id == session_id
     ).delete()
