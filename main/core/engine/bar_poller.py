@@ -186,6 +186,12 @@ class BarPoller:
         return self._stock_codes
 
     @property
+    def period(self) -> str:
+        """轮询周期（透传 bars 的周期）。LiveEngine 用它区分 bars_by_code 来源：
+        本周期 = BarPoller 透传（count 窗口判完成用）；其他周期 = 边界分发预拉。"""
+        return self._period
+
+    @property
     def last_completed_stime(self) -> Optional[datetime]:
         """所有 code 中最高的完成 bar 时间(观测值,供测试/监控;判定逻辑用 per-code)。"""
         vals = [t for t in self._last_completed.values() if t is not None]
@@ -200,10 +206,14 @@ class BarPoller:
         """
         # 本轮新完成 bar,按时间合并:stime -> {code: ohlcv}
         new_by_time: Dict[datetime, Dict[str, dict]] = {}
+        # 本轮各 code 拉到的原始 bar 列表(count 窗口,含 forming 最新一根)——挂到 BarEvent.
+        # bars_by_code 透传,注入并入预热缓存复用,消除 1m 双拉(判完成与算公式共用一次拉取)。
+        raw_by_code: Dict[str, list] = {}
         any_data = False
 
         for code in self._stock_codes:
             bars = self._dispatcher.query_quote(code, period=self._period, count=self._count)
+            raw_by_code[code] = bars
             # 该 code 的 stime -> ohlcv
             stime_map: Dict[datetime, dict] = {}
             stimes: List[datetime] = []
@@ -246,10 +256,15 @@ class BarPoller:
                 self._initialized = True
             return []
 
-        # 按时间排序触发(旧→新),每根构造 BarEvent(带周期,C6 节拍过滤用)
+        # 按时间排序触发(旧→新),每根构造 BarEvent(带周期,C6 节拍过滤用)。
+        # bars_by_code 只含该 bar.stocks 对应 code 的本轮原始 bars(透传给注入复用)。
         triggered: List[BarEvent] = []
         for t in sorted(new_by_time):
-            bar_event = BarEvent(stocks=new_by_time[t], bar_time=t, period=self._period)
+            provided = {c: raw_by_code.get(c, []) for c in new_by_time[t]}
+            bar_event = BarEvent(
+                stocks=new_by_time[t], bar_time=t, period=self._period,
+                bars_by_code=provided,
+            )
             self.on_bar(bar_event)
             triggered.append(bar_event)
         return triggered

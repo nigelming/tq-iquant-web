@@ -275,6 +275,38 @@ def test_only_bars_beyond_last_completed_trigger():
     assert result[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
 
 
+def test_poll_attaches_fetched_bars_for_triggered_bar():
+    """BarPoller 把本轮该 code 拉到的原始 bars 挂到 BarEvent.bars_by_code。
+
+    注入复用（消除 1m 双拉）：BarPoller 本轮已拉 count=10 根，注入若再走
+    _get_bars_with_increment 增量拉（同样 count=10）是双份冗余。透传后注入
+    把本轮 bars 并入预热缓存直接复用。挂在事件上而非改 on_bar 签名（保持
+    1 参回调兼容）。
+    """
+    rec = _QuoteRecorder(per_code={"600000.SH": [
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32), _bar("20260805101000", 9.40)],
+    ]})
+    poller, _ = _make_poller(rec)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                       # 基线
+    poller.poll()                       # 10:09 完成 → 触发
+
+    assert len(fired) == 1
+    bar = fired[0]
+    assert bar.bars_by_code is not None
+    assert set(bar.bars_by_code.keys()) == {"600000.SH"}
+    raw = bar.bars_by_code["600000.SH"]
+    # 本轮拉到的原始 bars（含最新 forming 10:10），供注入并入缓存复用
+    assert [parse_bar_time(b) for b in raw] == [
+        datetime(2026, 8, 5, 10, 8, 0),
+        datetime(2026, 8, 5, 10, 9, 0),
+        datetime(2026, 8, 5, 10, 10, 0),
+    ]
+
+
 # ---------------- 多股票合并 ----------------
 def test_multiple_stocks_same_time_merged_into_one_bar_event():
     """多股票同一 bar 时间 → 合并为一根 BarEvent.stocks。"""

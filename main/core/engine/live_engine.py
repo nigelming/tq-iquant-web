@@ -681,12 +681,18 @@ class LiveEngine:
         5m/15m/30m/1h 策略在边界时点才被驱动（C6(A)），1m 节拍不再每 bar 算长周期。
         C4(#28)：df_cache/raw_cache 建在此（跨组合共享）——同 (code,period) 只 query_quote
         一次、同 (code,period,formula) 只 compute_injected 一次（TQ 计算最贵）。
+        BarPoller 透传的本轮 bars（bar.bars_by_code）直接给 _handle_bar 注入复用——
+        1m 判完成与算公式共用一次拉取，消除双拉（BarPoller 已拉 count=10，注入不再增量重拉）。
         """
         df_cache: Dict = {}
         raw_cache: Dict = {}
+        bars_by_code = getattr(bar, "bars_by_code", None) or None
         for portfolio in self.portfolios:
             try:
-                self._handle_bar(portfolio, bar, df_cache=df_cache, raw_cache=raw_cache)
+                self._handle_bar(
+                    portfolio, bar, bars_by_code=bars_by_code,
+                    df_cache=df_cache, raw_cache=raw_cache,
+                )
             except BridgeUnavailableError as e:
                 # 下单时桥离线：标记并中断本 bar（循环下一轮心跳会暂停）
                 self._bridge_online = False
@@ -1071,6 +1077,9 @@ class LiveEngine:
         缓存值 (bars, used_count)。同 code+period 的公式 count 更大 → 升级重拉（过小会缺
         历史，公式长均线 NaN 静默失效）；bars_by_code 已按该周期最大 count 预拉 → 直接复用，
         记 used=(code,period) 最大 count，避免无谓升级重拉。
+        bars_by_code 提供的 bars **不足 count**（BarPoller 本轮拉的 count 窗口，如 10 根）
+        → 不能直接复用（拿 10 根喂 200 根窗口公式 = 长均线 NaN 静默失效），改走
+        _reuse_provided_with_cache：并入预热缓存，缓存覆盖 count 则复用、否则增量补齐。
         底层实际拉取走 _get_bars_with_increment（预热缓存 + 增量拼接），不再直接 query_quote
         全量——1m 算公式（bars_by_code=None）与升级重拉都受益。
         """
@@ -1084,13 +1093,47 @@ class LiveEngine:
             df_cache[key] = (bars, count)
             return bars
         if bars_by_code is not None and code in bars_by_code:
-            bars = bars_by_code[code]
-            df_cache[key] = (bars, max(count, self._code_period_count.get((code, period),
-                                                                          self._formula_count)))
+            provided = bars_by_code[code]
+            # 提供 bars 已覆盖公式窗口 → 直接复用（used 记该 (code,period) 最大 count，
+            # 同 bar 内更大 count 公式也直接复用不重拉）。
+            if len(provided) >= count:
+                used = max(count, self._code_period_count.get((code, period), self._formula_count))
+                df_cache[key] = (provided, used)
+                return provided
+            # 提供 bars 不足 count：
+            #   非轮询周期（5m/1d...边界分发预拉，本就按 _code_period_count 全量，桥只返
+            #   这么多历史）→ 直接复用（历史就这么多，不能无中生有）。
+            #   轮询周期（1m，BarPoller 透传，count 窗口仅判完成用）→ 并入预热缓存复用/补齐。
+            if period != self._bar_poller.period:
+                used = max(count, self._code_period_count.get((code, period), self._formula_count))
+                df_cache[key] = (provided, used)
+                return provided
+            bars = self._reuse_provided_with_cache(code, period, provided, count)
+            df_cache[key] = (bars, count)
             return bars
         bars = self._get_bars_with_increment(code, period, count)
         df_cache[key] = (bars, count)
         return bars
+
+    def _reuse_provided_with_cache(self, code: str, period: str, provided: list, count: int) -> list:
+        """把调用方本轮已拉到的 bars（BarPoller 透传）并入预热缓存复用，零额外拉取。
+
+        BarPoller 每轮已拉 1m（count 窗口，如 10 根），注入若再走 _get_bars_with_increment
+        增量拉（同样 count 窗口）就是同一批 bars 的双份冗余。把本轮已拉的并入缓存后：
+          缓存历史已够 count 根（启动预热 code_period_count 根）→ 直接返回，零拉桥；
+          缓存历史不够（未预热/离线清空/请求 count 更大）→ 回退 _get_bars_with_increment
+          全量/增量补齐（同原路径，冷启动安全）。
+        """
+        cache = self._preheat_cache.get((code, period))
+        if cache is None:
+            # 冷启动/离线清空：提供 bars 量小不足公式窗口，走全量拉补缓存（含这些 bars）。
+            return self._get_bars_with_increment(code, period, count)
+        merged = self._sort_and_cap(cache["bars"] + provided, count)
+        cache["bars"] = merged
+        cache["last_stime"] = self._max_stime(merged)
+        if len(merged) >= count:
+            return merged
+        return self._get_bars_with_increment(code, period, count)
 
     @staticmethod
     def _bars_to_formula_df(bars: list, code: str) -> Optional[dict]:

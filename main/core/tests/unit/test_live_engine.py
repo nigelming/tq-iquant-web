@@ -2054,6 +2054,49 @@ def test_fill_signal_cache_upgrades_quote_count_for_larger_formula():
     assert any("count=500" in c for c in queries)
 
 
+def test_on_bar_1m_inject_reuses_poller_bars_merge_cache_no_fetch():
+    """优化：BarPoller 透传的本轮 1m bars 经 _on_bar → 注入并入预热缓存复用，零额外拉取。
+
+    优化前：BarPoller 拉 count=10 判完成即弃，注入走 _get_bars_with_increment 增量
+    再拉 count=10（双份冗余）；且 _fetch_cached_bars 遇 bars_by_code 无脑复用——拿
+    3 根喂 200 根窗口公式（长均线 NaN 静默失效，真实缺陷）。优化后：本轮已拉 bars
+    并入预热缓存（启动预热 code_period_count 根历史）→ 复用完整窗口，本轮零 /quote。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    provided = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])  # BarPoller 本轮拉 3 根
+    # 预热历史：200 根到 09:59 止（升序，provided 10:00-10:02 更新）
+    hist = _quote_bars(stock, [datetime(2026, 8, 5, 9, 59) - timedelta(minutes=i) for i in range(200)])
+    _mock_dispatcher_with_quote(rec, stock, hist)   # 兜底：任何 fallback 拉取也有数据
+    engine = _make_engine_formula_portfolio(
+        disp, factory, port, {1: "MA_CROSS"}, formula_count=200,
+    )
+    engine._preheat_cache[("600000.SH", "1m")] = engine._make_cache_entry(hist, 200)
+
+    received = {}
+    def _compute(**kw):
+        df = kw.get("ohlcv_df") or {}
+        received["rows"] = len(df["Close"]) if "Close" in df else 0
+        return {"ErrorId": "0", stock: {"open_sig": [{"Date": "202608051002", "Value": 1}]}}
+    engine._tq_formula.compute_injected = _compute
+
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+    bar.bars_by_code = {stock: provided}   # BarPoller 本轮透传
+    engine._on_bar(bar)
+
+    # 公式拿到完整窗口（200 根）——并入预热缓存后复用，不是拿 3 根裸复用
+    assert received["rows"] == 200
+    # 本轮注入零额外 /quote 拉取（BarPoller 自身的拉取由 poll 外部计数）
+    assert _count_quote(rec) == []
+    # 信号仍正确填充（窗口完整 → 公式算出信号）
+    assert (1, stock, bar_time) in engine.signal_cache
+
+
 def test_dispatch_period_bar_uses_period_max_formula_count():
     """C4：#28 边界分发预拉 count = 该周期策略最大 formula_count（供注入，够最长公式）。"""
     factory, _ = _db_factory()
