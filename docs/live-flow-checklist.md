@@ -9,6 +9,7 @@
 > 一项的结论可能同时更新本表 + open-questions.md + 全流程设计对应章节。
 >
 > **2026-08-10 状态更新**:切片5 订单状态机 + /deals 回填(G1/G2/G6)、G7 桥状态并入、C6 三段式实盘周期链路(1m 边界分发 + 1d 14:30 快照 + 1w/1mon 通达信注入)、E8 离线恢复不补 bar、F10 submitted 拆分、I4 挂回未完结单、B6 全局限 1 session、F5 接桥 available、C4 三维去重(#28)+ Formula.formula_count(#27)、D4/H4 熔断计数读回/持久化、F6 同 bar 可用量递减记账 + G5 独立 5s 回填轮询、D3 对账(仅告警不修正)、A2 账号改配置 + 桥部署 README、B5 SSE 事件流(signal/order/trade/position/risk 五类推送)、B4 前端实盘工作台(SSE 事件日志 + 持仓/委托/成交三表 + 历史加载 + B4b orders/trades/positions 历史查询端点),均已 TDD 实现并提交(eb4bc40/9e46869/c2e1482/3c826e8/3b74cbf/d5d8e90/1d60d4f/5d5dd20/411127b/d0b66d4/本提交),对应行已标 ✅。🧠 决策已清零,🔲 待实现表已清空。
+> **2026-08-14 状态更新**:F11 在途单门(同股同向未确认单压掉新同向单,杜绝连续 bar 重复开/平仓)已 TDD 实现并提交(37841dc)——根因真机 2026-08-13 连续两根 1m bar 两次 OPEN;对称 BUY/SELL,rejected 释放,边界无 cancelled 状态已在注释说明。下次启动新 session 生效。
 
 ---
 
@@ -119,6 +120,7 @@
 | F8 | 成交价近似 | ✅已修正 | — | 用 `bar.close`,prType=14 实际是盘口一档价。切片5 回填修正(→ design §5.6) | ✅ 切片5 已修正:成交价/量/佣金取 /deals 真实回报,成交均价=金额/量(`_backfill_order`,live_engine.py:741),不再用 bar.close 近似 |
 | F9 | 佣金/印花税 | ⚠️已知 | — | 首期 0,真实成本从 /deals 回报取 | ⚠️ 佣金已实现:取 /deals commission(`_backfill_order`);印花税仍 0(DEAL 印花税字段待真机验证) |
 | F10 | 落库 `status=accepted` | ✅已实现 | ✅ | 应拆 `submitted`,切片5(→ design §5.7) | ✅ 切片5 已拆(G1,eb4bc40):先写 `LiveOrder(status=submitted)`+commit 再发 passorder(`_persist_order_submitted`);submitted 阶段不 apply_trade、不写 LiveTrade,回填确认 filled 才 apply |
+| F11 | **在途单门(同股同向未确认单压掉新同向单)** | ✅已实现 | ✅+🔬 | 根因(真机 2026-08-13):下单→/deals 成交回填之间存在**在途窗口**,期间虚拟持仓未更新,连续两根 bar 的 OPEN/CLOSE 信号看持仓是旧的 → 同股同向重复买单/卖单(真机:159888/159929/159936 两根连续 1m bar 两次 OPEN,信号却记成 OPEN 而非 ADD)。**门规则**:`_handle_bar` 订单循环在落库 submitted 前(D6 跨重启去重门之后)查同 `(组合,策略,股票)` 是否已有**同向** `status in (submitted,partial)` 单 → 有则 `continue` 压掉。**同向才拦**:在途 BUY 不拦 SELL(风控止损/平仓不被未确认买入挡住)、在途 SELL 不拦 BUY。**bar_time 不是放行理由**(不同 bar 只是两次信号时点,上一单未确认就再下同向单仍是重复)。**释放条件**:filled 后由 `portfolio.py` 持仓守卫(OPEN 持仓>0 抑制)接管;rejected 释放门(被拒不会成交,必须允许重试)。**边界**:无 cancelled 状态,纯撤单无成交的单一直 submitted → 该股被门挡住;比重复买入更安全(prType=14 对手价秒成秒回填,正常路径不受影响) | ✅ 已实现(2026-08-14 TDD,37841dc):`live_engine.py:_handle_bar` 对称在途单门(BUY 拦 BUY/SELL 拦 SELL),3 新测(buy/sell 被在途单拦截、rejected 释放)+ `dup_buy_different_bar_time` 种子改 filled 保安全侧;全套 420 passed |
 
 ---
 
@@ -184,6 +186,7 @@
 | G6 | 拒单/部分成交持仓修正(回填确认 filled 才 apply) | eb4bc40 |
 | G7 | 桥状态并入 session API(`bridge_online`/`pending_orders`/`last_backfill_time`) | eb4bc40 |
 | F10 | 落库 status 拆 submitted | eb4bc40 |
+| F11 | 在途单门(同股同向未确认单压掉新同向单,杜绝连续 bar 重复开/平仓) | 37841dc |
 | #27 | `Formula.formula_count` 字段+迁移+前端公式页(count 按公式配) | 3b74cbf |
 | #28 | C4 三维去重(拉取 `(code,period)` + 计算 `(code,period,formula)`) | 3b74cbf |
 | B5 | SSE 事件流(`_emit` 五类事件 signal/order/trade/position/risk + `/stream` 端点转发,前端消费留待 B4 实盘启动页) | 本提交 |
