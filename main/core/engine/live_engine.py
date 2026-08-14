@@ -44,6 +44,11 @@ _CST = timezone(timedelta(hours=8))
 # 上海 14:30 收盘后驱动。提为常量消除魔法数字（审计 #33）。
 _DAILY_CLOSE_TIME = (14, 30)
 
+# 深交所收盘时点（上海 15:00）。收盘后禁止新下单——报不进交易所，会成待报单
+# 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
+# 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
+_MARKET_CLOSE_TIME = (15, 0)
+
 # submitted 但始终匹配不到桥 order_ref 的单的失效阈值（秒）。
 # passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
 # 超过此时长判定失效，避免无限轮询陈旧单（含跨重启遗留单）。
@@ -508,6 +513,20 @@ class LiveEngine:
                 )
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
             self._bar_poller.poll()
+            # P2：超时检查移主循环——deals 循环被 60s 主循环饿死（单 worker 串行，
+            # 主循环拉 ~73 只行情耗 50-57s/轮），180s 超时实际 440s 才跑到。移到主循环
+            # 60s 节拍，最坏 60s 延迟。#1 修复后受理即丢弃已即时 rejected，此超时退为
+            # 兜底（桥未丢但 order_ref 迟迟匹配不上的边缘场景）。同 _persist_breaker_count
+            # 的 db session 模式；_expire_stale_orders 自身不 commit，由本块负责。
+            db_tick = self._db_session_factory()
+            try:
+                self._expire_stale_orders(db_tick)
+                db_tick.commit()
+            except Exception:  # noqa: BLE001
+                db_tick.rollback()
+                logger.exception("expire stale orders error (session %s)", self.session_id)
+            finally:
+                db_tick.close()
             # E5/E6：14:30 日终一次 update_daily（日内亏损/熔断次日恢复推进）
             self._maybe_daily_close()
             # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
@@ -770,6 +789,20 @@ class LiveEngine:
                     "signal_type": order.signal_type.value if order.signal_type else None,
                     "bar_time": order.bar_time.isoformat() if order.bar_time else None,
                 })
+                # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
+                # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
+                # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
+                # 不依赖本机时钟/时区，测试与真实部署一致；主循环 60s 延迟不影响——延迟
+                # 处理的是 15:00 前的合法 bar，其 bar_time<15:00 不被拦，正常下单）。
+                # 不写 DB、不进 pending。
+                bt = order.bar_time
+                if bt is not None and (bt.hour, bt.minute) >= _MARKET_CLOSE_TIME:
+                    logger.info(
+                        "skip after-close order %s %s %s bar=%s (bar_time >= 15:00)",
+                        order.trade_type.value, order.stock_code, order.signal_name,
+                        bt,
+                    )
+                    continue
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
                 pos = ctx.positions.get(order.stock_code)
                 if pos is None and order.trade_type == TradeType.BUY:
@@ -1455,29 +1488,9 @@ class LiveEngine:
                     if lo.order_ref is not None:
                         claimed_refs.add(lo.order_ref)
             # 1b. 陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
-            # created_at 为 UTC（SQLite CURRENT_TIMESTAMP），用 utcnow 比较；
-            # created_at 缺失（异常数据）不过期，留给后续轮次。
-            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-            for lo in pending:
-                if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
-                    continue
-                if lo.created_at is None:
-                    continue
-                age = now_utc - lo.created_at
-                if age >= _ORDER_REF_MATCH_TIMEOUT:
-                    lo.status = "rejected"
-                    lo.error_message = (
-                        "order match timeout: no bridge order_ref within %ds"
-                        % int(age.total_seconds())
-                    )
-                    self._pending_orders.pop(lo.id, None)
-                    self._emit("order", {
-                        "portfolio_id": lo.portfolio_strategy_id,
-                        "order_id": lo.id,
-                        "status": "rejected",
-                        "stock_code": lo.stock_code,
-                        "error_message": lo.error_message,
-                    })
+            # （抽为 _expire_stale_orders 供主循环 _tick_main 复用——deals 循环被 60s 主循环
+            # 饿死时，超时检查随主循环 60s 节拍跑，不再 440s 才生效。两处调用幂等。）
+            self._expire_stale_orders(db, pending)
             db.commit()
             # 2. 有 order_ref 的单：查 /deals 回填
             need_ref = [lo for lo in pending if lo.order_ref is not None]
@@ -1501,6 +1514,50 @@ class LiveEngine:
             # rollback 清理未提交事务，close 归还连接。
             db.rollback()
             db.close()
+
+    def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
+        """陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
+
+        created_at 为 UTC（SQLite CURRENT_TIMESTAMP），用 utcnow 比较；
+        created_at 缺失（异常数据）不过期，留给后续轮次。
+        被调用两处（幂等：已 rejected 的单 status not in (submitted,partial) 跳过）：
+          - _poll_deals（deals 循环 5s 节拍，兜底）
+          - _tick_main（主循环 60s 节拍，核心——deals 循环被单 worker 饿死时此处保证
+            180s 超时最坏 60s 延迟生效，而非现状 440s）。
+        pending 为调用方已查的 submitted/partial 列表（复用省一次查询）；None 则自查。
+        注意：调用方负责 commit（_poll_deals 在 expire 后 commit；_tick_main 自带
+        try/commit/rollback/finally close，同 _persist_breaker_count 模式）。
+        """
+        if pending is None:
+            pending = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        for lo in pending:
+            if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
+                continue
+            if lo.created_at is None:
+                continue
+            age = now_utc - lo.created_at
+            if age >= _ORDER_REF_MATCH_TIMEOUT:
+                lo.status = "rejected"
+                lo.error_message = (
+                    "order match timeout: no bridge order_ref within %ds"
+                    % int(age.total_seconds())
+                )
+                self._pending_orders.pop(lo.id, None)
+                self._emit("order", {
+                    "portfolio_id": lo.portfolio_strategy_id,
+                    "order_id": lo.id,
+                    "status": "rejected",
+                    "stock_code": lo.stock_code,
+                    "error_message": lo.error_message,
+                })
 
     def _sync_pending_orders(self, db: Session) -> None:
         """重查 DB 剩余 submitted/partial 同步在途集合（G7 计数）。

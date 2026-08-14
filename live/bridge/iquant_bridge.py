@@ -225,6 +225,43 @@ def _log_order(oid, op, code, volume, result, dup=False):
           % (oid, str(op).upper(), code, volume, tail))
 
 
+def _confirm_order_arrival(remark, account):
+    """Confirm the order record exists after passorder (arrival check).
+
+    passorder returning 0 means "accepted", NOT "an order record was created".
+    iQuant can accept-then-drop the order silently (real-machine 2026-08-14:
+    id36-39, passorder result=0 but NO row in the ORDER detail table). Core
+    then polls /orders forever finding no order_ref, only timing out at 180s.
+    This function closes that gap: after passorder returns 0, sleep briefly and
+    re-query the ORDER detail table by remark (m_strRemark == the passorder
+    userOrderId we set). If the row is there -> True; if not -> False, so _do_place
+    returns ok=False and Core marks the order rejected immediately (its existing
+    BridgeOrderRejected path) instead of waiting 180s.
+
+    Sleep 0.3s first (passorder->ORDER row usually <200ms; verified 24-39ms
+    backfill), then retry up to 2 times (total <=~1s) -- keeps the place chain
+    short. Single-threaded init-blocked bridge: get_trade_detail_data here runs
+    on the same thread as passorder, no concurrency issue (same as query_orders).
+
+    *** DUAL-BRIDGE MIRROR *** -- identical logic must exist in
+    iquant_bridge_live.py _confirm_order_arrival. Hand-sync on any change.
+    """
+    fn = _iq("get_trade_detail_data")
+    if fn is None:
+        return True  # cannot verify -> do not block the order (let 180s timeout backstop)
+    time.sleep(0.3)
+    for _ in range(2):
+        try:
+            rows = fn(account, "STOCK", "ORDER") or []
+            for o in rows:
+                if getattr(o, "m_strRemark", None) == remark:
+                    return True
+        except Exception:
+            pass  # query failed -> retry once more, else treat as not-arrived
+        time.sleep(0.3)
+    return False
+
+
 def _do_place(params):
     code = params.get("code")
     op = params.get("op", "buy")                  # buy / sell
@@ -270,6 +307,13 @@ def _do_place(params):
         # appears.
         if result != 0:
             return {"ok": False, "error": "passorder rejected (code=%s)" % result}
+        # Arrival check: passorder accepted does NOT guarantee an order record was
+        # created (accept-then-drop, real-machine 2026-08-14 id36-39). Re-query the
+        # ORDER table by remark; if no row, report ok=False so Core marks rejected
+        # immediately instead of waiting 180s for order_ref that will never appear.
+        if not _confirm_order_arrival(remark, account):
+            return {"ok": False,
+                    "error": "passorder accepted but no order record (dropped)"}
         return {"ok": True, "passorder_result": str(result)}
     except Exception as e:
         return {"ok": False, "error": "passorder raised: %s" % e}

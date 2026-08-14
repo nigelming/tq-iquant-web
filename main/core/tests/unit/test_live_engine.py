@@ -3548,3 +3548,139 @@ def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
     assert engine.bridge_online is True
     assert len(reset_calls) == 1
 
+
+# ---------------- 收盘后不下单守卫（修复2）----------------
+def test_handle_bar_after_close_skips_order_but_emits_signal():
+    """修复2：bar_time >= 15:00（深交所收盘）→ 信号仍 emit，但不落 LiveOrder。
+
+    根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42，报不进交易所成待报单冻结持仓
+    永不成交。守卫用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区），bar_time>=15:00
+    则信号推送后 continue 跳过落单。不写 DB、不进 pending。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)  # 收盘后
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    # 信号已推送（用户能看到收盘后的信号意图）
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    assert any(e["type"] == "signal" and e["stock_code"] == stock for e in events)
+    # 无 order 事件、无 LiveOrder 落库
+    assert not any(e["type"] == "order" for e in events)
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_handle_bar_before_close_places_order_normally():
+    """修复2回归：bar_time < 15:00（盘中）→ 守卫不拦，正常落 LiveOrder(submitted)。
+
+    守卫不能误伤盘中合法 bar（含 14:59 的 bar：主循环 60s 延迟处理时其 bar_time 仍 <15:00）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 14, 59)  # 盘中最后一分钟
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert orders[0].status == "submitted"
+    db.close()
+
+
+# ---------------- 桥到达确认 → 受理即丢弃即时 rejected（修复1）----------------
+def test_handle_bar_bridge_dropped_order_marks_rejected_immediately():
+    """修复1：桥 passorder 受理但回查无委托记录（受理即丢弃）→ ok:false + error
+    "no order record (dropped)" → Core 走既有 BridgeOrderRejected 路径即时标 rejected。
+
+    根因：真机 2026-08-14 id36-39，桥 passorder result=0（受理）但 iQuant 未生成委托记录，
+    Core 轮询 /orders 找不到 order_ref，180s 后才标 rejected。修复后桥 _confirm_order_arrival
+    回查 ORDER 表无记录 → 返回 ok:false，Core 即时 rejected（error 含 "no order record"），
+    不再等 180s 超时。Core 侧零改动——接 dispatcher 既有 BridgeOrderRejected 路径。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+
+    def respond(request):
+        if request.url.path == "/order":
+            return httpx.Response(200, json={
+                "ok": False,
+                "error": "passorder accepted but no order record (dropped)",
+            })
+        return httpx.Response(200, json={"ok": True})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    events = [q.get_nowait(), q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "signal"
+    assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
+    # 即时 rejected（不等 180s 超时），error 回显桥侧到达确认失败原因
+    assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
+    assert "no order record" in events[2]["error_message"]
+    assert q.empty()
+    # DB 落库：submitted 后即 rejected，无残留 pending
+    db = factory()
+    lo = db.query(LiveOrder).filter(LiveOrder.status == "rejected").first()
+    assert lo is not None
+    assert "no order record" in lo.error_message
+    db.close()
+
+
+# ---------------- 超时检查移主循环（修复3）----------------
+def test_tick_main_expires_stale_order_without_order_ref():
+    """修复3：order_ref 始终匹配不到且超过 180s 的陈旧 submitted 单 → _tick_main 标 rejected。
+
+    根因：超时检查原在 _poll_deals（deals 循环 5s 节拍），但 deals 循环被 60s 主循环饿死
+    （单 worker 串行，主循环拉 ~73 只行情耗 50-57s/轮），180s 超时实际 440s 才生效。
+    修复后 _tick_main 每轮调 _expire_stale_orders，超时检查随主循环 60s 节拍跑。
+    直接调 _tick_main 验证（先例 test_offline_recovery_clears_preheat_cache:2539）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 桥侧无任何匹配委托
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    fresh = _submitted_order(db, quantity=700)
+    fresh.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    db.close()
+
+    engine._tick_main()
+
+    db = factory()
+    stale2 = db.get(LiveOrder, stale.id)
+    fresh2 = db.get(LiveOrder, fresh.id)
+    assert stale2.status == "rejected"
+    assert stale2.error_message  # 有失效原因
+    assert fresh2.status == "submitted"  # 未超时不动
+    db.close()
+
