@@ -27,6 +27,9 @@ Thumbs.db
 # OpenCode state (local only)
 .omo/
 
+# Claude Code local session/settings
+.claude/
+
 # Env
 .env
 .env.local
