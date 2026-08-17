@@ -159,6 +159,52 @@ curl http://127.0.0.1:8790/deals
 
 ---
 
+### 验证 7 — T+0 ETF 当日可卖规则 ⏳
+
+**背景**：2026-08-17 在 etf 股票池加入部分 T+0 ETF（跨境/债券/货币等当日买当日可卖）。原池全是 T+1 ETF，T+0 标的的交收行为**尚未真机验过**——F5 真机验证时只确认了 T+1 ETF 的 `m_nCanUseVolume=0`（买入当日不可用）语义，T+0 标的该字段取值是缺口。
+
+**为何应该自动对（无需改代码）**：实盘 T+1 检查用 `LiveT1Checker`（`execution_engine.py:79`），**不自己判断哪只 T+0/T+1**，直接读桥 `/positions` 返回的 `m_nCanUseVolume`（可用数量）作 SELL 上限：
+
+```python
+avail = self._available_map.get(position.stock_code)  # 桥 m_nCanUseVolume
+return min(position.quantity, avail)
+```
+
+iQuant 客户端按标的自身交收规则设 `m_nCanUseVolume`：T+1 ETF 买入当日 = 0；T+0 ETF 买入当日 = 买入量。每 bar 刷一次（`live_engine.py:765` `_refresh_available_map` → `live_engine.py:1033`），实时取数。→ Core 对 T+0 当日可卖、T+1 当日不可卖**走同一条路自动覆盖**，券商端兜底。
+
+**回测不覆盖 T+0**（已知，不影响实盘）：回测用 `SimulatedT1Checker`（`execution_engine.py:73`）走 `position.available_shares_on`（`position.py:94`），硬编码"query_date 之前（不含当日）买入的份额"——所有标的一律 T+1。回测含 T+0 ETF 的策略时当日回转会被错误压掉，回测失真。**本验证只管实盘**，回测 T+0 另行处理（若需回测 T+0 ETF 策略再单列）。
+
+**待验**：iQuant 对 T+0 ETF 买入当日，`/positions` 的 `m_nCanUseVolume` 是否返回买入量（非 0）——这是整条链路的取数源头。
+
+**验证法**：
+
+```bash
+# 当日买入 T+0 ETF 后，拉桥 /positions 看可用数量字段
+curl http://127.0.0.1:8790/positions
+# 找刚买入的 T+0 ETF，看 available(m_nCanUseVolume) 是否 = 买入量（非 0）
+```
+
+或对账时读 iQuant `Position.csv` 的 `可用数量` 列。
+
+**观测点**：
+
+| # | 位置 | 应看到（T+0 正确） | 查法 |
+|---|---|---|---|
+| 1 | 桥 `/positions` | 当日买入的 T+0 ETF `available` = 买入量（非 0） | `curl .../positions` 找该 code |
+| 2 | iQuant `Position.csv` | 该 T+0 ETF `可用数量` = 买入量；对照同日 T+1 ETF `可用数量` = 0 | Read `Position.csv` |
+| 3 | DB `live_orders` | 当日对该 T+0 ETF 出 SELL 信号 → 落单 quantity 为全额可卖量（不被压到 0） | `SELECT id,stock_code,trade_type,quantity,status FROM live_orders WHERE stock_code='<T0代码>' AND date(bar_time)=date('YYYY-MM-DD')` |
+| 4 | DB `live_trades` | 当日买入后当日卖出该 ETF → 有 sell 成交、持仓归 0 | `SELECT stock_code,trade_type,quantity FROM live_trades WHERE stock_code='<T0代码>'` |
+
+**通过判据**：#1 桥 `available` 非 0 + #3 当日 SELL 不被压 + #4 当日回转成交记录。三项（或 #1+#3，当日没卖出信号时）满足 = T+0 规则在实盘正确生效。
+
+**失败判据**：
+- #1 桥 `available` = 0 → iQuant 把该 T+0 ETF 当 T+1 了（标的分类/客户端配置问题），Core 跟着压掉当日卖——这是 bug 信号，需查 iQuant 端该标的交收规则设置。
+- #3 SELL 被 `cap_quantity` 压到 0 但 #1 非 0 → `_refresh_available_map` 聚合没拿到该 code（查 `instrument.exchange` 拼接是否与 `stock_code` 一致）。
+
+**与验证 1b 同类（可主动验）**：交易日盘中，买入 100 股某 T+0 ETF 后立即 `curl /positions` 看 `available`，确认非 0 即可（不必等卖出信号）。用小额 + 收盘后模拟盘更稳。
+
+---
+
 ## 验证总览表
 
 | # | 项 | 优先级 | 触发条件 | 可主动验 | 状态 |
@@ -170,6 +216,7 @@ curl http://127.0.0.1:8790/deals
 | 4 | F9 印花税字段 | P3 | 有卖出成交时看 /deals | 是 | ⏳ |
 | 5 | D3 对账自动校准放开 | P3 | 长期跑顺后 | 否 | ⏳（暂不动） |
 | 6 | id40-41 陈旧 submitted | — | — | — | 已知缺口 |
+| 7 | T+0 ETF 当日可卖规则 | P3 | 当日买入 T+0 ETF | 是（curl /positions） | ⏳ |
 
 ## 建议验证顺序
 
@@ -177,7 +224,8 @@ curl http://127.0.0.1:8790/deals
 2. **验证 3（易观察）**：交易日中留意 DB 是否有 order_ref=NULL 的 submitted 单，观察其 rejected 时效（应 ≤240s 非 440s）。
 3. **验证 1 + 2（靠自然）**：每日对账时对照——出现 15:00 后信号看 #2、出现 DB rejected 看是 dropped 还是 timeout 文案判 #1/#3。
 4. **验证 4（附带）**：有卖出成交时顺带看 /deals 印花税字段。
-5. **验证 5/6**：长期项，暂不动。
+5. **验证 7（可主动）**：盘中买入 T+0 ETF 后 `curl /positions` 看 `available` 非 0——确认 iQuant 对 T+0 标的当日可用量语义，整条当日可卖链路的取数源头。
+6. **验证 5/6**：长期项，暂不动。
 
 ## 每日对账时快速对照
 
@@ -186,4 +234,5 @@ curl http://127.0.0.1:8790/deals
 - 出现 `no order record (dropped)` 的 rejected 单 → **验证 1 触发**，查时间差是否 ≤1s。
 - 出现 15:00 后信号但无委托 → **验证 2 触发**，确认信号事件有、DB 无单。
 - 出现 `order match timeout` 的 rejected 单 → **验证 3 触发**，查时间差是否 ≤240s。
+- 当日买入 T+0 ETF → **验证 7 对照**，看 Position.csv 该 code `可用数量` 是否非 0（T+0 正确）；同日 T+1 ETF `可用数量` 应 = 0 印证对照。
 - 当日平稳无异常 → 三条均未触发（记 —），等下一日。
