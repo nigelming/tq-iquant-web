@@ -47,6 +47,7 @@ web/stdin.empty
 main/data/*.db
 main/data/*.db-journal
 main/data/*.db.bak
+main/data/*.db.bak-*
 main/data/*.sqlite
 main/data/*.sqlite3
 
