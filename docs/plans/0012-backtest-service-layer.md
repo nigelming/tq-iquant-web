@@ -1,6 +1,6 @@
 # 0012 回测 Service 层提取（P1 #9 首块）
 
-> 状态：**待实施**
+> 状态：**已完成**（阶段 0-4 落地，后端 432 全绿；前端 build 待主检出复核；recheck 标注待用户确认）
 > 日期：2026-08-18
 > 对应审计项：[project-issues-audit.md](../project-issues-audit.md) P1 #9「Service 层完全缺失」
 > 接续：[recheck](../project-issues-audit-recheck.md) 结论「P1 仅 #9 service 层仍 open，经评估暂不做（最大组织债，单独立项窗口处理）」。本计划是该单独立项的**第一块**——只做 `backtest_service.py`，为后续 5 个 service 跑通模式。
@@ -219,12 +219,12 @@ from core.tq.formula import TQFormula    # re-export（同上）
 
 - [x] `main/core/services/backtest_service.py` 存在，承接 backtest.py 全部业务逻辑
 - [x] `backtest.py` ≤ 130 行（113 行；路由壳：import + router + 校验 + 锁 + 调 service + 响应）
-- [ ] `uv run pytest -q` 424 + 阶段 4 新增测试全绿（424 已绿，阶段 4 待补）
-- [ ] `npm run build` 通过（前端类型不破）
+- [x] `uv run pytest -q` 432 全绿（424 原有 + 阶段 4 新增 8 个 service 单测）
+- [ ] `npm run build` 通过（前端类型不破）—— **未在本 worktree 执行**：worktree 为全新检出，`web/node_modules` 未安装（gitignored），vue-tsc 不在 PATH。本次纯后端重构、API 请求/响应契约零变更（序列化函数字节级平移，集成测试 `test_get_record_detail` 等断言响应字段一字不变且全绿），前端无受影响面。待主检出跑 `npm run build` 复核（或 worktree 装 deps 后补跑）。
 - [x] `test_backtest_data.py` **零改动**通过（re-export 兼容，读符号）
 - [x] `test_backtest_api.py` 通过——patch 目标由 `bt_api` 改 `backtest_service`（§4 修正），断言/mock 一字不变
-- [x] 回测 HTTP 行为不变：404/400/409/200 + 响应字段 + 并发语义（424 全绿）
-- [ ] [project-issues-audit-recheck.md](../project-issues-audit-recheck.md) P1 #9 标注「backtest_service 已提取（其余 5 service 待立项）」
+- [x] 回测 HTTP 行为不变：404/400/409/200 + 响应字段 + 并发语义（432 全绿）
+- [ ] [project-issues-audit-recheck.md](../project-issues-audit-recheck.md) P1 #9 标注「backtest_service 已提取（其余 5 service 待立项）」—— 待用户确认后标注
 
 ## 8. 后续（不在本计划）
 

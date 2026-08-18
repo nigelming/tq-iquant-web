@@ -333,3 +333,13 @@ P3 最后 5 项收尾。其中 #42 代码已修（仅文档表同步）、#44 �
 **P3 当前结论**：#37/#41/#42/#44/#45 全部处理，**P3 9/9 清零**。
 
 **整体收尾状态**：45 项审计中，**P0 8/8、P2 19/19、P3 9/9 全部处理**；P1 仅 #9 service 层经评估暂不做（最大组织债，单独立项窗口处理）。当前仍 open 唯一项 = **P1 #9**。
+
+### 2026-08-18 P1 #9 首块落地：backtest_service 提取
+
+#9 由「暂不做」转为**分块立项执行**。第一块只做 `backtest_service.py`，跑通「路由薄 / service 厚」模式为其余 5 个 service 立模板。详见 [0012-backtest-service-layer.md](plans/0012-backtest-service-layer.md)。
+
+| # | 状态 | 处理 |
+|---|------|------|
+| 9 | 🟡 **首块已落地（backtest）/ 其余 5 service 待立项** | `main/core/services/backtest_service.py` 新建，承接 `backtest.py` 全部业务逻辑（数据获取层 / 公式信号 / DB 辅助 / 持久化 / 序列化 / 查询 / 主链路 `run_backtest`）。`backtest.py` 874→113 行，仅剩路由壳（HTTP 入口 + 404/400/409 校验 + `_BACKTEST_LOCK` + 调 service + `ok()`/`err()` 包装）。后端 `uv run pytest -q` **432 全绿**（424 原有 + 8 新增 service 单测 `test_backtest_service.py`）；回测 HTTP 行为（404/400/409/200 + 响应字段 + 并发语义）一字不变。**关键经验**：re-export 兼容只对「读符号」测试成立（`test_backtest_data.py` 零改动）；patch 模块函数的测试须把 setattr 目标改到 service 模块（`test_backtest_api.py` 13 处机械改动），patch 类方法（TQData/TQFormula）则 re-export 即够——此为后续 5 service 立项时的通用判据。**仍 open**：stock_pool / formula / strategy / live / system 5 个 service 待逐个单独立项；live_service 风险最高（实盘在跑），需真机回归窗口 |
+
+**P1 最终结论**（更新）：9 项中 8 项已处理，#9 由「暂不做」转为「首块（backtest）已落地，其余 5 service 待立项」。**P1 open 1→1（#9 仍 open，但已破冰分块执行）**。
