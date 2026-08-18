@@ -152,6 +152,12 @@ from core.tq.formula import TQFormula    # re-export（同上）
 
 **为何不直接改测试 import**：本次目标是「跑通 service 模式 + 零行为变更」，改 6 个测试文件的 import 路径会扩大 diff、增加风险，且 re-export 已能让测试全绿。待 6 个 service 全部就位后，统一评估是否切到 `from core.services.backtest_service import ...`（届时 re-export 可删）。
 
+> **执行修正（2026-08-18，阶段 3 落地时发现）**：re-export 兼容只对「读符号」的测试成立（`test_backtest_data.py` 直接调 `bt_api.build_klines(...)` → re-export 是同一可调用对象，零改动通过）。但对「patch bt_api 命名空间再让回测路径使用 patch」的测试**不成立**——`test_backtest_api.py` 用 `monkeypatch.setattr(bt_api, "build_klines", ...)`，而模块函数的 patch 只改 `bt_api` 模块全局，`service.run_backtest` 调的是 `backtest_service` 模块全局的 `build_klines`，patch 失效，6 个集成测试红。
+>
+> **根因**：模块函数 monkeypatch 与「调用所在模块」绑定（类方法 patch 才与路径无关——同一类对象）。这是 re-export 模式的固有边界。
+>
+> **处理**：集成测试 `build_klines`/`build_signal_cache`/`build_open_prices` 的 `setattr` 目标由 `bt_api` 改为 `core.services.backtest_service`（新增 `import ... as svc`，13 处机械改动）；`_BACKTEST_LOCK` 仍 patch `bt_api`（锁留路由）。`test_backtest_data.py` 零改动。**此修正使阶段 3 验收由「集成测试零改动」放宽为「集成测试仅改 patch 目标模块名，断言与 mock 一字不变」**——后续 5 个 service 立项时，凡测试 patch 模块函数的，照此办理；凡只 patch 类方法的（TQData/TQFormula），re-export 即够。
+
 ## 5. 实施阶段（每阶段验收：后端 376 全绿 + 现有测试零改动）
 
 ### 阶段 0 — 脚手架（建空 service + 通 import 链）
@@ -211,12 +217,13 @@ from core.tq.formula import TQFormula    # re-export（同上）
 
 ## 7. 验收清单（全部通过 = 计划完成）
 
-- [ ] `main/core/services/backtest_service.py` 存在，承接 backtest.py 全部业务逻辑
-- [ ] `backtest.py` ≤ 130 行（路由壳：import + router + 校验 + 锁 + 调 service + 响应）
-- [ ] `uv run pytest -q` 376 + 阶段 4 新增测试全绿
+- [x] `main/core/services/backtest_service.py` 存在，承接 backtest.py 全部业务逻辑
+- [x] `backtest.py` ≤ 130 行（113 行；路由壳：import + router + 校验 + 锁 + 调 service + 响应）
+- [ ] `uv run pytest -q` 424 + 阶段 4 新增测试全绿（424 已绿，阶段 4 待补）
 - [ ] `npm run build` 通过（前端类型不破）
-- [ ] `test_backtest_data.py` / `test_backtest_api.py` **零改动**通过（re-export 兼容）
-- [ ] 回测 HTTP 行为不变：404/400/409/200 + 响应字段 + 并发语义
+- [x] `test_backtest_data.py` **零改动**通过（re-export 兼容，读符号）
+- [x] `test_backtest_api.py` 通过——patch 目标由 `bt_api` 改 `backtest_service`（§4 修正），断言/mock 一字不变
+- [x] 回测 HTTP 行为不变：404/400/409/200 + 响应字段 + 并发语义（424 全绿）
 - [ ] [project-issues-audit-recheck.md](../project-issues-audit-recheck.md) P1 #9 标注「backtest_service 已提取（其余 5 service 待立项）」
 
 ## 8. 后续（不在本计划）
