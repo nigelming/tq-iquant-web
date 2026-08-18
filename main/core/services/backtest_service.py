@@ -13,7 +13,7 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 故测试零改动。纯重构，行为不变。
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -21,8 +21,12 @@ import polars as pl
 from sqlalchemy.orm import Session
 
 from core.models import (
-    StockPoolStock, Strategy, Formula,
+    StockPoolStock, Strategy, Formula, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
+)
+from core.engine.backtest_engine import BacktestEngine
+from core.engine.portfolio_builder import (
+    assemble_portfolio as _assemble_portfolio,
 )
 from core.tq.data import TQData
 from core.tq.formula import TQFormula
@@ -693,3 +697,136 @@ def delete_record(db: Session, record_id: int) -> bool:
     db.delete(rec)
     db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# 主链路
+# ---------------------------------------------------------------------------
+def _log_timing(msg: str) -> None:
+    """打印耗时日志，带时间戳。同步端点（uvicorn 单线程），print 安全。"""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{ts} {msg}", flush=True)
+
+
+def _log_kline_summary(record_id: int, klines: dict) -> None:
+    """打印 K 线数据量摘要：股票数、各周期 bar 数。"""
+    if not klines:
+        _log_timing(f"[回测#{record_id}] K线数据为空")
+        return
+    stock_count = len(klines)
+    first_code = next(iter(klines))
+    period_bars = {}
+    for period, df in klines[first_code].items():
+        period_bars[period] = len(df) if df is not None else 0
+    _log_timing(
+        f"[回测#{record_id}] K线: {stock_count}只股票, "
+        + ", ".join(f"{p}={n}bar" for p, n in period_bars.items())
+    )
+
+
+def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
+    """回测主链路（从路由 _run_backtest_locked 迁入）。
+
+    前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
+    内部：写 record(running) → assemble → build_klines → build_signal_cache →
+          build_open_prices → build_benchmark_data → 空行情保护 → engine.run →
+          _persist_result → 标 completed → 返回 {record_id, trades_count,
+          snapshots_count, evaluations}。
+    异常：标 record(failed) + re-raise（路由层全局异常处理器兜底转 {code:500}，
+          与现状一致——原 _run_backtest_locked 也是 raise 出去）。
+
+    返回纯 dict（不经 ok() 包装，由路由层统一 ok()）。
+    """
+    strategies = (
+        db.query(Strategy)
+        .filter_by(portfolio_id=ps.id)
+        .all()
+    )
+
+    # 写 record（running）
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps.id,
+        name=req.name,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        status="running",
+        progress=0,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    record_id = rec.id
+
+    try:
+        t0 = datetime.now()
+        portfolio = _assemble_portfolio(ps, strategies, db)
+        t1 = datetime.now()
+        klines = build_klines(ps, req.start_date, req.end_date, db)
+        t2 = datetime.now()
+        # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
+        _log_kline_summary(record_id, klines)
+        signal_cache = build_signal_cache(ps, klines, db)
+        t3 = datetime.now()
+        open_prices = build_open_prices(ps, klines)
+        t4 = datetime.now()
+        benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
+        t5 = datetime.now()
+
+        # 各阶段耗时日志（定位回测慢的根因）
+        _log_timing(f"[回测#{record_id}] 组装组合: {(t1-t0).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ K线拉取: {(t2-t1).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ 公式计算: {(t3-t2).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 提取开盘价: {(t4-t3).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t5-t4).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 数据准备合计: {(t5-t0).total_seconds():.1f}s")
+
+        # 空行情保护：TQ 在该区间/股票池拉不到任何 K 线 → 标 failed 而非静默 completed。
+        # 这正是"启动了但没运行直接完成"的根因（日期填反/未来日/股票池空等）。
+        if not klines:
+            rec.status = "failed"
+            rec.error_message = (
+                f"未取到任何行情数据：区间 {req.start_date}~{req.end_date}，"
+                f"股票池 id={ps.stock_pool_id}。请检查日期区间与股票池成分。"
+            )
+            db.commit()
+            return {"record_id": record_id, "trades_count": 0,
+                    "snapshots_count": 0, "evaluations": {}}
+
+        t6 = datetime.now()
+        engine = BacktestEngine()
+        result = engine.run(
+            portfolio,
+            klines=klines,
+            signal_cache=signal_cache,
+            open_prices=open_prices,
+            benchmark_data=benchmark_data,
+        )
+        t7 = datetime.now()
+        _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
+
+        _persist_result(db, record_id, ps.id, result, strategies)
+        t8 = datetime.now()
+        _log_timing(f"[回测#{record_id}] 结果持久化: {(t8-t7).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 总耗时: {(t8-t0).total_seconds():.1f}s")
+
+        rec.status = "completed"
+        rec.progress = 100
+        rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
+        db.commit()
+    except Exception as e:
+        # 异常时把 record 标 failed 并落库。session 可能因异常处于脏状态，
+        # 先 rollback 再改字段重提交，确保状态写进去（否则前端会看到永久 running）。
+        db.rollback()
+        rec = db.get(BacktestRecord, record_id)
+        if rec is not None:
+            rec.status = "failed"
+            rec.error_message = str(e) or repr(e)
+            db.commit()
+        raise
+
+    return {
+        "record_id": record_id,
+        "trades_count": len(result["trades"]),
+        "snapshots_count": len(result["snapshots"]),
+        "evaluations": result.get("evaluations") or {},
+    }
