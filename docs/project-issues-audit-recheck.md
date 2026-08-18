@@ -343,3 +343,22 @@ P3 最后 5 项收尾。其中 #42 代码已修（仅文档表同步）、#44 �
 | 9 | 🟡 **首块已落地（backtest）/ 其余 5 service 待立项** | `main/core/services/backtest_service.py` 新建，承接 `backtest.py` 全部业务逻辑（数据获取层 / 公式信号 / DB 辅助 / 持久化 / 序列化 / 查询 / 主链路 `run_backtest`）。`backtest.py` 874→113 行，仅剩路由壳（HTTP 入口 + 404/400/409 校验 + `_BACKTEST_LOCK` + 调 service + `ok()`/`err()` 包装）。后端 `uv run pytest -q` **432 全绿**（424 原有 + 8 新增 service 单测 `test_backtest_service.py`）；回测 HTTP 行为（404/400/409/200 + 响应字段 + 并发语义）一字不变。**关键经验**：re-export 兼容只对「读符号」测试成立（`test_backtest_data.py` 零改动）；patch 模块函数的测试须把 setattr 目标改到 service 模块（`test_backtest_api.py` 13 处机械改动），patch 类方法（TQData/TQFormula）则 re-export 即够——此为后续 5 service 立项时的通用判据。**仍 open**：stock_pool / formula / strategy / live / system 5 个 service 待逐个单独立项；live_service 风险最高（实盘在跑），需真机回归窗口 |
 
 **P1 最终结论**（更新）：9 项中 8 项已处理，#9 由「暂不做」转为「首块（backtest）已落地，其余 5 service 待立项」。**P1 open 1→1（#9 仍 open，但已破冰分块执行）**。
+
+### 2026-08-18 P1 #9 续块落地：stock_pool / formula / strategy / system 四 service 一次性提取
+
+承接 0012 的「路由薄 / service 厚」模板，把其余 4 个非实盘 service **一次性**提取完成（详见 [0013-remaining-services-extraction.md](plans/0013-remaining-services-extraction.md)）；live_service 按用户指示排除（实盘在跑，风险最高，单独立项 0014 真机回归窗口处理）。
+
+| service | 路由文件行数变化 | 关键设计 |
+|---|---|---|
+| `system_service.py` | `system.py` 15→~15 | 最轻：`get_config`/`update_config` 直接包 `load_config`/`save_config`，路由函数加 `_route` 后缀避 shadowing |
+| `formula_service.py` | `formulas.py` 175→~80 | `serialize_formula`/CRUD 全下沉；`VALID_SIGNAL_TYPES`/`VALID_TRIGGER_VALUES`/`_validate_signals` 留路由；`delete` 抛 IntegrityError→路由 409 |
+| `stock_pool_service.py` | `stock_pools.py` 178→~90 | **异常契约式**：service 抛 `TDXConnectionError`（路由→500）/`LookupError`（→404 板块不存在）/`IntegrityError`（→409 被引用），service 不碰 ok/err |
+| `strategy_service.py` | `strategies.py` 392→~273 | 最重：`_create_strategies_two_step`（flush 拿 id 再 UPDATE master_strategy_id）、`serialize_portfolio` 二次查询、master-slave 引用计数 `count_slave_strategies` 留路由做 400 校验 |
+
+**与 0012 的根本差异（为什么这批远比 backtest 简单）**：grep 测试 import 发现这 4 模块的测试**不 patch 路由/service 模块函数**——`test_stock_pool_api` patch 的是 `core.tq.data.get_tq`（另一模块，TQData 类方法路径无关），`test_formula_api`/`test_portfolio_api` 是纯 TestClient。故**无需 re-export、无需 patch 重定向、测试零改动**。`VALID_PERIODS` 被 `test_backtest_data.py:557` 直接 import 做白名单对齐，**必须留路由**（已保留）。
+
+**validate-before-service 顺序修正**：当 service 合并「判 404 + apply + commit」后，路由必须先 validate（400）再调 service，否则非法字段会被写库。`update_formula`/`update_portfolio`/`update_strategy` 三处统一改为「先校验后调 service」并加注释说明（「不存在 id + 非法参数」无测试覆盖且 400 语义更合理）。
+
+**验收**：后端 `uv run pytest -q` **432 全绿**（测试零改动）；前端 `npm run build` 通过（vue-tsc 干净，695 模块）；HTTP 行为（404/400/409/200 + 响应字段 + IntegrityError 翻译 + master-slave 规则）一字不变。
+
+**P1 最终结论**（再更新）：9 项中 8 项已处理，#9 由「首块已落地」推进为「**5/6 service 已落地（backtest + stock_pool + formula + strategy + system），仅 live_service 待立项**」。**P1 open 仍 1→1（#9 仍 open，剩 live_service 0014）**。
