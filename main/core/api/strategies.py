@@ -1,5 +1,9 @@
 """组合策略管理 CRUD — 组合（PortfolioStrategy）+ 嵌套子策略（Strategy）。
 
+业务逻辑已下沉到 core.services.strategy_service（P1 #9 续块）。
+路由层仅剩：HTTP 入口 + pydantic 模型 + VALID_* 校验常量 + _validate_* 纯校验函数
++ 资源校验(404) + IntegrityError→409/400 翻译 + ok/err 包装。
+
 模型无 relationship，子列表用显式二次查询。主从策略自引用（master_strategy_id）
 用两步 commit 处理：先 insert 全部子策略拿 id，再 UPDATE master_strategy_id。
 
@@ -14,6 +18,20 @@ from sqlalchemy.orm import Session
 from core.api.response import err, ok
 from core.db import get_db
 from core.models import PortfolioStrategy, Strategy, StockPool, Formula
+from core.services.strategy_service import (
+    list_portfolios as _svc_list_portfolios,
+    get_portfolio as _svc_get_portfolio,
+    create_portfolio as _svc_create_portfolio,
+    update_portfolio as _svc_update_portfolio,
+    delete_portfolio as _svc_delete_portfolio,
+    portfolio_exists as _svc_portfolio_exists,
+    list_strategies as _svc_list_strategies,
+    create_strategy as _svc_create_strategy,
+    get_strategy as _svc_get_strategy,
+    update_strategy as _svc_update_strategy,
+    delete_strategy as _svc_delete_strategy,
+    count_slave_strategies as _svc_count_slave_strategies,
+)
 
 router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
@@ -21,7 +39,8 @@ router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 # 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
 # 实盘三段式（C6）：1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；
 # 1w/1mon 桥端 xtdata 拉不到，走通达信 TQFormula.compute 启动/日终注入（见 live_engine._STARTUP_ONLY_PERIODS）。
-# 注意 60m 两端都不认（TQ periodstr error + xtdata 白名单是 1h 不是 60m）。
+# 注意 60h 两端都不认（TQ periodstr error + xtdata 白名单是 1h 不是 60m）。
+# VALID_PERIODS 被 test_backtest_data 直接 import 做白名单对齐，必须留路由。
 VALID_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"}
 VALID_ROLES = {"independent", "master", "slave"}  # draft:223
 VALID_TRADING_SESSIONS = {"full", "am", "pm"}  # draft:499，非 morning/afternoon
@@ -62,58 +81,6 @@ class PortfolioCreate(BaseModel):
     trading_session: str = "full"
     status: str = "active"
     strategies: list[StrategyItem] = []
-
-
-def _serialize_strategy(s: Strategy) -> dict:
-    return {
-        "id": s.id,
-        "portfolio_id": s.portfolio_id,
-        "name": s.name,
-        "formula_id": s.formula_id,
-        "period": s.period,
-        "role": s.role,
-        "master_strategy_id": s.master_strategy_id,
-        "capital_ratio": float(s.capital_ratio) if s.capital_ratio is not None else None,
-        "max_positions": s.max_positions,
-        "single_open_ratio": float(s.single_open_ratio) if s.single_open_ratio is not None else None,
-        "stop_loss_ratio": float(s.stop_loss_ratio) if s.stop_loss_ratio is not None else None,
-        "take_profit_ratio": float(s.take_profit_ratio) if s.take_profit_ratio is not None else None,
-        "trailing_stop_ratio": float(s.trailing_stop_ratio) if s.trailing_stop_ratio is not None else None,
-        "add_position_threshold": float(s.add_position_threshold) if s.add_position_threshold is not None else None,
-        "max_add_count": s.max_add_count,
-        "add_position_ratio": float(s.add_position_ratio) if s.add_position_ratio is not None else None,
-        "reduce_position_ratio": float(s.reduce_position_ratio) if s.reduce_position_ratio is not None else None,
-    }
-
-
-def _serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
-    """显式二次查询子策略（模型无 relationship）。"""
-    subs = (
-        db.query(Strategy)
-        .filter(Strategy.portfolio_id == p.id)
-        .order_by(Strategy.id)
-        .all()
-    )
-    return {
-        "id": p.id,
-        "name": p.name,
-        "stock_pool_id": p.stock_pool_id,
-        "benchmark_index": p.benchmark_index,
-        "initial_capital": float(p.initial_capital) if p.initial_capital is not None else None,
-        "max_drawdown": float(p.max_drawdown) if p.max_drawdown is not None else None,
-        "daily_loss_limit": float(p.daily_loss_limit) if p.daily_loss_limit is not None else None,
-        "max_holdings": p.max_holdings,
-        "min_commission": float(p.min_commission) if p.min_commission is not None else None,
-        "buy_commission_rate": float(p.buy_commission_rate) if p.buy_commission_rate is not None else None,
-        "sell_commission_rate": float(p.sell_commission_rate) if p.sell_commission_rate is not None else None,
-        "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
-        "slippage": float(p.slippage) if p.slippage is not None else None,
-        "trading_session": p.trading_session,
-        "status": p.status,
-        "created_at": p.created_at,
-        "updated_at": p.updated_at,
-        "strategies": [_serialize_strategy(s) for s in subs],
-    }
 
 
 def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
@@ -157,63 +124,17 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
     return None
 
 
-def _apply_portfolio_fields(p: PortfolioStrategy, req: PortfolioCreate) -> None:
-    p.name = req.name
-    p.stock_pool_id = req.stock_pool_id
-    p.benchmark_index = req.benchmark_index
-    p.initial_capital = req.initial_capital
-    p.max_drawdown = req.max_drawdown
-    p.daily_loss_limit = req.daily_loss_limit
-    p.max_holdings = req.max_holdings
-    p.min_commission = req.min_commission
-    p.buy_commission_rate = req.buy_commission_rate
-    p.sell_commission_rate = req.sell_commission_rate
-    p.stamp_duty_rate = req.stamp_duty_rate
-    p.slippage = req.slippage
-    p.trading_session = req.trading_session
-    p.status = req.status
-
-
-def _create_strategies_two_step(db: Session, pid: int, strategies: list[StrategyItem]) -> None:
-    """两步 commit：先 insert 全部子策略拿 id，再 UPDATE master_strategy_id。
-    master_strategy_id: 0..N = 本批索引；正整数 = 已存在 id（保留）；None = 无。"""
-    # 第一步：insert 全部，master_strategy_id 暂置 None
-    inserted: list[Strategy] = []
-    for s in strategies:
-        strat = Strategy(
-            portfolio_id=pid, name=s.name, formula_id=s.formula_id,
-            period=s.period, role=s.role, master_strategy_id=None,
-            capital_ratio=s.capital_ratio, max_positions=s.max_positions,
-            single_open_ratio=s.single_open_ratio,
-            stop_loss_ratio=s.stop_loss_ratio, take_profit_ratio=s.take_profit_ratio,
-            trailing_stop_ratio=s.trailing_stop_ratio,
-            add_position_threshold=s.add_position_threshold, max_add_count=s.max_add_count,
-            add_position_ratio=s.add_position_ratio, reduce_position_ratio=s.reduce_position_ratio,
-        )
-        db.add(strat)
-        inserted.append(strat)
-    db.flush()  # 拿到所有 inserted[i].id
-    # 第二步：UPDATE master_strategy_id
-    for s, strat in zip(strategies, inserted):
-        if s.role == "slave" and s.master_strategy_id is not None:
-            if s.master_strategy_id >= 0:
-                # 本批索引
-                strat.master_strategy_id = inserted[s.master_strategy_id].id
-            # 负整数（已存在 id）保留为 None 本次不支持，编辑场景由 PUT 走全量替换
-
-
 @router.get("")
 def list_portfolios(db: Session = Depends(get_db)):
-    items = db.query(PortfolioStrategy).order_by(PortfolioStrategy.id).all()
-    return ok([_serialize_portfolio(db, p) for p in items])
+    return ok(_svc_list_portfolios(db))
 
 
 @router.get("/{pid}")
 def get_portfolio(pid: int, db: Session = Depends(get_db)):
-    p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
-    if not p:
+    data = _svc_get_portfolio(db, pid)
+    if data is None:
         return err(404, "组合策略不存在")
-    return ok(_serialize_portfolio(db, p))
+    return ok(data)
 
 
 @router.post("")
@@ -221,41 +142,28 @@ def create_portfolio(req: PortfolioCreate, db: Session = Depends(get_db)):
     err_msg = _validate_portfolio(req, db)
     if err_msg:
         return err(400, err_msg)
-    p = PortfolioStrategy()
-    _apply_portfolio_fields(p, req)
-    db.add(p)
-    db.flush()
-    _create_strategies_two_step(db, p.id, req.strategies)
-    db.commit()
-    db.refresh(p)
-    return ok(_serialize_portfolio(db, p))
+    return ok(_svc_create_portfolio(db, req))
 
 
 @router.put("/{pid}")
 def update_portfolio(pid: int, req: PortfolioCreate, db: Session = Depends(get_db)):
-    p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
-    if not p:
-        return err(404, "组合策略不存在")
+    # 校验参数（400）→ 再调 service（内部判 404 + 应用 + 提交）。
+    # service 把「判存在 + 应用 + 提交」合并后，须先校验避免把非法字段写库；
+    # 「不存在 id + 非法参数」无测试覆盖且语义上 400 更合理。
     err_msg = _validate_portfolio(req, db)
     if err_msg:
         return err(400, err_msg)
-    _apply_portfolio_fields(p, req)
-    # 子表全量替换（同 formulas.py 模式）：删旧建新
-    db.query(Strategy).filter(Strategy.portfolio_id == pid).delete()
-    _create_strategies_two_step(db, pid, req.strategies)
-    db.commit()
-    db.refresh(p)
-    return ok(_serialize_portfolio(db, p))
+    data = _svc_update_portfolio(db, pid, req)
+    if data is None:
+        return err(404, "组合策略不存在")
+    return ok(data)
 
 
 @router.delete("/{pid}")
 def delete_portfolio(pid: int, db: Session = Depends(get_db)):
-    p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
-    if not p:
-        return err(404, "组合策略不存在")
     try:
-        db.delete(p)  # Strategy 随 ondelete=CASCADE 删
-        db.commit()
+        if not _svc_delete_portfolio(db, pid):
+            return err(404, "组合策略不存在")
     except IntegrityError:
         db.rollback()
         return err(409, "该组合策略被回测记录或实盘 session 引用，无法删除")
@@ -283,24 +191,6 @@ class StrategyCreate(BaseModel):
     max_add_count: int = 2
     add_position_ratio: float = 0.1
     reduce_position_ratio: float = 0.3
-
-
-def _apply_strategy_fields(s: Strategy, req: StrategyCreate) -> None:
-    s.name = req.name
-    s.formula_id = req.formula_id
-    s.period = req.period
-    s.role = req.role
-    s.master_strategy_id = req.master_strategy_id
-    s.capital_ratio = req.capital_ratio
-    s.max_positions = req.max_positions
-    s.single_open_ratio = req.single_open_ratio
-    s.stop_loss_ratio = req.stop_loss_ratio
-    s.take_profit_ratio = req.take_profit_ratio
-    s.trailing_stop_ratio = req.trailing_stop_ratio
-    s.add_position_threshold = req.add_position_threshold
-    s.max_add_count = req.max_add_count
-    s.add_position_ratio = req.add_position_ratio
-    s.reduce_position_ratio = req.reduce_position_ratio
 
 
 def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None:
@@ -332,57 +222,47 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
 
 @router.get("/{pid}/strategies")
 def list_strategies(pid: int, db: Session = Depends(get_db)):
-    if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
+    if not _svc_portfolio_exists(db, pid):
         return err(404, "组合策略不存在")
-    items = db.query(Strategy).filter(Strategy.portfolio_id == pid).order_by(Strategy.id).all()
-    return ok([_serialize_strategy(s) for s in items])
+    return ok(_svc_list_strategies(db, pid))
 
 
 @router.post("/{pid}/strategies")
 def create_strategy(pid: int, req: StrategyCreate, db: Session = Depends(get_db)):
-    if not db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first():
+    if not _svc_portfolio_exists(db, pid):
         return err(404, "组合策略不存在")
     err_msg = _validate_strategy(req, db, pid)
     if err_msg:
         return err(400, err_msg)
-    s = Strategy(portfolio_id=pid)
-    _apply_strategy_fields(s, req)
-    db.add(s)
-    db.commit()
-    db.refresh(s)
-    return ok(_serialize_strategy(s))
+    return ok(_svc_create_strategy(db, pid, req))
 
 
 @router.put("/{pid}/strategies/{sid}")
 def update_strategy(pid: int, sid: int, req: StrategyCreate, db: Session = Depends(get_db)):
-    s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
-    if not s:
-        return err(404, "子策略不存在")
+    # 校验参数（400）→ 再调 service（判 404 + 应用 + 提交），同 update_portfolio。
     err_msg = _validate_strategy(req, db, pid)
     if err_msg:
         return err(400, err_msg)
-    _apply_strategy_fields(s, req)
-    db.commit()
-    db.refresh(s)
-    return ok(_serialize_strategy(s))
+    data = _svc_update_strategy(db, pid, sid, req)
+    if data is None:
+        return err(404, "子策略不存在")
+    return ok(data)
 
 
 @router.delete("/{pid}/strategies/{sid}")
 def delete_strategy(pid: int, sid: int, db: Session = Depends(get_db)):
-    s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
+    s = _svc_get_strategy(db, pid, sid)
     if not s:
         return err(404, "子策略不存在")
     # 删 master 前 check 无 slave 引用
     if s.role == "master":
-        slave_count = db.query(Strategy).filter(Strategy.master_strategy_id == sid).count()
-        if slave_count > 0:
+        if _svc_count_slave_strategies(db, sid) > 0:
             return err(400, "该主策略被从策略引用，无法删除")
     # 子策略可能被 backtest_trades / live_trades / live_orders 引用（历史交易记录，
     # strategy_id FK 默认 RESTRICT）。直删触发 IntegrityError → 拦截返回可读错误，
     # 不破坏历史数据；用户需先删相关回测/实盘记录才能删该子策略。
     try:
-        db.delete(s)
-        db.commit()
+        _svc_delete_strategy(db, pid, sid)
     except IntegrityError:
         db.rollback()
         return err(

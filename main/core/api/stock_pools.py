@@ -2,12 +2,16 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import func
 
 from core.api.response import err, ok
 from core.db import get_db
-from core.models import StockPool, StockPoolStock
-from core.tq.data import TQData
+from core.services.stock_pool_service import (
+    list_local_pools as _svc_list_local_pools,
+    list_tdx_pools as _svc_list_tdx_pools,
+    list_tdx_stocks as _svc_list_tdx_stocks,
+    sync_pool as _svc_sync_pool,
+    delete_pool as _svc_delete_pool,
+)
 from core.tq.utils import TDXConnectionError
 
 router = APIRouter(prefix="/api/stock-pools", tags=["stock_pools"])
@@ -17,25 +21,12 @@ class SyncReq(BaseModel):
     code: str
 
 
-def _serialize_pool(db: Session, p: StockPool) -> dict:
-    """本地 StockPool → dict，含 stock_count（显式二次查询，模型无 relationship）。"""
-    count = db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).count()
-    return {
-        "id": p.id,
-        "code": p.code,
-        "name": p.name,
-        "synced_at": p.synced_at,
-        "stock_count": count,
-    }
-
-
 # ---------------------------------------------------------------------------
 # GET /api/stock-pools — 本地已同步池（供组合策略引用）
 # ---------------------------------------------------------------------------
 @router.get("")
 def list_local_pools(db: Session = Depends(get_db)):
-    pools = db.query(StockPool).order_by(StockPool.id).all()
-    return ok([_serialize_pool(db, p) for p in pools])
+    return ok(_svc_list_local_pools(db))
 
 
 # ---------------------------------------------------------------------------
@@ -51,57 +42,24 @@ def list_tdx_pools(db: Session = Depends(get_db)):
     - stock_count: 本地成分股数（未同步为 0）
     """
     try:
-        tdx_pools = TQData().get_stock_pools()
+        data = _svc_list_tdx_pools(db)
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
-
-    local_pools = db.query(StockPool).all()
-    local_by_code = {p.code: p for p in local_pools}
-    tdx_codes = {t["code"] for t in tdx_pools}
-
-    result = []
-    # 通达信板块
-    for t in tdx_pools:
-        p = local_by_code.get(t["code"])
-        count = (
-            db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).count()
-            if p else 0
-        )
-        result.append({
-            "code": t["code"],
-            "name": t["name"],
-            "synced": p is not None,
-            "exists_in_tdx": True,
-            "stock_count": count,
-        })
-    # 本地残留（通达信已删）
-    for p in local_pools:
-        if p.code not in tdx_codes:
-            count = db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).count()
-            result.append({
-                "code": p.code,
-                "name": p.name,
-                "synced": True,
-                "exists_in_tdx": False,
-                "stock_count": count,
-            })
-    return ok(result)
+    return ok(data)
 
 
 # ---------------------------------------------------------------------------
 # GET /api/stock-pools/tdx/{code}/stocks — 通达信成分股实时
 # ---------------------------------------------------------------------------
 @router.get("/tdx/{code}/stocks")
-def list_tdx_stocks(code: str, db: Session = Depends(get_db)):
+def list_tdx_stocks(code: str):
     """实时成分股。板块在通达信不存在 → 404；通达信不可达 → 500。"""
     try:
-        tdx = TQData()
-        sectors = tdx.get_stock_pools()
-        if not any(s["code"] == code for s in sectors):
-            return err(404, "板块不存在")
-        stocks = tdx.get_pool_stocks(code)
+        stocks = _svc_list_tdx_stocks(code)
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
+    except LookupError:
+        return err(404, "板块不存在")
     return ok(stocks)
 
 
@@ -112,37 +70,12 @@ def list_tdx_stocks(code: str, db: Session = Depends(get_db)):
 def sync_pool(req: SyncReq, db: Session = Depends(get_db)):
     """按 code upsert：查通达信拿 name + 成分股，本地有则更新无则新建，全量替换成分股。"""
     try:
-        tdx = TQData()
-        sectors = tdx.get_stock_pools()
-        sector = next((s for s in sectors if s["code"] == req.code), None)
-        if sector is None:
-            return err(404, "板块不存在")
-        tdx_stocks = tdx.get_pool_stocks(req.code)
+        data = _svc_sync_pool(db, req.code)
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
-
-    p = db.query(StockPool).filter(StockPool.code == req.code).first()
-    if p is None:
-        p = StockPool(code=req.code, name=sector["name"])
-        db.add(p)
-        db.flush()
-    else:
-        p.name = sector["name"]
-
-    # 全量替换成分股
-    db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).delete()
-    for s in tdx_stocks:
-        code = s.get("stock_code")
-        if code:
-            db.add(StockPoolStock(
-                pool_id=p.id,
-                stock_code=code,
-                stock_name=s.get("stock_name"),
-            ))
-    p.synced_at = func.now()
-    db.commit()
-    db.refresh(p)
-    return ok(_serialize_pool(db, p))
+    except LookupError:
+        return err(404, "板块不存在")
+    return ok(data)
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +83,9 @@ def sync_pool(req: SyncReq, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @router.delete("/{pool_id}")
 def delete_pool(pool_id: int, db: Session = Depends(get_db)):
-    p = db.query(StockPool).filter(StockPool.id == pool_id).first()
-    if not p:
-        return err(404, "股票池不存在")
     try:
-        db.delete(p)  # StockPoolStock 随 ondelete=CASCADE 删；被策略引用时 ondelete=RESTRICT 抛 IntegrityError
-        db.commit()
+        if not _svc_delete_pool(db, pool_id):
+            return err(404, "股票池不存在")
     except IntegrityError:
         db.rollback()
         return err(409, "该股票池被组合策略引用，无法删除")

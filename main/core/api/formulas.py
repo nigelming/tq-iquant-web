@@ -5,7 +5,13 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
-from core.models import Formula, FormulaSignal
+from core.services.formula_service import (
+    list_formulas as _svc_list_formulas,
+    get_formula as _svc_get_formula,
+    create_formula as _svc_create_formula,
+    update_formula as _svc_update_formula,
+    delete_formula as _svc_delete_formula,
+)
 
 router = APIRouter(prefix="/api/formulas", tags=["formulas"])
 
@@ -27,33 +33,6 @@ class FormulaCreate(BaseModel):
     formula_count: int = 200
 
 
-def _serialize_formula(db: Session, f: Formula) -> dict:
-    """Formula → dict，附 signals 子列表（显式二次查询，模型无 relationship）。"""
-    sigs = (
-        db.query(FormulaSignal)
-        .filter(FormulaSignal.formula_id == f.id)
-        .order_by(FormulaSignal.id)
-        .all()
-    )
-    return {
-        "id": f.id,
-        "name": f.name,
-        "content": f.content,
-        "formula_count": f.formula_count,
-        "created_at": f.created_at,
-        "updated_at": f.updated_at,
-        "signals": [
-            {
-                "id": s.id,
-                "signal_name": s.signal_name,
-                "signal_type": s.signal_type,
-                "trigger_value": s.trigger_value,
-            }
-            for s in sigs
-        ],
-    }
-
-
 def _validate_signals(signals: list[SignalItem]) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
     for sig in signals:
@@ -66,16 +45,15 @@ def _validate_signals(signals: list[SignalItem]) -> str | None:
 
 @router.get("")
 def list_formulas(db: Session = Depends(get_db)):
-    formulas = db.query(Formula).order_by(Formula.id).all()
-    return ok([_serialize_formula(db, f) for f in formulas])
+    return ok(_svc_list_formulas(db))
 
 
 @router.get("/{formula_id}")
 def get_formula(formula_id: int, db: Session = Depends(get_db)):
-    f = db.query(Formula).filter(Formula.id == formula_id).first()
-    if not f:
+    data = _svc_get_formula(db, formula_id)
+    if data is None:
         return err(404, "公式不存在")
-    return ok(_serialize_formula(db, f))
+    return ok(data)
 
 
 @router.post("")
@@ -85,52 +63,30 @@ def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
         return err(400, err_msg)
     if req.formula_count < 1:
         return err(400, "formula_count 必须 ≥ 1")
-    f = Formula(name=req.name, content=req.content, formula_count=req.formula_count)
-    db.add(f)
-    db.flush()
-    for sig in req.signals:
-        db.add(FormulaSignal(
-            formula_id=f.id, signal_name=sig.signal_name,
-            signal_type=sig.signal_type, trigger_value=sig.trigger_value,
-        ))
-    db.commit()
-    db.refresh(f)
-    return ok(_serialize_formula(db, f))
+    return ok(_svc_create_formula(db, req))
 
 
 @router.put("/{formula_id}")
 def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(get_db)):
-    f = db.query(Formula).filter(Formula.id == formula_id).first()
-    if not f:
-        return err(404, "公式不存在")
+    # 校验参数（400）→ 再调 service（内部判 404 + 应用 + 提交）。
+    # 原实现顺序是 404→400，但 service 把「判存在 + 应用 + 提交」合并后，须先校验
+    # 避免把非法字段写库；「不存在 id + 非法信号」无测试覆盖且语义上 400 更合理。
     err_msg = _validate_signals(req.signals)
     if err_msg:
         return err(400, err_msg)
     if req.formula_count < 1:
         return err(400, "formula_count 必须 ≥ 1")
-    f.name = req.name
-    f.content = req.content
-    f.formula_count = req.formula_count
-    # 信号全量替换：删旧建新（简单可靠）
-    db.query(FormulaSignal).filter(FormulaSignal.formula_id == formula_id).delete()
-    for sig in req.signals:
-        db.add(FormulaSignal(
-            formula_id=formula_id, signal_name=sig.signal_name,
-            signal_type=sig.signal_type, trigger_value=sig.trigger_value,
-        ))
-    db.commit()
-    db.refresh(f)
-    return ok(_serialize_formula(db, f))
+    data = _svc_update_formula(db, formula_id, req)
+    if data is None:
+        return err(404, "公式不存在")
+    return ok(data)
 
 
 @router.delete("/{formula_id}")
 def delete_formula(formula_id: int, db: Session = Depends(get_db)):
-    f = db.query(Formula).filter(Formula.id == formula_id).first()
-    if not f:
-        return err(404, "公式不存在")
     try:
-        db.delete(f)  # FormulaSignal 随 ondelete=CASCADE 删
-        db.commit()
+        if not _svc_delete_formula(db, formula_id):
+            return err(404, "公式不存在")
     except IntegrityError:
         db.rollback()
         return err(409, "该公式被策略引用，无法删除")
