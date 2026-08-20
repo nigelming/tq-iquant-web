@@ -1085,6 +1085,102 @@ def test_poll_deals_expires_stale_order_without_order_ref():
     db.close()
 
 
+def test_poll_deals_backfills_via_remark_when_order_ref_missing():
+    """order_ref 匹配不上（/orders 实时表已无此单）但 /deals 有 remark 匹配成交 → 回填。
+
+    真机 2026-08-19 id45/46 根因：iQuant get_trade_detail_data(ORDER) 对已成交单不可靠
+    （成交后从 ORDER 实时表移除），Core 轮询 /orders 拿不到 order_ref → 旧逻辑走到超时
+    rejected 且成交不回填。但 /deals（DEAL 表）保留全部已成交记录，且 DEAL 对象也带
+    m_strRemark。本测试验证修复 A：order_ref 匹配失败的单，按 bridge_order_id[:20] 在
+    /deals 直连 remark 匹配回填，绕过 order_ref。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 不返回本单（模拟成交后已从 ORDER 实时表移除 → order_ref 永远匹配不上）
+    # /deals 返回本单成交，remark = bridge_order_id[:20]（DEAL 对象带 m_strRemark）
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never-matched",  # 真实 order_ref，但 Core 拿不到（/orders 无此单）
+        "remark": _TEST_REMARK,            # 按 remark 直连匹配
+        "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)  # bridge_order_id=_TEST_OID, remark=_TEST_REMARK
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    # 修复 A：order_ref 匹配不上，但按 remark 从 /deals 直连回填 → filled
+    assert lo2.status == "filled"
+    assert lo2.filled_quantity == 600
+    assert lo2.filled_price == Decimal("9.25")
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 600
+    assert trades[0].amount == Decimal("5550.0")
+    # filled 后 apply：持仓 600，现金扣 amount+commission（同正常回填路径）
+    assert ctx.positions[stock].quantity == 600
+    assert port.account.cash == Decimal("100000") - (Decimal("5550.0") + Decimal("1.39"))
+    db.close()
+
+
+def test_poll_deals_remark_backfill_partial_then_filled_across_rounds():
+    """慢成交单：第1轮 /deals 只有部分成交(partial) → 第2轮补齐 → filled。
+
+    真机 id45 场景：限价单 17 分钟才补完，前 4800 股先成交。修复 A 让每轮按 remark
+    从 /deals 回填，partial 不 apply，补齐后 filled + apply。不依赖 order_ref、不超时。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 始终无此单；/deals 第1轮 300 股，第2轮补到 600
+    deals_round1 = [{
+        "order_ref": "ref-slow", "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 300, "amount": 2775.0, "commission": 0.69,
+        "trade_time": "150001", "trade_date": "20260805",
+    }]
+    deals_round2 = [{
+        "order_ref": "ref-slow", "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 600, "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150002", "trade_date": "20260805",
+    }]
+    _mock_orders_deals(rec, orders=[], deals=deals_round1)
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    # 第1轮：partial（300/600），不 apply
+    engine._poll_deals()
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "partial"
+    assert lo2.filled_quantity == 300
+    assert ctx.positions.get(stock) is None or ctx.positions[stock].quantity == 0
+    db.close()
+
+    # 第2轮：/deals 补齐到 600 → filled + apply
+    _mock_orders_deals(rec, orders=[], deals=deals_round2)
+    engine._poll_deals()
+    db = factory()
+    lo3 = db.get(LiveOrder, lo.id)
+    assert lo3.status == "filled"
+    assert lo3.filled_quantity == 600
+    assert ctx.positions[stock].quantity == 600
+    db.close()
+
+
 def test_poll_deals_bridge_offline_skips():
     """query_deals 抛 BridgeUnavailableError → 本轮跳过，状态不变，下轮重试。"""
     factory, _ = _db_factory()

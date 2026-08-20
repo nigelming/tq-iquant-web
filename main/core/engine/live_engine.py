@@ -1492,17 +1492,43 @@ class LiveEngine:
             # 饿死时，超时检查随主循环 60s 节拍跑，不再 440s 才生效。两处调用幂等。）
             self._expire_stale_orders(db, pending)
             db.commit()
-            # 2. 有 order_ref 的单：查 /deals 回填
+            # 2. 查 /deals 回填。两类待回填单共用一次 /deals 查询：
+            #    need_ref  = 已定位 order_ref 的单（主路径，按 order_ref 过滤 deals）
+            #    need_remark = order_ref 始终匹配不上（/orders 实时表无此单）但有
+            #                  bridge_order_id 的单 → 按 remark 直连 /deals 回填（修复 A）。
+            #    修复 A 背景（真机 2026-08-19 id45/46）：iQuant get_trade_detail_data(ORDER)
+            #    对已成交单不可靠（成交后从 ORDER 实时表移除），Core 轮询 /orders 拿不到
+            #    order_ref → 旧逻辑走到超时 rejected 且成交不回填。但 /deals（DEAL 表）保留
+            #    全部已成交记录且 DEAL 对象带 m_strRemark，故 order_ref 匹配失败的单改按
+            #    bridge_order_id[:20] 在 /deals 直连 remark 匹配回填，绕过 order_ref。
+            #    _backfill_order 本就用 live_order.id 写 LiveTrade、不依赖 order_ref，
+            #    此处只是补一条进入它的路径。
             need_ref = [lo for lo in pending if lo.order_ref is not None]
-            if not need_ref:
+            need_remark = [
+                lo for lo in pending
+                if lo.order_ref is None and lo.bridge_order_id
+            ]
+            if not need_ref and not need_remark:
                 self._sync_pending_orders(db)
                 return
             try:
                 deals = self._dispatcher.query_deals()
             except BridgeUnavailableError:
                 return  # 桥离线，本轮跳过
+            # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
             for lo in need_ref:
                 matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                if not matched:
+                    continue
+                self._backfill_order(db, lo, matched)
+            # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
+            # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
+            # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
+            for lo in need_remark:
+                if lo.status not in ("submitted", "partial"):
+                    continue  # 主路径已回填，不重复
+                expected_remark = lo.bridge_order_id[:20]
+                matched = [d for d in deals if d.get("remark") == expected_remark]
                 if not matched:
                     continue
                 self._backfill_order(db, lo, matched)
