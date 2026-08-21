@@ -210,12 +210,16 @@ class Portfolio:
                 return None
             trade_type = TradeType.BUY
         elif sig.signal_type == SignalType.ADD:
-            # ADD：需有持仓，且现价较成本下跌 ≥ threshold，且未超 max_add_count
+            # ADD：需有持仓，且未超 max_add_count。
+            # threshold=-1 特殊值 → 跳过 drop 检查（任何价格都加，含上涨/大涨）；
+            # 否则现价较成本下跌 ≥ threshold 才加（逢跌加仓，正常取值 1%~20%）。
+            # max_add_count 加仓次数上限始终生效（第一道闸）；资金审批/熔断在执行层兜底。
             if pos is None or pos.quantity == 0:
                 return None
-            drop = (pos.avg_cost - close) / pos.avg_cost
-            if drop < ctx.add_position_threshold:
-                return None
+            if ctx.add_position_threshold != Decimal("-1"):
+                drop = (pos.avg_cost - close) / pos.avg_cost
+                if drop < ctx.add_position_threshold:
+                    return None
             if pos.add_count >= ctx.max_add_count:
                 return None
             quantity = int(ctx.add_position_ratio * strategy_fund / close / 100) * 100

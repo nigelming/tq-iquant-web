@@ -103,6 +103,11 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             return f"子策略[{idx}] period 必须为 {sorted(VALID_PERIODS)}，收到 {s.period}"
         if not (0 < s.capital_ratio <= 1):
             return f"子策略[{idx}] capital_ratio 必须在 (0,1]，收到 {s.capital_ratio}"
+        # 加仓阈值：-1=特殊值（任何价格都加），0=不涨即加，正常 (0,1]
+        if s.add_position_threshold != -1 and not (0 <= s.add_position_threshold <= 1):
+            return f"子策略[{idx}] 加仓阈值须为 -1（任何价都加）或 [0,1]，收到 {s.add_position_threshold}"
+        if not (0 <= s.max_add_count <= 10):
+            return f"子策略[{idx}] 加仓次数须在 [0,10]（0=禁加仓），收到 {s.max_add_count}"
         if not db.query(Formula).filter(Formula.id == s.formula_id).first():
             return f"子策略[{idx}] 公式 id={s.formula_id} 不存在"
         # 主从配置期校验
@@ -201,6 +206,11 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
         return f"period 必须为 {sorted(VALID_PERIODS)}，收到 {req.period}"
     if not (0 < req.capital_ratio <= 1):
         return f"capital_ratio 必须在 (0,1]，收到 {req.capital_ratio}"
+    # 加仓阈值：-1=特殊值（任何价格都加），0=不涨即加，正常 (0,1]
+    if req.add_position_threshold != -1 and not (0 <= req.add_position_threshold <= 1):
+        return f"加仓阈值须为 -1（任何价都加）或 [0,1]，收到 {req.add_position_threshold}"
+    if not (0 <= req.max_add_count <= 10):
+        return f"加仓次数须在 [0,10]（0=禁加仓），收到 {req.max_add_count}"
     if not db.query(Formula).filter(Formula.id == req.formula_id).first():
         return f"公式 id={req.formula_id} 不存在"
     if req.role == "slave":

@@ -285,6 +285,76 @@ def test_add_signal_exceeds_max_count_skipped():
     assert orders == []
 
 
+def test_add_signal_threshold_minus_one_adds_on_rise():
+    """threshold=-1 特殊值：跳过 drop 检查，上涨也加仓。
+    预置 avg_cost=10，现价 11（涨 10%，drop=-0.1），正常阈值会拦。
+    stop_loss 抬到 0.2、take_profit 抬到 0.2 避免风控抢跑。
+    量 = add_position_ratio(0.05)×60000/11=272→200。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        add_position_ratio=Decimal("0.05"),
+        stop_loss=Decimal("0.2"),
+    )
+    ctx.strategy_risk.take_profit_ratio = Decimal("0.2")  # 现价涨10% < 20%止盈，不抢跑
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "11", datetime(2026, 7, 30, 15, 0))  # 涨 10%（drop=-0.1）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.BUY
+    assert orders[0].quantity == 200
+
+
+def test_add_signal_threshold_minus_one_adds_on_extreme_rise():
+    """threshold=-1：涨3倍（drop=-2 < -1）也加——真正"任何价格都加"。
+    现有 drop<threshold 逻辑在 drop=-2<-1 时会拦，需显式跳过分支才不拦。
+    预置 avg_cost=10，现价 30（涨200%，drop=-2）。止盈抬到 3（300%）避免抢跑。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        add_position_ratio=Decimal("0.05"),
+        stop_loss=Decimal("0.2"),
+    )
+    ctx.strategy_risk.take_profit_ratio = Decimal("3")  # 涨200% < 300% 不止盈
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "30", datetime(2026, 7, 30, 15, 0))  # 涨200%（drop=-2）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.BUY
+
+
+def test_add_signal_threshold_minus_one_still_respects_max_count():
+    """threshold=-1 时 drop 失效，但 max_add_count 加仓次数上限仍生效。
+    add_count=2 == max_add_count=2 → 即便跌够（现价 9.0 跌 10%）也不出单。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        max_add_count=2, stop_loss=Decimal("0.2"),
+    )
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    pos.add_count = 2  # 已加满
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "9.0", datetime(2026, 7, 30, 15, 0))  # 跌 10%（drop 失效不看）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert orders == []
+
+
 def test_reduce_signal_quantity_from_ratio():
     """REDUCE 量 = 持仓 × reduce_position_ratio，取 100 整数倍。
     持仓 1000 × 0.3 = 300。"""

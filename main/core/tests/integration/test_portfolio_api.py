@@ -284,6 +284,79 @@ def test_create_portfolio_capital_ratio_out_of_range(client):
 
 
 # ---------------------------------------------------------------------------
+# POST — 加仓阈值特殊值 -1 / max_add_count 范围校验
+# -1=特殊值（任何价格都加），0=不涨即加，正常 (0,1]；max_add_count [0,10]（0=禁加仓）
+# ---------------------------------------------------------------------------
+def test_create_portfolio_add_position_threshold_minus_one_accepted(client):
+    """threshold=-1 特殊值（跳过回撤检查，任何价格都加）应放行。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["add_position_threshold"] = -1
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+
+
+def test_create_portfolio_add_position_threshold_zero_accepted(client):
+    """threshold=0（不涨即加，drop≥0）应放行——别用 (0,1] 把 0 排除。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["add_position_threshold"] = 0
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+
+
+@pytest.mark.parametrize("threshold", [-0.5, -2, 1.5, 2])
+def test_create_portfolio_add_position_threshold_invalid_rejected(client, threshold):
+    """-1 与 [0,1] 之外的值（如 -0.5/-2/1.5）应拒绝。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["add_position_threshold"] = threshold
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 400
+    assert "加仓阈值" in body["message"]
+
+
+def test_create_portfolio_max_add_count_zero_accepted(client):
+    """max_add_count=0（禁加仓）应放行——0 是合法值。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["max_add_count"] = 0
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+
+
+@pytest.mark.parametrize("count", [-1, 11, 100])
+def test_create_portfolio_max_add_count_out_of_range_rejected(client, count):
+    """max_add_count 须在 [0,10]，越界应拒绝。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["max_add_count"] = count
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 400
+    assert "加仓次数" in body["message"]
+
+
+# ---------------------------------------------------------------------------
 # POST — 主从策略配置（两步 commit + 配置期校验）
 # ---------------------------------------------------------------------------
 def test_create_portfolio_master_slave_two_step_commit(client):
@@ -577,6 +650,52 @@ def test_create_strategy_formula_not_found(client):
 
     body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(formula_id=999)).json()
     assert body["code"] == 400
+
+
+def test_create_strategy_add_position_threshold_minus_one_accepted(client):
+    """单策略路径 threshold=-1 特殊值应放行。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(
+        f"/api/portfolios/{pid}/strategies",
+        json=_strategy_payload(add_position_threshold=-1),
+    ).json()
+    assert body["code"] == 0
+
+
+@pytest.mark.parametrize("threshold", [-0.5, -2, 1.5])
+def test_create_strategy_add_position_threshold_invalid_rejected(client, threshold):
+    """单策略路径非法加仓阈值应拒绝。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(
+        f"/api/portfolios/{pid}/strategies",
+        json=_strategy_payload(add_position_threshold=threshold),
+    ).json()
+    assert body["code"] == 400
+    assert "加仓阈值" in body["message"]
+
+
+@pytest.mark.parametrize("count", [-1, 11])
+def test_create_strategy_max_add_count_out_of_range_rejected(client, count):
+    """单策略路径 max_add_count 越界应拒绝。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(
+        f"/api/portfolios/{pid}/strategies",
+        json=_strategy_payload(max_add_count=count),
+    ).json()
+    assert body["code"] == 400
+    assert "加仓次数" in body["message"]
 
 
 def test_create_strategy_slave_with_master(client):
