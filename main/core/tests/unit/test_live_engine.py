@@ -3895,3 +3895,196 @@ def test_tick_main_expires_stale_order_without_order_ref():
     assert fresh2.status == "submitted"  # 未超时不动
     db.close()
 
+
+# ---------------- 修复 A+：expire 前按 remark 兜底回填 ----------------
+# 真机 2026-08-21 id54-58 同源复现：修复 A（remark 直连 /deals 回填）被 _expire_stale_orders
+# 拦截——expire 在 deals 回填之前执行并 commit，超时单先变 rejected，deals 回填阶段见
+# status=rejected 直接 continue（live_engine.py 旧逻辑）。修复 A+：_expire_stale_orders
+# 标 rejected 前，先按 remark 查 /deals 兜底一次（成交则 filled 不 reject）。
+# 同时覆盖两条调用路径：_poll_deals（deals 循环）与 _tick_main（主循环饿死场景）。
+
+def test_expire_stale_backfills_via_remark_before_rejecting():
+    """修复 A+：单已超 180s + order_ref 缺失 + /deals 有 remark 成交 → 回填 filled 不 rejected。
+
+    复现 2026-08-21 id54 场景：单 created 14:32:25，iQuant 秒成，ORDER 实时表移除 →
+    order_ref 永远 None，旧逻辑 223s 超时 rejected。但 /deals（DEAL 表）保留成交记录且带
+    m_strRemark，故 expire 标 rejected 前应先按 bridge_order_id[:20] 在 /deals 兜底回填。
+    直接调 _expire_stale_orders 验证（内部兜底）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 无本单（成交后从 ORDER 实时表移除），/deals 有 remark 命中成交
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never-matched",  # 真实 ref，但 /orders 无此单 Core 拿不到
+        "remark": _TEST_REMARK,            # 按 remark 直连匹配
+        "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)  # bridge_order_id=_TEST_OID → remark=_TEST_REMARK
+    # 回拨 created_at 10 分钟，超过 _ORDER_REF_MATCH_TIMEOUT(180s)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    # expire 自身不 commit（调用方负责，同 _poll_deals line 1535-1536 模式）
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    # 修复 A+：超时但 /deals 有 remark 成交 → 回填 filled，不 rejected
+    assert lo2.status == "filled"
+    assert lo2.filled_quantity == 600
+    assert lo2.filled_price == Decimal("9.25")
+    assert not lo2.error_message  # 超时错误未写入
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 600
+    assert trades[0].amount == Decimal("5550.0")
+    # filled 后 apply：持仓 600，现金扣 amount+commission
+    assert ctx.positions[stock].quantity == 600
+    assert port.account.cash == Decimal("100000") - (Decimal("5550.0") + Decimal("1.39"))
+    db.close()
+
+
+def test_expire_stale_rejects_when_no_deals_match():
+    """修复 A+：单已超时 + /deals 无成交 → 仍 rejected（真空单兜底也救不了）。
+
+    确保兜底不误救真空单：桥真未落单（/deals 也无成交），expire 正常标 rejected。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # /deals 无任何成交
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"
+    assert lo2.error_message  # 真空单：写入失效原因
+    db.close()
+
+
+def test_expire_stale_backfill_skips_order_without_bridge_order_id():
+    """修复 A+：超时单无 bridge_order_id（遗留单无 remark 匹配键）→ 无法兜底，仍 rejected。
+
+    无 bridge_order_id 的单没有 remark 匹配键，/deals 兜底无意义，应直接 rejected
+    （不因查 /deals 而卡住或误判）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "remark": "other-order-remark-xx",  # 别的单的 remark，本单无匹配键
+        "price": 9.25, "volume": 600, "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600, bridge_order_id=None)  # 无匹配键
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"  # 无 remark 键，兜底跳过，正常 reject
+    assert lo2.error_message
+    db.close()
+
+
+def test_expire_stale_backfill_tolerates_bridge_offline():
+    """修复 A+：兜底查 /deals 时桥离线（BridgeUnavailableError）→ 不崩，退回 rejected。
+
+    兜底不应因桥离线而抛异常中断 expire。桥离线时无法验证成交，按原逻辑 rejected
+    （下轮 /deals 恢复时若仍有问题再处理；但真空单本来就该 reject）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+
+    def respond(request):
+        # /deals 抛离线（模拟桥不可用）
+        if request.url.path == "/deals":
+            raise BridgeUnavailableError("bridge offline")
+        return httpx.Response(200, json={"ok": True, "data": []})
+
+    rec._respond = respond
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)  # 不应抛异常
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"  # 桥离线无法兜底，退回 rejected
+    db.close()
+
+
+def test_poll_deals_does_not_reject_when_deals_has_remark_fill():
+    """修复 A+：_poll_deals 全链路——超时单 + /deals 有 remark 成交 → filled 不 rejected。
+
+    端到端验证：_poll_deals 内 expire 调用前的兜底生效，超时单不会被先 reject 再跳过。
+    复现今天 id54 的 _poll_deals 调用路径（非直接调 expire）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never-matched",
+        "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "filled"  # 走全链路也不被 reject
+    assert lo2.filled_quantity == 600
+    assert ctx.positions[stock].quantity == 600
+    db.close()
+

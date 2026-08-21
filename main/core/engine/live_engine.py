@@ -1595,6 +1595,14 @@ class LiveEngine:
         pending 为调用方已查的 submitted/partial 列表（复用省一次查询）；None 则自查。
         注意：调用方负责 commit（_poll_deals 在 expire 后 commit；_tick_main 自带
         try/commit/rollback/finally close，同 _persist_breaker_count 模式）。
+
+        修复 A+（真机 2026-08-21 id54-58）：超时单标 rejected 前，先按 remark 查 /deals
+        兜底一次——iQuant 秒成后 ORDER 实时表移除单的 order_ref 永远 None，旧逻辑直接
+        rejected 但其实 /deals（DEAL 表）有成交记录。兜底命中则 _backfill_order 转 filled，
+        不 reject；真空单（/deals 也无成交）才 rejected。这同时覆盖两条调用路径
+        （_poll_deals 的顺序 bug + _tick_main 饿死场景不查 /deals）——两处调 expire 都兜底。
+        无 bridge_order_id 的单无 remark 匹配键，跳过兜底直接 reject；桥离线则容错退回 reject。
+        deals 只在确有超时待兜底单时查一次（lazy），无超时单不产生查询开销。
         """
         if pending is None:
             pending = (
@@ -1606,26 +1614,47 @@ class LiveEngine:
                 .all()
             )
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 修复 A+：超时单标 rejected 前，先按 remark 查 /deals 兜底一次——iQuant 秒成后
+        # ORDER 实时表移除单的 order_ref 永远 None，旧逻辑直接 rejected 但 /deals（DEAL 表）
+        # 其实有成交记录。兜底命中则 _backfill_order 转 filled 不 reject；真空单
+        # （/deals 也无成交）才 rejected。同时覆盖两条调用路径（_poll_deals 顺序 bug +
+        # _tick_main 饿死场景不查 /deals）。deals 只在确有超时待兜底单时 lazy 查一次，复用。
+        deals_cache: Optional[list] = None  # None=未查；list=已查（含空列表），全循环复用
         for lo in pending:
             if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
                 continue
             if lo.created_at is None:
                 continue
             age = now_utc - lo.created_at
-            if age >= _ORDER_REF_MATCH_TIMEOUT:
-                lo.status = "rejected"
-                lo.error_message = (
-                    "order match timeout: no bridge order_ref within %ds"
-                    % int(age.total_seconds())
-                )
-                self._pending_orders.pop(lo.id, None)
-                self._emit("order", {
-                    "portfolio_id": lo.portfolio_strategy_id,
-                    "order_id": lo.id,
-                    "status": "rejected",
-                    "stock_code": lo.stock_code,
-                    "error_message": lo.error_message,
-                })
+            if age < _ORDER_REF_MATCH_TIMEOUT:
+                continue
+            # 超时单：先尝试 remark 兜底（修复 A+）。无 bridge_order_id 跳过兜底直接 reject。
+            if lo.bridge_order_id:
+                if deals_cache is None:
+                    try:
+                        deals_cache = self._dispatcher.query_deals()
+                    except BridgeUnavailableError:
+                        deals_cache = []  # 桥离线：本单及后续超时单都无法兜底，退回 reject
+                expected_remark = lo.bridge_order_id[:20]
+                matched = [d for d in deals_cache if d.get("remark") == expected_remark]
+                if matched:
+                    self._backfill_order(db, lo, matched)  # 幂等：转 filled + 写 LiveTrade + apply
+                    continue
+            lo.status = "rejected"
+            lo.error_message = (
+                "order match timeout: no bridge order_ref within %ds"
+                % int(age.total_seconds())
+            )
+            self._pending_orders.pop(lo.id, None)
+            self._emit("order", {
+                "portfolio_id": lo.portfolio_strategy_id,
+                "order_id": lo.id,
+                "status": "rejected",
+                "stock_code": lo.stock_code,
+                "error_message": lo.error_message,
+            })
+
+
 
     def _sync_pending_orders(self, db: Session) -> None:
         """重查 DB 剩余 submitted/partial 同步在途集合（G7 计数）。
