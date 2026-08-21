@@ -4,7 +4,6 @@ from core.engine.account import Account
 from core.engine.event import TradeEvent
 from tq_iquant_shared.constants import TradeType
 
-
 def _trade(trade_type, price, quantity):
     return TradeEvent(
         strategy_id=1,
@@ -67,6 +66,19 @@ def test_approve_order_below_one_lot_rejects_and_counts():
     assert approved is False
     assert qty == 0
     assert acc.insufficient_count == 1
+
+
+def test_approve_order_below_one_lot_logs_debug(caplog):
+    """④ 资金不足不足1手拒绝 → logger.debug（回测/实盘共用，DEBUG 级别）。"""
+    import logging
+    acc = Account(Decimal("400"), strategy_capital_limit=Decimal("100000"))
+    with caplog.at_level(logging.DEBUG, logger="core.engine.account"):
+        approved, qty = acc.approve_order(1000, Decimal("10"), Decimal("0"))
+    assert approved is False
+    assert qty == 0
+    assert any(
+        r.levelno == logging.DEBUG for r in caplog.records
+    ), "资金不足不足1手拒绝应打 debug 日志"
 
 
 def test_approve_order_existing_position_reduces_available_limit():

@@ -180,6 +180,10 @@ class Portfolio:
                 return None
             quantity = int(pos.quantity * ctx.reduce_position_ratio / 100) * 100
             if quantity < 100:
+                logger.debug(
+                    "REDUCE 拦截:计算量 %d <100（%s 持仓 %d × reduce_ratio %s）",
+                    quantity, sig.stock_code, pos.quantity, ctx.reduce_position_ratio,
+                )
                 return None
             trade_type = TradeType.SELL
         elif sig.signal_type == SignalType.OPEN:
@@ -191,9 +195,18 @@ class Portfolio:
             # 受 max_positions 约束：已达上限不开新仓
             held = sum(1 for p in ctx.positions.values() if p.quantity > 0)
             if held >= ctx.max_positions:
+                logger.debug(
+                    "OPEN 拦截:max_positions 已满（持有 %d >= 上限 %d，%s 不开新仓）",
+                    held, ctx.max_positions, sig.stock_code,
+                )
                 return None
             quantity = int(ctx.single_open_ratio * strategy_fund / close / 100) * 100
             if quantity < 100:
+                logger.debug(
+                    "OPEN 拦截:计算量 %d <100（%s ratio %s × 资金 %s / 价 %s）",
+                    quantity, sig.stock_code, ctx.single_open_ratio,
+                    strategy_fund, close,
+                )
                 return None
             trade_type = TradeType.BUY
         elif sig.signal_type == SignalType.ADD:
@@ -207,6 +220,11 @@ class Portfolio:
                 return None
             quantity = int(ctx.add_position_ratio * strategy_fund / close / 100) * 100
             if quantity < 100:
+                logger.debug(
+                    "ADD 拦截:计算量 %d <100（%s ratio %s × 资金 %s / 价 %s）",
+                    quantity, sig.stock_code, ctx.add_position_ratio,
+                    strategy_fund, close,
+                )
                 return None
             trade_type = TradeType.BUY
         else:

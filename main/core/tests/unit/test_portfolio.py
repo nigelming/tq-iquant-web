@@ -334,6 +334,95 @@ def test_open_signal_respects_max_positions():
     assert orders == []
 
 
+def test_max_positions_block_logs_debug(caplog):
+    """① max_positions 拦截 → logger.debug（回测/实盘共用，DEBUG 不刷回测默认 INFO）。
+
+    实盘可调到 DEBUG 级别可见；回测默认 INFO 看不到，不污染输出。
+    目标票 000009.SZ 不在预置 5 只持仓内，避免被"本票已持仓"早退拦截。
+    """
+    import logging
+    port, ctx = _strategy_with_params(
+        "000009.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+        max_positions=5,
+    )
+    for i in range(1, 6):
+        code = f"00000{i}.SZ"
+        pos = Position(code)
+        pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+        ctx.positions[code] = pos
+    bar = BarEvent(
+        stocks={f"00000{i}.SZ": {
+            "open": Decimal("10"), "high": Decimal("11"), "low": Decimal("9"),
+            "close": Decimal("10.5"), "volume": 1000,
+        } for i in range(1, 6)} | {"000009.SZ": {
+            "open": Decimal("10"), "high": Decimal("10.6"),
+            "low": Decimal("9.9"), "close": Decimal("10.5"), "volume": 1000,
+        }},
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    cache = {(1, "000009.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "max_positions" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "max_positions 拦截应打 debug 日志"
+
+
+def test_open_quantity_below_100_block_logs_debug(caplog):
+    """② OPEN 算出量 <100 → logger.debug（回测/实盘共用，DEBUG 级别）。"""
+    import logging
+    # 策略资金 60000 × ratio 0.001 = 60 / 价 10.2 = 5 → <100 拦截
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+        single_open_ratio=Decimal("0.001"),
+    )
+    bar = _bar("000001.SZ", "10.2", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "100" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "量<100 拦截应打 debug 日志"
+
+
+def test_reduce_quantity_below_100_block_logs_debug(caplog):
+    """③ REDUCE 算出量 <100 → logger.debug（回测/实盘共用，DEBUG 级别）。
+
+    持仓 300 × reduce_ratio 0.3 = 90 <100。现价 11 高于成本 10，不触发止损抢跑。
+    """
+    import logging
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "reduce_sig", "signal_type": SignalType.REDUCE, "trigger_value": 1}],
+        reduce_position_ratio=Decimal("0.3"),
+    )
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 300, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "11", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "reduce_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "REDUCE" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "REDUCE 量<100 拦截应打 debug 日志"
+
+
 def test_open_signal_ignored_when_stock_already_held():
     """OPEN 信号对本票已持仓时忽略——加仓是 ADD 的职责，OPEN 只开新仓。
 

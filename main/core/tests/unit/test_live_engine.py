@@ -336,6 +336,43 @@ def test_handle_bar_sell_capped_by_bridge_available():
     db.close()
 
 
+def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
+    """⑤ 实盘 cap_quantity 返回 None（资金不足不足1手）→ logger.info。
+
+    实盘专用路径（回测走 engine.execute 不经此），INFO 级别。账户 cash 清零
+    使 approve_order 不足1手拒绝 → cap_quantity None → 不下单 + 打日志。
+    """
+    import logging
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    port.account.cash = Decimal("0")  # 现金清零 → 不足1手拒绝
+
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert orders == []  # 不下单
+    assert any(
+        r.levelno == logging.INFO for r in caplog.records
+    ), "cap_quantity None 拦截应打 info 日志"
+    db.close()
+
+
 def test_handle_bar_refreshes_available_once_per_bar():
     """F5：多组合共享同一 bar 对象 → 每 bar 只刷一次 /positions（强引用去重）。"""
     factory, _ = _db_factory()

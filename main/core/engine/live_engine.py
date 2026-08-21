@@ -812,6 +812,10 @@ class LiveEngine:
                 # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
                 capped = self._engine.cap_quantity(order, portfolio.account, pos)
                 if capped is None:
+                    logger.info(
+                        "skip order %s %s %s: cap_quantity None（资金/持仓上限拦截，不下单）",
+                        order.trade_type.value, order.stock_code, order.signal_name,
+                    )
                     continue
                 order.quantity = capped
                 # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
