@@ -69,7 +69,9 @@ def list_sessions(db: Session = Depends(get_db)):
     links = db.query(LiveSessionPortfolio).all()
     by_session: Dict[int, list] = {}
     for l in links:
-        by_session.setdefault(l.session_id, []).append(l.portfolio_strategy_id)
+        by_session.setdefault(l.session_id, []).append(
+            {"portfolio_id": l.portfolio_strategy_id, "status": l.status}
+        )
     return ok([
             {
                 "id": s.id,
@@ -78,7 +80,8 @@ def list_sessions(db: Session = Depends(get_db)):
                 "status": s.status,
                 "started_at": s.started_at,
                 "stopped_at": s.stopped_at,
-                "portfolio_ids": sorted(by_session.get(s.id, [])),
+                "portfolio_ids": sorted(p["portfolio_id"] for p in by_session.get(s.id, [])),
+                "portfolios": by_session.get(s.id, []),
             }
             for s in sessions
         ])
@@ -280,6 +283,34 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
     session.stopped_at = datetime.now()
     db.commit()
     return ok({"id": session.id, "status": "stopped"})
+
+
+@router.post("/sessions/{session_id}/portfolios/{portfolio_id}/recover")
+def recover_breaker(session_id: int, portfolio_id: int, db: Session = Depends(get_db)):
+    """手动恢复某组合熔断（3 次转手动恢复后的人工恢复入口）。
+
+    引擎运行中：engine.recover_breaker 负责内存态 + DB 双写；
+    引擎未运行：只改 DB（下次 start → recover 读回 count=0 不补挂，组合正常）。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return err(404, "资源不存在")
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=session_id, portfolio_strategy_id=portfolio_id,
+    ).first()
+    if link is None:
+        return err(404, "该组合不在此 session 中")
+    engine = _ENGINES.get(session_id)
+    if engine is not None:
+        # 运行中：引擎方法负责内存 + DB 双写
+        if not engine.recover_breaker(portfolio_id):
+            return err(404, "该组合不在此 session 引擎中")
+    else:
+        # 未运行：只改 DB（下次 start → recover 只在 count>=3 转手动；count=0 不补挂）
+        link.circuit_breaker_count = 0
+        link.status = "active"
+        db.commit()
+    return ok({"portfolio_id": portfolio_id, "status": "active", "circuit_breaker_count": 0})
 
 
 @router.get("/sessions/{session_id}/bridge-status")

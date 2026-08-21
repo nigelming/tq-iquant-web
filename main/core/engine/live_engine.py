@@ -992,6 +992,44 @@ class LiveEngine:
         finally:
             db.close()
 
+    def recover_breaker(self, portfolio_id: int) -> bool:
+        """手动恢复某组合熔断：清零计数 + 解除手动恢复 + 落库 status=active。
+
+        3 次转手动恢复（§8.3）的人工恢复入口。重置内存态 + DB LiveSessionPortfolio。
+        peak_value 保持当前值（不重置历史峰值，回撤基准不变）。
+        返回 True 若找到组合并恢复，False 若组合不属本 session。
+        """
+        port = next((p for p in self.portfolios if p.portfolio_id == portfolio_id), None)
+        if port is None:
+            return False
+        rm = port.risk_manager
+        rm.consecutive_drawdown_triggers = 0
+        rm.circuit_breaker_active = False
+        rm.manual_recovery = False
+        rm.breaker_trigger_date = None
+        # 同步已落库计数，否则下一 bar _persist_breaker_count 比对 old==count 跳过回写
+        self._breaker_count_written[portfolio_id] = 0
+        db = self._db_session_factory()
+        try:
+            link = db.query(LiveSessionPortfolio).filter_by(
+                session_id=self.session_id,
+                portfolio_strategy_id=portfolio_id,
+            ).first()
+            if link is not None:
+                link.circuit_breaker_count = 0
+                link.status = "active"
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("recover_breaker persist failed: portfolio %s", portfolio_id)
+        finally:
+            db.close()
+        self._emit("risk", {
+            "portfolio_id": portfolio_id, "rule": "max_drawdown",
+            "triggered": False, "count": 0, "message": "熔断已手动恢复（计数清零）",
+        })
+        return True
+
     def _dispatch_period_bar(self, period: str, boundary_time: datetime) -> None:
         """C6(A) 边界分发：period 边界到（1m stime 判定）→ 拉该周期 bar → 注入 → 驱动该周期策略。
 

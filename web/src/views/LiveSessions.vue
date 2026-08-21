@@ -10,6 +10,7 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
+  recoverLiveBreaker,
   type PortfolioItem, type LiveSessionItem,
 } from '../api'
 
@@ -19,10 +20,24 @@ const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实�
 const showCreate = ref(false)
 const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] as number[] })
 
-// 组合名称解析(会话 portfolio_ids → 名称列表)
-function portfolioNames(ids: number[] | undefined): string {
-  if (!ids || ids.length === 0) return '-'
-  return ids.map((id) => portfolios.value.find((p) => p.id === id)?.name || `#${id}`).join('、')
+// 组合级状态列表：优先用后端 portfolios 字段，缺省时兜底 portfolio_ids(无状态视为 active)
+function portfolioStatuses(s: LiveSessionItem): { portfolio_id: number; status: string }[] {
+  if (s.portfolios && s.portfolios.length > 0) return s.portfolios
+  return (s.portfolio_ids || []).map((id) => ({ portfolio_id: id, status: 'active' }))
+}
+
+function portfolioName(id: number): string {
+  return portfolios.value.find((p) => p.id === id)?.name || `#${id}`
+}
+
+async function recoverBreaker(s: LiveSessionItem, pid: number) {
+  if (!confirm(`确定手动恢复组合「${portfolioName(pid)}」的熔断？将清零熔断计数并恢复开仓。`)) return
+  try {
+    await recoverLiveBreaker(s.id, pid)
+    await load()
+  } catch (e: any) {
+    alert(e?.message || '恢复失败')
+  }
 }
 
 // ---- B4a: 实时事件日志面板（SSE）----
@@ -169,7 +184,14 @@ onUnmounted(closeEventStream)
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:#888">#{{ s.id }}</td>
           <td>{{ s.name }}</td>
-          <td style="color:#666">{{ portfolioNames(s.portfolio_ids) }}</td>
+          <td style="color:#666">
+            <span v-for="p in portfolioStatuses(s)" :key="p.portfolio_id" class="portfolio-chip">
+              {{ portfolioName(p.portfolio_id) }}
+              <span v-if="p.status === 'circuit_broken'" class="badge badge-red" style="margin-left:4px">熔断</span>
+              <button v-if="p.status === 'circuit_broken'" @click="recoverBreaker(s, p.portfolio_id)" class="btn btn-sm" style="margin-left:4px">恢复</button>
+            </span>
+            <span v-if="portfolioStatuses(s).length === 0">-</span>
+          </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
@@ -321,5 +343,9 @@ onUnmounted(closeEventStream)
   cursor: pointer;
   font-size: 13px;
   background: #fafafa;
+}
+.portfolio-chip {
+  display: inline-block;
+  margin-right: 6px;
 }
 </style>

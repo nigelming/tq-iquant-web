@@ -2821,6 +2821,84 @@ def test_recover_breaker_count_three_sets_manual_halt():
     assert port.risk_manager.is_trading_halted() is True
 
 
+def test_recover_breaker_resets_manual_recovery():
+    """§8.3 转手动恢复后的人工恢复入口：recover_breaker 清零计数 + 解除手动恢复 + 落库 active。
+
+    构造 count=3 + status=circuit_broken（同 test_recover_breaker_count_three_sets_manual_halt
+    前置），调 engine.recover_breaker(1) → 内存态全清 + DB status=active/count=0 +
+    _breaker_count_written 同步（否则下 bar _persist_breaker_count 比对跳过回写）。
+    peak_value 不重置（用户决策：保留历史峰值）。
+    """
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 先置 3 次熔断转手动（内存 + DB）
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)  # 还原内存态：count=3 → manual_recovery=True
+    db.close()
+    assert port.risk_manager.manual_recovery is True  # 前置：确实卡在手动恢复
+    engine._breaker_count_written[1] = 3  # 模拟已落库 3（recover 预置）
+
+    ok_flag = engine.recover_breaker(1)
+
+    assert ok_flag is True
+    # 内存态全清
+    assert port.risk_manager.consecutive_drawdown_triggers == 0
+    assert port.risk_manager.manual_recovery is False
+    assert port.risk_manager.circuit_breaker_active is False
+    assert port.risk_manager.breaker_trigger_date is None
+    assert port.risk_manager.is_trading_halted() is False
+    # _breaker_count_written 同步（防下 bar 跳过回写）
+    assert engine._breaker_count_written[1] == 0
+    # DB 落库
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    assert link.status == "active"
+    assert link.circuit_breaker_count == 0
+    db.close()
+
+
+def test_recover_breaker_unknown_portfolio_returns_false():
+    """recover_breaker 对不属于本 session 的组合返回 False（不抛异常、不改任何状态）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+
+    ok_flag = engine.recover_breaker(999)  # 不存在的 portfolio_id
+
+    assert ok_flag is False
+    # 现有组合状态未被动过
+    assert port.risk_manager.consecutive_drawdown_triggers == 0
+    assert port.risk_manager.manual_recovery is False
+
+
+def test_recover_breaker_emits_risk_event():
+    """recover_breaker 后 emit risk(triggered=False) 事件——前端 SSE 实时看到恢复。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    port.risk_manager.manual_recovery = True  # 前置：卡在手动恢复
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine.recover_breaker(1)
+
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "max_drawdown"
+    assert ev["triggered"] is False
+    assert ev["count"] == 0
+    assert ev["portfolio_id"] == 1
+    assert q.empty()
+
+
 # ---------------- F6 同 bar 多策略超卖（bar 内可用量递减记账）----------------
 def test_live_t1_checker_consume_available_decrements():
     """F6：consume_available 递减 bar 可用量——同 bar 后续 SELL 见递减后的值；重设快照恢复全量。"""

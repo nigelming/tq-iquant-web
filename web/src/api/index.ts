@@ -457,6 +457,7 @@ export interface LiveSessionItem {
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
+  portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
 }
 
 export interface LiveSessionCreate {
@@ -487,6 +488,13 @@ export async function stopLiveSession(id: number) {
 
 export async function deleteLiveSession(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/live/sessions/${id}`)
+  return res.data.data
+}
+
+export async function recoverLiveBreaker(sessionId: number, portfolioId: number) {
+  const res = await api.post<ApiResponse<{ portfolio_id: number; status: string; circuit_breaker_count: number }>>(
+    `/live/sessions/${sessionId}/portfolios/${portfolioId}/recover`,
+  )
   return res.data.data
 }
 
