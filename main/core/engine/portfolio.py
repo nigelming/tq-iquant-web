@@ -74,8 +74,18 @@ class Portfolio:
                 continue
             orders.extend(self._process_strategy(ctx, bar, signal_cache))
         # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
-        # §88：熔断期间不清仓，仅暂停新开仓。
+        # §88：熔断期间不清仓，仅暂停新开仓。DEBUG——熔断期每 bar 每 BUY 都会触发，
+        # INFO 会刷屏；DEBUG 供排查"为何 BUY 信号没下单"（被剥的 BUY 不进返回列表，
+        # 上层 live_engine 的 signal SSE 也不会发，故此处是唯一可见点）。
         if self.risk_manager.is_trading_halted():
+            stripped = [o for o in orders if o.trade_type == TradeType.BUY]
+            if stripped:
+                logger.debug(
+                    "portfolio %s 熔断/日内暂停中：剥掉 %d 个 BUY 新开仓 "
+                    "(保留 SELL 止损/平仓)：%s",
+                    self.portfolio_id, len(stripped),
+                    ", ".join("%s/%s" % (o.stock_code, o.signal_name) for o in stripped),
+                )
             orders = [o for o in orders if o.trade_type != TradeType.BUY]
         return orders
 

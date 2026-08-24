@@ -724,6 +724,32 @@ def test_check_risks_warns_when_strategy_risk_none(caplog):
     ), "strategy_risk 未注入应触发 warning，不应静默"
 
 
+def test_halt_strips_buy_logs_debug(caplog):
+    """熔断/日内暂停期间剥掉 BUY -> logger.debug（被剥的 BUY 不进返回列表，此处是唯一可见点）。
+
+    DEBUG 级别：熔断期每 bar 每 BUY 都触发，INFO 会刷屏。SELL（止损/平仓）保留（另测）。
+    用未持仓的新票出 OPEN BUY，避免被同票 CLOSE 的 cleared 集合抑制。
+    """
+    import logging
+    port, ctx = _portfolio_with_strategy(
+        "000009.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    port.risk_manager.circuit_breaker_active = True  # 熔断中
+
+    bar = _bar("000009.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000009.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []  # BUY 被剥
+    assert any(
+        "剥掉" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
 def _buy(price, quantity, trade_time):
     from core.engine.event import TradeEvent
     return TradeEvent(

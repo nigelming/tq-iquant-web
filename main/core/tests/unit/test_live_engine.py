@@ -4966,3 +4966,181 @@ def test_close_sweep_no_pending_logs_info(caplog):
         engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
     assert engine._last_close_sweep_date == date(2026, 8, 24)
     assert any("no pending" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+# ===================== 风控状态转换日志补全（max_drawdown / daily_loss / 恢复 / 重启读回）=====================
+def test_max_drawdown_trigger_logs_warning(caplog):
+    """max_drawdown 熔断触发（计数+1）-> logger.warning（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 清风控比例：drawdown bar 不触发止损单，聚焦熔断
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, _bar(stock, "100", datetime(2026, 8, 5, 10, 0)))  # 建峰
+        engine._handle_bar(port, _bar(stock, "70", datetime(2026, 8, 5, 10, 1)))   # 回撤 30%>20% 熔断
+
+    msgs = _log_msgs(caplog)
+    assert any("max_drawdown" in m and "触发" in m and "1 次" in m for m in msgs), msgs
+
+
+def test_max_drawdown_manual_halt_logs_warning(caplog):
+    """累计 3 次转手动恢复 -> logger.warning 标明 manual（最该留痕的风控事件）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        # 第 3 次触发：前两次已累计 2，本 bar 回撤触发第 3 次 -> 转手动
+        port.risk_manager.consecutive_drawdown_triggers = 2
+        engine._breaker_count_written[1] = 2  # 模拟已落库 2，使本次递增被识别
+        engine._handle_bar(port, _bar(stock, "100", datetime(2026, 8, 5, 10, 0)))  # 建峰
+        engine._handle_bar(port, _bar(stock, "70", datetime(2026, 8, 5, 10, 1)))   # 第 3 次 -> 手动
+
+    msgs = _log_msgs(caplog)
+    assert any("max_drawdown" in m and "3 次" in m and "手动" in m for m in msgs), msgs
+
+
+def test_max_drawdown_auto_recovery_logs_info(caplog):
+    """max_drawdown 熔断次日自动恢复（非手动）-> logger.info（此前 risk_manager 内静默置 False）。
+
+    走实盘真实路径 _handle_bar（每 bar 调 update_peak）：周五触发后周一一根回升 bar 自动恢复。
+    """
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.peak_value = Decimal("100000")
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = date(2026, 8, 21)       # 周五触发
+    rm.consecutive_drawdown_triggers = 1
+    engine._breaker_count_written[1] = 1
+    # 清风控比例 + 无信号缓存：该 bar 不出单，聚焦恢复日志（恢复检测在 update_peak 后、on_bar 前）
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 21, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        # 次日（8/24 周一）close=99 → total=99000，回撤 1%<20% 不重触发，date>trigger 自动恢复
+        engine._handle_bar(port, _bar(stock, "99", datetime(2026, 8, 24, 10, 0)))
+
+    msgs = _log_msgs(caplog)
+    assert rm.circuit_breaker_active is False
+    assert any("max_drawdown" in m and "次日自动恢复" in m for m in msgs), msgs
+
+
+def test_daily_loss_trigger_logs_warning(caplog):
+    """日内亏损熔断触发 -> logger.warning（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    port = engine.portfolios[0]
+    rm = port.risk_manager  # daily_loss_limit=0.05, initial_capital=100000
+    # 建立昨收基准：Day1 收盘 100000
+    rm.update_peak(Decimal("100000"), date(2026, 8, 21))
+
+    # Day2 盘中跌到 94000（日内亏 6000=6% ≥ 5%），update_peak 记录当日最后 total
+    rm.update_peak(Decimal("100000"), date(2026, 8, 24))  # 跨日刷新 prev_close=100000
+    rm.update_peak(Decimal("94000"), date(2026, 8, 24))
+    # _maybe_daily_close 用现金+持仓成本算 total，无持仓时即现金 → 置 94000 体现日内亏损
+    port.account.cash = Decimal("94000")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+
+    msgs = _log_msgs(caplog)
+    assert any("daily_loss" in m and "触发" in m for m in msgs), msgs
+
+
+def test_daily_loss_auto_recovery_logs_info(caplog):
+    """daily_loss 暂停次日自动恢复 -> logger.info（此前 risk_manager 内静默置 False）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    rm = engine.portfolios[0].risk_manager
+    rm.daily_pause_active = True
+    rm.daily_loss_trigger_date = date(2026, 8, 21)  # 周五触发
+    # 昨收基准：恢复日 total 不再重触（94000 接近 prev_close）
+    rm.update_peak(Decimal("94000"), date(2026, 8, 21))
+    rm.update_peak(Decimal("94000"), date(2026, 8, 24))  # 跨日 prev_close=94000
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))  # 8/24 > 8/21 -> 恢复
+
+    msgs = _log_msgs(caplog)
+    assert rm.daily_pause_active is False
+    assert any("daily_loss" in m and "恢复" in m for m in msgs), msgs
+
+
+def test_recover_breaker_manual_logs_info(caplog):
+    """API 手动恢复熔断 -> logger.info（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)  # 还原内存态：count=3 -> manual_recovery=True
+    db.close()
+    assert port.risk_manager.manual_recovery is True
+    engine._breaker_count_written[1] = 3
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine.recover_breaker(1)
+
+    msgs = _log_msgs(caplog)
+    assert any("手动恢复" in m and "portfolio 1" in m for m in msgs), msgs
+
+
+def test_recover_restores_manual_breaker_logs_warning(caplog):
+    """重启 recover 读回 count>=3 转手动 -> logger.warning（此前静默，重启后卡手动无痕迹）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        db = factory()
+        engine.recover(db)
+        db.close()
+
+    msgs = _log_msgs(caplog)
+    assert port.risk_manager.manual_recovery is True
+    assert any("重启读回" in m and "3 次" in m and "手动" in m for m in msgs), msgs

@@ -626,14 +626,26 @@ class LiveEngine:
                 portfolio.risk_manager.update_daily(
                     total, today, portfolio.account.initial_capital
                 )
+                now_paused = portfolio.risk_manager.daily_pause_active
                 # B5：日内亏损熔断刚触发（daily_pause_active 变 True）→ 推送风控事件
-                if portfolio.risk_manager.daily_pause_active and not was_paused:
+                if now_paused and not was_paused:
                     self._emit("risk", {
                         "portfolio_id": portfolio.portfolio_id,
                         "rule": "daily_loss",
                         "triggered": True,
                         "message": "日内亏损熔断触发，当日暂停新开仓",
                     })
+                    logger.warning(
+                        "circuit breaker: portfolio %s daily_loss 触发 "
+                        "on %s (当日暂停新开仓，次日自动恢复) (session %s)",
+                        portfolio.portfolio_id, today, self.session_id,
+                    )
+                elif was_paused and not now_paused:
+                    logger.info(
+                        "circuit breaker: portfolio %s daily_loss 次日自动恢复 "
+                        "on %s (session %s)",
+                        portfolio.portfolio_id, today, self.session_id,
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "update_daily error (portfolio %s, date %s)",
@@ -974,7 +986,17 @@ class LiveEngine:
         E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测）。
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
-        portfolio.risk_manager.update_peak(portfolio.total_value(bar), bar.bar_time.date())
+        rm = portfolio.risk_manager
+        was_broken = rm.circuit_breaker_active
+        was_manual = rm.manual_recovery
+        rm.update_peak(portfolio.total_value(bar), bar.bar_time.date())
+        # max_drawdown 次日自动恢复（非手动恢复）此前在 risk_manager 内静默置 False，这里补日志
+        if was_broken and not rm.circuit_breaker_active and not was_manual:
+            logger.info(
+                "circuit breaker: portfolio %s max_drawdown 次日自动恢复 "
+                "(session %s, %s)",
+                portfolio.portfolio_id, self.session_id, bar.bar_time.date(),
+            )
         # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
         self._persist_breaker_count(portfolio)
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
@@ -1204,6 +1226,18 @@ class LiveEngine:
                 "count": count,
                 "message": "最大回撤熔断触发（累计 %d 次）" % count,
             })
+            if count >= 3:
+                logger.warning(
+                    "circuit breaker: portfolio %s max_drawdown 触发 "
+                    "(累计 %d 次) → 转手动恢复，停新开仓等人工介入 (session %s)",
+                    portfolio.portfolio_id, count, self.session_id,
+                )
+            else:
+                logger.warning(
+                    "circuit breaker: portfolio %s max_drawdown 触发 "
+                    "(累计 %d 次，次日自动恢复) (session %s)",
+                    portfolio.portfolio_id, count, self.session_id,
+                )
         db = self._db_session_factory()
         try:
             link = (
@@ -1264,6 +1298,10 @@ class LiveEngine:
             "portfolio_id": portfolio_id, "rule": "max_drawdown",
             "triggered": False, "count": 0, "message": "熔断已手动恢复（计数清零）",
         })
+        logger.info(
+            "circuit breaker: portfolio %s 手动恢复（计数清零，解除停新开仓）(session %s)",
+            portfolio_id, self.session_id,
+        )
         return True
 
     def _dispatch_period_bar(self, period: str, boundary_time: datetime) -> None:
@@ -2273,6 +2311,17 @@ class LiveEngine:
             if link.circuit_breaker_count >= 3:
                 port.risk_manager.manual_recovery = True
                 port.risk_manager.circuit_breaker_active = True
+                logger.warning(
+                    "circuit breaker: portfolio %s 重启读回累计 %d 次 → 转手动恢复，"
+                    "停新开仓等人工介入 (session %s)",
+                    link.portfolio_strategy_id, link.circuit_breaker_count, self.session_id,
+                )
+            else:
+                logger.info(
+                    "circuit breaker: portfolio %s 重启读回累计 %d 次（未转手动，正常运行）"
+                    " (session %s)",
+                    link.portfolio_strategy_id, link.circuit_breaker_count, self.session_id,
+                )
         # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
         self._reconcile_positions()
 
