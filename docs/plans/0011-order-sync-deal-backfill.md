@@ -83,7 +83,7 @@ Core 下单 → 桥 passorder 受理(返回0)
 | traded_price | m_dTradedPrice | 成交均价 |
 | volume | m_nVolumeTotalOriginal | 委托量 |
 | traded_volume | m_nVolumeTraded | 已成交量 |
-| status | m_nOrderStatus | **54=撤单/55=部分撤/56=全成/其他=待成交** |
+| status | m_nOrderStatus | **官方码：48未报/49待报/50已报/51已报待撤/52部成待撤/53部撤(终态)/54已撤(终态)/55部成(非终态,剩余仍撮合)/56已成(终态)/57废单(终态)**。Core 终态处理：53/54→canceled、57→rejected、56→filled(deals回填)、55→在途不碰。⚠️ 55 是「部成」非「部撤」，旧代码误判已修正（2026-08-24 据 D:\iquant xtconstant.py 核对） |
 | source | m_strSource | BRIDGE/GUI |
 | insert_time/date | m_strInsertTime/m_strInsertDate | 委托时间 |
 | cancel_amount | m_dCancelAmount | 撤单量 |

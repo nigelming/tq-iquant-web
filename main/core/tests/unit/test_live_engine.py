@@ -4090,7 +4090,11 @@ def test_poll_deals_does_not_reject_when_deals_has_remark_fill():
 
 
 # ---------------------------------------------------------------------------
-# 第一层：Core 读 /orders 的 m_nOrderStatus 同步撤单终态（54 全撤 / 55 部撤）
+# 第一层：Core 读 /orders 的 m_nOrderStatus 同步终态。
+# 官方码（D:\iquant xtconstant.py，文档 iQuant_Python_API_Doc.html:10643）：
+#   52=部成待撤 53=部撤(终态) 54=已撤(终态) 55=部成(在途,剩余仍撮合)
+#   56=已成(终态) 57=废单(终态)
+# 关键：55 是「部成」非终态，绝不能当终态撤单——否则剩余后续成交会重复 apply/丢单。
 # ---------------------------------------------------------------------------
 
 def _order_with_ref(ref="ref-cancel-1", status=54, traded_volume=0, volume=600,
@@ -4139,13 +4143,13 @@ def test_poll_deals_marks_fully_canceled_order():
 
 
 def test_poll_deals_partial_cancel_applies_fills_then_cancels():
-    """55 部撤 + 部分成交 → 先 apply 真实成交，再 canceled（终态必须落持仓）。"""
+    """53 部撤 + 部分成交 → 先 apply 真实成交，再 canceled（终态必须落持仓）。"""
     factory, _ = _db_factory()
     port, ctx = _portfolio_single()
     stock = "600000.SH"
     rec = _Recorder()
     _mock_orders_deals(rec, orders=[
-        _order_with_ref(ref="ref-pc", status=55, traded_volume=300, volume=600)],
+        _order_with_ref(ref="ref-pc", status=53, traded_volume=300, volume=600)],
         deals=[{
             "order_ref": "ref-pc", "price": 9.25, "volume": 300,
             "amount": 2775.0, "commission": 0.69,
@@ -4174,13 +4178,13 @@ def test_poll_deals_partial_cancel_applies_fills_then_cancels():
 
 
 def test_poll_deals_cancel_defers_when_deals_lag():
-    """55 部撤但 traded_volume>0 且 /deals 尚未回报 → 不 cancel，留待下轮 /deals 追上。"""
+    """53 部撤但 traded_volume>0 且 /deals 尚未回报 → 不 cancel，留待下轮 /deals 追上。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     rec = _Recorder()
     # /orders 说部撤 300，但 /deals 还没这笔（传播滞后）
     _mock_orders_deals(rec, orders=[
-        _order_with_ref(ref="ref-lag", status=55, traded_volume=300, volume=600)],
+        _order_with_ref(ref="ref-lag", status=53, traded_volume=300, volume=600)],
         deals=[])
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
@@ -4246,6 +4250,71 @@ def test_poll_deals_inflight_status_stays_submitted():
     db = factory()
     lo2 = db.get(LiveOrder, lo.id)
     assert lo2.status == "submitted"
+    db.close()
+
+
+def test_poll_deals_status_55_part_succ_stays_alive():
+    """55=部成（部分成交、剩余仍在撮合）→ 绝不能当终态撤单。
+
+    回归 bug（2026-08-24 官方码核对）：旧代码把 55 误当「部撤」终态，会提前 cancel
+    真实在途单，剩余成交后重复 apply/丢单。55 必须保持 partial/submitted。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 55 部成 300，/deals 同步回报 300（剩余 300 仍在途）
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-alive", status=55, traded_volume=300, volume=600)],
+        deals=[{
+            "order_ref": "ref-alive", "price": 9.25, "volume": 300,
+            "amount": 2775.0, "commission": 0.69,
+            "trade_time": "100001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-alive", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    # 仍是在途状态，绝不 canceled
+    assert lo2.status in ("submitted", "partial")
+    assert lo2.status != "canceled"
+    assert lo2.filled_quantity == 300   # 部分成交已记录
+    # partial 不 apply（等终态/全成），所以剩余后续成交不会重复 apply
+    assert ctx.positions.get(stock) is None
+    db.close()
+
+
+def test_poll_deals_status_57_junk_marks_rejected():
+    """57=废单（终态，柜台拒单）→ rejected，无成交、不 apply。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-junk", status=57, traded_volume=0, volume=600)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-junk", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "rejected"
+    assert lo2.filled_quantity == 0
+    assert db.query(LiveTrade).count() == 0
+    assert ctx.positions.get("600000.SH") is None
+    assert port.account.cash == Decimal("100000")
     db.close()
 
 

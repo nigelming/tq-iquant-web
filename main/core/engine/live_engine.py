@@ -57,12 +57,18 @@ _ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
 # 不得早于本单 created_at 超过此时长。挡住跨会话遗留的同代码同向同量旧单（真机 bug：
 # 新单 11:21 创建时真单尚未可查，被匹配到 09:55 的遗留单 → 回填错成交、真单丢失）。
 _ORDER_INSERT_TOLERANCE = timedelta(seconds=120)
-# iQuant ORDER 实时表 m_nOrderStatus 终态（真机验证，见 docs/plans/0011、checklist G4）：
-#   54 = 全撤、55 = 部撤、56 = 全成；其余为待报/在途等非终态，保持 submitted。
+# iQuant ORDER 实时表 m_nOrderStatus（官方码，D:\iquant xtconstant.py / API 文档 10643）：
+#   48=未报 49=待报 50=已报 51=已报待撤 52=部成待撤 53=部撤(终态) 54=已撤(终态)
+#   55=部成(非终态!剩余仍在撮合) 56=已成(终态) 57=废单(终态) 255=未知
+# 关键：55 是「部成」非终态，绝不能当撤单——否则剩余后续成交会重复 apply/丢单。
 # 第一层自愈：Core 读这些状态把已撤/废单转出 submitted（桥 /orders 本就返回 status 字段）。
 _ORDER_STATUS_FILLED = 56
-_ORDER_STATUS_PARTIAL_CANCELED = 55
-_ORDER_STATUS_CANCELED = 54
+_ORDER_STATUS_PARTIAL_CANCELED = 53   # 部撤：部分成交后撤剩余，终态
+_ORDER_STATUS_CANCELED = 54           # 已撤：全撤，终态
+_ORDER_STATUS_JUNK = 57               # 废单：柜台拒单，终态
+# 终态集合：撤单类 → canceled；废单 → rejected（语义：柜台拒单非我方撤）。
+_ORDER_STATUS_TERMINAL_CANCELED = (53, 54)
+_ORDER_STATUS_TERMINAL_REJECTED = (57,)
 
 
 def _parse_insert_utc(insert_date, insert_time):
@@ -858,8 +864,8 @@ class LiveEngine:
                 # 卖出不被未确认的买入挡住。bar_time 不是放行理由（不同 bar 只是两次
                 # 信号时点，上一单未确认就再下同向单仍是重复）。回填确认（filled）后由
                 # portfolio.py 持仓守卫接管；rejected 释放门（被拒不会成交，必须允许重试）。
-                # 边界：无 cancelled 状态，纯撤单无成交的单会一直 submitted → 该股被门挡住；
-                # 比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
+                # 终态（filled/canceled/rejected）都不在 submitted/partial 内，正确释放门；
+                # 仅在途单占门。比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
                 op = "buy" if order.trade_type == TradeType.BUY else "sell"
                 inflight = db.query(LiveOrder).filter(
                     LiveOrder.live_session_id == self.session_id,
@@ -1511,8 +1517,9 @@ class LiveEngine:
 
         每轮处理：未回填 order_ref 的单先尝试定位；有 order_ref 的单按 order_ref
         过滤 /deals 成交回报，调 _backfill_order 更新状态 + 写 LiveTrade + apply。
-        成交回填后，按 /orders 的 m_nOrderStatus 同步撤单终态（54 全撤 / 55 部撤），
-        把已撤单转出 submitted——第一层自愈，覆盖 GUI 撤单/收盘自动撤（Core 仍在轮询时）。
+        成交回填后，按 /orders 的 m_nOrderStatus 同步终态（53部撤/54全撤→canceled，
+        57废单→rejected；55部成是在途不碰、56全成走deals回填），
+        把终态单转出 submitted——第一层自愈，覆盖 GUI 撤单/收盘自动撤/柜台废单。
         桥离线/查失败 → 本轮跳过（不改状态），下轮重试。
         """
         db = self._db_session_factory()
@@ -1596,10 +1603,11 @@ class LiveEngine:
                     db.commit()
             else:
                 deals = None
-            # 3. 撤单终态同步（第一层自愈）：成交回填后，按 /orders m_nOrderStatus 把
-            #    54 全撤 / 55 部撤的单转出 submitted。必须在 deals 回填之后——否则 _backfill_order
-            #    会把刚标的 canceled 覆盖回 partial。部撤的部分成交真实存在，此处补 apply
-            #    （_backfill_order 对 partial 不 apply，撤单是终态必须落持仓）。
+            # 3. 终态同步（第一层自愈）：成交回填后，按 /orders m_nOrderStatus 把
+            #    53部撤/54全撤→canceled、57废单→rejected 转出 submitted。必须在 deals 回填
+            #    之后——否则 _backfill_order 会把刚标的 canceled 覆盖回 partial。53部撤的部分
+            #    成交真实存在，此处补 apply（_backfill_order 对 partial 不 apply，撤单终态必落持仓）。
+            #    注意 55=部成是在途非终态，绝不在此处理（2026-08-24 官方码修正）。
             self._sync_terminal_order_status(db, pending, orders, deals)
             db.commit()
             # 4. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected/canceled 自然移除）
@@ -1613,10 +1621,13 @@ class LiveEngine:
     def _sync_terminal_order_status(self, db: Session, pending: list,
                                     orders: Optional[list],
                                     deals: Optional[list]) -> None:
-        """撤单终态同步（第一层自愈）：据 /orders 的 m_nOrderStatus 转出 submitted。
+        """终态同步（第一层自愈）：据 /orders 的 m_nOrderStatus 转出 submitted。
 
-        iQuant 收盘自动撤 / GUI 手动撤后，ORDER 实时表里该单 status 变：
-          54 = 全撤（无成交）、55 = 部撤（部分成交后撤剩余）、56 = 全成（走 deals 回填，不碰）。
+        iQuant 收盘自动撤 / GUI 手动撤 / 柜台废单后，ORDER 实时表里该单 status 变终态：
+          53=部撤（部分成交后撤剩余）、54=全撤（无成交）、57=废单（柜台拒单）。
+          55=部成是**非终态**（剩余仍在撮合），不在此处理——误判会提前 cancel 真实在途单，
+          剩余成交后重复 apply/丢单（2026-08-24 据官方码修正，旧代码误把 55 当部撤）。
+          56=全成走 deals 回填，不碰。
         Core 旧状态机只认 /deals 成交与 order_ref 超时，从不读 status，导致已撤单（有
         order_ref、无成交）永远卡在 submitted（真机 id40/41/44，F7 在途门被污染）。本方法
         在成交回填之后补这个出口。
@@ -1625,10 +1636,11 @@ class LiveEngine:
         - 必须在 _backfill_order 之后调（否则回填会把 canceled 覆盖回 partial）。
         - 只认 /orders 列表里**确实查到**的单；查不到（实时表移除）不据缺席判撤——已成单
           同样会被移除，缺席无法区分，保持 submitted 等下轮 /deals 或超时兜底。
-        - 部撤(55)的部分成交是真实持仓：必须先 apply 再 canceled。若 /orders 报 traded_volume>0
+        - 部撤(53)的部分成交是真实持仓：必须先 apply 再 canceled。若 /orders 报 traded_volume>0
           但本单 filled_quantity 尚未追上（/deals 回报滞后或离线），**延后不 cancel**——
           等下轮 /deals 把成交价/量/金额回填齐再 apply，避免无价格依据的空 apply。
-        - 56 全成留给成交回填路径；已 filled 的单跳过。
+        - 废单(57)按 rejected 处理（语义：柜台拒单，非我方撤）；正常不会带成交，若有残留
+          filled_quantity 一并保留记录但不再 apply。
         """
         if not orders:
             return  # 桥离线或无 /orders 数据：无法判终态，全部留待下轮
@@ -1648,10 +1660,22 @@ class LiveEngine:
             if o is None:
                 continue  # 实时表查不到：不据缺席判撤
             status = o.get("status")
-            if status not in (
-                _ORDER_STATUS_CANCELED, _ORDER_STATUS_PARTIAL_CANCELED
-            ):
-                continue  # 56 全成或在途非终态：不处理（56 走 deals 回填）
+            if status in _ORDER_STATUS_TERMINAL_REJECTED:
+                # 57 废单：柜台拒单 → rejected（废单通常无成交；若已有部分成交记录保留）。
+                lo.status = "rejected"
+                lo.error_message = "order rejected by broker as junk (m_nOrderStatus=%s)" % status
+                self._pending_orders.pop(lo.id, None)
+                self._emit("order", {
+                    "portfolio_id": lo.portfolio_strategy_id,
+                    "order_id": lo.id,
+                    "status": "rejected",
+                    "stock_code": lo.stock_code,
+                    "filled_quantity": int(lo.filled_quantity or 0),
+                    "error_message": lo.error_message,
+                })
+                continue
+            if status not in _ORDER_STATUS_TERMINAL_CANCELED:
+                continue  # 55 部成/56 全成或在途非终态：不处理（56 走 deals 回填，55 仍在途）
             traded_volume = int(o.get("traded_volume") or 0)
             # 部撤/全撤带成交：必须等 /deals 把成交回填齐（有成交价/量/金额）才 apply + cancel。
             # filled_quantity < traded_volume 说明成交回报滞后，延后下轮，不空 apply。
