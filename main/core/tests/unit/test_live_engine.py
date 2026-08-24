@@ -4088,3 +4088,204 @@ def test_poll_deals_does_not_reject_when_deals_has_remark_fill():
     assert ctx.positions[stock].quantity == 600
     db.close()
 
+
+# ---------------------------------------------------------------------------
+# 第一层：Core 读 /orders 的 m_nOrderStatus 同步撤单终态（54 全撤 / 55 部撤）
+# ---------------------------------------------------------------------------
+
+def _order_with_ref(ref="ref-cancel-1", status=54, traded_volume=0, volume=600,
+                    remark=_TEST_REMARK, direction=48):
+    """构造一笔 /orders 返回的 BRIDGE 委托字典（含 m_nOrderStatus）。"""
+    return {
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": direction, "volume": volume, "order_ref": ref,
+        "traded_volume": traded_volume, "status": status, "remark": remark,
+        "insert_date": "20260805", "insert_time": "100000",
+    }
+
+
+def _place_order_with_ref(db, ref, quantity=600, status="submitted"):
+    """预置一笔已有 order_ref 的 LiveOrder（模拟 ref 已回填、等待成交/撤单）。"""
+    lo = _submitted_order(db, quantity=quantity, status=status)
+    lo.order_ref = ref
+    db.flush()
+    return lo
+
+
+def test_poll_deals_marks_fully_canceled_order():
+    """54 全撤 + 无成交 → canceled，无 LiveTrade、不 apply、出 order 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(status=54, traded_volume=0)],
+                       deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-cancel-1")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert lo2.filled_quantity == 0
+    assert db.query(LiveTrade).count() == 0
+    assert ctx.positions.get("600000.SH") is None
+    assert port.account.cash == Decimal("100000")
+    db.close()
+
+
+def test_poll_deals_partial_cancel_applies_fills_then_cancels():
+    """55 部撤 + 部分成交 → 先 apply 真实成交，再 canceled（终态必须落持仓）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-pc", status=55, traded_volume=300, volume=600)],
+        deals=[{
+            "order_ref": "ref-pc", "price": 9.25, "volume": 300,
+            "amount": 2775.0, "commission": 0.69,
+            "trade_time": "150001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-pc", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"          # 部撤终态
+    assert lo2.filled_quantity == 300        # 部分成交真实落账
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 300
+    # 部撤的部分成交必须 apply（现有 partial 不 apply，终态撤单必须补上）
+    assert ctx.positions[stock].quantity == 300
+    assert port.account.cash == Decimal("100000") - (Decimal("2775.0") + Decimal("0.69"))
+    db.close()
+
+
+def test_poll_deals_cancel_defers_when_deals_lag():
+    """55 部撤但 traded_volume>0 且 /deals 尚未回报 → 不 cancel，留待下轮 /deals 追上。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    # /orders 说部撤 300，但 /deals 还没这笔（传播滞后）
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-lag", status=55, traded_volume=300, volume=600)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-lag", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"         # 不提前 cancel，等 /deals
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+
+
+def test_poll_deals_filled_not_canceled_by_status_sync():
+    """56 全成 + /deals 全成 → filled（成交回填优先），不被状态同步误 cancel。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-filled", status=56, traded_volume=600, volume=600)],
+        deals=[{
+            "order_ref": "ref-filled", "price": 9.25, "volume": 600,
+            "amount": 5550.0, "commission": 1.39,
+            "trade_time": "150001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-filled", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "filled"
+    assert ctx.positions["600000.SH"].quantity == 600
+    db.close()
+
+
+def test_poll_deals_inflight_status_stays_submitted():
+    """非终态 status（如 52 待报）→ 保持 submitted，不误判。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-inflight", status=52, traded_volume=0)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-inflight")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+
+
+def test_poll_deals_cancel_missing_from_orders_stays_submitted():
+    """/orders 列表里查不到本单（实时表已移除）→ 不据缺席判撤，保持 submitted。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 实时表无此单
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-gone")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+
+
+def test_poll_deals_cancel_bridge_offline_stays_submitted():
+    """/orders 桥离线 → 不改状态、不崩，下轮重试。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder(fail_paths={"/orders", "/deals"})
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-off")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()  # 不应抛异常
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+

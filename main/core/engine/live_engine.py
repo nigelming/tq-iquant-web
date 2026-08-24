@@ -57,6 +57,12 @@ _ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
 # 不得早于本单 created_at 超过此时长。挡住跨会话遗留的同代码同向同量旧单（真机 bug：
 # 新单 11:21 创建时真单尚未可查，被匹配到 09:55 的遗留单 → 回填错成交、真单丢失）。
 _ORDER_INSERT_TOLERANCE = timedelta(seconds=120)
+# iQuant ORDER 实时表 m_nOrderStatus 终态（真机验证，见 docs/plans/0011、checklist G4）：
+#   54 = 全撤、55 = 部撤、56 = 全成；其余为待报/在途等非终态，保持 submitted。
+# 第一层自愈：Core 读这些状态把已撤/废单转出 submitted（桥 /orders 本就返回 status 字段）。
+_ORDER_STATUS_FILLED = 56
+_ORDER_STATUS_PARTIAL_CANCELED = 55
+_ORDER_STATUS_CANCELED = 54
 
 
 def _parse_insert_utc(insert_date, insert_time):
@@ -1389,7 +1395,8 @@ class LiveEngine:
         db.flush()  # 取 live_order.id
         return live_order
 
-    def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None) -> None:
+    def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None,
+                             orders=None) -> None:
         """轮询桥 /orders 定位本单的 m_strOrderRef 回写（G3 匹配键）。
 
         passorder 返回 0 无法预知 OrderRef，需从桥 /orders 列表定位本单。两层策略：
@@ -1410,11 +1417,15 @@ class LiveEngine:
         同代码同向同量可能有多笔在途单，候选按 insert_date+insert_time 降序取最新，且
         跳过 claimed_refs 中已被本 session 其他单占用的 order_ref。找不到 → 留 None，
         下轮 _poll_deals 再找。
+
+        orders：调用方已拉取的 /orders 列表（_poll_deals 一次查询复用于定位+终态同步，
+        避免每笔单各查一次）；None 时本方法自取（_handle_bar 单笔下单后立即定位走此路径）。
         """
-        try:
-            orders = self._dispatcher.query_orders()
-        except BridgeUnavailableError:
-            return  # 桥离线，下轮再找
+        if orders is None:
+            try:
+                orders = self._dispatcher.query_orders()
+            except BridgeUnavailableError:
+                return  # 桥离线，下轮再找
         claimed = claimed_refs if claimed_refs is not None else set()
         bridge_oid = live_order.bridge_order_id
         if bridge_oid:
@@ -1500,6 +1511,8 @@ class LiveEngine:
 
         每轮处理：未回填 order_ref 的单先尝试定位；有 order_ref 的单按 order_ref
         过滤 /deals 成交回报，调 _backfill_order 更新状态 + 写 LiveTrade + apply。
+        成交回填后，按 /orders 的 m_nOrderStatus 同步撤单终态（54 全撤 / 55 部撤），
+        把已撤单转出 submitted——第一层自愈，覆盖 GUI 撤单/收盘自动撤（Core 仍在轮询时）。
         桥离线/查失败 → 本轮跳过（不改状态），下轮重试。
         """
         db = self._db_session_factory()
@@ -1515,6 +1528,13 @@ class LiveEngine:
             if not pending:
                 self._sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
                 return
+            # 0. 一次 /orders 查询，复用于 order_ref 定位 + 撤单终态同步（避免每笔单各查一次）。
+            #    桥离线时 orders=None：定位与终态同步都跳过，本单留 submitted 下轮重试；
+            #    /deals 回填仍可独立进行（成交优先）。
+            try:
+                orders = self._dispatcher.query_orders()
+            except BridgeUnavailableError:
+                orders = None
             # 1. 未回填 order_ref 的单：尝试定位。
             # claimed_refs = 本 session 所有已占用 order_ref（历史已回填 + 本轮刚分配），
             # 防止同代码同向同量的多笔在途单撞同一个 ref（重复回填 → 虚拟持仓虚高）。
@@ -1526,7 +1546,7 @@ class LiveEngine:
             )
             for lo in pending:
                 if lo.order_ref is None:
-                    self._try_match_order_ref(lo, claimed_refs)
+                    self._try_match_order_ref(lo, claimed_refs, orders=orders)
                     if lo.order_ref is not None:
                         claimed_refs.add(lo.order_ref)
             # 1b. 陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
@@ -1550,38 +1570,116 @@ class LiveEngine:
                 lo for lo in pending
                 if lo.order_ref is None and lo.bridge_order_id
             ]
-            if not need_ref and not need_remark:
-                self._sync_pending_orders(db)
-                return
-            try:
-                deals = self._dispatcher.query_deals()
-            except BridgeUnavailableError:
-                return  # 桥离线，本轮跳过
-            # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
-            for lo in need_ref:
-                matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
-                if not matched:
-                    continue
-                self._backfill_order(db, lo, matched)
-            # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
-            # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
-            # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
-            for lo in need_remark:
-                if lo.status not in ("submitted", "partial"):
-                    continue  # 主路径已回填，不重复
-                expected_remark = lo.bridge_order_id[:20]
-                matched = [d for d in deals if d.get("remark") == expected_remark]
-                if not matched:
-                    continue
-                self._backfill_order(db, lo, matched)
+            if need_ref or need_remark:
+                try:
+                    deals = self._dispatcher.query_deals()
+                except BridgeUnavailableError:
+                    deals = None  # 桥离线：本轮换过成交回填，但终态同步仍可据 /orders 推进
+                if deals is not None:
+                    # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
+                    for lo in need_ref:
+                        matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                        if not matched:
+                            continue
+                        self._backfill_order(db, lo, matched)
+                    # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
+                    # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
+                    # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
+                    for lo in need_remark:
+                        if lo.status not in ("submitted", "partial"):
+                            continue  # 主路径已回填，不重复
+                        expected_remark = lo.bridge_order_id[:20]
+                        matched = [d for d in deals if d.get("remark") == expected_remark]
+                        if not matched:
+                            continue
+                        self._backfill_order(db, lo, matched)
+                    db.commit()
+            else:
+                deals = None
+            # 3. 撤单终态同步（第一层自愈）：成交回填后，按 /orders m_nOrderStatus 把
+            #    54 全撤 / 55 部撤的单转出 submitted。必须在 deals 回填之后——否则 _backfill_order
+            #    会把刚标的 canceled 覆盖回 partial。部撤的部分成交真实存在，此处补 apply
+            #    （_backfill_order 对 partial 不 apply，撤单是终态必须落持仓）。
+            self._sync_terminal_order_status(db, pending, orders, deals)
             db.commit()
-            # 3. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected 自然移除）
+            # 4. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected/canceled 自然移除）
             self._sync_pending_orders(db)
         finally:
             # 异常向上抛到 _deals_loop 统一记日志（不再此处静默吞），
             # rollback 清理未提交事务，close 归还连接。
             db.rollback()
             db.close()
+
+    def _sync_terminal_order_status(self, db: Session, pending: list,
+                                    orders: Optional[list],
+                                    deals: Optional[list]) -> None:
+        """撤单终态同步（第一层自愈）：据 /orders 的 m_nOrderStatus 转出 submitted。
+
+        iQuant 收盘自动撤 / GUI 手动撤后，ORDER 实时表里该单 status 变：
+          54 = 全撤（无成交）、55 = 部撤（部分成交后撤剩余）、56 = 全成（走 deals 回填，不碰）。
+        Core 旧状态机只认 /deals 成交与 order_ref 超时，从不读 status，导致已撤单（有
+        order_ref、无成交）永远卡在 submitted（真机 id40/41/44，F7 在途门被污染）。本方法
+        在成交回填之后补这个出口。
+
+        安全约束：
+        - 必须在 _backfill_order 之后调（否则回填会把 canceled 覆盖回 partial）。
+        - 只认 /orders 列表里**确实查到**的单；查不到（实时表移除）不据缺席判撤——已成单
+          同样会被移除，缺席无法区分，保持 submitted 等下轮 /deals 或超时兜底。
+        - 部撤(55)的部分成交是真实持仓：必须先 apply 再 canceled。若 /orders 报 traded_volume>0
+          但本单 filled_quantity 尚未追上（/deals 回报滞后或离线），**延后不 cancel**——
+          等下轮 /deals 把成交价/量/金额回填齐再 apply，避免无价格依据的空 apply。
+        - 56 全成留给成交回填路径；已 filled 的单跳过。
+        """
+        if not orders:
+            return  # 桥离线或无 /orders 数据：无法判终态，全部留待下轮
+        # 按 order_ref 索引 /orders（有 ref 才能精确对应本单；无 ref 的单此处不处理，
+        # 它们走 expire 超时或 remark /deals 回填路径）。
+        by_ref = {}
+        for o in orders:
+            ref = o.get("order_ref")
+            if ref is not None:
+                by_ref[ref] = o
+        for lo in pending:
+            if lo.status not in ("submitted", "partial"):
+                continue  # 本轮已 filled/rejected/canceled，不碰
+            if lo.order_ref is None:
+                continue
+            o = by_ref.get(lo.order_ref)
+            if o is None:
+                continue  # 实时表查不到：不据缺席判撤
+            status = o.get("status")
+            if status not in (
+                _ORDER_STATUS_CANCELED, _ORDER_STATUS_PARTIAL_CANCELED
+            ):
+                continue  # 56 全成或在途非终态：不处理（56 走 deals 回填）
+            traded_volume = int(o.get("traded_volume") or 0)
+            # 部撤/全撤带成交：必须等 /deals 把成交回填齐（有成交价/量/金额）才 apply + cancel。
+            # filled_quantity < traded_volume 说明成交回报滞后，延后下轮，不空 apply。
+            if traded_volume > 0 and int(lo.filled_quantity or 0) < traded_volume:
+                continue
+            # 有已回填的部分成交（partial）→ 终态撤单前 apply 落持仓（_backfill_order 对
+            # partial 不 apply，此处补上；撤单后不会再有成交，这是最后的 apply 时机）。
+            if int(lo.filled_quantity or 0) > 0 and lo.status == "partial":
+                trade = (
+                    db.query(LiveTrade)
+                    .filter(LiveTrade.live_order_id == lo.id)
+                    .first()
+                )
+                if trade is not None:
+                    self._apply_filled_trade(
+                        lo, trade.price, trade.quantity, trade.amount, trade.commission
+                    )
+            lo.status = "canceled"
+            lo.error_message = "order canceled by broker (m_nOrderStatus=%s)" % status
+            self._pending_orders.pop(lo.id, None)
+            self._emit("order", {
+                "portfolio_id": lo.portfolio_strategy_id,
+                "order_id": lo.id,
+                "status": "canceled",
+                "stock_code": lo.stock_code,
+                "filled_quantity": int(lo.filled_quantity or 0),
+                "error_message": lo.error_message,
+            })
 
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         """陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
