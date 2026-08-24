@@ -30,6 +30,7 @@ from .http_bridge_dispatcher import (
     BridgeOrderRejected,
 )
 from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
+from .trading_calendar import TradingCalendar
 from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -48,6 +49,10 @@ _DAILY_CLOSE_TIME = (14, 30)
 # 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
 # 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
 _MARKET_CLOSE_TIME = (15, 0)
+# 收盘清扫时点（15:05）：交易所已收盘、iQuant 自动撤单已落定后，对当日仍卡在
+# submitted/partial 的单做一次确定性兜底——成交回填 + 终态同步 + 剩余未成交按 A 股
+# 规则（收盘未成交=撤单）标 canceled。晚 5 分钟给柜台/桥状态收敛留时间。
+_MARKET_CLOSE_SWEEP_TIME = (15, 5)
 
 # submitted 但始终匹配不到桥 order_ref 的单的失效阈值（秒）。
 # passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
@@ -159,10 +164,14 @@ class LiveEngine:
         formula_count: int = 200,
         formula_count_by_name: Optional[Dict[str, int]] = None,
         code_period_count: Optional[Dict[tuple, int]] = None,
+        trading_calendar: Optional[TradingCalendar] = None,
     ):
         self.session_id = session_id
         self.portfolios = portfolios
         self._dispatcher = dispatcher
+        # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
+        # fail-open（工作日放行），测试可注入假日历。
+        self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
         self._bar_poller = bar_poller
         self._db_session_factory = db_session_factory
         self._poll_interval = poll_interval
@@ -247,6 +256,8 @@ class LiveEngine:
         self._last_daily_date: Optional[date] = None
         # C6(B/C)：14:30 日终 1d 快照 bar + 1w/1mon 注入已驱动的日期标记（每日一次）
         self._last_daily_bar_date: Optional[date] = None
+        # 15:05 收盘清扫已执行的日期标记（每日一次，确定性兜底未成交单）
+        self._last_close_sweep_date: Optional[date] = None
         # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
         # 主循环 _poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
         # 运行中 _handle_bar 发单也计入、拒单弹出；_poll_deals 每轮回合重查 DB 同步（G7）。
@@ -543,6 +554,9 @@ class LiveEngine:
             self._maybe_daily_close()
             # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
             self._maybe_daily_bars()
+            # 15:05 收盘清扫：交易日收盘后对仍未完结的单做确定性兜底（成交回填 +
+            # 终态同步 + 剩余按 A 股收盘未成交=撤单标 canceled）。实时轮询的权威收口。
+            self._maybe_close_sweep()
         except BridgeUnavailableError as e:
             self._bridge_online = False
             logger.warning("bridge unavailable: %s, skip this round", e)
@@ -591,6 +605,10 @@ class LiveEngine:
         if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
             return
         today = now.date()
+        # 非交易日（周末/节假日）不算日终：避免周末/假期 14:30 用陈旧 bar 重复估值、
+        # 误触 daily_loss 或错误刷新 prev_close。桥日历离线时 fail-open（工作日照常）。
+        if not self._calendar.is_trading_day(today):
+            return
         if self._last_daily_date == today:
             return
         self._last_daily_date = today
@@ -645,6 +663,9 @@ class LiveEngine:
         if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
             return
         today = now.date()
+        # 非交易日不驱动日线（同上：周末/假期不用陈旧快照触发 1d/1w/1mon 信号）。
+        if not self._calendar.is_trading_day(today):
+            return
         if self._last_daily_bar_date == today:
             return
         # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）。数据源 **iQuant 桥**
@@ -704,6 +725,165 @@ class LiveEngine:
                         period, portfolio.portfolio_id, daily_time,
                     )
 
+    # ---------------- 收盘清扫（15:05 确定性兜底）----------------
+    def _maybe_close_sweep(self, now: Optional[datetime] = None) -> None:
+        """交易日 15:05 后对当日仍未完结单做一次确定性兜底（幂等）。
+
+        实时轮询（_poll_deals，5s）是「尽力而为」：桥抖动/被饿死/ORDER 实时表移除单
+        都可能让单残留 submitted/partial。收盘后状态已全部收敛，做一次权威清扫：
+          1) /orders + /deals 各查一次，补 order_ref 定位 + 按 order_ref/remark 回填成交；
+          2) _sync_terminal_order_status 处理 53部撤/54全撤/57废单（含 partial 先 apply 再 cancel）；
+          3) A 股规则：收盘仍未成交（含 48-52 在途/55 部成/实时表缺席）的单一律标 canceled
+             ——收盘后不会再有成交，未成交部分被交易所/券商自动撤。partial 已回填的部分成交
+             先 apply 落持仓再 cancel（与 53 部撤同处理，不丢成交）。
+        与实时轮询的关系：清扫是「权威收口」，实时是「近实时反馈」；清扫幂等可重复执行。
+        非交易日/桥离线：跳过（下轮或下个交易日重试，不误标）。
+        """
+        if now is None:
+            now = now_shanghai()
+        if (now.hour, now.minute) < _MARKET_CLOSE_SWEEP_TIME:
+            return
+        today = now.date()
+        if not self._calendar.is_trading_day(today):
+            return
+        if self._last_close_sweep_date == today:
+            return
+        db = self._db_session_factory()
+        try:
+            pending = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+            if not pending:
+                self._last_close_sweep_date = today
+                return
+            logger.info(
+                "close sweep start (session %s, %s): %d pending order(s)",
+                self.session_id, today, len(pending),
+            )
+            # 1) 一次 /orders + /deals：补 ref + 回填成交（复用实时轮询同套逻辑）。
+            try:
+                orders = self._dispatcher.query_orders()
+            except BridgeUnavailableError:
+                logger.warning("close sweep: bridge offline (/orders), skip")
+                return
+            claimed_refs = set(
+                r[0] for r in db.query(LiveOrder.order_ref).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.order_ref.isnot(None),
+                ).all()
+            )
+            for lo in pending:
+                if lo.order_ref is None:
+                    self._try_match_order_ref(lo, claimed_refs, orders=orders)
+                    if lo.order_ref is not None:
+                        claimed_refs.add(lo.order_ref)
+            db.commit()
+
+            try:
+                deals = self._dispatcher.query_deals()
+            except BridgeUnavailableError:
+                deals = None
+            if deals is not None:
+                for lo in pending:
+                    if lo.status not in ("submitted", "partial"):
+                        continue
+                    if lo.order_ref is not None:
+                        matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                        if matched:
+                            self._backfill_order(db, lo, matched)
+                            continue
+                    if lo.bridge_order_id:
+                        expected_remark = lo.bridge_order_id[:20]
+                        matched = [d for d in deals if d.get("remark") == expected_remark]
+                        if matched:
+                            self._backfill_order(db, lo, matched)
+                db.commit()
+
+            # 2) 终态同步：53/54 → canceled（partial 先 apply）、57 → rejected。
+            self._sync_terminal_order_status(db, pending, orders, deals)
+            db.commit()
+
+            # 3) A 股收盘兜底：仍在 submitted/partial 的单 = 收盘未成交 → canceled。
+            #    实时表缺席（已撤单被移除）或状态仍在途（48-52/55/255）都落此：收盘后
+            #    不会再成交，未成交即撤。已有部分成交（filled_quantity>0）先 apply 再 cancel。
+            #
+            #    资金安全：若 /orders 报 traded_volume > filled_quantity，说明 /deals 成交回报
+            #    滞后（成交价/量/金额尚未回填齐），此时绝不能 cancel——会丢真实成交。延后本轮
+            #    （不置 _last_close_sweep_date），下轮 60s tick 等 /deals 追上再清扫，与
+            #    _sync_terminal_order_status 同一守卫。仅对 /orders 里**确实查到**的单可比
+            #    traded_volume；实时表缺席的单无此字段，按 A 股规则直接 cancel（不会再有成交）。
+            by_ref = {}
+            for o in (orders or []):
+                ref = o.get("order_ref")
+                if ref is not None:
+                    by_ref[ref] = o
+            deferred = 0
+            for lo in pending:
+                if lo.status not in ("submitted", "partial"):
+                    continue
+                o = by_ref.get(lo.order_ref) if lo.order_ref is not None else None
+                if o is not None:
+                    traded_volume = int(o.get("traded_volume") or 0)
+                    if traded_volume > 0 and int(lo.filled_quantity or 0) < traded_volume:
+                        deferred += 1
+                        logger.warning(
+                            "close sweep: order %s %s %s deferring — /orders traded_volume=%s "
+                            "ahead of filled=%s, waiting for /deals backfill",
+                            lo.id, lo.trade_type, lo.stock_code,
+                            traded_volume, int(lo.filled_quantity or 0),
+                        )
+                        continue
+                if int(lo.filled_quantity or 0) > 0:
+                    # 已有部分成交（partial，或 submitted 带成交的不一致态）：先 apply 落持仓
+                    # 再 cancel——撤单后不会再有成交，这是最后的 apply 时机。
+                    trade = (
+                        db.query(LiveTrade)
+                        .filter(LiveTrade.live_order_id == lo.id)
+                        .first()
+                    )
+                    if trade is not None:
+                        self._apply_filled_trade(
+                            lo, trade.price, trade.quantity, trade.amount, trade.commission
+                        )
+                lo.status = "canceled"
+                if not lo.error_message:
+                    lo.error_message = "close sweep: unfilled remainder canceled after market close"
+                self._pending_orders.pop(lo.id, None)
+                logger.info(
+                    "close sweep: order %s %s %s marked canceled (filled=%s/%s)",
+                    lo.id, lo.trade_type, lo.stock_code,
+                    int(lo.filled_quantity or 0), lo.quantity,
+                )
+                self._emit("order", {
+                    "portfolio_id": lo.portfolio_strategy_id,
+                    "order_id": lo.id,
+                    "status": "canceled",
+                    "stock_code": lo.stock_code,
+                    "filled_quantity": int(lo.filled_quantity or 0),
+                    "error_message": lo.error_message,
+                })
+            db.commit()
+            self._sync_pending_orders(db)
+            if deferred:
+                # 有成交回报滞后的单：本轮不标记完成，下轮 60s tick 重试，等 /deals 回填齐。
+                logger.warning(
+                    "close sweep: %d order(s) deferred for /deals backfill, will retry "
+                    "(session %s, %s)", deferred, self.session_id, today,
+                )
+                return
+            self._last_close_sweep_date = today
+            logger.info("close sweep done (session %s, %s)", self.session_id, today)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("close sweep error (session %s)", self.session_id)
+        finally:
+            db.close()
+
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
         """BarPoller 回调（1m 节拍）：① 驱动 1m 策略；② 按 bar stime 边界分发长周期。
@@ -751,6 +931,15 @@ class LiveEngine:
                 except Exception:  # noqa: BLE001
                     logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
             self._dispatched_boundaries.add(bar.bar_time)
+
+    # 非日内周期：bar_time 按约定是当日 00:00，只判交易日，不卡 09:30–15:00 时段。
+    _DAILY_PERIODS = ("1d", "1w", "1mon")
+
+    def _trading_allowed_for(self, bt: datetime, period: str) -> bool:
+        """bar_time 是否允许下新单。日内周期判交易日+交易时段；日线及以上只判交易日。"""
+        if period in self._DAILY_PERIODS:
+            return self._calendar.is_trading_day(bt.date())
+        return self._calendar.is_trading_allowed(bt)
 
     def _handle_bar(
         self,
@@ -813,6 +1002,20 @@ class LiveEngine:
                         "skip after-close order %s %s %s bar=%s (bar_time >= 15:00)",
                         order.trade_type.value, order.stock_code, order.signal_name,
                         bt,
+                    )
+                    continue
+                # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
+                # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
+                # 周末/节假日绝不误下，真实交易日不误挡。风控 update_peak 与 signal 事件仍
+                # 照常执行（只拦落单）。
+                # 日内周期(1m/5m...)额外卡交易时段 09:30–15:00；1d/1w/1mon 的 bar_time 按
+                # 约定是当日 00:00（由 14:30 _maybe_daily_bars 统一驱动），不套时段门，
+                # 只判交易日，否则会把 14:30 合法驱动的日线单误杀。
+                if bt is not None and not self._trading_allowed_for(bt, bar.period):
+                    logger.info(
+                        "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
+                        order.trade_type.value, order.stock_code, order.signal_name,
+                        bt, bar.period,
                     )
                     continue
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）

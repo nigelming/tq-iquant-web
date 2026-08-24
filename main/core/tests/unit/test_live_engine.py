@@ -6,7 +6,7 @@
 """
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -182,6 +182,81 @@ def test_handle_bar_signal_to_trade_persisted():
     # submitted 阶段不 apply：持仓/现金不变
     assert ctx.positions[stock].quantity == 0
     assert port.account.cash == Decimal("100000")
+    db.close()
+
+
+# ---- 交易日历下单总闸（#144）----
+def _calendar_engine(factory, port, disp, trading_dates, stock):
+    """构造带注入假日历的 LiveEngine（假日历不经桥，直接给日期列表）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    cal = TradingCalendar(lambda: list(trading_dates))
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        trading_calendar=cal,
+    )
+
+
+def test_handle_bar_blocks_order_on_non_trading_day():
+    """交易日历总闸：节假日/非交易日 → 信号推但不落单、不发桥。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    # 2026-10-01 国庆：日历里没有它
+    bar_time = datetime(2026, 10, 1, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 10, 9)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 非交易日不落单
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 不发桥
+
+
+def test_handle_bar_blocks_order_before_open():
+    """日内周期：盘前 09:29 不下单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 9, 29)  # 周一，交易日，但未开盘
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_handle_bar_daily_period_trading_day_at_midnight_ok():
+    """1d 周期 bar_time=00:00（14:30 驱动约定）：只判交易日，不卡时段，正常落单。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)  # 日线约定 00:00
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
     db.close()
 
 
@@ -3395,6 +3470,297 @@ def test_maybe_daily_close_uses_shanghai_time(monkeypatch):
     # 14:30 → 触发
     engine._maybe_daily_close(now=datetime(2026, 8, 10, 14, 30))
     assert engine._last_daily_date == datetime(2026, 8, 10).date()
+
+
+# ---- 14:30 钩子交易日历守卫（#145）----
+def test_maybe_daily_close_skips_non_trading_day():
+    """非交易日（周末/节假日）14:30 不调 update_daily（不用陈旧 bar 误估值/误触熔断）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    # 注入只认 08-24 为交易日的日历：08-22 周六、10-01 国庆都不在
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+    engine._last_daily_date = None
+
+    # 国庆 14:30 → 非交易日，不触发
+    engine._maybe_daily_close(now=datetime(2026, 10, 1, 14, 30))
+    assert engine._last_daily_date is None
+
+    # 周六 14:30 → 非交易日，不触发
+    engine._maybe_daily_close(now=datetime(2026, 8, 22, 14, 30))
+    assert engine._last_daily_date is None
+
+    # 交易日 14:30 → 正常触发
+    engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+    assert engine._last_daily_date == date(2026, 8, 24)
+
+
+def test_maybe_daily_bars_skips_non_trading_day():
+    """非交易日 14:30 不驱动日线（不拉桥 /quote?period=1d、不触发 1d 策略信号）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    rec = _Recorder(respond=_respond_quote_bars(stock, [
+        {"stime": "20261001000000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+
+    engine._maybe_daily_bars(now=datetime(2026, 10, 1, 14, 30))  # 国庆
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 非交易日不落单
+    db.close()
+    # 没拉日线快照
+    assert not any(r.url.path == "/quote" and "period=1d" in str(r.url) for r in rec.requests)
+
+
+# ---- 收盘清扫 _maybe_close_sweep（15:05 确定性兜底，#146）----
+def _sweep_engine(factory, port, rec, trading_day=date(2026, 8, 24)):
+    """构造带交易日历的引擎（只认 trading_day 为交易日）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine._calendar = TradingCalendar(lambda: [trading_day])
+    return engine, disp
+
+
+def test_close_sweep_skips_before_1505():
+    """15:05 前不执行清扫。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 4))
+
+    db = factory()
+    lo = db.query(LiveOrder).first()
+    assert lo.status == "submitted"  # 未清扫
+    assert engine._last_close_sweep_date is None
+    db.close()
+
+
+def test_close_sweep_skips_non_trading_day():
+    """非交易日 15:05 不清扫（周末/假期）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 10, 1, 15, 5))  # 国庆
+
+    db = factory()
+    assert db.query(LiveOrder).first().status == "submitted"
+    db.close()
+
+
+def test_close_sweep_unfilled_order_marked_canceled():
+    """收盘仍 submitted、无成交、/orders 缺席 → A 股收盘未成交=撤单，标 canceled。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 实时表已无此单
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert "close sweep" in (lo2.error_message or "")
+    # 无成交 → 不写 LiveTrade、不 apply
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+    assert ctx.positions.get(stock) is None
+    assert port.account.cash == Decimal("100000")
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+
+
+def test_close_sweep_partial_fill_applied_then_canceled():
+    """部分成交：先回填成交 apply 落持仓，剩余 canceled（不丢成交）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-part-1",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,  # 部成在途
+    }], deals=[{
+        "order_ref": "ref-part-1", "price": 9.2, "volume": 300,
+        "amount": 2760.0, "commission": 0.69, "trade_time": "145500",
+        "trade_date": "20260824",
+    }])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"          # 剩余收盘撤
+    assert int(lo2.filled_quantity) == 300   # 成交部分保留
+    assert db.query(LiveTrade).count() == 1
+    db.close()
+    # 部分成交已 apply：持仓 300，现金扣 2760+0.69
+    assert ctx.positions[stock].quantity == 300
+    assert port.account.cash == Decimal("100000") - (Decimal("2760.0") + Decimal("0.69"))
+
+
+def test_close_sweep_terminal_status_54_canceled():
+    """/orders 已报 54 全撤 → 终态同步标 canceled。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-can-1",
+        "remark": _TEST_REMARK, "status": 54, "traded_volume": 0,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    assert db.get(LiveOrder, lo.id).status == "canceled"
+    db.close()
+
+
+def test_close_sweep_junk_57_marked_rejected():
+    """/orders 报 57 废单 → rejected（语义：柜台拒单非我方撤）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-junk-1",
+        "remark": _TEST_REMARK, "status": 57, "traded_volume": 0,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    assert db.get(LiveOrder, lo.id).status == "rejected"
+    db.close()
+
+
+def test_close_sweep_defers_when_traded_volume_ahead_of_filled():
+    """/orders 报 traded_volume > filled_quantity（/deals 回报滞后）→ 延后不 cancel，
+    不标记完成，等下轮 /deals 追上再清扫——绝不丢真实成交。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 显示已成交 300，但 /deals 还没回报（空）——成交价/量/金额未回填齐
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-lag-1",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    lo.order_ref = "ref-lag-1"  # 已匹配到 ref，才能在 /orders 里按 ref 查到
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"          # 未 cancel（延后）
+    assert int(lo2.filled_quantity) == 0       # /deals 没回报，不凭空 apply
+    db.close()
+    assert ctx.positions.get(stock) is None    # 未落持仓
+    assert engine._last_close_sweep_date is None  # 不标记完成，下轮 60s 重试
+
+
+def test_close_sweep_deferred_then_completes_after_deals_catch_up():
+    """延后场景：下轮 /deals 追上回填成交 → apply 成交、剩余 canceled、标记完成。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-lag-2",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,
+    }], deals=[{
+        "order_ref": "ref-lag-2", "price": 9.2, "volume": 300,
+        "amount": 2760.0, "commission": 0.69, "trade_time": "150200",
+        "trade_date": "20260824",
+    }])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    lo.order_ref = "ref-lag-2"
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 6))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert int(lo2.filled_quantity) == 300
+    db.close()
+    assert ctx.positions[stock].quantity == 300  # 成交已 apply
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+
+
+def test_close_sweep_idempotent_same_day():
+    """同日重复清扫：第二次 no-op（不重复处理，_last_close_sweep_date 幂等）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+    # 再插一笔新 submitted（模拟清扫后又有单残留），同日第二次不应处理
+    db = factory()
+    lo2 = _submitted_order(db, bridge_order_id="b" * 32)
+    db.commit()
+    db.close()
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 10))
+
+    db = factory()
+    assert db.get(LiveOrder, lo2.id).status == "submitted"  # 同日二次不清扫
+    db.close()
 
 
 def _ss_plain_engine(factory, ping_interval=0.05):
