@@ -4243,6 +4243,11 @@ def test_tick_main_expires_stale_order_without_order_ref():
     _mock_orders_deals(rec, orders=[], deals=[])  # 桥侧无任何匹配委托
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
+    # 注入"今日非交易日"日历：隔离 expire 路径——_maybe_daily_close/bars 与
+    # _maybe_close_sweep 都因非交易日提前返回，避免收盘后（墙钟≥15:05）清扫把
+    # fresh 单标 canceled 污染本测试（时间敏感，收盘后跑会误失败）。
+    from core.engine.trading_calendar import TradingCalendar
+    engine._calendar = TradingCalendar(lambda: [date(2026, 1, 1)])
     db = factory()
     stale = _submitted_order(db, quantity=600)
     stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
@@ -4724,3 +4729,240 @@ def test_poll_deals_cancel_bridge_offline_stays_submitted():
     assert lo2.status == "submitted"
     db.close()
 
+
+
+# ---- 关键状态流转日志可观测性（INFO/WARNING，低频事件，不刷屏）----
+def _log_msgs(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_order_accepted_logs_info(caplog):
+    """桥受理成功后落 logger.info（此前只发 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(strategy_id=1, period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": []})
+        if path in ("/order", "/ping", "/quote"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, bar)
+
+    assert any("order accepted" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_backfill_filled_logs_info(caplog):
+    """/deals 成交回填 -> logger.info（此前只发 SSE order/trade）。"""
+    import logging
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    deals = [{"order_ref": "ref-bf", "volume": 1000, "amount": 9000,
+              "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._backfill_order(db, lo, deals)
+        db.commit()
+    db.close()
+    assert any("backfill" in m and "600000.SH" in m and "filled" in m
+               for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_backfill_same_partial_does_not_spam_log(caplog):
+    """5s 轮询对同一 partial 单反复回填相同成交量 -> 只首次记日志，不刷屏。"""
+    import logging
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf2",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    partial = [{"order_ref": "ref-bf2", "volume": 300, "amount": 2700,
+                "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._backfill_order(db, lo, partial)   # 首次 partial：记日志
+        engine._backfill_order(db, lo, partial)   # 同量同状态：不重复
+        db.commit()
+    backfill_logs = [m for m in _log_msgs(caplog) if "backfill" in m]
+    assert len(backfill_logs) == 1, backfill_logs
+    assert "partial" in backfill_logs[0]
+    db.close()
+
+
+def test_expire_rejected_logs_warning(caplog):
+    """expire 超时真空单标 rejected -> logger.warning（此前只发 SSE）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._expire_stale_orders(db)
+        db.commit()
+    db.close()
+    assert any(r.levelno == logging.WARNING and "expire" in m and "rejected" in m
+               for r, m in zip(caplog.records, _log_msgs(caplog))), _log_msgs(caplog)
+
+
+def test_expire_remark_backfill_logs_info(caplog):
+    """A+ remark 兜底命中 -> logger.info（真机 id54 路径，事后可追溯）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never", "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 600, "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._expire_stale_orders(db)
+        db.commit()
+    db.close()
+    assert any("remark" in m and "backfill" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_terminal_sync_canceled_logs_info(caplog):
+    """54 全撤终态同步 -> logger.info（此前只发 SSE canceled）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(status=54, traded_volume=0)], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _place_order_with_ref(db, "ref-cancel-1")
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._poll_deals()
+    assert any("terminal" in m and "canceled" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_terminal_sync_junk_rejected_logs_warning(caplog):
+    """57 废单终态同步 -> logger.warning（柜台拒单，需关注）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(ref="ref-junk", status=57, traded_volume=0)],
+                       deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _place_order_with_ref(db, "ref-junk")
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._poll_deals()
+    assert any(r.levelno == logging.WARNING and "junk" in m and "rejected" in m
+               for r, m in zip(caplog.records, _log_msgs(caplog))), _log_msgs(caplog)
+
+
+def test_maybe_daily_close_logs_info(caplog):
+    """14:30 日终估值成功 -> logger.info（此前成功路径无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+    assert any("daily close" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_maybe_daily_bars_logs_info(caplog):
+    """14:30 日线驱动成功 -> logger.info（此前成功路径无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    rec = _Recorder(respond=_respond_quote_bars(stock, [
+        {"stime": "20260822000000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._tq_formula.compute_injected = lambda **kw: {
+        stock: {"ErrorId": 0},
+    }
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_daily_bars(now=datetime(2026, 8, 24, 14, 30))
+    assert any("daily bar" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_close_sweep_no_pending_logs_info(caplog):
+    """15:05 无残留单 -> logger.info（干净日也要有清扫跑过的痕迹）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+    assert any("no pending" in m for m in _log_msgs(caplog)), _log_msgs(caplog)

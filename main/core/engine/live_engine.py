@@ -639,6 +639,10 @@ class LiveEngine:
                     "update_daily error (portfolio %s, date %s)",
                     portfolio.portfolio_id, today,
                 )
+        logger.info(
+            "daily close done (session %s, %s): %d portfolio(s) valuated",
+            self.session_id, today, len(self.portfolios),
+        )
 
     def _maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
         """C6(B/C)：日终（≥14:30 当日一次）1d 快照 bar + 1w/1mon 通达信注入驱动。
@@ -697,7 +701,8 @@ class LiveEngine:
             daily_time = datetime.combine(today, datetime.min.time())
         self._last_daily_bar_date = today
         # 日切检测：新 daily_time 的 1w/1mon cache miss → 通达信补注入
-        if self._startup_periods_missing(daily_time):
+        reinjected = self._startup_periods_missing(daily_time)
+        if reinjected:
             self._inject_startup_periods(daily_time)
         # 1d 快照即最终值（14:30 后），每 code 取最新 forming 1d bar 的 OHLCV
         stocks = {code: to_ohlcv(bars[-1]) for code, bars in bars_by_code.items()}
@@ -724,6 +729,12 @@ class LiveEngine:
                         "daily %s bar error (portfolio %s, time %s)",
                         period, portfolio.portfolio_id, daily_time,
                     )
+        logger.info(
+            "daily bar driven (session %s, %s): %s snapshot over %d code(s), "
+            "1w/1mon reinject=%s",
+            self.session_id, daily_time, "1d", len(bars_by_code),
+            reinjected,
+        )
 
     # ---------------- 收盘清扫（15:05 确定性兜底）----------------
     def _maybe_close_sweep(self, now: Optional[datetime] = None) -> None:
@@ -760,6 +771,10 @@ class LiveEngine:
             )
             if not pending:
                 self._last_close_sweep_date = today
+                logger.info(
+                    "close sweep: no pending orders, nothing to do (session %s, %s)",
+                    self.session_id, today,
+                )
                 return
             logger.info(
                 "close sweep start (session %s, %s): %d pending order(s)",
@@ -1157,6 +1172,12 @@ class LiveEngine:
                 if order.trade_type == TradeType.SELL:
                     self._t1_checker.consume_available(order.stock_code, order.quantity)
                 db.commit()
+                logger.info(
+                    "order accepted: id=%s %s %s %s qty=%s price=%s bar=%s (session %s)",
+                    live_order.id, order.trade_type.value, order.stock_code,
+                    order.signal_name, live_order.quantity, live_order.price,
+                    order.bar_time, self.session_id,
+                )
         except Exception:
             db.rollback()
             raise
@@ -1868,6 +1889,10 @@ class LiveEngine:
                 lo.status = "rejected"
                 lo.error_message = "order rejected by broker as junk (m_nOrderStatus=%s)" % status
                 self._pending_orders.pop(lo.id, None)
+                logger.warning(
+                    "terminal sync: order %s %s %s rejected (junk m_nOrderStatus=%s)",
+                    lo.id, lo.trade_type, lo.stock_code, status,
+                )
                 self._emit("order", {
                     "portfolio_id": lo.portfolio_strategy_id,
                     "order_id": lo.id,
@@ -1899,6 +1924,11 @@ class LiveEngine:
             lo.status = "canceled"
             lo.error_message = "order canceled by broker (m_nOrderStatus=%s)" % status
             self._pending_orders.pop(lo.id, None)
+            logger.info(
+                "terminal sync: order %s %s %s canceled (m_nOrderStatus=%s, filled=%s)",
+                lo.id, lo.trade_type, lo.stock_code, status,
+                int(lo.filled_quantity or 0),
+            )
             self._emit("order", {
                 "portfolio_id": lo.portfolio_strategy_id,
                 "order_id": lo.id,
@@ -1964,11 +1994,21 @@ class LiveEngine:
                 matched = [d for d in deals_cache if d.get("remark") == expected_remark]
                 if matched:
                     self._backfill_order(db, lo, matched)  # 幂等：转 filled + 写 LiveTrade + apply
+                    logger.info(
+                        "expire: order %s %s %s rescued via remark backfill "
+                        "(no order_ref within %ds, /deals matched remark)",
+                        lo.id, lo.trade_type, lo.stock_code, int(age.total_seconds()),
+                    )
                     continue
             lo.status = "rejected"
             lo.error_message = (
                 "order match timeout: no bridge order_ref within %ds"
                 % int(age.total_seconds())
+            )
+            logger.warning(
+                "expire: order %s %s %s rejected (no order_ref and no /deals match "
+                "within %ds)",
+                lo.id, lo.trade_type, lo.stock_code, int(age.total_seconds()),
             )
             self._pending_orders.pop(lo.id, None)
             self._emit("order", {
@@ -2013,10 +2053,21 @@ class LiveEngine:
         total_commission = sum(Decimal(str(d.get("commission") or 0)) for d in matched_deals)
         avg_price = total_amount / Decimal(total_qty)
 
+        # 5s 轮询会对同一 partial 反复调本方法；先记旧值，只在量增或状态变化时记日志，避免刷屏。
+        prev_qty = int(live_order.filled_quantity or 0) if live_order.filled_quantity else 0
+        prev_status = live_order.status
         live_order.filled_quantity = total_qty
         live_order.filled_price = avg_price
-        live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
+        new_status = "filled" if total_qty >= live_order.quantity else "partial"
+        live_order.status = new_status
         self._last_backfill_time = now_shanghai()  # G7：记录最近一次回填时点
+        if total_qty != prev_qty or new_status != prev_status:
+            logger.info(
+                "backfill: order %s %s %s %s qty=%s/%s price=%.4f amount=%s commission=%s",
+                live_order.id, live_order.trade_type, live_order.stock_code, new_status,
+                total_qty, live_order.quantity, float(avg_price), total_amount,
+                total_commission,
+            )
         # B5：订单状态推送（filled/partial 都由成交回报回填推进）
         self._emit("order", {
             "portfolio_id": live_order.portfolio_strategy_id,
