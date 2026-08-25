@@ -5044,7 +5044,7 @@ def test_max_drawdown_auto_recovery_logs_info(caplog):
     port.strategies[0].positions[stock] = pos
     port.account.cash = Decimal("0")
 
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.breaker"):
         # 次日（8/24 周一）close=99 → total=99000，回撤 1%<20% 不重触发，date>trigger 自动恢复
         engine._handle_bar(port, _bar(stock, "99", datetime(2026, 8, 24, 10, 0)))
 
@@ -5088,7 +5088,7 @@ def test_daily_loss_auto_recovery_logs_info(caplog):
     rm.update_peak(Decimal("94000"), date(2026, 8, 21))
     rm.update_peak(Decimal("94000"), date(2026, 8, 24))  # 跨日 prev_close=94000
 
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.breaker"):
         engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))  # 8/24 > 8/21 -> 恢复
 
     msgs = _log_msgs(caplog)
