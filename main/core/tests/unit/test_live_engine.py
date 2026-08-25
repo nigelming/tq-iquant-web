@@ -4792,7 +4792,7 @@ def test_backfill_filled_logs_info(caplog):
     lo = db.query(LiveOrder).filter_by(id=lo_id).first()
     deals = [{"order_ref": "ref-bf", "volume": 1000, "amount": 9000,
               "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
         engine._backfill_order(db, lo, deals)
         db.commit()
     db.close()
@@ -4823,7 +4823,7 @@ def test_backfill_same_partial_does_not_spam_log(caplog):
     lo = db.query(LiveOrder).filter_by(id=lo_id).first()
     partial = [{"order_ref": "ref-bf2", "volume": 300, "amount": 2700,
                 "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
         engine._backfill_order(db, lo, partial)   # 首次 partial：记日志
         engine._backfill_order(db, lo, partial)   # 同量同状态：不重复
         db.commit()
@@ -4877,7 +4877,7 @@ def test_expire_remark_backfill_logs_info(caplog):
     db.close()
 
     db = factory()
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
         engine._expire_stale_orders(db)
         db.commit()
     db.close()
@@ -4898,7 +4898,7 @@ def test_terminal_sync_canceled_logs_info(caplog):
     db.commit()
     db.close()
 
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
         engine._poll_deals()
     assert any("terminal" in m and "canceled" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
 
