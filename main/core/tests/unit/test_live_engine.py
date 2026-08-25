@@ -4930,7 +4930,7 @@ def test_maybe_daily_close_logs_info(caplog):
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     engine, _ = _ss_engine(factory, port)
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
         engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
     assert any("daily close" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
 
@@ -4950,7 +4950,7 @@ def test_maybe_daily_bars_logs_info(caplog):
     engine._tq_formula.compute_injected = lambda **kw: {
         stock: {"ErrorId": 0},
     }
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
         engine._maybe_daily_bars(now=datetime(2026, 8, 24, 14, 30))
     assert any("daily bar" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
 
@@ -4962,7 +4962,7 @@ def test_close_sweep_no_pending_logs_info(caplog):
     port, _ = _portfolio_single()
     rec = _Recorder()
     engine, _ = _sweep_engine(factory, port, rec)
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
         engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
     assert engine._last_close_sweep_date == date(2026, 8, 24)
     assert any("no pending" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
