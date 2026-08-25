@@ -41,6 +41,7 @@ from .live.timing import (
     periods_on_boundary,
 )
 from .live.event_bus import EventBus
+from .live.context import EngineContext
 from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -107,14 +108,21 @@ class LiveEngine:
         code_period_count: Optional[Dict[tuple, int]] = None,
         trading_calendar: Optional[TradingCalendar] = None,
     ):
-        self.session_id = session_id
-        self.portfolios = portfolios
-        self._dispatcher = dispatcher
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
         self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
         self._bar_poller = bar_poller
-        self._db_session_factory = db_session_factory
+        # 协作者共享状态容器（0010 步骤 2a）：session_id/portfolios/dispatcher/
+        # db_session_factory/code_period_count/clock 归 EngineContext，引擎上的同名
+        # 属性保留为 property 委托（见类体下方），调用点与测试直连无需改动。
+        self.ctx = EngineContext(
+            session_id=session_id,
+            portfolios=portfolios,
+            dispatcher=dispatcher,
+            db_session_factory=db_session_factory,
+            code_period_count=code_period_count,
+            clock=now_shanghai,
+        )
         self._poll_interval = poll_interval
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
@@ -159,11 +167,7 @@ class LiveEngine:
         # 股票，慢股票仍在其完成那轮被驱动求值）。stime 含日期，跨日无碰撞。
         self._dispatched_boundaries: set = set()
 
-        # 按 (code, period) 的预热/分发最大 count：该股票该周期所有公式 formula_count 最大值
-        # （跨组合跨策略，由 _build_engine 算好传入）。比 _period_count（全局按周期）更细：
-        # 不同股票该周期所需根数可能不同（如 C 只需 100、A 需 200），按需拉不浪费。
-        # _period_count 保留作"只知 period 不知 code"的兜底。无公式兜底 formula_count(200)。
-        self._code_period_count: Dict[tuple, int] = code_period_count or {}
+        # _code_period_count 已迁入 self.ctx（EngineContext），见类体下方 property 委托。
 
         # 预热缓存：(code, period) -> {"bars": [...], "last_stime": datetime, "count": int}
         # 启动 _preheat() 填充（拉 code_period_count[(code,period)] 根历史）；
@@ -233,6 +237,50 @@ class LiveEngine:
     @_stream_ping_interval.setter
     def _stream_ping_interval(self, value: float) -> None:
         self._event_bus.ping_interval = value
+
+    # ---- EngineContext 委托（0010 步骤 2a）----
+    # 这些字段已迁入 self.ctx；保留同名 property 让既有调用点与测试的直接赋值
+    # （engine.portfolios=[...]、engine._code_period_count={...}、engine._dispatcher=...）
+    # 穿透到同一份 ctx 对象，纯搬移不改行为。
+    @property
+    def session_id(self) -> int:
+        return self.ctx.session_id
+
+    @session_id.setter
+    def session_id(self, value: int) -> None:
+        self.ctx.session_id = value
+
+    @property
+    def portfolios(self) -> List[Portfolio]:
+        return self.ctx.portfolios
+
+    @portfolios.setter
+    def portfolios(self, value: List[Portfolio]) -> None:
+        self.ctx.portfolios = value
+
+    @property
+    def _dispatcher(self) -> HttpBridgeDispatcher:
+        return self.ctx.dispatcher
+
+    @_dispatcher.setter
+    def _dispatcher(self, value: HttpBridgeDispatcher) -> None:
+        self.ctx.dispatcher = value
+
+    @property
+    def _db_session_factory(self) -> Callable[[], Session]:
+        return self.ctx.db_session_factory
+
+    @_db_session_factory.setter
+    def _db_session_factory(self, value: Callable[[], Session]) -> None:
+        self.ctx.db_session_factory = value
+
+    @property
+    def _code_period_count(self) -> Dict[tuple, int]:
+        return self.ctx.code_period_count
+
+    @_code_period_count.setter
+    def _code_period_count(self, value: Dict[tuple, int]) -> None:
+        self.ctx.code_period_count = value
 
     # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
     def _emit(self, event_type: str, payload: dict) -> None:
