@@ -12,7 +12,6 @@
 """
 import asyncio
 import logging
-import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
@@ -31,15 +30,22 @@ from .http_bridge_dispatcher import (
 )
 from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
 from .trading_calendar import TradingCalendar
+# 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
+# re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
+# 保持 core.engine.live_engine 命名空间可见。
+from .live.timing import (
+    _CST,
+    _parse_insert_utc,
+    _to_int,
+    now_shanghai,
+    periods_on_boundary,
+)
+from .live.event_bus import EventBus
 from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
-
-# Asia/Shanghai 固定时区——实盘日终 (14:30) 判定/时间记录按上海时间，
-# 不依赖本机时区（Core 部署 UTC 服务器时本机 14:30 ≠ 上海 14:30，日终会哑火）。
-_CST = timezone(timedelta(hours=8))
 
 # 实盘日终判定时点（E5/E6 update_daily + C6(B/C) 1d 快照/1w/1mon 注入共用）。
 # 上海 14:30 收盘后驱动。提为常量消除魔法数字（审计 #33）。
@@ -76,76 +82,11 @@ _ORDER_STATUS_TERMINAL_CANCELED = (53, 54)
 _ORDER_STATUS_TERMINAL_REJECTED = (57,)
 
 
-def _parse_insert_utc(insert_date, insert_time):
-    """桥 /orders 的 insert_date(YYYYMMDD)+insert_time(HHMMSS，上海本地) → UTC naive。
-
-    无法解析返回 None。桥 insert 时间是 Asia/Shanghai 本地 naive，Core created_at 是
-    UTC naive，比较前需换算。取前 6 位（兼容 HHMMSSsss 毫秒后缀）。
-    """
-    ds = str(insert_date or "").strip()
-    ts = str(insert_time or "").strip()
-    if len(ds) != 8 or len(ts) < 6:
-        return None
-    try:
-        local_naive = datetime.strptime(ds + ts[:6], "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    return local_naive - timedelta(hours=8)  # Asia/Shanghai → UTC
-
-
-def now_shanghai() -> datetime:
-    """当前上海时间（naive，已剥时区）。实盘固有时点判定专用。
-
-    naive 与引擎内其余 datetime（均 naive）比较一致；aware 与 naive 比较会抛 TypeError。
-    """
-    return datetime.now(tz=_CST).replace(tzinfo=None)
-
-
 # TQ 公式输出中需跳过的非变量键（同 backtest._FORMULA_META_KEYS）
 _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
 
 # C6(C)：1w/1mon 走通达信启动/日终注入（桥端 xtdata 拉不到），_fill_signal_cache 跳过不拉桥
 _STARTUP_ONLY_PERIODS = ("1w", "1mon")
-
-
-def periods_on_boundary(bar_time: Optional[datetime]) -> List[str]:
-    """1m bar 结束时刻 → 命中的边界周期列表（可累积，只读 bar stime，不引入本机时钟）。
-
-    minute%5==0→5m、%15→15m、%30→30m、minute==0→1h。可累积：10:30 → [5m,15m,30m]，
-    11:00 → [5m,15m,30m,1h]。非边界时刻（如 10:03）→ []。
-    """
-    if bar_time is None:
-        return []
-    result: List[str] = []
-    minute = bar_time.minute
-    if minute % 5 == 0:
-        result.append("5m")
-    if minute % 15 == 0:
-        result.append("15m")
-    if minute % 30 == 0:
-        result.append("30m")
-    if minute == 0:
-        result.append("1h")
-    return result
-
-
-def _to_int(val) -> int:
-    """数值转 int（公式 trigger_value）；NaN/None/无法解析 → 0。同 backtest._to_int。"""
-    if val is None:
-        return 0
-    if isinstance(val, bool):
-        return int(val)
-    if isinstance(val, (int, float)):
-        try:
-            if math.isnan(val):
-                return 0
-        except (TypeError, ValueError):
-            pass
-        return int(val)
-    try:
-        return int(Decimal(str(val)))
-    except (ValueError, ArithmeticError):
-        return 0
 
 
 class LiveEngine:
@@ -275,69 +216,40 @@ class LiveEngine:
         # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
         # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
         self._reconcile_mismatches: List[dict] = []
-        # B5：SSE 事件流——_stream_subscribers 为当前已连接客户端的订阅队列，
-        # _emit 向各队列 put_nowait 广播；stream_events 注册/退订队列。
-        # stream_ping_interval：流空闲无事件时的 ping 心跳间隔（design §5.6.10，30s）。
-        self._stream_ping_interval = stream_ping_interval
-        self._stream_subscribers: List["asyncio.Queue"] = []
+        # B5：SSE 事件总线（0010 步骤 1 抽到 core.engine.live.event_bus.EventBus）。
+        # 持有订阅队列集合、跨线程投递、ping 心跳；引擎保留 _emit/stream_events 薄委托，
+        # 并暴露 _stream_subscribers/_stream_ping_interval 兼容测试直连。
+        self._event_bus = EventBus(ping_interval=stream_ping_interval, clock=now_shanghai)
 
-    # ---------------- B5 SSE 事件流 ----------------
+    @property
+    def _stream_subscribers(self) -> List["asyncio.Queue"]:
+        """兼容测试直连（append/extend/in）：转发到 EventBus 的订阅列表。"""
+        return self._event_bus.subscribers
+
+    @property
+    def _stream_ping_interval(self) -> float:
+        return self._event_bus.ping_interval
+
+    @_stream_ping_interval.setter
+    def _stream_ping_interval(self, value: float) -> None:
+        self._event_bus.ping_interval = value
+
+    # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
     def _emit(self, event_type: str, payload: dict) -> None:
-        """向所有 SSE 订阅队列广播 {type, **payload}（signal/order/trade/position/risk）。
-
-        线程安全（审计 #3）：_emit 可能从事件线程（stream_events 消费侧、同步测试直调）
-        或 worker 线程（_loop/_deals_loop tick 内 _handle_bar/_backfill_order）被调。
-        asyncio.Queue.put_nowait 非线程安全 → worker 线程内经 call_soon_threadsafe
-        回到事件线程投递；事件线程内（或未 start、_loop_ref=None 的同步路径）直接
-        put_nowait（保留既有同步测试 get_nowait 立即可见的语义）。
-        队列积压（订阅端消费慢）→ 丢弃该事件（EventSource 断线重连后见最新状态，
-        design §5.6.10：浏览器自动重连，无需重放）。
-        """
-        ev = {"type": event_type, **payload}
-        loop = self._loop_ref
-        if loop is None:
-            # 未 start（同步测试 / start 前）：直接投递
-            self._emit_to_subscribers(ev)
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            # 事件线程内：直接投递
-            self._emit_to_subscribers(ev)
-        else:
-            # worker 线程内：回到事件线程投递（asyncio.Queue 非线程安全）
-            loop.call_soon_threadsafe(self._emit_to_subscribers, ev)
+        """向所有 SSE 订阅队列广播（委托 EventBus.emit，线程安全语义见 event_bus）。"""
+        self._event_bus.emit(event_type, payload)
 
     def _emit_to_subscribers(self, ev: dict) -> None:
-        """实际向各订阅队列 put_nowait（仅在事件线程执行）。积压 → 丢弃不阻塞。"""
-        for q in list(self._stream_subscribers):
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:
-                pass  # 积压丢弃，不阻塞引擎
+        """兼容旧调用/测试：直接向订阅队列投递（委托 EventBus）。"""
+        self._event_bus._emit_to_subscribers(ev)
 
-    async def stream_events(self) -> AsyncIterator[dict]:
-        """SSE 事件流：订阅引擎事件队列，逐条 yield；空闲超 ping 间隔 yield ping 心跳。
+    def stream_events(self) -> AsyncIterator[dict]:
+        """SSE 事件流（委托 EventBus.stream；公共签名不变，live.py 与测试仍调此方法）。
 
-        每个 /stream 连接调用一次（/stream 端点 async for 消费）。连接结束（aclose）
-        → finally 退订。引擎停止（_running=False）→ 队列空则流结束（端点侧转 ping-only）。
+        直接返回内部 async generator（不用 `async for ... yield` 包裹），这样调用方
+        aclose() 直接作用于 bus 的生成器，其 finally（退订队列）立即执行。
         """
-        q: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self._stream_subscribers.append(q)
-        try:
-            while self._running or not q.empty():
-                try:
-                    ev = await asyncio.wait_for(
-                        q.get(), timeout=self._stream_ping_interval
-                    )
-                except asyncio.TimeoutError:
-                    ev = {"type": "ping", "time": now_shanghai().isoformat()}
-                yield ev
-        finally:
-            if q in self._stream_subscribers:
-                self._stream_subscribers.remove(q)
+        return self._event_bus.stream(lambda: self._running)
 
     # ---------------- 预热 + 增量拼接（拉取优化）----------------
     def _preheat(self) -> None:
@@ -433,6 +345,7 @@ class LiveEngine:
         self._running = True
         # 审计 #3：捕获运行中的事件循环，供 _emit 跨线程 call_soon_threadsafe 回投。
         self._loop_ref = asyncio.get_running_loop()
+        self._event_bus.bind_loop(self._loop_ref)
         # 审计 #3：stop() 会 shutdown executor（释放非 daemon worker 线程，防进程退出
         # 挂起）；若引擎被重启（同实例二次 start），旧 executor 已 shutdown → 重建一个。
         # 每次 start 重建开销可忽略（1 线程，session 生命周期内仅一次）。
@@ -481,6 +394,7 @@ class LiveEngine:
         # 审计 #3：停止后清空 loop 引用——worker 线程已不再产生 _emit；
         # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
         self._loop_ref = None
+        self._event_bus.clear_loop()
         # 审计 #3：释放单 worker 线程（ThreadPoolExecutor 默认非 daemon，不 shutdown 会
         # 在进程退出时挂起 join）。wait=False：正在跑的 tick 是 loopback HTTP，瞬间完成，
         # 不阻塞 stop；任务已 cancel，不会再提交新 tick。

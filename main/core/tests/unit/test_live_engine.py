@@ -3414,7 +3414,7 @@ def test_maybe_daily_close_emits_risk_on_daily_loss(monkeypatch):
         @classmethod
         def now(cls, tz=None):
             return datetime(2026, 8, 5, 14, 30)
-    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+    monkeypatch.setattr("core.engine.live.timing.datetime", _FakeDateTime)
 
     engine._maybe_daily_close()
 
@@ -3444,7 +3444,7 @@ def test_now_shanghai_returns_shanghai_wall_clock(monkeypatch):
             if tz is not None:
                 return (_fixed_utc + tz.utcoffset(None)).replace(tzinfo=tz)
             return _fixed_utc
-    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+    monkeypatch.setattr("core.engine.live.timing.datetime", _FakeDateTime)
 
     # UTC 06:30 → 上海 14:30（+8）；now_shanghai 剥 tz 后仍 14:30
     assert now_shanghai() == datetime(2026, 8, 10, 14, 30)
