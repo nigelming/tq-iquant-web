@@ -51,6 +51,11 @@ class Portfolio:
         self.risk_manager = risk_manager
         self.strategies: List[StrategyContext] = []
         self.benchmark_value: Optional[Decimal] = None
+        # 持仓最新价快照（code → close）。BarPoller 逐票完成会发残缺 bar，
+        # 实盘分钟 bar 只含本轮新完成的股票；停牌股整天无 bar。估值必须对所有
+        # 持仓用最近已知价，不能把缺席持仓当 0（否则组合总市值瞬间塌掉误触发
+        # max_drawdown 熔断，见 2026-08-25 对账）。每根 bar 用其有效 close 刷新。
+        self._price_snapshot: Dict[str, Decimal] = {}
         # 交易成本参数（来自组合表），供 BacktestEngine 构建 dispatcher 时透传
         self.cost_params: Dict = cost_params or {}
 
@@ -268,15 +273,52 @@ class Portfolio:
                 return ctx
         return None
 
-    def total_value(self, bar: BarEvent) -> Decimal:
-        """组合总市值 = 现金 + 所有策略持仓按当前 close 的市值（回测/实盘共用，审计 #25 去重）。"""
-        total = self.account.cash
-        for ctx in self.strategies:
-            for stock_code, pos in ctx.positions.items():
-                if pos.quantity == 0 or stock_code not in bar.stocks:
+    def _refresh_price_snapshot(self, bar: BarEvent) -> None:
+        """用本根 bar 的有效 close(>0) 刷新持仓最新价快照。
+
+        close=0 是 TQ NaN 规整而来（停牌/无数据），不得采用、不得覆盖已有快照。
+        """
+        for code, ohlcv in bar.stocks.items():
+            close = ohlcv.get("close")
+            if close is not None and close > 0:
+                self._price_snapshot[code] = close
+
+    def _holdings_value(self, ctx: Optional[StrategyContext] = None) -> Decimal:
+        """持仓按最近已知价的市值合计（不含现金）。须在 _refresh_price_snapshot 之后调。
+
+        - 有快照价用快照价；从未报过价的回退 avg_cost（持仓成本）；price<=0 同样回退。
+        - ctx=None 合计全部策略；否则只算该策略持仓（供回测策略层净值，保证与组合层
+          同一口径、Σ策略市值 == 组合市值）。
+        """
+        market_value = Decimal("0")
+        contexts = (ctx,) if ctx is not None else self.strategies
+        for c in contexts:
+            for code, pos in c.positions.items():
+                if pos.quantity == 0:
                     continue
-                total += bar.stocks[stock_code]["close"] * pos.quantity
-        return total
+                price = self._price_snapshot.get(code)
+                if price is None or price <= 0:
+                    price = pos.avg_cost
+                market_value += price * pos.quantity
+        return market_value
+
+    def holdings_value(self, ctx: StrategyContext) -> Decimal:
+        """单策略持仓按最近已知价的市值（回测策略层快照用，口径同 total_value）。"""
+        return self._holdings_value(ctx)
+
+    def _refresh_and_value_holdings(self, bar: BarEvent) -> Decimal:
+        """刷新价格快照并返回所有持仓市值合计（不含现金）。
+
+        估值口径：对每只持仓取「最近已知价」——本根 bar 带有效 close 的刷新后采用；
+        缺席的（残缺 bar / 停牌全天无 bar）沿用快照里上一次的价；从未报过价的回退
+        avg_cost。这样 BarPoller 逐票完成的残缺 1m bar 不会让缺席持仓被当 0，总市值连续。
+        """
+        self._refresh_price_snapshot(bar)
+        return self._holdings_value()
+
+    def total_value(self, bar: BarEvent) -> Decimal:
+        """组合总市值 = 现金 + 所有策略持仓按最近已知价的市值（回测/实盘共用，审计 #25 去重）。"""
+        return self.account.cash + self._refresh_and_value_holdings(bar)
 
     def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
         """按 strategy_id 在本组合策略列表中找上下文。"""
@@ -293,13 +335,11 @@ class Portfolio:
         return pos is not None and pos.quantity > 0
 
     def snapshot(self, snap_date: date, current_value: Decimal, bar: BarEvent = None) -> dict:
-        market_value = Decimal("0")
+        # market_value 复用最近已知价口径（与 total_value 一致）：bar 为 None 时
+        # 直接用已积累的价格快照 + avg_cost 兜底，不把缺席持仓当 0。
         if bar is not None:
-            for ctx in self.strategies:
-                for stock_code, pos in ctx.positions.items():
-                    if pos.quantity == 0 or stock_code not in bar.stocks:
-                        continue
-                    market_value += bar.stocks[stock_code]["close"] * pos.quantity
+            self._refresh_price_snapshot(bar)
+        market_value = self._holdings_value()
         return {
             "snap_date": snap_date,
             "total_value": current_value,

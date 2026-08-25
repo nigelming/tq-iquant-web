@@ -176,13 +176,12 @@ class BacktestEngine:
         """
         sum_ratio = sum((ctx.capital_ratio for ctx in portfolio.strategies), Decimal("0"))
         cash = portfolio.account.cash
+        # 与组合层 total_value 同口径：刷新价格快照后按最近已知价估每策略持仓市值，
+        # 缺席（停牌/缺 bar）沿用昨收而非按 0，保证 Σ策略市值 == 组合市值。
+        portfolio._refresh_price_snapshot(bar)
         snaps: List[dict] = []
         for ctx in portfolio.strategies:
-            market_value = Decimal("0")
-            for stock_code, pos in ctx.positions.items():
-                if pos.quantity == 0 or stock_code not in bar.stocks:
-                    continue
-                market_value += bar.stocks[stock_code]["close"] * pos.quantity
+            market_value = portfolio.holdings_value(ctx)
             if sum_ratio > 0:
                 allocated_cash = cash * (ctx.capital_ratio / sum_ratio)
             else:

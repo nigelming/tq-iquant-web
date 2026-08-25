@@ -9,6 +9,7 @@ from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import StrategyRiskManager, PortfolioRiskManager
 from core.engine.execution_engine import SimulatedDispatcher
 from core.engine.position import Position
+from core.engine.event import BarEvent
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -343,3 +344,57 @@ def test_no_benchmark_data_no_curve():
     assert all(s["benchmark_value"] is None for s in snaps)
     assert result["evaluations"]["benchmark_return"] == Decimal("0")
 
+
+
+def test_strategy_snapshots_additivity_with_suspended_stock():
+    """停牌/缺 bar 时，策略层市值必须与组合层同口径（缺席持仓沿用昨收而非按 0），
+    保证 Σ策略市值 == 组合市值。回归 2026-08-25：旧 _strategy_snapshots 对不在
+    bar.stocks 的持仓 continue 当 0，与已修复的 total_value 口径分叉。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+
+    def _ctx(sid, code, qty, cost):
+        c = StrategyContext(
+            strategy_id=sid, period="1d",
+            capital_ratio=Decimal("0.5"), max_positions=5,
+        )
+        c.formula_signals = []
+        c.strategy_risk = StrategyRiskManager(
+            stop_loss_ratio=Decimal("0.2"), take_profit_ratio=Decimal("0.2"),
+            trailing_stop_ratio=Decimal("0"),
+        )
+        p = Position(code)
+        p.quantity = qty
+        p.avg_cost = Decimal(str(cost))
+        c.positions[code] = p
+        return c
+
+    # 策略1 持 A(1000@10)，策略2 持 B(5000@10)；现金 40000，总市值应恒为 100000
+    port.strategies.append(_ctx(1, "000001.SZ", 1000, 10))
+    port.strategies.append(_ctx(2, "600000.SH", 5000, 10))
+    port.account.cash = Decimal("40000")
+
+    # 先给全量 bar 建立两只票的价格快照
+    full = BarEvent(stocks={
+        "000001.SZ": {"open": Decimal("10"), "high": Decimal("10"),
+                      "low": Decimal("10"), "close": Decimal("10"), "volume": 1},
+        "600000.SH": {"open": Decimal("10"), "high": Decimal("10"),
+                      "low": Decimal("10"), "close": Decimal("10"), "volume": 1},
+    }, bar_time=datetime(2026, 8, 24))
+    port.total_value(full)
+
+    # 次日 B 停牌：bar 只含 A，B 缺席 → 应按昨收 10 估，策略2 市值不塌
+    suspended = BarEvent(stocks={
+        "000001.SZ": {"open": Decimal("10"), "high": Decimal("10"),
+                      "low": Decimal("10"), "close": Decimal("10"), "volume": 1},
+    }, bar_time=datetime(2026, 8, 25))
+
+    snaps = BacktestEngine()._strategy_snapshots(port, suspended, date(2026, 8, 25))
+    by_id = {s["target_id"]: s for s in snaps}
+    # 两只各 10000 市值（A=1000×10，B=5000×10 沿用昨收）
+    assert by_id[1]["market_value"] == Decimal("10000")
+    assert by_id[2]["market_value"] == Decimal("50000")
+    # 可加性：Σ策略持仓市值 == 组合层持仓市值（total_value - 现金）
+    holdings_sum = sum((s["market_value"] for s in snaps), Decimal("0"))
+    assert holdings_sum == port.total_value(suspended) - port.account.cash
+    assert port.total_value(suspended) == Decimal("100000")
