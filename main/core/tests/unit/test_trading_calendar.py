@@ -48,7 +48,8 @@ def test_weekday_holiday_not_in_calendar_is_non_trading():
 
 
 def test_provider_failure_fail_open_on_weekday(caplog):
-    """桥离线：工作日默认交易日（fail-open），并记录告警。"""
+    """桥离线：工作日默认交易日（fail-open），并记录一次日志（现 INFO，非告警）。"""
+    caplog.set_level("INFO", logger="core.engine.trading_calendar")
     def boom():
         raise RuntimeError("bridge offline")
     cal = TradingCalendar(boom)

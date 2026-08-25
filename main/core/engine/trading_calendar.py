@@ -43,10 +43,12 @@ class TradingCalendar:
         dates: Set[date] = set()
         try:
             raw = list(self._provider() or [])
-        except Exception as exc:  # 桥离线/超时/老桥 404
+        except Exception as exc:  # 桥离线/超时/老桥 404（现桥无 /calendar 端点，属预期）
             raw = []
             if year not in self._warned_year:
-                logger.warning(
+                # 预期的 fail-open（老桥无日历端点），降 INFO：不再刷 WARNING 告警，
+                # 但保留一次性审计痕迹。fail-open 行为不变（工作日放行）。
+                logger.info(
                     "trading calendar unavailable (%s); fail-open: treating weekdays "
                     "as trading days for %s", exc, year)
                 self._warned_year.add(year)
@@ -57,7 +59,7 @@ class TradingCalendar:
         # 空集合存为 None，触发 fail-open；非空才当权威数据
         self._by_year[year] = dates if dates else None
         if not dates and year not in self._warned_year:
-            logger.warning(
+            logger.info(
                 "trading calendar empty for %s; fail-open: treating weekdays as "
                 "trading days", year)
             self._warned_year.add(year)
