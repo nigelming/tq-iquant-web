@@ -26,3 +26,8 @@ def setup_logging():
     root.setLevel(logging.INFO)
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    # 压低第三方 HTTP 客户端噪音：httpx/httpcore 默认每拍一行 "HTTP Request ... 200/404"，
+    # 会快速轮转冲掉盘中关键日志（14:30 日终、13:47 熔断实时日志因此丢失）。只留 WARNING+。
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
