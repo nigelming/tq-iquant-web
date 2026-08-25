@@ -543,16 +543,31 @@ class LiveEngine:
                 now_paused = portfolio.risk_manager.daily_pause_active
                 # B5：日内亏损熔断刚触发（daily_pause_active 变 True）→ 推送风控事件
                 if now_paused and not was_paused:
+                    # 触发幅度（可观测性）：日终市值/昨收/日内盈亏/亏损%/阈值。
+                    dpm = portfolio.risk_manager
+                    prev = dpm.prev_close_value
+                    init_cap = portfolio.account.initial_capital
+                    if prev is not None and init_cap > 0:
+                        pnl = total - prev
+                        loss_pct = abs(pnl) / init_cap * 100
+                        detail = (
+                            " total=%s prev_close=%s pnl=%s loss=%.2f%% threshold=%s"
+                            % (total, prev, pnl, loss_pct, dpm.daily_loss_limit)
+                        )
+                    else:
+                        detail = ""
                     self._emit("risk", {
                         "portfolio_id": portfolio.portfolio_id,
                         "rule": "daily_loss",
                         "triggered": True,
+                        "total_value": str(total),
+                        "prev_close_value": str(prev) if prev is not None else None,
                         "message": "日内亏损熔断触发，当日暂停新开仓",
                     })
                     logger.warning(
-                        "circuit breaker: portfolio %s daily_loss 触发 "
+                        "circuit breaker: portfolio %s daily_loss 触发%s "
                         "on %s (当日暂停新开仓，次日自动恢复) (session %s)",
-                        portfolio.portfolio_id, today, self.session_id,
+                        portfolio.portfolio_id, detail, today, self.session_id,
                     )
                 elif was_paused and not now_paused:
                     logger.info(
@@ -903,7 +918,8 @@ class LiveEngine:
         rm = portfolio.risk_manager
         was_broken = rm.circuit_breaker_active
         was_manual = rm.manual_recovery
-        rm.update_peak(portfolio.total_value(bar), bar.bar_time.date())
+        total_value = portfolio.total_value(bar)
+        rm.update_peak(total_value, bar.bar_time.date())
         # max_drawdown 次日自动恢复（非手动恢复）此前在 risk_manager 内静默置 False，这里补日志
         if was_broken and not rm.circuit_breaker_active and not was_manual:
             logger.info(
@@ -912,7 +928,7 @@ class LiveEngine:
                 portfolio.portfolio_id, self.session_id, bar.bar_time.date(),
             )
         # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
-        self._persist_breaker_count(portfolio)
+        self._persist_breaker_count(portfolio, total_value)
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
         # SELL 减仓上限用 m_nCanUseVolume（T+1 可用），供 cap_quantity 取数。
         if self._available_bar is not bar:
@@ -1120,37 +1136,59 @@ class LiveEngine:
         finally:
             db.close()
 
-    def _persist_breaker_count(self, portfolio: Portfolio) -> None:
+    def _persist_breaker_count(
+        self, portfolio: Portfolio, total_value: Decimal = None
+    ) -> None:
         """H4：把组合 max_drawdown 累计触发次数持久化到 LiveSessionPortfolio.circuit_breaker_count。
 
         每 bar update_peak 后比对：计数未变则不落库（避免每 bar 写）；变化（熔断触发 / 达 3 次
         转手动）→ 写 count，达 3 次 status 转 circuit_broken（design §8.3）。找不到 link
         （组合未关联本 session）→ 跳过。写库失败不阻断交易，记日志。
+
+        total_value：触发时的组合总市值（来自 _handle_bar），仅用于把 total/peak/回撤幅度
+        打进触发日志，便于事后核算（不参与落库逻辑）。None 时日志退化为不带幅度。
         """
-        count = portfolio.risk_manager.consecutive_drawdown_triggers
+        rm = portfolio.risk_manager
+        count = rm.consecutive_drawdown_triggers
         old = self._breaker_count_written.get(portfolio.portfolio_id)
         if old == count:
             return
         # B5：计数递增（max_drawdown 熔断刚触发）→ 推送风控事件（首 bar old=None 不推）
         if old is not None and count > old:
+            # 触发幅度（可观测性）：total/peak/回撤%/阈值。peak 在 update_peak 内是先抬峰再
+            # 判回撤，触发那根 bar 的 peak 即触发热值；drawdown=(peak-total)/peak。
+            if total_value is not None and rm.peak_value > 0:
+                dd_pct = (rm.peak_value - total_value) / rm.peak_value * 100
+                detail = (
+                    " total=%s peak=%s drawdown=%.2f%% threshold=%s"
+                    % (total_value, rm.peak_value, dd_pct, rm.max_drawdown)
+                )
+            else:
+                detail = ""
             self._emit("risk", {
                 "portfolio_id": portfolio.portfolio_id,
                 "rule": "max_drawdown",
                 "triggered": True,
                 "count": count,
+                "total_value": str(total_value) if total_value is not None else None,
+                "peak_value": str(rm.peak_value),
+                "drawdown_pct": (
+                    float((rm.peak_value - total_value) / rm.peak_value)
+                    if total_value is not None and rm.peak_value > 0 else None
+                ),
                 "message": "最大回撤熔断触发（累计 %d 次）" % count,
             })
             if count >= 3:
                 logger.warning(
-                    "circuit breaker: portfolio %s max_drawdown 触发 "
+                    "circuit breaker: portfolio %s max_drawdown 触发%s "
                     "(累计 %d 次) → 转手动恢复，停新开仓等人工介入 (session %s)",
-                    portfolio.portfolio_id, count, self.session_id,
+                    portfolio.portfolio_id, detail, count, self.session_id,
                 )
             else:
                 logger.warning(
-                    "circuit breaker: portfolio %s max_drawdown 触发 "
+                    "circuit breaker: portfolio %s max_drawdown 触发%s "
                     "(累计 %d 次，次日自动恢复) (session %s)",
-                    portfolio.portfolio_id, count, self.session_id,
+                    portfolio.portfolio_id, detail, count, self.session_id,
                 )
         db = self._db_session_factory()
         try:
