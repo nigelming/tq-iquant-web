@@ -29,7 +29,9 @@ from .http_bridge_dispatcher import (
     BridgeOrderRejected,
 )
 from .bar_poller import BarPoller
-from .trading_calendar import TradingCalendar
+# TradingCalendar 为 live 专属（仅实盘引擎及其协作者使用，回测不依赖），
+# 0010 后续迁入 live 子包；旧路径 core.engine.trading_calendar 保留 re-export shim。
+from .live.calendar import TradingCalendar
 # 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
 # re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
 # 保持 core.engine.live_engine 命名空间可见。
