@@ -710,6 +710,42 @@ def test_fill_signal_cache_populates_cache():
     assert out_map["open_sig"] == 1
 
 
+def test_fill_signal_cache_logs_inject_timing_summary(caplog):
+    """fill_signal_cache 末尾打一条 INFO 汇总：注入 codes 数 + tq/fetch/total 耗时。
+
+    每根 bar 每个有注入的组合一条（1m 每分钟一条），用于实测"每分钟公式花多少秒、
+    是否随会话累积变慢"；tq= 为 tqcenter compute_injected 累计、fetch= 为拉桥累计，
+    据此区分瓶颈在通达信公式还是桥。
+    """
+    import logging
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+
+    engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
+    engine.portfolios = [port]
+    engine._tq_formula.compute_injected = lambda **kw: {
+        "ErrorId": "0",
+        stock: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]},
+    }
+    bar = _bar(stock, "9.3", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live.market_data"):
+        engine._fill_signal_cache(port, bar)
+
+    msgs = [r.message for r in caplog.records if "signal inject" in r.message]
+    assert msgs, "expected INFO inject timing summary"
+    m = msgs[-1]
+    assert "codes=1" in m
+    for token in ("tq=", "fetch=", "total="):
+        assert token in m
+
+
 def test_fill_signal_cache_skips_strategy_without_formula():
     """策略不在 formula_by_strategy → 跳过，不查 quote 不算公式。"""
     factory, _ = _db_factory()

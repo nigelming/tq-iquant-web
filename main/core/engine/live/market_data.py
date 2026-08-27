@@ -20,6 +20,7 @@ LiveEngine._bars_to_formula_df(...) 等）全部穿透到本服务，行为不�
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
@@ -282,6 +283,12 @@ class MarketDataService:
             df_cache = {}
         if raw_cache is None:
             raw_cache = {}
+        # 节拍诊断：累计本根 bar 的 tqcenter 公式耗时 / 拉桥耗时，末尾汇总一条，
+        # 实测每分钟公式求值是否随会话累积变慢（午后 quote 断档根因定位）。
+        t_start = time.perf_counter()
+        tq_elapsed = 0.0
+        fetch_elapsed = 0.0
+        n_inject = 0
         for ctx in portfolio.strategies:
             formula_name = self._formula_by_strategy.get(ctx.strategy_id)
             if not formula_name:
@@ -299,27 +306,43 @@ class MarketDataService:
                 # 股票池过滤：池外股票不拉公式（多组合共享行情 bar，各策略只算自己池内）
                 if ctx.stock_pool is not None and code not in ctx.stock_pool:
                     continue
+                _tf = time.perf_counter()
                 try:
                     bars = self._fetch_cached_bars(
                         df_cache, bars_by_code, code, period, count
                     )
                 except BridgeUnavailableError:
+                    fetch_elapsed += time.perf_counter() - _tf
                     # 拉历史失败：跳过该股（不阻断 on_bar，风控信号仍可触发）
                     logger.warning("quote failed for formula inject %s %s", code, period)
                     continue
+                fetch_elapsed += time.perf_counter() - _tf
                 raw_key = (code, period, formula_name)
                 if raw_key not in raw_cache:
                     df = self._bars_to_formula_df(bars, code)
                     raw = None
                     if df is not None:
+                        _tt = time.perf_counter()
                         raw = self._tq_formula.compute_injected(
                             formula_name=formula_name, ohlcv_df=df,
                             stocks=[code], period=period,
                         )
+                        tq_elapsed += time.perf_counter() - _tt
+                        n_inject += 1
                     raw_cache[raw_key] = self._extract_latest_signal(raw, code)
                 outputs = raw_cache[raw_key]
                 if outputs:
                     self.signal_cache[(ctx.strategy_id, code, bar.bar_time)] = outputs
+        if n_inject:
+            # 每根 bar 每个有注入的组合一条（1m 每分钟一条）：tq= 为 tqcenter 公式
+            # 累计耗时、fetch= 为拉桥累计，据此区分瓶颈在通达信公式还是桥，观察 tq=
+            # 是否随会话累积增大（午后变慢机理验证）。
+            logger.info(
+                "signal inject: portfolio=%s period=%s bar=%s codes=%d "
+                "tq=%.2fs fetch=%.2fs total=%.2fs",
+                portfolio.portfolio_id, bar.period, bar.bar_time, n_inject,
+                tq_elapsed, fetch_elapsed, time.perf_counter() - t_start,
+            )
 
     def _fetch_cached_bars(
         self,

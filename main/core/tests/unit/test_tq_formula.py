@@ -122,6 +122,30 @@ def test_compute_injected_multi_stocks_all_set_before_process(fake_tq):
     assert kwargs["stock_list"] == ["600000.SH", "000001.SZ"]
 
 
+def test_compute_injected_logs_timing_debug(fake_tq, caplog):
+    """compute_injected 打 DEBUG 分段耗时日志（fmt/set/proc/total），供午后变慢节拍诊断。
+
+    逐 code 调用量大，默认 DEBUG 不刷屏；需要下钻单只股票 tqcenter 各阶段耗时（定位
+    是 set_data 累积还是 process count=-1 全量重算慢）时开 core.tq.formula=DEBUG。
+    """
+    import logging
+    with patch("core.tq.formula.get_tq", return_value=fake_tq), \
+         patch("core.tq.formula.get_tdx_lock"), \
+         caplog.at_level(logging.DEBUG, logger="core.tq.formula"):
+        formula = TQFormula()
+        formula.compute_injected(
+            formula_name="MACROSSPRO", ohlcv_df=_ohlcv_df(),
+            stocks=["600000.SH"], period="1m",
+        )
+
+    timed = [r for r in caplog.records if "compute_injected" in r.message]
+    assert timed, "expected DEBUG timing log from compute_injected"
+    msg = timed[-1].message
+    assert "MACROSSPRO" in msg and "period=1m" in msg
+    for token in ("fmt=", "set=", "proc=", "total="):
+        assert token in msg
+
+
 @pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
 def test_compute_injected_passes_period_through(fake_tq, period):
     """compute_injected 应把 period 原样透传给 set_data 与 process_mul_zb 的 stock_period。

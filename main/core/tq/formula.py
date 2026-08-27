@@ -1,5 +1,9 @@
+import logging
+import time
 from typing import Dict, List, Optional
 from .utils import get_tdx_lock, get_tq
+
+logger = logging.getLogger(__name__)
 
 
 class TQFormula:
@@ -43,22 +47,32 @@ class TQFormula:
         返回 formula_process_mul_zb 的 raw（同 compute）。
         """
         with get_tdx_lock():
+            t0 = time.perf_counter()
             tq = get_tq()
             formatted = tq.formula_format_data(ohlcv_df)
+            t_fmt = time.perf_counter() - t0
             if not formatted:
                 return None
+            # 分段计时：set_data（内存注入）随会话累积可能变慢，process count=-1 每次
+            # 全量重算注入数据——两者是午后节拍变慢的嫌疑点，DEBUG 日志供下钻定位。
+            t_set = 0.0
+            n_bars = 0
             for code in stocks:
                 stock_data = formatted.get(code)
                 if stock_data is None or len(stock_data) == 0:
                     return None
+                ts = time.perf_counter()
                 sd = tq.formula_set_data(
                     stock_code=code, stock_period=period,
                     stock_data=stock_data, count=len(stock_data),
                     dividend_type=0,
                 )
+                t_set += time.perf_counter() - ts
+                n_bars = len(stock_data)
                 if not sd or str(sd.get("ErrorId", "1")) != "0":
                     return None
-            return tq.formula_process_mul_zb(
+            tp = time.perf_counter()
+            raw = tq.formula_process_mul_zb(
                 formula_name=formula_name,
                 formula_arg=formula_arg,
                 return_count=-1,
@@ -71,6 +85,14 @@ class TQFormula:
                 count=-1,
                 dividend_type=dividend_type,
             )
+            t_proc = time.perf_counter() - tp
+            logger.debug(
+                "compute_injected formula=%s period=%s n=%d bars=%d "
+                "fmt=%.3fs set=%.3fs proc=%.3fs total=%.3fs",
+                formula_name, period, len(stocks), n_bars,
+                t_fmt, t_set, t_proc, time.perf_counter() - t0,
+            )
+            return raw
 
     def get_formula_list(self, formula_type: int = 0) -> List[dict]:
         tq = get_tq()
