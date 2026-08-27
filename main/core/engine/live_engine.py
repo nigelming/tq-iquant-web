@@ -269,7 +269,7 @@ class LiveEngine:
 
     # ---- MarketDataService 委托（0010 步骤 2b）----
     # 缓存/公式注入配置归 MarketDataService；保留可读写 property 让既有测试直连
-    # （engine.signal_cache={...}、engine._tq_formula.compute_injected=...、
+    # （engine.signal_cache={...}、engine._tq_formula.compute_injected_batch=...、
     # engine._preheat_cache[...] = ...）穿透到同一份服务对象。
     @property
     def signal_cache(self) -> Dict:
@@ -597,7 +597,8 @@ class LiveEngine:
         边界判定只读 1m bar stime（periods_on_boundary），不引入本机时钟；
         5m/15m/30m/1h 策略在边界时点才被驱动（C6(A)），1m 节拍不再每 bar 算长周期。
         C4(#28)：df_cache/raw_cache 建在此（跨组合共享）——同 (code,period) 只 query_quote
-        一次、同 (code,period,formula) 只 compute_injected 一次（TQ 计算最贵）。
+        一次、同 (code,period,formula) 只算一次（TQ 计算最贵）；同组 (formula,period) 的
+        多 code 再合并成一次 compute_injected_batch（N set + 1 process，治 1m 全池节拍）。
         BarPoller 透传的本轮 bars（bar.bars_by_code）直接给 _handle_bar 注入复用——
         1m 判完成与算公式共用一次拉取，消除双拉（BarPoller 已拉 count=10，注入不再增量重拉）。
         """

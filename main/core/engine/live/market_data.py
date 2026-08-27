@@ -263,7 +263,7 @@ class MarketDataService:
         对每个策略 × bar.stocks 每只股票：
           bridge query_quote(code, period, count=N) 拉历史+实时 bar
           → _bars_to_formula_df 转 OHLCV DataFrame
-          → TQFormula.compute_injected 内存注入算公式
+          → TQFormula.compute_injected_batch 批量内存注入算公式
           → _extract_latest_signal 取最后一条（当前 bar 信号）
           → 填 signal_cache[(strategy_id, code, bar.bar_time)]
         C6 节拍过滤：bar.period 非 None 时只注入匹配周期的策略（5m 边界 bar 不注入 1m 策略）；
@@ -271,7 +271,8 @@ class MarketDataService:
         bars_by_code：调用方已预拉好的 bars（边界/日终分发），避免二次拉桥。
         C4(#28) 三维去重（单 bar 生命周期，跨组合共享）：
           df_cache[(code, period)]   → 同 key 只 query_quote 一次（count 更大时升级重拉）
-          raw_cache[(code,period,formula)] → 同 key 只 compute_injected 一次（TQ 计算最贵）
+          raw_cache[(code,period,formula)] → 同 key 只算一次（TQ 计算最贵）；同组
+          (formula,period) 的多 code 合并成一次 compute_injected_batch（process 只 1 次）
           count 不进 key 的前提：count 是 Formula.formula_count 公式级字段（#27），
           同公式 count 恒定 → 同 (code,period,formula) 的 count 必然相同。
         signal_cache key 仍带 strategy_id（隔离不变，值相同各自存一份）。
@@ -289,6 +290,16 @@ class MarketDataService:
         tq_elapsed = 0.0
         fetch_elapsed = 0.0
         n_inject = 0
+        # 两阶段批量（process 批量化，治 1m 全池 111 只/分钟 ~83s 超节拍）：
+        #   Phase A 按 (formula, period) 收集本根 bar 待算的 {code: 单列 df}，
+        #   Phase B 每组只调一次 compute_injected_batch（N 次 set + 1 次 process，
+        #           而非逐只 2N 次 DLL 往返；喂入每只的数据与逐只路径完全一致），
+        #   Phase C 按 ctx 回填 signal_cache。
+        # 去重：raw_cache 跨组合/本 bar 已算的 key 不再收集；seen_pending 防本次调用内
+        #   （同组合多策略）重复收集。count 是公式级字段，同 (formula,period) 组内恒定。
+        pending: Dict[tuple, Dict[str, dict]] = {}
+        seen_pending: set = set()
+        signal_targets: List[tuple] = []  # (strategy_id, raw_key)
         for ctx in portfolio.strategies:
             formula_name = self._formula_by_strategy.get(ctx.strategy_id)
             if not formula_name:
@@ -306,6 +317,11 @@ class MarketDataService:
                 # 股票池过滤：池外股票不拉公式（多组合共享行情 bar，各策略只算自己池内）
                 if ctx.stock_pool is not None and code not in ctx.stock_pool:
                     continue
+                raw_key = (code, period, formula_name)
+                signal_targets.append((ctx.strategy_id, raw_key))
+                # 三维去重：跨组合已算（raw_cache）或本次已收集（seen_pending）→ 不重复
+                if raw_key in raw_cache or raw_key in seen_pending:
+                    continue
                 _tf = time.perf_counter()
                 try:
                     bars = self._fetch_cached_bars(
@@ -317,22 +333,29 @@ class MarketDataService:
                     logger.warning("quote failed for formula inject %s %s", code, period)
                     continue
                 fetch_elapsed += time.perf_counter() - _tf
-                raw_key = (code, period, formula_name)
-                if raw_key not in raw_cache:
-                    df = self._bars_to_formula_df(bars, code)
-                    raw = None
-                    if df is not None:
-                        _tt = time.perf_counter()
-                        raw = self._tq_formula.compute_injected(
-                            formula_name=formula_name, ohlcv_df=df,
-                            stocks=[code], period=period,
-                        )
-                        tq_elapsed += time.perf_counter() - _tt
-                        n_inject += 1
-                    raw_cache[raw_key] = self._extract_latest_signal(raw, code)
-                outputs = raw_cache[raw_key]
-                if outputs:
-                    self.signal_cache[(ctx.strategy_id, code, bar.bar_time)] = outputs
+                seen_pending.add(raw_key)
+                df = self._bars_to_formula_df(bars, code)
+                if df is None:
+                    # 无有效 bar：空信号占位（免下轮/跨组合重算）
+                    raw_cache[raw_key] = []
+                    continue
+                pending.setdefault((formula_name, period), {})[code] = df
+        # Phase B：每组 (formula, period) 一次批量 process，逐 code 拆结果填 raw_cache。
+        for (formula_name, period), df_by_code in pending.items():
+            _tt = time.perf_counter()
+            raw = self._tq_formula.compute_injected_batch(
+                formula_name=formula_name, ohlcv_by_code=df_by_code, period=period,
+            )
+            tq_elapsed += time.perf_counter() - _tt
+            n_inject += len(df_by_code)
+            for code in df_by_code:
+                raw_cache[(code, period, formula_name)] = \
+                    self._extract_latest_signal(raw, code)
+        # Phase C：回填 signal_cache（含本轮批量算的与 raw_cache 已命中的）。
+        for strategy_id, raw_key in signal_targets:
+            outputs = raw_cache.get(raw_key)
+            if outputs:
+                self.signal_cache[(strategy_id, raw_key[0], bar.bar_time)] = outputs
         if n_inject:
             # 每根 bar 每个有注入的组合一条（1m 每分钟一条）：tq= 为 tqcenter 公式
             # 累计耗时、fetch= 为拉桥累计，据此区分瓶颈在通达信公式还是桥，观察 tq=

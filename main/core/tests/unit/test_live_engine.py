@@ -692,7 +692,7 @@ def test_fill_signal_cache_populates_cache():
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
     # mock compute_injected：返回最后一条 open_sig=1
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0",
         stock: {"open_sig": [
             {"Date": "202608051000", "Value": 0.0},
@@ -729,7 +729,7 @@ def test_fill_signal_cache_logs_inject_timing_summary(caplog):
 
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0",
         stock: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]},
     }
@@ -756,13 +756,13 @@ def test_fill_signal_cache_skips_strategy_without_formula():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_with_formula(disp, factory, {})  # 空：无策略映射
     engine.portfolios = [port]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
     bar = _bar(stock, "9.3", bar_time)
 
     engine._fill_signal_cache(port, bar)
 
     assert engine.signal_cache == {}
-    engine._tq_formula.compute_injected.assert_not_called()
+    engine._tq_formula.compute_injected_batch.assert_not_called()
 
 
 def test_fill_signal_cache_empty_bars_skipped():
@@ -776,12 +776,12 @@ def test_fill_signal_cache_empty_bars_skipped():
     _mock_dispatcher_with_quote(rec, stock, [])  # 空 bars
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
     bar = _bar(stock, "9.3", bar_time)
 
     engine._fill_signal_cache(port, bar)
 
-    engine._tq_formula.compute_injected.assert_not_called()
+    engine._tq_formula.compute_injected_batch.assert_not_called()
     assert engine.signal_cache == {}
 
 
@@ -803,7 +803,7 @@ def test_handle_bar_with_formula_signal_triggers_trade():
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
     # mock compute_injected：最后一条 open_sig=1 → 触发 OPEN
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0",
         stock: {"open_sig": [
             {"Date": "202608051000", "Value": 0.0},
@@ -2017,7 +2017,7 @@ def test_dispatch_period_bar_drives_5m_strategy_only():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
     # mock compute_injected：返回 open_sig=1（无论周期）
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
     }
 
@@ -2047,7 +2047,7 @@ def test_dispatch_period_bar_uses_latest_completed_bar():
     rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
     }
 
@@ -2087,7 +2087,7 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}
     }
     daily_time = datetime(2026, 8, 10, 0, 0)
@@ -2139,10 +2139,11 @@ def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
     captured = {}
 
     def spy(**kw):
-        captured["df"] = kw.get("ohlcv_df")
+        # 批量路径：df 在 ohlcv_by_code[code]（单列 ohlcv_df），逐只喂入与旧路径一致
+        captured["df"] = kw.get("ohlcv_by_code", {}).get(stock)
         return {stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}}
 
-    engine._tq_formula.compute_injected = spy
+    engine._tq_formula.compute_injected_batch = spy
 
     engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
 
@@ -2202,7 +2203,7 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
     daily_time = datetime(2026, 8, 10, 0, 0)
     engine.signal_cache[(1, stock, daily_time)] = [{"name": "open_sig", "value": 1}]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
 
     engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
 
@@ -2210,7 +2211,7 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
     db.close()
-    engine._tq_formula.compute_injected.assert_not_called()  # 1w 不走桥注入
+    engine._tq_formula.compute_injected_batch.assert_not_called()  # 1w 不走桥注入
 
 
 def test_maybe_daily_bars_day_rollover_reinjects_1w():
@@ -2335,7 +2336,7 @@ def _counting_compute(engine, stock, value=1):
             ]},
         }
 
-    engine._tq_formula.compute_injected = _compute
+    engine._tq_formula.compute_injected_batch =_compute
     return calls
 
 
@@ -2395,6 +2396,57 @@ def test_fill_signal_cache_dedups_compute_by_formula():
         assert (sid, stock, bar_time) in engine.signal_cache
 
 
+def test_fill_signal_cache_batches_process_across_stocks():
+    """process 批量化：同公式同周期的多只 code 合并成 1 次 compute_injected_batch。
+
+    旧路径逐 code 调 compute_injected（N 次 set + N 次 process = 2N 次 DLL 往返）；
+    批量后 Phase B 每组 (formula,period) 只调 1 次，ohlcv_by_code 含全部 code，
+    process_mul_zb 在 tqcenter 内批量求值（N set + 1 process）。各 code 信号仍独立填。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1m", strategy_id=1)
+    s1, s2 = "600000.SH", "000001.SZ"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    bars1 = _quote_bars(s1, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    bars2 = _quote_bars(s2, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+
+    def respond(request):
+        if request.url.path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {s1: bars1, s2: bars2}})
+        if request.url.path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MACROSSPRO"})
+
+    calls = {"n": 0, "codes": None}
+
+    def _batch(**kw):
+        calls["n"] += 1
+        calls["codes"] = sorted(kw.get("ohlcv_by_code", {}).keys())
+        return {"ErrorId": "0", **{
+            c: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]} for c in (s1, s2)
+        }}
+
+    engine._tq_formula.compute_injected_batch = _batch
+
+    bar = _bar(s1, "9.3", bar_time)
+    bar.stocks[s2] = {
+        "open": Decimal("9.0"), "high": Decimal("9.3"),
+        "low": Decimal("9.0"), "close": Decimal("9.3"), "volume": 10000,
+    }
+    engine._fill_signal_cache(port, bar)
+
+    assert calls["n"] == 1                  # 同组 (MACROSSPRO,1m) 只批量 process 1 次
+    assert set(calls["codes"]) == {s1, s2}  # 两只 df 都在同一批
+    # 两只信号各自填入（隔离不丢）
+    for code in (s1, s2):
+        out = {o["name"]: o["value"] for o in engine.signal_cache[(1, code, bar_time)]}
+        assert out["open_sig"] == 1
+
+
 def test_fill_signal_cache_uses_formula_count():
     """#27→#28：注入 count 来自 Formula.formula_count（按公式配），非全局 200。"""
     factory, _ = _db_factory()
@@ -2409,7 +2461,7 @@ def test_fill_signal_cache_uses_formula_count():
         disp, factory, port, {1: "MA_CROSS"}, formula_count=200,
         formula_count_by_name={"MA_CROSS": 300},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
     }
     bar = _bar(stock, "9.3", bar_time)
@@ -2435,7 +2487,7 @@ def test_fill_signal_cache_upgrades_quote_count_for_larger_formula():
         disp, factory, port, {1: "FORM_A", 2: "FORM_B"}, formula_count=200,
         formula_count_by_name={"FORM_A": 200, "FORM_B": 500},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
     }
     bar = _bar(stock, "9.3", bar_time)
@@ -2473,10 +2525,10 @@ def test_on_bar_1m_inject_reuses_poller_bars_merge_cache_no_fetch():
 
     received = {}
     def _compute(**kw):
-        df = kw.get("ohlcv_df") or {}
+        df = kw.get("ohlcv_by_code", {}).get(stock) or {}
         received["rows"] = len(df["Close"]) if "Close" in df else 0
         return {"ErrorId": "0", stock: {"open_sig": [{"Date": "202608051002", "Value": 1}]}}
-    engine._tq_formula.compute_injected = _compute
+    engine._tq_formula.compute_injected_batch = _compute
 
     bar = _bar(stock, "9.3", bar_time)
     bar.period = "1m"
@@ -2508,7 +2560,7 @@ def test_dispatch_period_bar_uses_period_max_formula_count():
         disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"}, formula_count=200,
         formula_count_by_name={"MA_CROSS": 400},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "20260805", "Value": 1}]},
     }
 
@@ -2582,7 +2634,7 @@ def test_on_bar_dispatches_boundary_once_for_same_bar_time():
     rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "20260812", "Value": 1}]},
     }
 
@@ -4983,7 +5035,7 @@ def test_maybe_daily_bars_logs_info(caplog):
     ]))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"ErrorId": 0},
     }
     with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):

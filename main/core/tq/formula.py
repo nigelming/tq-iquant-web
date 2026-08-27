@@ -94,6 +94,80 @@ class TQFormula:
             )
             return raw
 
+    def compute_injected_batch(
+        self, formula_name: str, ohlcv_by_code: Dict[str, dict],
+        period: str = "1m", dividend_type: int = 1, formula_arg: str = "",
+    ) -> Optional[dict]:
+        """批量内存注入算公式（实盘逐 bar 链路，1m 全池 N 只/分钟的性能路径）。
+
+        ohlcv_by_code: {code: 单列 ohlcv_df}，每个 ohlcv_df 是
+            {Amount/Volume/Close/Open/High/Low: 单列 DataFrame（列=该 code）}，
+            由 _bars_to_formula_df 逐只构造。
+        链路：**逐只** formula_format_data → **逐只** formula_set_data(dividend_type=0
+            内存注入，各喂自己的 bars，长度/时间戳独立，**不做跨股票时间轴对齐、
+            无矩形 NaN 风险**）→ **一次** formula_process_mul_zb(stock_list=全部成功
+            code, count=-1)。
+        相比逐只 compute_injected（N 次 set + N 次 process = 2N 次 DLL 往返），本方法
+            N 次 set + 1 次 process = N+1 次往返——process 是 tqcenter 主要固定开销，
+            合并后 1m 全池 111 只从 ~222 次往返/分钟降到 ~112 次，把每轮 ~83s 压回
+            60s 节拍内。喂入每只的数据与逐只路径完全一致（同窗口、同 format），
+            process 对 stock_list 批量求值与逐只 process 结果等价。
+        某只 format/set 失败 → 剔除出 stock_list（该只本轮无信号，与逐只返回 None
+            等价），不阻断其余；空输入 / 全部失败 → None。
+        """
+        codes = [c for c, df in ohlcv_by_code.items() if df]
+        if not codes:
+            return None
+        with get_tdx_lock():
+            t0 = time.perf_counter()
+            tq = get_tq()
+            t_fmt = 0.0
+            t_set = 0.0
+            n_bars_max = 0
+            stock_list: List[str] = []
+            for code in codes:
+                tf = time.perf_counter()
+                formatted = tq.formula_format_data(ohlcv_by_code[code])
+                t_fmt += time.perf_counter() - tf
+                stock_data = formatted.get(code) if formatted else None
+                if stock_data is None or len(stock_data) == 0:
+                    continue
+                ts = time.perf_counter()
+                sd = tq.formula_set_data(
+                    stock_code=code, stock_period=period,
+                    stock_data=stock_data, count=len(stock_data),
+                    dividend_type=0,
+                )
+                t_set += time.perf_counter() - ts
+                if not sd or str(sd.get("ErrorId", "1")) != "0":
+                    continue
+                stock_list.append(code)
+                n_bars_max = max(n_bars_max, len(stock_data))
+            if not stock_list:
+                return None
+            tp = time.perf_counter()
+            raw = tq.formula_process_mul_zb(
+                formula_name=formula_name,
+                formula_arg=formula_arg,
+                return_count=-1,
+                return_date=True,
+                xsflag=-1,
+                stock_list=stock_list,
+                stock_period=period,
+                start_time="",
+                end_time="",
+                count=-1,
+                dividend_type=dividend_type,
+            )
+            t_proc = time.perf_counter() - tp
+            logger.debug(
+                "compute_injected_batch formula=%s period=%s ok=%d/%d bars~%d "
+                "fmt=%.3fs set=%.3fs proc=%.3fs total=%.3fs",
+                formula_name, period, len(stock_list), len(codes), n_bars_max,
+                t_fmt, t_set, t_proc, time.perf_counter() - t0,
+            )
+            return raw
+
     def get_formula_list(self, formula_type: int = 0) -> List[dict]:
         tq = get_tq()
         return tq.formula_get_all(formula_type=formula_type) or []

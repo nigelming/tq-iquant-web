@@ -146,6 +146,96 @@ def test_compute_injected_logs_timing_debug(fake_tq, caplog):
         assert token in msg
 
 
+def _single_col_ohlcv(code):
+    """构造单列 ohlcv_df（{字段: 单列 DataFrame，列=code}），模拟 _bars_to_formula_df 输出。"""
+    import pandas as pd
+    from datetime import datetime
+    idx = pd.DatetimeIndex([datetime(2026, 8, 5, 10, i) for i in range(3)])
+    return {
+        "Open": pd.DataFrame({code: [9.0] * 3}, index=idx),
+        "High": pd.DataFrame({code: [9.3] * 3}, index=idx),
+        "Low": pd.DataFrame({code: [9.0] * 3}, index=idx),
+        "Close": pd.DataFrame({code: [9.3] * 3}, index=idx),
+        "Volume": pd.DataFrame({code: [10000] * 3}, index=idx),
+        "Amount": pd.DataFrame({code: [93000.0] * 3}, index=idx),
+    }
+
+
+def test_compute_injected_batch_formats_per_stock_but_processes_once(fake_tq):
+    """批量注入：逐只 format_data+set_data（各喂自己的 bars），process_mul_zb 只调 1 次。
+
+    DLL 往返 N(set)+1(process) 而非逐只的 2N；每只数据独立、不做跨股票时间轴对齐
+    （无矩形 NaN 风险）。这是 1m 全池 111 只/分钟的性能路径。
+    """
+    codes = ["600000.SH", "000001.SZ"]
+
+    def fmt(df):
+        code = df["Open"].columns[0]
+        return {code: [{"Open": 1, "Close": 9.3} for _ in range(3)]}
+
+    fake_tq.formula_format_data.side_effect = fmt
+    fake_tq.formula_set_data.return_value = {"ErrorId": "0"}
+    fake_tq.formula_process_mul_zb.return_value = {
+        "ErrorId": "0",
+        **{c: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]} for c in codes},
+    }
+    ohlcv_by_code = {c: _single_col_ohlcv(c) for c in codes}
+    with patch("core.tq.formula.get_tq", return_value=fake_tq), \
+         patch("core.tq.formula.get_tdx_lock"):
+        formula = TQFormula()
+        raw = formula.compute_injected_batch(
+            formula_name="MACROSSPRO", ohlcv_by_code=ohlcv_by_code, period="1m",
+        )
+
+    assert raw is not None and raw["ErrorId"] == "0"
+    assert fake_tq.formula_format_data.call_count == 2   # 逐只 format
+    assert fake_tq.formula_set_data.call_count == 2       # 逐只 set
+    assert fake_tq.formula_process_mul_zb.call_count == 1  # process 合并 1 次
+    kwargs = fake_tq.formula_process_mul_zb.call_args.kwargs
+    assert kwargs["stock_list"] == codes
+    assert kwargs["count"] == -1
+    assert kwargs["start_time"] == "" and kwargs["end_time"] == ""
+    # set_data 仍是内存注入（dividend_type=0）、各自 period
+    for c in fake_tq.formula_set_data.call_args_list:
+        assert c.kwargs["dividend_type"] == 0
+        assert c.kwargs["stock_period"] == "1m"
+
+
+def test_compute_injected_batch_skips_failed_set_data_stock(fake_tq):
+    """某只 set_data 失败 → 剔除出 stock_list，process 仍对成功 code 调用，raw 不含失败 code。"""
+    codes = ["600000.SH", "000001.SZ"]
+
+    def fmt(df):
+        code = df["Open"].columns[0]
+        return {code: [{"Open": 1} for _ in range(3)]}
+
+    fake_tq.formula_format_data.side_effect = fmt
+    fake_tq.formula_set_data.side_effect = [
+        {"ErrorId": "0"}, {"ErrorId": "1", "Error": "inject fail"},
+    ]
+    fake_tq.formula_process_mul_zb.return_value = {
+        "ErrorId": "0", "600000.SH": {"open_sig": [{"Value": 1.0}]},
+    }
+    ohlcv_by_code = {c: _single_col_ohlcv(c) for c in codes}
+    with patch("core.tq.formula.get_tq", return_value=fake_tq), \
+         patch("core.tq.formula.get_tdx_lock"):
+        formula = TQFormula()
+        raw = formula.compute_injected_batch("MACROSSPRO", ohlcv_by_code, "1m")
+
+    kwargs = fake_tq.formula_process_mul_zb.call_args.kwargs
+    assert kwargs["stock_list"] == ["600000.SH"]  # 失败那只被剔除
+    assert "000001.SZ" not in raw
+
+
+def test_compute_injected_batch_empty_returns_none(fake_tq):
+    """空输入 / 全部失败 → None，不调 process。"""
+    with patch("core.tq.formula.get_tq", return_value=fake_tq), \
+         patch("core.tq.formula.get_tdx_lock"):
+        formula = TQFormula()
+        assert formula.compute_injected_batch("MACROSSPRO", {}, "1m") is None
+    fake_tq.formula_process_mul_zb.assert_not_called()
+
+
 @pytest.mark.parametrize("period", ["1m", "5m", "15m", "30m", "1h", "1d"])
 def test_compute_injected_passes_period_through(fake_tq, period):
     """compute_injected 应把 period 原样透传给 set_data 与 process_mul_zb 的 stock_period。
