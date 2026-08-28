@@ -23,8 +23,10 @@ from sqlalchemy.orm import Session
 from core.models import (
     StockPoolStock, Strategy, Formula, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
+    BacktestDecisionEvent,
 )
 from core.engine.backtest_engine import BacktestEngine
+from core.engine.decision import summarize_decisions
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
 )
@@ -522,6 +524,25 @@ def _persist_result(
             return_stability=sev.get("return_stability"),
         ))
 
+    # ---- 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条，调参可观测性）----
+    for d in result.get("decisions") or []:
+        db.add(BacktestDecisionEvent(
+            backtest_record_id=record_id,
+            gate=d["gate"],
+            layer=d["layer"],
+            action=d["action"],
+            portfolio_id=d.get("portfolio_id"),
+            strategy_id=d.get("strategy_id"),
+            stock_code=d.get("stock_code"),
+            bar_time=d.get("bar_time"),
+            param_name=d.get("param_name"),
+            param_value=d.get("param_value"),
+            actual_value=d.get("actual_value"),
+            requested_qty=d.get("requested_qty"),
+            final_qty=d.get("final_qty"),
+            message=(d.get("message") or "")[:200],
+        ))
+
 
 # ---------------------------------------------------------------------------
 # 序列化
@@ -580,6 +601,43 @@ def _serialize_trade_with_name(t: BacktestTrade, name_map: dict) -> dict:
     d = _serialize_trade(t)
     d["strategy_name"] = name_map.get(t.strategy_id, f"策略{t.strategy_id}")
     return d
+
+
+def _serialize_decision(d: BacktestDecisionEvent) -> dict:
+    """决策闸门事件 → dict（详情页下钻明细）。"""
+    return {
+        "id": d.id,
+        "gate": d.gate,
+        "layer": d.layer,
+        "action": d.action,
+        "portfolio_id": d.portfolio_id,
+        "strategy_id": d.strategy_id,
+        "stock_code": d.stock_code,
+        "bar_time": d.bar_time.isoformat() if d.bar_time else None,
+        "param_name": d.param_name,
+        "param_value": d.param_value,
+        "actual_value": d.actual_value,
+        "requested_qty": d.requested_qty,
+        "final_qty": d.final_qty,
+        "message": d.message,
+    }
+
+
+def _serialize_decision_summary(s: dict) -> dict:
+    """聚合统计行 → dict（bar_time 转 ISO 字符串）。"""
+    return {
+        "gate": s["gate"],
+        "layer": s["layer"],
+        "action": s["action"],
+        "param_name": s["param_name"],
+        "param_value": s["param_value"],
+        "count": s["count"],
+        "first_bar_time": s["first_bar_time"].isoformat() if s.get("first_bar_time") else None,
+        "last_bar_time": s["last_bar_time"].isoformat() if s.get("last_bar_time") else None,
+        "stock_count": s["stock_count"],
+        "requested_qty_sum": s["requested_qty_sum"],
+        "final_qty_sum": s["final_qty_sum"],
+    }
 
 
 def _serialize_evaluation(e: BacktestEvaluation) -> dict:
@@ -674,6 +732,18 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         for sid, curve in curves_by_sid.items()
     ]
 
+    # ---- 决策闸门事件（调参可观测性）：聚合统计 + 原始明细 ----
+    decision_rows = (
+        db.query(BacktestDecisionEvent)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestDecisionEvent.bar_time, BacktestDecisionEvent.id)
+        .all()
+    )
+    # summarize_decisions 吃 ORM 行（getattr 取字段），bar_time 按 datetime 比较
+    decision_summary = [
+        _serialize_decision_summary(s) for s in summarize_decisions(decision_rows)
+    ]
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -681,6 +751,8 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         "evaluations": _serialize_evaluation(evals) if evals else None,
         "strategy_evaluations": strategy_evaluations,
         "strategy_snapshots": strategy_snapshots,
+        "decision_summary": decision_summary,
+        "decisions": [_serialize_decision(d) for d in decision_rows],
     }
 
 
@@ -694,6 +766,7 @@ def delete_record(db: Session, record_id: int) -> bool:
     db.query(BacktestTrade).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).delete()
+    db.query(BacktestDecisionEvent).filter_by(backtest_record_id=record_id).delete()
     db.delete(rec)
     db.commit()
     return True

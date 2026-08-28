@@ -29,12 +29,13 @@ from core.config import load_config
 from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
-    StockPoolStock, Formula, LiveOrder, LiveTrade,
+    StockPoolStock, Formula, LiveOrder, LiveTrade, LiveDecisionEvent,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
+from core.engine.decision import summarize_decisions
 from core.engine.event import TradeEvent
 from core.engine.position import Position
 from core.tq.formula import TQFormula
@@ -549,3 +550,45 @@ def session_positions(db: Session, session_id: int, engine: Optional[LiveEngine]
         .all()
     )
     return aggregate_positions_from_trades(trades)
+
+
+def serialize_decision(d: LiveDecisionEvent) -> dict:
+    """决策闸门事件序列化（实盘/回测同字段口径）。"""
+    return {
+        "id": d.id,
+        "gate": d.gate,
+        "layer": d.layer,
+        "action": d.action,
+        "portfolio_id": d.portfolio_id,
+        "strategy_id": d.strategy_id,
+        "stock_code": d.stock_code,
+        "bar_time": d.bar_time.isoformat() if d.bar_time else None,
+        "param_name": d.param_name,
+        "param_value": d.param_value,
+        "actual_value": d.actual_value,
+        "requested_qty": d.requested_qty,
+        "final_qty": d.final_qty,
+        "message": d.message,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+    }
+
+
+def session_decisions(db: Session, session_id: int) -> Optional[dict]:
+    """决策闸门事件：聚合统计 + 原始事件。session 不存在返回 None。
+
+    summary 复用 summarize_decisions（与回测详情同口径），按 (gate, param_name)
+    分组计数；events 按 bar_time 正序返回（下钻看逐次触发）。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return None
+    rows = (
+        db.query(LiveDecisionEvent)
+        .filter(LiveDecisionEvent.live_session_id == session_id)
+        .order_by(LiveDecisionEvent.bar_time, LiveDecisionEvent.id)
+        .all()
+    )
+    return {
+        "summary": summarize_decisions(rows),
+        "events": [serialize_decision(d) for d in rows],
+    }

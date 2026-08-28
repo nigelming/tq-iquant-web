@@ -61,7 +61,8 @@ from .live.order_machine import (
 )
 from .live.breaker import BreakerService
 from .live.daily_closer import DailyCloser
-from core.models import LiveOrder, LiveTrade
+from .decision import DecisionRecorder
+from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -113,6 +114,11 @@ class LiveEngine:
             code_period_count=code_period_count,
             clock=now_shanghai,
         )
+        # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
+        # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
+        self._recorder = DecisionRecorder()
+        for p in portfolios:
+            p.set_recorder(self._recorder)
         self._poll_interval = poll_interval
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
@@ -120,7 +126,7 @@ class LiveEngine:
         # 实盘执行引擎：复用回测 ExecutionEngine，注入桥 dispatcher + 实盘 T+1 检查
         # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
         self._t1_checker = LiveT1Checker()
-        self._engine = ExecutionEngine(dispatcher, self._t1_checker)
+        self._engine = ExecutionEngine(dispatcher, self._t1_checker, recorder=self._recorder)
 
         # 行情/信号协作者（0010 步骤 2b）：预热/增量 bar 缓存、公式信号注入、周期边界
         # 分发、1w/1mon 通达信注入归 MarketDataService。on_bar 回调注入 self._handle_bar
@@ -242,6 +248,11 @@ class LiveEngine:
     @portfolios.setter
     def portfolios(self, value: List[Portfolio]) -> None:
         self.ctx.portfolios = value
+        # 构造后替换组合列表（测试直连 / recover 重建）也要注入决策采集器
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            for p in value:
+                p.set_recorder(rec)
 
     @property
     def _dispatcher(self) -> HttpBridgeDispatcher:
@@ -680,11 +691,11 @@ class LiveEngine:
         )
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
         orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
-        if not orders:
-            return
+        # db 会话在 on_bar 之后即开：决策闸门事件（熔断 halt/剥 BUY/风险触发）可能在无新单
+        # 时也产生，需随本 bar 落库——故不再 orders 为空就早退，drain 放 finally 收尾。
         db = self._db_session_factory()
         try:
-            for order in orders:
+            for order in (orders or []):
                 ctx = portfolio.find_strategy(order.strategy_id)
                 if ctx is None:
                     continue
@@ -710,6 +721,10 @@ class LiveEngine:
                         order.trade_type.value, order.stock_code, order.signal_name,
                         bt,
                     )
+                    self._rec_live(
+                        "after_close_block", "block", portfolio, order,
+                        message="bar_time %s >= 15:00 收盘后不下单" % bt,
+                    )
                     continue
                 # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
                 # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
@@ -723,6 +738,10 @@ class LiveEngine:
                         "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
                         order.trade_type.value, order.stock_code, order.signal_name,
                         bt, bar.period,
+                    )
+                    self._rec_live(
+                        "non_trading_block", "block", portfolio, order,
+                        message="非交易日/非交易时段 period=%s bar=%s" % (bar.period, bt),
                     )
                     continue
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
@@ -765,6 +784,10 @@ class LiveEngine:
                             op.upper(), order.stock_code, order.signal_name,
                             order.bar_time, dup.id,
                         )
+                        self._rec_live(
+                            "dup_skip", "block", portfolio, order,
+                            message="同 bar 同向单已存在 order=%s" % dup.id,
+                        )
                         continue
                 # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
                 # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
@@ -791,6 +814,10 @@ class LiveEngine:
                         op.upper(), order.stock_code, order.signal_name,
                         order.bar_time, inflight.id, inflight.status,
                     )
+                    self._rec_live(
+                        "inflight_skip", "block", portfolio, order,
+                        message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
+                    )
                     continue
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
                 live_order = self._persist_order_submitted(db, order)
@@ -816,6 +843,10 @@ class LiveEngine:
                     live_order.status = "rejected"
                     live_order.error_message = "bridge unavailable"
                     self._bridge_online = False
+                    self._rec_live(
+                        "bridge_unavailable", "reject", portfolio, order,
+                        message="桥离线（dispatcher 不可达）",
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -831,6 +862,10 @@ class LiveEngine:
                     # （此前被吞成笼统 "approval failed"，真机查不了原因）。
                     live_order.status = "rejected"
                     live_order.error_message = str(e)
+                    self._rec_live(
+                        "bridge_rejected", "reject", portfolio, order,
+                        message="桥业务拒单: %s" % str(e),
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -846,6 +881,10 @@ class LiveEngine:
                     # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
                     live_order.status = "rejected"
                     live_order.error_message = "approval failed"
+                    self._rec_live(
+                        "approval_failed", "reject", portfolio, order,
+                        message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -870,11 +909,73 @@ class LiveEngine:
                     order.signal_name, live_order.quantity, live_order.price,
                     order.bar_time, self.session_id,
                 )
+            # 决策闸门事件随本 bar 统一落库 + SSE 推送（含 orders 为空时的 halt/strip 事件）。
+            self._drain_decisions(db, portfolio)
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
+
+    def _rec_live(
+        self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,
+        message: Optional[str] = None,
+    ) -> None:
+        """记录一条实盘专属闸门事件（收盘/日历/去重/在途/桥拒单）。"""
+        self._recorder.record(
+            gate=gate, layer="live_gate", action=action,
+            portfolio_id=portfolio.portfolio_id,
+            strategy_id=order.strategy_id,
+            stock_code=order.stock_code,
+            bar_time=order.bar_time,
+            message=message,
+        )
+
+    def _drain_decisions(self, db, portfolio: Portfolio) -> None:
+        """把本 bar 缓冲的决策闸门事件落 LiveDecisionEvent + 推 SSE，一次 commit。
+
+        失败不影响交易主链路（仅观测）：回滚本批事件行、记异常，不抛出。
+        """
+        events = self._recorder.drain()
+        if not events:
+            return
+        try:
+            for ev in events:
+                db.add(LiveDecisionEvent(
+                    live_session_id=self.session_id,
+                    gate=ev.gate,
+                    layer=ev.layer,
+                    action=ev.action,
+                    portfolio_id=ev.portfolio_id,
+                    strategy_id=ev.strategy_id,
+                    stock_code=ev.stock_code,
+                    bar_time=ev.bar_time,
+                    param_name=ev.param_name,
+                    param_value=ev.param_value,
+                    actual_value=ev.actual_value,
+                    requested_qty=ev.requested_qty,
+                    final_qty=ev.final_qty,
+                    message=(ev.message or "")[:200],
+                ))
+                self._emit("decision", {
+                    "portfolio_id": ev.portfolio_id,
+                    "strategy_id": ev.strategy_id,
+                    "stock_code": ev.stock_code,
+                    "gate": ev.gate,
+                    "layer": ev.layer,
+                    "action": ev.action,
+                    "param_name": ev.param_name,
+                    "param_value": ev.param_value,
+                    "actual_value": ev.actual_value,
+                    "requested_qty": ev.requested_qty,
+                    "final_qty": ev.final_qty,
+                    "message": ev.message,
+                    "bar_time": ev.bar_time.isoformat() if ev.bar_time else None,
+                })
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("drain decision events failed (session %s)", self.session_id)
 
     def _persist_breaker_count(
         self, portfolio: Portfolio, total_value: Decimal = None

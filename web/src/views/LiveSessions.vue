@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, TRADE_TYPE_LABEL, ORDER_STATUS_LABEL, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, TRADE_TYPE_LABEL, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, type LiveEvent } from '../utils/liveEvents'
 import {
   orderEventToRow, orderHistoryToRows,
   tradeEventToRow, tradeHistoryToRows,
   upsertPositionRows, positionHistoryToRows, prependCapped,
-  type OrderRow, type TradeRow, type PositionRow,
+  decisionEventToRow, decisionHistoryToRows,
+  type OrderRow, type TradeRow, type PositionRow, type DecisionRow,
 } from '../utils/liveWorkbench'
 import {
-  getLiveOrders, getLiveTrades, getLivePositions, getPortfolios,
+  getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker,
-  type PortfolioItem, type LiveSessionItem,
+  type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
 } from '../api'
 
 const sessions = ref<LiveSessionItem[]>([])
@@ -45,15 +46,36 @@ const events = ref<LiveEvent[]>([])
 const connState = ref<'closed' | 'connecting' | 'open'>('closed')
 const connLabel: Record<string, string> = { closed: '未连接', connecting: '连接中', open: '已连接' }
 let es: EventSource | null = null
-const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk'] as const
+const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk', 'decision'] as const
 const LOG_CAP = 200
 
-// ---- B4b: 工作台（持仓/委托/成交）----
+// ---- B4b: 工作台（持仓/委托/成交/决策拦截）----
 const positions = ref<PositionRow[]>([])
 const orders = ref<OrderRow[]>([])
 const trades = ref<TradeRow[]>([])
-const wbTab = ref<'positions' | 'orders' | 'trades'>('positions')
-const TAB_LABEL: Record<'positions' | 'orders' | 'trades', string> = { positions: '持仓', orders: '委托', trades: '成交' }
+const decisions = ref<DecisionRow[]>([])
+const decisionSummary = ref<DecisionSummaryItem[]>([])
+type WbTab = 'positions' | 'orders' | 'trades' | 'decisions'
+const wbTab = ref<WbTab>('positions')
+const TAB_LABEL: Record<WbTab, string> = { positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截' }
+
+// 决策闸门阈值/实际：比率（0<|v|<1）转百分比，数量原样。
+function fmtGateVal(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '—'
+  if (n !== 0 && Math.abs(n) < 1) return `${(n * 100).toFixed(2)}%`
+  return String(Math.round(n * 10000) / 10000)
+}
+function qtyPair(req: number | null | undefined, fin: number | null | undefined): string {
+  if (req === null || req === undefined) return '—'
+  if (fin === null || fin === undefined) return `${req}（全拦）`
+  if (Number(fin) === Number(req)) return `${req}`
+  if (Number(fin) === 0) return `${req}（全拦）`
+  return `${req} → ${fin}`
+}
+const layerLabel = (l: string) => LAYER_LABEL[l] || l || '—'
+const actionLabel = (a: string) => ACTION_LABEL[a] || a || '—'
 
 const nowTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false })
 
@@ -73,16 +95,21 @@ function applyToWorkbench(type: string, data: Record<string, unknown>, time: str
   if (type === 'position') positions.value = upsertPositionRows(positions.value, data)
   else if (type === 'order') orders.value = prependCapped(orders.value, orderEventToRow(data, time))
   else if (type === 'trade') trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
+  else if (type === 'decision') decisions.value = prependCapped(decisions.value, decisionEventToRow(data, time), 500)
 }
 
 async function loadHistory(id: number) {
   try {
-    const [pos, ord, trd] = await Promise.all([
+    const [pos, ord, trd, dec] = await Promise.all([
       getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
+      getLiveDecisions(id).catch(() => null),
     ])
     positions.value = positionHistoryToRows(pos)
     orders.value = orderHistoryToRows(ord)
     trades.value = tradeHistoryToRows(trd)
+    // 决策历史：聚合统计 + 逐事件（旧库/迁移未应用时端点 404 → 兜底空）
+    decisionSummary.value = dec?.summary ?? []
+    decisions.value = dec ? decisionHistoryToRows(dec.events) : []
   } catch {
     // 会话已删除等 → 保持现状
   }
@@ -265,6 +292,52 @@ onUnmounted(closeEventStream)
       </table>
       <div v-if="trades.length === 0" class="empty-state"><p>暂无成交</p></div>
     </div>
+
+    <!-- 决策/拦截（调参可观测性：闸门触发聚合 + 逐事件流） -->
+    <div v-if="wbTab === 'decisions'" class="table-wrap">
+      <!-- 聚合统计 -->
+      <table v-if="decisionSummary.length > 0" style="margin-bottom:14px">
+        <thead><tr>
+          <th>闸门</th><th>层</th><th>动作</th><th>参数</th><th>阈值</th>
+          <th>次数</th><th>首次</th><th>末次</th><th>股票数</th><th>请求/实发</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="(s, i) in [...decisionSummary].sort((a,b) => b.count - a.count)" :key="s.gate + (s.param_name || '') + i">
+            <td>{{ gateLabel(s.gate) }} <span class="gate-code">{{ s.gate }}</span></td>
+            <td>{{ layerLabel(s.layer) }}</td>
+            <td>{{ actionLabel(s.action) }}</td>
+            <td style="color:#667eea;font-family:monospace">{{ s.param_name || '—' }}</td>
+            <td>{{ fmtGateVal(s.param_value) }}</td>
+            <td style="text-align:right;font-weight:700;color:#ef4444">{{ s.count }}</td>
+            <td style="color:#888;font-size:11px">{{ s.first_bar_time ? s.first_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
+            <td style="color:#888;font-size:11px">{{ s.last_bar_time ? s.last_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
+            <td style="text-align:right">{{ s.stock_count }}</td>
+            <td style="text-align:right">{{ qtyPair(s.requested_qty_sum, s.final_qty_sum) }}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- 逐事件流 -->
+      <table>
+        <thead><tr><th>时间</th><th>闸门</th><th>层</th><th>代码</th><th>策略</th><th>阈值</th><th>实际</th><th>请求/实发</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr v-for="d in decisions" :key="d.key">
+            <td style="color:#888">{{ d.time }}</td>
+            <td><span class="badge badge-purple">{{ gateLabel(d.gate) }}</span></td>
+            <td style="color:#888;font-size:11px">{{ layerLabel(d.layer) }}</td>
+            <td>{{ d.stock_code || '—' }}</td>
+            <td>{{ d.strategy_id ? `#${d.strategy_id}` : '组合' }}</td>
+            <td>{{ fmtGateVal(d.param_value) }}</td>
+            <td>{{ fmtGateVal(d.actual_value) }}</td>
+            <td style="text-align:right">{{ qtyPair(d.requested_qty, d.final_qty) }}</td>
+            <td style="color:#555;white-space:normal;min-width:160px">{{ d.message || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="decisions.length === 0" class="empty-state">
+        <p>暂无闸门拦截/触发记录。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
+      </div>
+    </div>
   </div>
 
   <!-- B4a: 实时事件日志 -->
@@ -347,5 +420,14 @@ onUnmounted(closeEventStream)
 .portfolio-chip {
   display: inline-block;
   margin-right: 6px;
+}
+.gate-code {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: #f0f1f3;
+  color: #999;
+  font-size: 11px;
+  font-weight: 400;
 }
 </style>

@@ -27,6 +27,7 @@ from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, BacktestRecord,
     BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
+    BacktestDecisionEvent,
 )
 from core.services import backtest_service as svc
 
@@ -300,6 +301,91 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     assert db_session.query(BacktestTrade).filter_by(backtest_record_id=rid).count() == 0
     assert db_session.query(BacktestDailySnapshot).filter_by(backtest_record_id=rid).count() == 0
     assert db_session.query(BacktestEvaluation).filter_by(backtest_record_id=rid).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# 决策闸门事件：持久化 + 详情聚合 + 级联删除
+# ---------------------------------------------------------------------------
+def _fake_decisions(strat_id):
+    """result["decisions"] 形态：engine.run 产出的 to_dict() 列表。"""
+    base = {"portfolio_id": 1, "strategy_id": strat_id}
+    return [
+        {**base, "gate": "stop_loss", "layer": "strategy_risk", "action": "trigger",
+         "stock_code": "000001.SZ", "bar_time": datetime(2026, 7, 30),
+         "param_name": "stop_loss_ratio", "param_value": 0.05, "actual_value": 0.06,
+         "requested_qty": None, "final_qty": None, "message": "止损触发"},
+        {**base, "gate": "stop_loss", "layer": "strategy_risk", "action": "trigger",
+         "stock_code": "000002.SZ", "bar_time": datetime(2026, 7, 31),
+         "param_name": "stop_loss_ratio", "param_value": 0.05, "actual_value": 0.07,
+         "requested_qty": None, "final_qty": None, "message": "止损触发"},
+        {**base, "gate": "insufficient_funds", "layer": "capital_gate", "action": "reject",
+         "stock_code": "000003.SZ", "bar_time": datetime(2026, 7, 30),
+         "param_name": "cash", "param_value": None, "actual_value": 500.0,
+         "requested_qty": 1000, "final_qty": 0, "message": "资金不足拒单"},
+    ]
+
+
+def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch):
+    """result["decisions"] 逐行落 backtest_decision_events；详情带聚合统计 + 明细。"""
+    ps, strat_id = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    fake_result = {
+        "trades": [], "snapshots": [], "evaluations": {},
+        "strategy_snapshots": {}, "strategy_evaluations": {},
+        "decisions": _fake_decisions(strat_id),
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+    rid = svc.run_backtest(db_session, ps, _req())["record_id"]
+
+    # 落库 3 行
+    assert db_session.query(BacktestDecisionEvent).filter_by(
+        backtest_record_id=rid).count() == 3
+
+    detail = svc.get_record_detail(db_session, rid)
+    # 聚合：stop_loss×2 + insufficient_funds×1，按 count 降序
+    summary = detail["decision_summary"]
+    assert len(summary) == 2
+    assert summary[0]["gate"] == "stop_loss" and summary[0]["count"] == 2
+    assert summary[0]["stock_count"] == 2  # 000001/000002 两只
+    assert summary[0]["param_name"] == "stop_loss_ratio"
+    assert summary[0]["param_value"] == 0.05
+    assert summary[1]["gate"] == "insufficient_funds" and summary[1]["count"] == 1
+    assert summary[1]["requested_qty_sum"] == 1000
+    assert summary[1]["final_qty_sum"] == 0
+    # 时间范围（ISO 字符串）
+    assert summary[0]["first_bar_time"].startswith("2026-07-30")
+    assert summary[0]["last_bar_time"].startswith("2026-07-31")
+    # 原始明细：按 bar_time 排序，字段齐全
+    decisions = detail["decisions"]
+    assert len(decisions) == 3
+    assert decisions[0]["bar_time"].startswith("2026-07-30")
+    assert {d["gate"] for d in decisions} == {"stop_loss", "insufficient_funds"}
+    assert decisions[0]["message"]  # 人读原因透传
+
+
+def test_delete_record_cascades_decisions(db_session, monkeypatch):
+    """删除回测记录时 decision 事件一并清空。"""
+    ps, strat_id = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    fake_result = {
+        "trades": [], "snapshots": [], "evaluations": {},
+        "strategy_snapshots": {}, "strategy_evaluations": {},
+        "decisions": _fake_decisions(strat_id),
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+    rid = svc.run_backtest(db_session, ps, _req())["record_id"]
+    assert db_session.query(BacktestDecisionEvent).filter_by(
+        backtest_record_id=rid).count() == 3
+
+    assert svc.delete_record(db_session, rid) is True
+    assert db_session.query(BacktestDecisionEvent).filter_by(
+        backtest_record_id=rid).count() == 0
 
 
 def test_list_records_returns_newest_first(db_session, monkeypatch):

@@ -7,8 +7,9 @@ import {
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
-  BacktestEvaluationItem,
+  BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
 } from '../api'
+import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
 // ===== 列表 =====
 const records = ref<BacktestRecordItem[]>([])
@@ -114,6 +115,7 @@ async function openDetail(id: number) {
   }
   currentRecord.value = detail.value?.record || null
   currentPage.value = 1
+  selectedKey.value = null
   // 等 DOM 渲染后初始化图表
   await nextTick()
   initCharts()
@@ -283,6 +285,49 @@ const paginatedTrades = computed(() => {
   const trades = detail.value?.trades || []
   const start = (currentPage.value - 1) * pageSize
   return trades.slice(start, start + pageSize)
+})
+
+// ===== 风控与拦截统计（决策闸门，调参可观测性）=====
+// 闸门阈值/实际值：比率类（0<|v|<1）转百分比，数量类（max_positions 等）原样显示。
+function fmtGateVal(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '—'
+  if (n !== 0 && Math.abs(n) < 1) return `${(n * 100).toFixed(2)}%`
+  return String(Math.round(n * 10000) / 10000)
+}
+// 请求/实发量对：相等表示未拦截；final=0 整单被拦；否则缩量。
+function qtyPair(req: number | null | undefined, fin: number | null | undefined): string {
+  if (req === null || req === undefined) return '—'
+  if (fin === null || fin === undefined) return `${req}（全拦）`
+  if (Number(fin) === Number(req)) return `${req}`
+  if (Number(fin) === 0) return `${req}（全拦）`
+  return `${req} → ${fin}`
+}
+function fmtBarTime(t: string | null | undefined): string {
+  return t ? t.replace('T', ' ').slice(0, 16) : '—'
+}
+function layerLabel(l: string): string { return LAYER_LABEL[l] || l || '—' }
+function actionLabel(a: string): string { return ACTION_LABEL[a] || a || '—' }
+
+// 聚合表按触发次数降序，高频闸门（最该调的参数）排最前。
+const decisionSummary = computed<DecisionSummaryItem[]>(() =>
+  [...(detail.value?.decision_summary || [])].sort((a, b) => b.count - a.count))
+
+// 下钻：点选某行（gate + param_name 唯一）展开该闸门逐事件明细。
+const selectedKey = ref<string | null>(null)
+function gateKey(s: DecisionSummaryItem): string { return `${s.gate}::${s.param_name || ''}` }
+function toggleGate(s: DecisionSummaryItem) {
+  const k = gateKey(s)
+  selectedKey.value = selectedKey.value === k ? null : k
+}
+const selectedSummary = computed<DecisionSummaryItem | null>(() =>
+  decisionSummary.value.find((s) => gateKey(s) === selectedKey.value) || null)
+const selectedEvents = computed<DecisionEventItem[]>(() => {
+  const sel = selectedSummary.value
+  if (!sel) return []
+  return (detail.value?.decisions || []).filter(
+    (e) => e.gate === sel.gate && (e.param_name || '') === (sel.param_name || ''))
 })
 
 // ===== echarts 初始化 =====
@@ -526,6 +571,73 @@ onUnmounted(() => {
       <div ref="drawdownChartEl" class="chart-container"></div>
     </div>
 
+    <!-- 风控与拦截统计（调参可观测性：信号→成交链路上每个闸门触发/拦截了多少次） -->
+    <div class="section-title">
+      风控与拦截统计
+      <span class="title-hint">点行展开该闸门逐笔明细 · 按触发次数降序</span>
+    </div>
+    <div v-if="decisionSummary.length === 0" class="table-container">
+      <div class="empty-state"><p>本次回测无闸门拦截/触发记录</p></div>
+    </div>
+    <template v-else>
+      <div class="table-container">
+        <table class="decision-table">
+          <thead>
+            <tr>
+              <th>闸门</th><th>层</th><th>动作</th><th>参数</th><th>阈值</th>
+              <th>触发次数</th><th>首次</th><th>末次</th><th>涉及股票</th><th>请求/实发(股)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in decisionSummary" :key="gateKey(s)"
+                class="decision-row" :class="{ active: gateKey(s) === selectedKey }"
+                @click="toggleGate(s)">
+              <td>
+                {{ gateLabel(s.gate) }}
+                <span class="gate-code">{{ s.gate }}</span>
+              </td>
+              <td>{{ layerLabel(s.layer) }}</td>
+              <td>{{ actionLabel(s.action) }}</td>
+              <td class="param-name">{{ s.param_name || '—' }}</td>
+              <td>{{ fmtGateVal(s.param_value) }}</td>
+              <td class="num strong">{{ s.count }}</td>
+              <td class="time">{{ fmtBarTime(s.first_bar_time) }}</td>
+              <td class="time">{{ fmtBarTime(s.last_bar_time) }}</td>
+              <td class="num">{{ s.stock_count }}</td>
+              <td class="num">{{ qtyPair(s.requested_qty_sum, s.final_qty_sum) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 下钻：选中闸门的逐笔事件 -->
+      <div v-if="selectedSummary" class="table-container drill-box">
+        <div class="drill-head">
+          「{{ gateLabel(selectedSummary.gate) }}」明细 · 共 {{ selectedEvents.length }} 条
+          <span class="drill-close" @click="selectedKey = null">收起 ✕</span>
+        </div>
+        <table class="trade-table">
+          <thead>
+            <tr>
+              <th>时间</th><th>策略</th><th>代码</th><th>阈值</th><th>实际</th>
+              <th>请求/实发</th><th>原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in selectedEvents" :key="e.id">
+              <td class="time">{{ fmtBarTime(e.bar_time) }}</td>
+              <td>{{ e.strategy_id ? `#${e.strategy_id}` : '组合' }}</td>
+              <td>{{ e.stock_code || '—' }}</td>
+              <td>{{ fmtGateVal(e.param_value) }}</td>
+              <td>{{ fmtGateVal(e.actual_value) }}</td>
+              <td class="num">{{ qtyPair(e.requested_qty, e.final_qty) }}</td>
+              <td class="msg">{{ e.message || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
     <!-- 交易明细 -->
     <div class="section-title">交易明细</div>
     <div class="table-container">
@@ -753,6 +865,64 @@ onUnmounted(() => {
   background: #f0f1f3;
   color: #666;
 }
+
+/* 风控与拦截统计 */
+.title-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: #9ca3af;
+  margin-left: 6px;
+}
+.decision-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.decision-table th {
+  padding: 10px 12px;
+  text-align: left;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.decision-table td {
+  padding: 9px 12px;
+  border-bottom: 1px solid #e9ecef;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.decision-row { cursor: pointer; }
+.decision-row:hover { background: #eef2ff; }
+.decision-row.active { background: #e0e7ff; }
+.decision-row.active td { font-weight: 600; }
+.gate-code {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: #f0f1f3;
+  color: #999;
+  font-size: 11px;
+  font-weight: 400;
+}
+.param-name { color: #667eea; font-family: monospace; }
+.decision-table .num, .trade-table .num { text-align: right; }
+.strong { font-weight: 700; color: #ef4444; }
+.decision-table .time, .trade-table .time { color: #888; font-size: 11px; }
+.trade-table .msg { white-space: normal; color: #555; min-width: 180px; }
+.drill-box { margin-top: 12px; border: 2px solid #667eea; }
+.drill-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: #4338ca;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.drill-close { cursor: pointer; color: #9ca3af; font-weight: 400; font-size: 12px; }
+.drill-close:hover { color: #ef4444; }
 
 /* 分页 */
 .pagination {

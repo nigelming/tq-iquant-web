@@ -102,6 +102,45 @@ def test_run_minimal_buy_then_stop_loss():
     assert port.account.cash < Decimal("100000")  # 亏损，现金减少
 
 
+def test_run_collects_decision_events():
+    """run 内建 DecisionRecorder 并注入组合/执行引擎：止损触发事件随 result['decisions'] 返回。
+
+    复用 test_run_minimal_buy_then_stop_loss 的行情：bar2 close=9.0 亏损 11.8% > 5%
+    → 记录一条 stop_loss(strategy_risk/trigger) 闸门事件，字段带策略/股票/阈值/实际。
+    """
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"), Decimal("9.0"), 1000),
+        (datetime(2026, 7, 31), Decimal("9.0"), Decimal("9.2"), Decimal("8.8"), Decimal("9.1"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    }
+    open_prices = {
+        stock: {
+            datetime(2026, 7, 30): Decimal("10.2"),
+            datetime(2026, 7, 31): Decimal("9.0"),
+        }
+    }
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+
+    decisions = result["decisions"]
+    stop = [d for d in decisions if d["gate"] == "stop_loss"]
+    assert len(stop) == 1
+    ev = stop[0]
+    assert ev["layer"] == "strategy_risk" and ev["action"] == "trigger"
+    assert ev["strategy_id"] == 1 and ev["stock_code"] == stock
+    assert ev["param_name"] == "stop_loss_ratio" and ev["param_value"] == 0.05
+    assert ev["actual_value"] is not None and ev["actual_value"] >= 0.05
+    # run 结束后 recorder 已 drain 干净（结果事件即全量）
+    assert isinstance(decisions, list) and len(decisions) >= 1
+
+
 def test_run_no_signal_no_trade():
     """无信号触发 → 0 笔 trades，快照数 = bar 数。"""
     stock = "000001.SZ"

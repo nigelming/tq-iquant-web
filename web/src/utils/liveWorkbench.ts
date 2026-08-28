@@ -5,7 +5,7 @@
  * 纯函数便于单元测试;key 用负 id 表示历史行(稳定),SSE 事件行用正自增 id。
  */
 import { nextEventId } from './liveEvents'
-import type { LiveOrderItem, LiveTradeItem, LivePositionItem } from '../api'
+import type { LiveOrderItem, LiveTradeItem, LivePositionItem, DecisionEventItem } from '../api'
 
 export interface OrderRow {
   key: number
@@ -35,6 +35,23 @@ export interface PositionRow {
   quantity: number
   avg_cost: number
   market_value: number
+}
+
+/** 决策闸门事件行（调参可观测性）。 */
+export interface DecisionRow {
+  key: number
+  time: string
+  gate: string
+  layer: string
+  action: string
+  stock_code: string
+  strategy_id: number | null
+  param_name: string | null
+  param_value: number | null
+  actual_value: number | null
+  requested_qty: number | null
+  final_qty: number | null
+  message: string
 }
 
 type Ev = Record<string, unknown>
@@ -128,7 +145,45 @@ export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] 
   }))
 }
 
-/** 头部插入 + 封顶（订单/成交表）。 */
+/** SSE decision 事件 → 决策闸门行（key 正自增）。 */
+export function decisionEventToRow(ev: Ev, liveTime = ''): DecisionRow {
+  return {
+    key: nextEventId(),
+    time: liveTime || shortTime(ev.bar_time as string | undefined),
+    gate: (ev.gate as string) || '',
+    layer: (ev.layer as string) || '',
+    action: (ev.action as string) || '',
+    stock_code: (ev.stock_code as string) || '',
+    strategy_id: (ev.strategy_id as number) ?? null,
+    param_name: (ev.param_name as string) ?? null,
+    param_value: (ev.param_value as number) ?? null,
+    actual_value: (ev.actual_value as number) ?? null,
+    requested_qty: (ev.requested_qty as number) ?? null,
+    final_qty: (ev.final_qty as number) ?? null,
+    message: (ev.message as string) || '',
+  }
+}
+
+/** 决策历史 → 行（key=-id，稳定）；历史按 bar_time 升序返回，前端展示倒序（最新在上）。 */
+export function decisionHistoryToRows(items: DecisionEventItem[]): DecisionRow[] {
+  return items.map((i) => ({
+    key: -(i.id ?? 0),
+    time: shortTime(i.bar_time || undefined) || shortTime(i.created_at || undefined),
+    gate: i.gate,
+    layer: i.layer,
+    action: i.action,
+    stock_code: i.stock_code || '',
+    strategy_id: i.strategy_id ?? null,
+    param_name: i.param_name ?? null,
+    param_value: i.param_value ?? null,
+    actual_value: i.actual_value ?? null,
+    requested_qty: i.requested_qty ?? null,
+    final_qty: i.final_qty ?? null,
+    message: i.message || '',
+  })).reverse()
+}
+
+/** 头部插入 + 封顶（订单/成交/决策表）。 */
 export function prependCapped<T>(list: T[], row: T, cap = 200): T[] {
   return [row, ...list].slice(0, cap)
 }

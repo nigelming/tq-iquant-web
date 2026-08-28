@@ -27,7 +27,9 @@ from core.engine.portfolio import Portfolio
 from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
-from core.models import Base, LiveOrder, LiveTrade, LiveSessionPortfolio
+from core.models import (
+    Base, LiveOrder, LiveTrade, LiveSessionPortfolio, LiveDecisionEvent,
+)
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -3365,7 +3367,10 @@ def test_handle_bar_bridge_reject_emits_order_rejected():
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert events[2]["order_id"] == events[1]["order_id"]
     assert "error_message" in events[2]
-    assert q.empty()
+    # 决策闸门事件（调参可观测性）：桥离线拒单记 bridge_unavailable
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_unavailable"
 
 
 def test_handle_bar_bridge_business_reject_surfaces_error():
@@ -3405,7 +3410,10 @@ def test_handle_bar_bridge_business_reject_surfaces_error():
     assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert events[2]["error_message"] == "volume 33900 exceeds max 100000"
-    assert q.empty()
+    # 决策闸门事件：桥业务拒单记 bridge_rejected
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_rejected"
 
 
 def test_handle_bar_emits_risk_on_max_drawdown_trigger():
@@ -3437,7 +3445,10 @@ def test_handle_bar_emits_risk_on_max_drawdown_trigger():
     assert ev["triggered"] is True
     assert ev["count"] == 1
     assert ev["portfolio_id"] == 1
-    assert q.empty()  # 计数未再变不重发
+    # 决策闸门事件：max_drawdown 熔断 halt 随本 bar drain 推一条 decision
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "max_drawdown" and extra[0]["action"] == "halt"
 
 
 def test_backfill_emits_order_filled_trade_position():
@@ -4307,7 +4318,10 @@ def test_handle_bar_bridge_dropped_order_marks_rejected_immediately():
     # 即时 rejected（不等 180s 超时），error 回显桥侧到达确认失败原因
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert "no order record" in events[2]["error_message"]
-    assert q.empty()
+    # 决策闸门事件：桥受理即丢弃走 BridgeOrderRejected → bridge_rejected
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_rejected"
     # DB 落库：submitted 后即 rejected，无残留 pending
     db = factory()
     lo = db.query(LiveOrder).filter(LiveOrder.status == "rejected").first()
@@ -5232,3 +5246,168 @@ def test_recover_restores_manual_breaker_logs_warning(caplog):
     msgs = _log_msgs(caplog)
     assert port.risk_manager.manual_recovery is True
     assert any("重启读回" in m and "3 次" in m and "手动" in m for m in msgs), msgs
+
+
+# ---------------- 决策闸门事件落库 + SSE（调参可观测性，#163）----------------
+def _decision_rows(factory):
+    db = factory()
+    rows = db.query(LiveDecisionEvent).order_by(LiveDecisionEvent.id).all()
+    db.close()
+    return rows
+
+
+def _drain_queue(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+def test_handle_bar_after_close_records_decision_event():
+    """收盘后拦单 → after_close_block(live_gate/block) 落 LiveDecisionEvent + SSE decision。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)  # 收盘后
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    rows = _decision_rows(factory)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.gate == "after_close_block"
+    assert ev.layer == "live_gate"
+    assert ev.action == "block"
+    assert ev.portfolio_id == 1
+    assert ev.strategy_id == 1
+    assert ev.stock_code == stock
+    assert ev.bar_time == bar_time
+    # SSE：signal + decision，无 order
+    queued = _drain_queue(q)
+    dec = [e for e in queued if e.get("type") == "decision"]
+    assert len(dec) == 1
+    assert dec[0]["gate"] == "after_close_block"
+    assert dec[0]["layer"] == "live_gate"
+    assert not any(e.get("type") == "order" for e in queued)
+    # 无 LiveOrder 落库（拦单不下单）
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_handle_bar_dup_skip_records_decision_event():
+    """同 bar 同向重驱 → 第二根记 dup_skip(block) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)  # 首根正常落 submitted
+    engine._handle_bar(port, bar)  # 同 bar 重驱 → dup
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["dup_skip"]
+    dup = _decision_rows(factory)[0]
+    assert dup.layer == "live_gate" and dup.action == "block"
+    assert dup.stock_code == stock and dup.bar_time == bar_time
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "dup_skip" for e in queued)
+
+
+def test_handle_bar_inflight_skip_records_decision_event():
+    """同向在途单未确认 → 下一根记 inflight_skip(block) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    t1 = datetime(2026, 8, 5, 10, 0)
+    t2 = datetime(2026, 8, 5, 10, 5)
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {
+        (1, stock, t1): [{"name": "open_sig", "value": 1}],
+        (1, stock, t2): [{"name": "open_sig", "value": 1}],
+    }
+
+    engine._handle_bar(port, _bar(stock, "9.0", t1))  # 首根 submitted 在途
+    engine._handle_bar(port, _bar(stock, "9.0", t2))  # 不同 bar → 过 dup，撞 inflight
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["inflight_skip"]
+    ev = _decision_rows(factory)[0]
+    assert ev.layer == "live_gate" and ev.action == "block"
+    assert ev.stock_code == stock and ev.bar_time == t2
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "inflight_skip" for e in queued)
+
+
+def test_handle_bar_bridge_unavailable_records_decision_event():
+    """桥离线（/order 连接被拒）→ bridge_unavailable(reject) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder(fail_paths={"/order"})
+    disp, _ = _make_dispatcher(rec, fail_paths={"/order"})
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["bridge_unavailable"]
+    ev = _decision_rows(factory)[0]
+    assert ev.layer == "live_gate" and ev.action == "reject"
+    assert ev.stock_code == stock
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "bridge_unavailable"
+               for e in queued)
+    # 订单标 rejected
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "rejected"
+    db.close()
+
+
+def test_handle_bar_no_orders_still_drains_halt_strip_event():
+    """早退路径（orders 为空）也要 drain：熔断剥 BUY 记 halted_buy_strip 落库。
+
+    熔断期 BUY 信号被 on_bar 剥掉（返回空 orders），但 halted_buy_strip 事件已记录；
+    重构后 db 会话在 orders 判定前打开、drain 放循环后，空 orders 也落库。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    # 强置日内亏损暂停（on_bar_update 只调 update_peak，不碰 daily_pause，态保持）
+    port.risk_manager.daily_pause_active = True
+    port.risk_manager.daily_loss_trigger_date = bar_time.date()
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    rows = _decision_rows(factory)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.gate == "halted_buy_strip"
+    assert ev.layer == "portfolio_risk" and ev.action == "strip"
+    assert ev.param_name == "daily_loss_limit"
+    assert ev.stock_code == stock and ev.bar_time == bar_time
+    # 熔断期不下单
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "halted_buy_strip"
+               for e in queued)

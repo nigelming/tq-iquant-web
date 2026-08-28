@@ -7,6 +7,7 @@ from .position import Position
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
+from .decision import DecisionRecorder
 
 
 class BacktestEngine:
@@ -28,6 +29,10 @@ class BacktestEngine:
         signal_cache = signal_cache if signal_cache is not None else {}
         open_prices = open_prices or {}
 
+        # 决策闸门采集（调参可观测性）：注入组合与执行引擎，run 结束随结果返回
+        recorder = DecisionRecorder()
+        portfolio.set_recorder(recorder)
+
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         pending_orders: List[OrderEvent] = []
@@ -43,7 +48,7 @@ class BacktestEngine:
             if pending_orders:
                 bar_open_prices = self._bar_open_prices(price_index, t)
                 dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
-                engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+                engine = ExecutionEngine(dispatcher, SimulatedT1Checker(), recorder=recorder)
                 for order in pending_orders:
                     # 成交日 = 当前 bar 时间 t（T+1 据此判断）
                     order.bar_time = t
@@ -107,6 +112,8 @@ class BacktestEngine:
             "evaluations": evaluations,
             "strategy_snapshots": strategy_snapshots,
             "strategy_evaluations": strategy_evaluations,
+            # 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条），供落库与调参统计
+            "decisions": [ev.to_dict() for ev in recorder.drain()],
         }
 
     def _build_timeline(self, klines: dict) -> List[datetime]:

@@ -166,6 +166,19 @@ def session_positions(session_id: int, db: Session = Depends(get_db)):
     return ok(rows)
 
 
+@router.get("/sessions/{session_id}/decisions")
+def session_decisions(session_id: int, db: Session = Depends(get_db)):
+    """决策闸门事件（调参可观测性）：聚合统计 summary + 原始事件 events。
+
+    覆盖信号→成交全链路拦截点（止损/止盈/熔断/资金不足/超仓/收盘/去重/桥拒单…），
+    与回测详情的 decision_summary/decisions 同口径。
+    """
+    data = svc.session_decisions(db, session_id)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: int, db: Session = Depends(get_db)):
     ok_flag, message = svc.delete_session(db, session_id, _ENGINES)

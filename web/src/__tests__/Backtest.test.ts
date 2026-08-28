@@ -301,4 +301,49 @@ describe('Backtest.vue — 详情视图', () => {
     // 基准归一化：3000→0%，3060→2%，3030→1%
     expect(benchSeries.data).toHaveLength(3)
   })
+
+  it('风控与拦截统计：渲染聚合闸门行，点行下钻逐笔明细', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      decision_summary: [
+        { gate: 'stop_loss', layer: 'strategy_risk', action: 'trigger',
+          param_name: 'stop_loss_ratio', param_value: 0.05, count: 2,
+          first_bar_time: '2026-07-02T10:00:00', last_bar_time: '2026-07-03T10:00:00',
+          stock_count: 1, requested_qty_sum: 1000, final_qty_sum: 1000 },
+        { gate: 'insufficient_funds', layer: 'capital_gate', action: 'reject',
+          param_name: 'cash', param_value: null, count: 5,
+          first_bar_time: '2026-07-02T09:35:00', last_bar_time: '2026-07-03T14:00:00',
+          stock_count: 2, requested_qty_sum: 3000, final_qty_sum: 0 },
+      ],
+      decisions: [
+        { id: 101, gate: 'stop_loss', layer: 'strategy_risk', action: 'trigger',
+          stock_code: '000001.SZ', strategy_id: 1, bar_time: '2026-07-02T10:00:00',
+          param_name: 'stop_loss_ratio', param_value: 0.05, actual_value: 0.052,
+          requested_qty: 1000, final_qty: 1000, message: '亏损 5.2% 超止损线 5%' },
+        { id: 102, gate: 'insufficient_funds', layer: 'capital_gate', action: 'reject',
+          stock_code: '600000.SH', strategy_id: 2, bar_time: '2026-07-02T09:35:00',
+          param_name: 'cash', param_value: null, actual_value: null,
+          requested_qty: 1000, final_qty: 0, message: '开仓资金不足1手' },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    // 面板标题 + 两个闸门中文名
+    expect(w.text()).toContain('风控与拦截统计')
+    expect(w.text()).toContain('止损')
+    expect(w.text()).toContain('资金不足拒单')
+    // 比率阈值转百分比
+    expect(w.text()).toContain('5.00%')
+
+    // 点「资金不足拒单」行下钻：该闸门逐笔（600000.SH）出现，止损笔（000001.SZ）不在下钻区
+    const rows = w.findAll('tr.decision-row')
+    const fundsRow = rows.find(r => r.text().includes('资金不足拒单'))!
+    await fundsRow.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('开仓资金不足1手')
+    expect(w.text()).toContain('600000.SH')
+  })
 })
