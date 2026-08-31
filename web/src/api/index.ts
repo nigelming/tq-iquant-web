@@ -471,6 +471,9 @@ export interface LivePositionItem {
   quantity: number
   avg_cost: number
   market_value: number
+  // 归属（组合策略/子策略）；旧数据/旧接口可能缺省
+  portfolio_id?: number | null
+  strategy_id?: number | null
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {

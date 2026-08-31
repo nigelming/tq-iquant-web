@@ -3495,6 +3495,7 @@ def test_backfill_emits_order_filled_trade_position():
     assert events[1]["amount"] == 9000
     assert events[2]["type"] == "position"
     assert events[2]["portfolio_id"] == 1
+    assert events[2]["strategy_id"] == 1
     assert events[2]["stock_code"] == "600000.SH"
     assert events[2]["quantity"] == 1000
     assert events[2]["avg_cost"] == 9.0

@@ -35,6 +35,9 @@ export interface PositionRow {
   quantity: number
   avg_cost: number
   market_value: number
+  // 归属（组合策略/子策略）；同票多子策略持有时各一行
+  portfolio_id: number | null
+  strategy_id: number | null
 }
 
 /** 决策闸门事件行（调参可观测性）。 */
@@ -118,15 +121,22 @@ export function tradeHistoryToRows(items: LiveTradeItem[]): TradeRow[] {
   }))
 }
 
-/** SSE position 事件 → 持仓行（按 code 原地 upsert，不重复）。 */
+/** 持仓行复合键：股票 + 组合 + 子策略（同票多子策略各占一行）。 */
+export function positionRowKey(r: Pick<PositionRow, 'stock_code' | 'portfolio_id' | 'strategy_id'>): string {
+  return `${r.stock_code}|${r.portfolio_id ?? null}|${r.strategy_id ?? null}`
+}
+
+/** SSE position 事件 → 持仓行（按 股票+组合+子策略 复合键原地 upsert，不重复）。 */
 export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
   const row: PositionRow = {
     stock_code: (ev.stock_code as string) || '',
     quantity: (ev.quantity as number) ?? 0,
     avg_cost: (ev.avg_cost as number) ?? 0,
     market_value: (ev.market_value as number) ?? 0,
+    portfolio_id: (ev.portfolio_id as number) ?? null,
+    strategy_id: (ev.strategy_id as number) ?? null,
   }
-  const idx = rows.findIndex((r) => r.stock_code === row.stock_code)
+  const idx = rows.findIndex((r) => positionRowKey(r) === positionRowKey(row))
   if (idx >= 0) {
     const next = [...rows]
     next[idx] = row
@@ -135,13 +145,15 @@ export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
   return [...rows, row]
 }
 
-/** 持仓历史 → 行。 */
+/** 持仓历史 → 行（归属 id 缺省为 null）。 */
 export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] {
   return items.map((i) => ({
     stock_code: i.stock_code,
     quantity: i.quantity,
     avg_cost: i.avg_cost,
     market_value: i.market_value,
+    portfolio_id: i.portfolio_id ?? null,
+    strategy_id: i.strategy_id ?? null,
   }))
 }
 

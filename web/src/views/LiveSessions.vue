@@ -6,6 +6,7 @@ import {
   tradeEventToRow, tradeHistoryToRows,
   upsertPositionRows, positionHistoryToRows, prependCapped,
   decisionEventToRow, decisionHistoryToRows,
+  positionRowKey,
   type OrderRow, type TradeRow, type PositionRow, type DecisionRow,
 } from '../utils/liveWorkbench'
 import {
@@ -29,6 +30,14 @@ function portfolioStatuses(s: LiveSessionItem): { portfolio_id: number; status: 
 
 function portfolioName(id: number): string {
   return portfolios.value.find((p) => p.id === id)?.name || `#${id}`
+}
+
+/** 子策略名：从已加载的 portfolios 嵌套 strategies 里解析；查不到兜底 #id。 */
+function strategyName(pid: number | null, sid: number | null): string {
+  if (sid === null || sid === undefined) return '—'
+  const p = portfolios.value.find((x) => x.id === pid)
+  const s = p?.strategies.find((y) => y.id === sid)
+  return s?.name || `#${sid}`
 }
 
 async function recoverBreaker(s: LiveSessionItem, pid: number) {
@@ -245,12 +254,15 @@ onUnmounted(closeEventStream)
       </div>
     </div>
 
-    <!-- 持仓 -->
+    <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
       <table>
-        <thead><tr><th>代码</th><th>数量</th><th>成本价</th><th>市值</th></tr></thead>
+        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th></tr></thead>
         <tbody>
-          <tr v-for="p in positions" :key="p.stock_code">
+          <tr v-for="(p, i) in positions" :key="positionRowKey(p)">
+            <td style="color:#888">{{ i + 1 }}</td>
+            <td>{{ p.portfolio_id !== null && p.portfolio_id !== undefined ? portfolioName(p.portfolio_id) : '—' }}</td>
+            <td>{{ strategyName(p.portfolio_id, p.strategy_id) }}</td>
             <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_cost }}</td><td>{{ p.market_value }}</td>
           </tr>
         </tbody>

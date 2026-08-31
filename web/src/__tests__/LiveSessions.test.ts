@@ -136,7 +136,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
   it('连接运行中 session → 加载三表历史', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
-      { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 },
+      { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350, portfolio_id: 1, strategy_id: 1 },
     ])
     ;(getLiveOrders as any).mockResolvedValue([
       { id: 3, stock_code: '600000.SH', trade_type: 'BUY', status: 'filled',
@@ -200,6 +200,50 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     await flushPromises()
     const cells = w.findAll('td').filter((c) => c.text() === '700')
     expect(cells.length).toBe(1)
+    w.unmount()
+  })
+
+  it('持仓表显示序号 + 组合/子策略名,同票多子策略分多行', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 },
+      { stock_code: '600000.SH', quantity: 200, avg_cost: 12, market_value: 2400, portfolio_id: 1, strategy_id: 2 },
+    ])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [
+        { id: 1, name: '日线趋势', portfolio_id: 1 },
+        { id: 2, name: '周线低吸', portfolio_id: 1 },
+      ] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 表头含序号列
+    expect(w.text()).toContain('序号')
+    // 组合/子策略名
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('日线趋势')
+    expect(w.text()).toContain('周线低吸')
+    // 同票两行：代码单元格出现两次
+    const codeCells = w.findAll('td').filter((c) => c.text() === '600000.SH')
+    expect(codeCells.length).toBe(2)
+    w.unmount()
+  })
+
+  it('SSE 同票不同子策略 position 事件 → 两行独立 upsert', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('position', { portfolio_id: 1, strategy_id: 1, stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000 })
+    es.emit('position', { portfolio_id: 1, strategy_id: 2, stock_code: '600000.SH', quantity: 200, avg_cost: 12, market_value: 2400 })
+    await flushPromises()
+
+    const codeCells = w.findAll('td').filter((c) => c.text() === '600000.SH')
+    expect(codeCells.length).toBe(2)
+    expect(w.text()).toContain('3000')
+    expect(w.text()).toContain('2400')
     w.unmount()
   })
 

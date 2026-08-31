@@ -57,19 +57,35 @@ describe('liveWorkbench', () => {
 
   describe('upsertPositionRows', () => {
     it('新 code 追加,已有 code 原位替换', () => {
-      const rows = [{ stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000 }]
+      const rows = [{ stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000, portfolio_id: null, strategy_id: null }]
       const afterAdd = upsertPositionRows(rows, { stock_code: '000001.SZ', quantity: 50, avg_cost: 5, market_value: 250 })
       expect(afterAdd).toHaveLength(2)
 
       const afterUpdate = upsertPositionRows(afterAdd, { stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040 })
       expect(afterUpdate).toHaveLength(2)
-      expect(afterUpdate[0]).toEqual({ stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040 })
+      expect(afterUpdate[0]).toEqual({ stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040, portfolio_id: null, strategy_id: null })
+    })
+
+    it('同 code 不同子策略 → 独立两行', () => {
+      const rows = upsertPositionRows([], { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 })
+      const rows2 = upsertPositionRows(rows, { stock_code: '600000.SH', quantity: 200, avg_cost: 12, market_value: 2400, portfolio_id: 1, strategy_id: 2 })
+      expect(rows2).toHaveLength(2)
+      expect(rows2[1]).toMatchObject({ portfolio_id: 1, strategy_id: 2, quantity: 200, market_value: 2400 })
+    })
+
+    it('同 code 同子策略新快照 → 原位替换不重复', () => {
+      const rows = upsertPositionRows([], { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 })
+      const rows2 = upsertPositionRows(rows, { stock_code: '600000.SH', quantity: 500, avg_cost: 10.4, market_value: 5200, portfolio_id: 1, strategy_id: 1 })
+      expect(rows2).toHaveLength(1)
+      expect(rows2[0].quantity).toBe(500)
     })
   })
 
   it('positionHistoryToRows 映射持仓历史', () => {
-    const rows = positionHistoryToRows([{ stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 }])
+    const rows = positionHistoryToRows([{ stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350, portfolio_id: 1, strategy_id: 2 }])
     expect(rows[0].market_value).toBe(7350)
+    expect(rows[0].portfolio_id).toBe(1)
+    expect(rows[0].strategy_id).toBe(2)
   })
 
   it('prependCapped 头部插入并封顶', () => {

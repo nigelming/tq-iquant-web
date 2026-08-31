@@ -521,10 +521,35 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
     assert row["quantity"] == 700
     assert row["avg_cost"] == 10.5
     assert row["market_value"] == pytest.approx(700 * 10.5)
+    # 归属：_add_trade 恒为 portfolio_strategy_id=1/strategy_id=1
+    assert row["portfolio_id"] == 1
+    assert row["strategy_id"] == 1
+
+
+def test_query_positions_splits_rows_by_strategy(client, mock_bridge):
+    """同票被两个子策略持有 → 停止态重放按 (组合, 子策略) 拆成两行。"""
+    c, Session = client
+    sid = _create_session(c)
+    db = Session()
+    tr1 = _add_trade(db, sid, qty=300, price="10")
+    tr2 = _add_trade(db, sid, qty=200, price="12")
+    tr2.strategy_id = 2  # 第二个子策略持有同一只票
+    db.add_all([tr1, tr2])
+    db.commit()
+    db.close()
+
+    resp = c.get("/api/live/sessions/%d/positions" % sid)
+    body = resp.json()
+    assert body["code"] == 0
+    rows = [p for p in body["data"] if p["stock_code"] == "600000.SH"]
+    assert len(rows) == 2
+    by_sid = {r["strategy_id"]: r for r in rows}
+    assert by_sid[1]["quantity"] == 300
+    assert by_sid[2]["quantity"] == 200
 
 
 def test_query_positions_uses_engine_when_running(client, mock_bridge):
-    """运行中 → /positions 读引擎内存态虚拟持仓（含未落库的当日变动）。"""
+    """运行中 → /positions 读引擎内存态虚拟持仓（含未落库的当日变动），带归属 id。"""
     c, Session = client
     db = Session()
     ps_id = _seed(db)
@@ -544,6 +569,9 @@ def test_query_positions_uses_engine_when_running(client, mock_bridge):
         row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
         assert row["quantity"] == 600
         assert row["avg_cost"] == 10.5
+        # 归属 id 与引擎内存态一致（不硬编码，测试库里 id 未必为 1）
+        assert row["portfolio_id"] == engine.portfolios[0].portfolio_id
+        assert row["strategy_id"] == engine.portfolios[0].strategies[0].strategy_id
     finally:
         c.post("/api/live/sessions/%d/stop" % sid)
 

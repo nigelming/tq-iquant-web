@@ -665,6 +665,7 @@ class OrderStateMachine:
             # B5：持仓变化推送（filled 后真实持仓/成本；pnl 无市价标记暂为 0）
             self._emit("position", {
                 "portfolio_id": live_order.portfolio_strategy_id,
+                "strategy_id": live_order.strategy_id,
                 "stock_code": live_order.stock_code,
                 "quantity": pos.quantity,
                 "avg_cost": float(pos.avg_cost),

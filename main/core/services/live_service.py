@@ -444,14 +444,16 @@ def serialize_trade(t: LiveTrade) -> dict:
 def aggregate_positions_from_trades(trades: List[LiveTrade]) -> List[dict]:
     """从 live_trades 重放聚合虚拟持仓（与 recover/Position.apply_trade 同口径）。
 
-    按 trade_time 顺序：BUY 加权累加持仓+均价，SELL 减仓均价不变。返回按 code 排序。
+    按 trade_time 顺序：BUY 加权累加持仓+均价，SELL 减仓均价不变。按 (组合策略, 子策略, 股票)
+    分组，同票被多个子策略持有时各成一行。返回按 (股票, 组合, 子策略) 排序。
     """
-    agg: Dict[str, Position] = {}
+    agg: Dict[tuple, Position] = {}
     for tr in trades:
-        pos = agg.get(tr.stock_code)
+        key = (tr.portfolio_strategy_id, tr.strategy_id, tr.stock_code)
+        pos = agg.get(key)
         if pos is None:
             pos = Position(tr.stock_code)
-            agg[tr.stock_code] = pos
+            agg[key] = pos
         pos.apply_trade(TradeEvent(
             strategy_id=tr.strategy_id,
             portfolio_id=tr.portfolio_strategy_id,
@@ -464,47 +466,42 @@ def aggregate_positions_from_trades(trades: List[LiveTrade]) -> List[dict]:
             stamp_duty=Decimal(str(tr.stamp_duty)),
             trade_time=tr.trade_time,
         ))
-    return [
+    rows = [
         {
+            "portfolio_id": pid,
+            "strategy_id": sid,
             "stock_code": code,
             "quantity": pos.quantity,
             "avg_cost": float(pos.avg_cost),
             "market_value": float(pos.market_value),
         }
-        for code, pos in sorted(agg.items())
+        for (pid, sid, code), pos in agg.items()
         if pos.quantity != 0
     ]
+    return sorted(rows, key=lambda r: (r["stock_code"], r["portfolio_id"], r["strategy_id"]))
 
 
 def engine_virtual_positions(engine: LiveEngine) -> List[dict]:
-    """运行中：聚合引擎各组合策略虚拟持仓（按 code 汇总净仓，多组合加权均价）。
+    """运行中：读引擎内存态虚拟持仓，一行一个 (组合策略, 子策略, 股票)。
 
     只读引擎内存态，不修改 Position 对象；含当日已成交未落库的变动（更实时）。
+    同票被多个子策略持有时各成一行（不再按 code 汇总净仓）。按 (股票, 组合, 子策略) 排序。
     """
-    agg: Dict[str, dict] = {}
+    rows = []
     for port in engine.portfolios:
         for ctx in port.strategies:
             for code, pos in ctx.positions.items():
                 if pos.quantity == 0:
                     continue
-                row = agg.get(code)
-                if row is None:
-                    agg[code] = {"quantity": pos.quantity, "avg_cost": pos.avg_cost}
-                else:
-                    total = row["quantity"] + pos.quantity
-                    row["avg_cost"] = (
-                        row["avg_cost"] * row["quantity"] + pos.avg_cost * pos.quantity
-                    ) / total
-                    row["quantity"] = total
-    return [
-        {
-            "stock_code": code,
-            "quantity": r["quantity"],
-            "avg_cost": float(r["avg_cost"]),
-            "market_value": float(r["avg_cost"] * r["quantity"]),
-        }
-        for code, r in sorted(agg.items())
-    ]
+                rows.append({
+                    "portfolio_id": port.portfolio_id,
+                    "strategy_id": ctx.strategy_id,
+                    "stock_code": code,
+                    "quantity": pos.quantity,
+                    "avg_cost": float(pos.avg_cost),
+                    "market_value": float(pos.market_value),
+                })
+    return sorted(rows, key=lambda r: (r["stock_code"], r["portfolio_id"], r["strategy_id"]))
 
 
 def session_orders(db: Session, session_id: int, status: Optional[str] = None) -> Optional[List[dict]]:
