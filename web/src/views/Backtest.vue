@@ -78,9 +78,17 @@ async function load() {
 }
 
 function openForm() {
+  const today = new Date()
+  const fmt = (d: Date) => {
+    const m = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${d.getFullYear()}-${m}-${day}`
+  }
   form.value = {
     portfolio_strategy_id: portfolios.value[0]?.id || 0,
-    name: '', start_date: '', end_date: '',
+    name: '',
+    start_date: '2021-01-01',
+    end_date: fmt(today),
   }
   showForm.value = true
 }

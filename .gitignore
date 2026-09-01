@@ -43,6 +43,9 @@ logs/
 main/stdin.empty
 web/stdin.empty
 
+# Local machine paths (TDX/iQuant install paths)
+config.yaml
+
 # SQLite databases (local runtime data)
 main/data/*.db
 main/data/*.db-journal

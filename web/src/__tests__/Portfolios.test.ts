@@ -318,6 +318,24 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     expect(args[1].max_positions).toBe(5)           // 数量不转
   })
 
+  it('加仓阈值填 -1（任何价都加）→ 提交保持 -1，不除以 100', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 20 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await expandFirst(w)
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+
+    await w.find('input[data-field="add_position_threshold"]').setValue('-1')
+    await w.find('input[data-field="name"]').setValue('NEW_S')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createStrategy).toHaveBeenCalledTimes(1)
+    const args = (createStrategy as any).mock.calls[0]
+    expect(args[1].add_position_threshold).toBe(-1)
+  })
+
   it('点子策略子行[编辑] → 回填（比例转百分比）并提交调 updateStrategy(pid, sid, req)', async () => {
     ;(updateStrategy as any).mockResolvedValue({ id: 10 })
     const w = mount(Portfolios)

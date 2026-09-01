@@ -167,6 +167,15 @@ describe('Backtest.vue — 发起回测', () => {
     expect(poolSelect).toBeTruthy()
     // 起止日期 input
     expect(w.find('input[type="date"]').exists()).toBe(true)
+    const today = new Date()
+    const fmt = (d: Date) => {
+      const m = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      return `${d.getFullYear()}-${m}-${day}`
+    }
+    const dateInputs = w.findAll('input[type="date"]')
+    expect((dateInputs[0].element as HTMLInputElement).value).toBe('2021-01-01')
+    expect((dateInputs[1].element as HTMLInputElement).value).toBe(fmt(today))
   })
 
   it('填表提交 → 调 runBacktest，参数含 portfolio_strategy_id/name/起止日期', async () => {
