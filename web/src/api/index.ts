@@ -169,6 +169,47 @@ export interface BacktestStrategySnapshotItem {
   curve: { snap_date: string | null; total_value: number | null }[]
 }
 
+// 决策闸门事件（回测/实盘同口径）— 对齐 decision_event 序列化
+// 覆盖信号→成交全链路拦截点：止损/止盈/熔断/资金不足/超仓/收盘/去重/桥拒单…
+export interface DecisionEventItem {
+  id?: number
+  gate: string          // 闸门代码（stop_loss/max_positions_full/insufficient_funds/after_close_block…）
+  layer: string         // strategy_risk|portfolio_risk|signal_gate|capital_gate|t1|live_gate
+  action: string        // trigger|halt|recover|strip|block|reject|shrink|clamp
+  portfolio_id: number | null
+  strategy_id: number | null
+  stock_code: string | null
+  bar_time: string | null
+  param_name: string | null   // 关联调参名（stop_loss_ratio/max_positions/max_drawdown…）
+  param_value: number | null  // 阈值
+  actual_value: number | null // 实际值（亏损%/回撤%/持仓数…）
+  requested_qty: number | null
+  final_qty: number | null
+  message: string | null
+  created_at?: string | null
+}
+
+// 决策闸门聚合统计（summarize_decisions，按 gate+param_name 分组）
+export interface DecisionSummaryItem {
+  gate: string
+  layer: string
+  action: string
+  param_name: string | null
+  param_value: number | null
+  count: number
+  first_bar_time: string | null
+  last_bar_time: string | null
+  stock_count: number
+  requested_qty_sum: number | null
+  final_qty_sum: number | null
+}
+
+// 决策事件查询响应（实盘 /decisions；回测详情内嵌同构字段）
+export interface DecisionData {
+  summary: DecisionSummaryItem[]
+  events: DecisionEventItem[]
+}
+
 // 回测详情（GET /backtest/records/{id}）— 对齐 backtest.get_record
 export interface BacktestDetailItem {
   record: BacktestRecordItem
@@ -177,6 +218,8 @@ export interface BacktestDetailItem {
   evaluations: BacktestEvaluationItem | null
   strategy_evaluations: BacktestStrategyEvaluationItem[]
   strategy_snapshots: BacktestStrategySnapshotItem[]
+  decision_summary: DecisionSummaryItem[]  // 风控与拦截统计（调参可观测性）
+  decisions: DecisionEventItem[]           // 逐闸门事件（下钻）
 }
 
 export async function getStockPools() {
@@ -428,6 +471,9 @@ export interface LivePositionItem {
   quantity: number
   avg_cost: number
   market_value: number
+  // 归属（组合策略/子策略）；旧数据/旧接口可能缺省
+  portfolio_id?: number | null
+  strategy_id?: number | null
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {
@@ -446,6 +492,12 @@ export async function getLivePositions(sessionId: number) {
   return res.data.data
 }
 
+// 决策闸门事件（调参可观测性）：聚合统计 + 逐事件，对齐 live.session_decisions
+export async function getLiveDecisions(sessionId: number) {
+  const res = await api.get<ApiResponse<DecisionData>>(`/live/sessions/${sessionId}/decisions`)
+  return res.data.data
+}
+
 // ---- #27: 实盘会话 CRUD/启停（LiveSessions.vue 曾原生 axios 直连）----
 // 列表对齐 live.py list_sessions serializer；启停/create 返回 {id, status}
 
@@ -457,6 +509,7 @@ export interface LiveSessionItem {
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
+  portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
 }
 
 export interface LiveSessionCreate {
@@ -487,6 +540,13 @@ export async function stopLiveSession(id: number) {
 
 export async function deleteLiveSession(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/live/sessions/${id}`)
+  return res.data.data
+}
+
+export async function recoverLiveBreaker(sessionId: number, portfolioId: number) {
+  const res = await api.post<ApiResponse<{ portfolio_id: number; status: string; circuit_breaker_count: number }>>(
+    `/live/sessions/${sessionId}/portfolios/${portfolioId}/recover`,
+  )
   return res.data.data
 }
 

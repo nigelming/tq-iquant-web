@@ -6,7 +6,7 @@
 """
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -27,7 +27,9 @@ from core.engine.portfolio import Portfolio
 from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
-from core.models import Base, LiveOrder, LiveTrade, LiveSessionPortfolio
+from core.models import (
+    Base, LiveOrder, LiveTrade, LiveSessionPortfolio, LiveDecisionEvent,
+)
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -185,6 +187,81 @@ def test_handle_bar_signal_to_trade_persisted():
     db.close()
 
 
+# ---- 交易日历下单总闸（#144）----
+def _calendar_engine(factory, port, disp, trading_dates, stock):
+    """构造带注入假日历的 LiveEngine（假日历不经桥，直接给日期列表）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    cal = TradingCalendar(lambda: list(trading_dates))
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        trading_calendar=cal,
+    )
+
+
+def test_handle_bar_blocks_order_on_non_trading_day():
+    """交易日历总闸：节假日/非交易日 → 信号推但不落单、不发桥。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    # 2026-10-01 国庆：日历里没有它
+    bar_time = datetime(2026, 10, 1, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 10, 9)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 非交易日不落单
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 不发桥
+
+
+def test_handle_bar_blocks_order_before_open():
+    """日内周期：盘前 09:29 不下单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 9, 29)  # 周一，交易日，但未开盘
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_handle_bar_daily_period_trading_day_at_midnight_ok():
+    """1d 周期 bar_time=00:00（14:30 驱动约定）：只判交易日，不卡时段，正常落单。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)  # 日线约定 00:00
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    db.close()
+
+
 def test_no_signal_no_trade():
     """bar 不触发信号 → 不落 trade、不落 order。"""
     factory, _ = _db_factory()
@@ -333,6 +410,43 @@ def test_handle_bar_sell_capped_by_bridge_available():
     assert orders[0].quantity == 200  # 先 cap 再落库：DB 量与实发一致
     placed = [r for r in rec.requests if r.url.path == "/order"]
     assert placed and json.loads(placed[0].content)["volume"] == 200
+    db.close()
+
+
+def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
+    """⑤ 实盘 cap_quantity 返回 None（资金不足不足1手）→ logger.info。
+
+    实盘专用路径（回测走 engine.execute 不经此），INFO 级别。账户 cash 清零
+    使 approve_order 不足1手拒绝 → cap_quantity None → 不下单 + 打日志。
+    """
+    import logging
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    port.account.cash = Decimal("0")  # 现金清零 → 不足1手拒绝
+
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert orders == []  # 不下单
+    assert any(
+        r.levelno == logging.INFO for r in caplog.records
+    ), "cap_quantity None 拦截应打 info 日志"
     db.close()
 
 
@@ -580,7 +694,7 @@ def test_fill_signal_cache_populates_cache():
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
     # mock compute_injected：返回最后一条 open_sig=1
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0",
         stock: {"open_sig": [
             {"Date": "202608051000", "Value": 0.0},
@@ -598,6 +712,42 @@ def test_fill_signal_cache_populates_cache():
     assert out_map["open_sig"] == 1
 
 
+def test_fill_signal_cache_logs_inject_timing_summary(caplog):
+    """fill_signal_cache 末尾打一条 INFO 汇总：注入 codes 数 + tq/fetch/total 耗时。
+
+    每根 bar 每个有注入的组合一条（1m 每分钟一条），用于实测"每分钟公式花多少秒、
+    是否随会话累积变慢"；tq= 为 tqcenter compute_injected 累计、fetch= 为拉桥累计，
+    据此区分瓶颈在通达信公式还是桥。
+    """
+    import logging
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    bars = _quote_bars(stock, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    _mock_dispatcher_with_quote(rec, stock, bars)
+
+    engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
+    engine.portfolios = [port]
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
+        "ErrorId": "0",
+        stock: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]},
+    }
+    bar = _bar(stock, "9.3", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live.market_data"):
+        engine._fill_signal_cache(port, bar)
+
+    msgs = [r.message for r in caplog.records if "signal inject" in r.message]
+    assert msgs, "expected INFO inject timing summary"
+    m = msgs[-1]
+    assert "codes=1" in m
+    for token in ("tq=", "fetch=", "total="):
+        assert token in m
+
+
 def test_fill_signal_cache_skips_strategy_without_formula():
     """策略不在 formula_by_strategy → 跳过，不查 quote 不算公式。"""
     factory, _ = _db_factory()
@@ -608,13 +758,13 @@ def test_fill_signal_cache_skips_strategy_without_formula():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_with_formula(disp, factory, {})  # 空：无策略映射
     engine.portfolios = [port]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
     bar = _bar(stock, "9.3", bar_time)
 
     engine._fill_signal_cache(port, bar)
 
     assert engine.signal_cache == {}
-    engine._tq_formula.compute_injected.assert_not_called()
+    engine._tq_formula.compute_injected_batch.assert_not_called()
 
 
 def test_fill_signal_cache_empty_bars_skipped():
@@ -628,12 +778,12 @@ def test_fill_signal_cache_empty_bars_skipped():
     _mock_dispatcher_with_quote(rec, stock, [])  # 空 bars
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
     bar = _bar(stock, "9.3", bar_time)
 
     engine._fill_signal_cache(port, bar)
 
-    engine._tq_formula.compute_injected.assert_not_called()
+    engine._tq_formula.compute_injected_batch.assert_not_called()
     assert engine.signal_cache == {}
 
 
@@ -655,7 +805,7 @@ def test_handle_bar_with_formula_signal_triggers_trade():
     engine = _make_engine_with_formula(disp, factory, {1: "MACROSSPRO"})
     engine.portfolios = [port]
     # mock compute_injected：最后一条 open_sig=1 → 触发 OPEN
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0",
         stock: {"open_sig": [
             {"Date": "202608051000", "Value": 0.0},
@@ -1869,7 +2019,7 @@ def test_dispatch_period_bar_drives_5m_strategy_only():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
     # mock compute_injected：返回 open_sig=1（无论周期）
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
     }
 
@@ -1899,7 +2049,7 @@ def test_dispatch_period_bar_uses_latest_completed_bar():
     rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260805", "Value": 1}], "ErrorId": 0}
     }
 
@@ -1939,7 +2089,7 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}
     }
     daily_time = datetime(2026, 8, 10, 0, 0)
@@ -1991,10 +2141,11 @@ def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
     captured = {}
 
     def spy(**kw):
-        captured["df"] = kw.get("ohlcv_df")
+        # 批量路径：df 在 ohlcv_by_code[code]（单列 ohlcv_df），逐只喂入与旧路径一致
+        captured["df"] = kw.get("ohlcv_by_code", {}).get(stock)
         return {stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}}
 
-    engine._tq_formula.compute_injected = spy
+    engine._tq_formula.compute_injected_batch = spy
 
     engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
 
@@ -2054,7 +2205,7 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
     daily_time = datetime(2026, 8, 10, 0, 0)
     engine.signal_cache[(1, stock, daily_time)] = [{"name": "open_sig", "value": 1}]
-    engine._tq_formula.compute_injected = MagicMock(return_value=None)
+    engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
 
     engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
 
@@ -2062,7 +2213,7 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
     db.close()
-    engine._tq_formula.compute_injected.assert_not_called()  # 1w 不走桥注入
+    engine._tq_formula.compute_injected_batch.assert_not_called()  # 1w 不走桥注入
 
 
 def test_maybe_daily_bars_day_rollover_reinjects_1w():
@@ -2187,7 +2338,7 @@ def _counting_compute(engine, stock, value=1):
             ]},
         }
 
-    engine._tq_formula.compute_injected = _compute
+    engine._tq_formula.compute_injected_batch =_compute
     return calls
 
 
@@ -2247,6 +2398,57 @@ def test_fill_signal_cache_dedups_compute_by_formula():
         assert (sid, stock, bar_time) in engine.signal_cache
 
 
+def test_fill_signal_cache_batches_process_across_stocks():
+    """process 批量化：同公式同周期的多只 code 合并成 1 次 compute_injected_batch。
+
+    旧路径逐 code 调 compute_injected（N 次 set + N 次 process = 2N 次 DLL 往返）；
+    批量后 Phase B 每组 (formula,period) 只调 1 次，ohlcv_by_code 含全部 code，
+    process_mul_zb 在 tqcenter 内批量求值（N set + 1 process）。各 code 信号仍独立填。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1m", strategy_id=1)
+    s1, s2 = "600000.SH", "000001.SZ"
+    bar_time = datetime(2026, 8, 5, 10, 2)
+    bars1 = _quote_bars(s1, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+    bars2 = _quote_bars(s2, [datetime(2026, 8, 5, 10, i) for i in range(3)])
+
+    def respond(request):
+        if request.url.path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {s1: bars1, s2: bars2}})
+        if request.url.path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MACROSSPRO"})
+
+    calls = {"n": 0, "codes": None}
+
+    def _batch(**kw):
+        calls["n"] += 1
+        calls["codes"] = sorted(kw.get("ohlcv_by_code", {}).keys())
+        return {"ErrorId": "0", **{
+            c: {"open_sig": [{"Date": "202608051002", "Value": 1.0}]} for c in (s1, s2)
+        }}
+
+    engine._tq_formula.compute_injected_batch = _batch
+
+    bar = _bar(s1, "9.3", bar_time)
+    bar.stocks[s2] = {
+        "open": Decimal("9.0"), "high": Decimal("9.3"),
+        "low": Decimal("9.0"), "close": Decimal("9.3"), "volume": 10000,
+    }
+    engine._fill_signal_cache(port, bar)
+
+    assert calls["n"] == 1                  # 同组 (MACROSSPRO,1m) 只批量 process 1 次
+    assert set(calls["codes"]) == {s1, s2}  # 两只 df 都在同一批
+    # 两只信号各自填入（隔离不丢）
+    for code in (s1, s2):
+        out = {o["name"]: o["value"] for o in engine.signal_cache[(1, code, bar_time)]}
+        assert out["open_sig"] == 1
+
+
 def test_fill_signal_cache_uses_formula_count():
     """#27→#28：注入 count 来自 Formula.formula_count（按公式配），非全局 200。"""
     factory, _ = _db_factory()
@@ -2261,7 +2463,7 @@ def test_fill_signal_cache_uses_formula_count():
         disp, factory, port, {1: "MA_CROSS"}, formula_count=200,
         formula_count_by_name={"MA_CROSS": 300},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
     }
     bar = _bar(stock, "9.3", bar_time)
@@ -2287,7 +2489,7 @@ def test_fill_signal_cache_upgrades_quote_count_for_larger_formula():
         disp, factory, port, {1: "FORM_A", 2: "FORM_B"}, formula_count=200,
         formula_count_by_name={"FORM_A": 200, "FORM_B": 500},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "202608051000", "Value": 1}]},
     }
     bar = _bar(stock, "9.3", bar_time)
@@ -2325,10 +2527,10 @@ def test_on_bar_1m_inject_reuses_poller_bars_merge_cache_no_fetch():
 
     received = {}
     def _compute(**kw):
-        df = kw.get("ohlcv_df") or {}
+        df = kw.get("ohlcv_by_code", {}).get(stock) or {}
         received["rows"] = len(df["Close"]) if "Close" in df else 0
         return {"ErrorId": "0", stock: {"open_sig": [{"Date": "202608051002", "Value": 1}]}}
-    engine._tq_formula.compute_injected = _compute
+    engine._tq_formula.compute_injected_batch = _compute
 
     bar = _bar(stock, "9.3", bar_time)
     bar.period = "1m"
@@ -2360,7 +2562,7 @@ def test_dispatch_period_bar_uses_period_max_formula_count():
         disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"}, formula_count=200,
         formula_count_by_name={"MA_CROSS": 400},
     )
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "20260805", "Value": 1}]},
     }
 
@@ -2434,7 +2636,7 @@ def test_on_bar_dispatches_boundary_once_for_same_bar_time():
     rec = _Recorder(respond=_respond_quote_bars(stock, bars_5m))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS", 2: "MA_CROSS"})
-    engine._tq_formula.compute_injected = lambda **kw: {
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
         "ErrorId": "0", stock: {"open_sig": [{"Date": "20260812", "Value": 1}]},
     }
 
@@ -2784,6 +2986,84 @@ def test_recover_breaker_count_three_sets_manual_halt():
     assert port.risk_manager.is_trading_halted() is True
 
 
+def test_recover_breaker_resets_manual_recovery():
+    """§8.3 转手动恢复后的人工恢复入口：recover_breaker 清零计数 + 解除手动恢复 + 落库 active。
+
+    构造 count=3 + status=circuit_broken（同 test_recover_breaker_count_three_sets_manual_halt
+    前置），调 engine.recover_breaker(1) → 内存态全清 + DB status=active/count=0 +
+    _breaker_count_written 同步（否则下 bar _persist_breaker_count 比对跳过回写）。
+    peak_value 不重置（用户决策：保留历史峰值）。
+    """
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 先置 3 次熔断转手动（内存 + DB）
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)  # 还原内存态：count=3 → manual_recovery=True
+    db.close()
+    assert port.risk_manager.manual_recovery is True  # 前置：确实卡在手动恢复
+    engine._breaker_count_written[1] = 3  # 模拟已落库 3（recover 预置）
+
+    ok_flag = engine.recover_breaker(1)
+
+    assert ok_flag is True
+    # 内存态全清
+    assert port.risk_manager.consecutive_drawdown_triggers == 0
+    assert port.risk_manager.manual_recovery is False
+    assert port.risk_manager.circuit_breaker_active is False
+    assert port.risk_manager.breaker_trigger_date is None
+    assert port.risk_manager.is_trading_halted() is False
+    # _breaker_count_written 同步（防下 bar 跳过回写）
+    assert engine._breaker_count_written[1] == 0
+    # DB 落库
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    assert link.status == "active"
+    assert link.circuit_breaker_count == 0
+    db.close()
+
+
+def test_recover_breaker_unknown_portfolio_returns_false():
+    """recover_breaker 对不属于本 session 的组合返回 False（不抛异常、不改任何状态）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+
+    ok_flag = engine.recover_breaker(999)  # 不存在的 portfolio_id
+
+    assert ok_flag is False
+    # 现有组合状态未被动过
+    assert port.risk_manager.consecutive_drawdown_triggers == 0
+    assert port.risk_manager.manual_recovery is False
+
+
+def test_recover_breaker_emits_risk_event():
+    """recover_breaker 后 emit risk(triggered=False) 事件——前端 SSE 实时看到恢复。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    port.risk_manager.manual_recovery = True  # 前置：卡在手动恢复
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine.recover_breaker(1)
+
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "max_drawdown"
+    assert ev["triggered"] is False
+    assert ev["count"] == 0
+    assert ev["portfolio_id"] == 1
+    assert q.empty()
+
+
 # ---------------- F6 同 bar 多策略超卖（bar 内可用量递减记账）----------------
 def test_live_t1_checker_consume_available_decrements():
     """F6：consume_available 递减 bar 可用量——同 bar 后续 SELL 见递减后的值；重设快照恢复全量。"""
@@ -3087,7 +3367,10 @@ def test_handle_bar_bridge_reject_emits_order_rejected():
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert events[2]["order_id"] == events[1]["order_id"]
     assert "error_message" in events[2]
-    assert q.empty()
+    # 决策闸门事件（调参可观测性）：桥离线拒单记 bridge_unavailable
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_unavailable"
 
 
 def test_handle_bar_bridge_business_reject_surfaces_error():
@@ -3127,7 +3410,10 @@ def test_handle_bar_bridge_business_reject_surfaces_error():
     assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert events[2]["error_message"] == "volume 33900 exceeds max 100000"
-    assert q.empty()
+    # 决策闸门事件：桥业务拒单记 bridge_rejected
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_rejected"
 
 
 def test_handle_bar_emits_risk_on_max_drawdown_trigger():
@@ -3159,7 +3445,10 @@ def test_handle_bar_emits_risk_on_max_drawdown_trigger():
     assert ev["triggered"] is True
     assert ev["count"] == 1
     assert ev["portfolio_id"] == 1
-    assert q.empty()  # 计数未再变不重发
+    # 决策闸门事件：max_drawdown 熔断 halt 随本 bar drain 推一条 decision
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "max_drawdown" and extra[0]["action"] == "halt"
 
 
 def test_backfill_emits_order_filled_trade_position():
@@ -3206,6 +3495,7 @@ def test_backfill_emits_order_filled_trade_position():
     assert events[1]["amount"] == 9000
     assert events[2]["type"] == "position"
     assert events[2]["portfolio_id"] == 1
+    assert events[2]["strategy_id"] == 1
     assert events[2]["stock_code"] == "600000.SH"
     assert events[2]["quantity"] == 1000
     assert events[2]["avg_cost"] == 9.0
@@ -3224,7 +3514,7 @@ def test_maybe_daily_close_emits_risk_on_daily_loss(monkeypatch):
         @classmethod
         def now(cls, tz=None):
             return datetime(2026, 8, 5, 14, 30)
-    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+    monkeypatch.setattr("core.engine.live.timing.datetime", _FakeDateTime)
 
     engine._maybe_daily_close()
 
@@ -3254,7 +3544,7 @@ def test_now_shanghai_returns_shanghai_wall_clock(monkeypatch):
             if tz is not None:
                 return (_fixed_utc + tz.utcoffset(None)).replace(tzinfo=tz)
             return _fixed_utc
-    monkeypatch.setattr("core.engine.live_engine.datetime", _FakeDateTime)
+    monkeypatch.setattr("core.engine.live.timing.datetime", _FakeDateTime)
 
     # UTC 06:30 → 上海 14:30（+8）；now_shanghai 剥 tz 后仍 14:30
     assert now_shanghai() == datetime(2026, 8, 10, 14, 30)
@@ -3280,6 +3570,297 @@ def test_maybe_daily_close_uses_shanghai_time(monkeypatch):
     # 14:30 → 触发
     engine._maybe_daily_close(now=datetime(2026, 8, 10, 14, 30))
     assert engine._last_daily_date == datetime(2026, 8, 10).date()
+
+
+# ---- 14:30 钩子交易日历守卫（#145）----
+def test_maybe_daily_close_skips_non_trading_day():
+    """非交易日（周末/节假日）14:30 不调 update_daily（不用陈旧 bar 误估值/误触熔断）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    # 注入只认 08-24 为交易日的日历：08-22 周六、10-01 国庆都不在
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+    engine._last_daily_date = None
+
+    # 国庆 14:30 → 非交易日，不触发
+    engine._maybe_daily_close(now=datetime(2026, 10, 1, 14, 30))
+    assert engine._last_daily_date is None
+
+    # 周六 14:30 → 非交易日，不触发
+    engine._maybe_daily_close(now=datetime(2026, 8, 22, 14, 30))
+    assert engine._last_daily_date is None
+
+    # 交易日 14:30 → 正常触发
+    engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+    assert engine._last_daily_date == date(2026, 8, 24)
+
+
+def test_maybe_daily_bars_skips_non_trading_day():
+    """非交易日 14:30 不驱动日线（不拉桥 /quote?period=1d、不触发 1d 策略信号）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    rec = _Recorder(respond=_respond_quote_bars(stock, [
+        {"stime": "20261001000000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+
+    engine._maybe_daily_bars(now=datetime(2026, 10, 1, 14, 30))  # 国庆
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 非交易日不落单
+    db.close()
+    # 没拉日线快照
+    assert not any(r.url.path == "/quote" and "period=1d" in str(r.url) for r in rec.requests)
+
+
+# ---- 收盘清扫 _maybe_close_sweep（15:05 确定性兜底，#146）----
+def _sweep_engine(factory, port, rec, trading_day=date(2026, 8, 24)):
+    """构造带交易日历的引擎（只认 trading_day 为交易日）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine._calendar = TradingCalendar(lambda: [trading_day])
+    return engine, disp
+
+
+def test_close_sweep_skips_before_1505():
+    """15:05 前不执行清扫。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 4))
+
+    db = factory()
+    lo = db.query(LiveOrder).first()
+    assert lo.status == "submitted"  # 未清扫
+    assert engine._last_close_sweep_date is None
+    db.close()
+
+
+def test_close_sweep_skips_non_trading_day():
+    """非交易日 15:05 不清扫（周末/假期）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 10, 1, 15, 5))  # 国庆
+
+    db = factory()
+    assert db.query(LiveOrder).first().status == "submitted"
+    db.close()
+
+
+def test_close_sweep_unfilled_order_marked_canceled():
+    """收盘仍 submitted、无成交、/orders 缺席 → A 股收盘未成交=撤单，标 canceled。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 实时表已无此单
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert "close sweep" in (lo2.error_message or "")
+    # 无成交 → 不写 LiveTrade、不 apply
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+    assert ctx.positions.get(stock) is None
+    assert port.account.cash == Decimal("100000")
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+
+
+def test_close_sweep_partial_fill_applied_then_canceled():
+    """部分成交：先回填成交 apply 落持仓，剩余 canceled（不丢成交）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-part-1",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,  # 部成在途
+    }], deals=[{
+        "order_ref": "ref-part-1", "price": 9.2, "volume": 300,
+        "amount": 2760.0, "commission": 0.69, "trade_time": "145500",
+        "trade_date": "20260824",
+    }])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"          # 剩余收盘撤
+    assert int(lo2.filled_quantity) == 300   # 成交部分保留
+    assert db.query(LiveTrade).count() == 1
+    db.close()
+    # 部分成交已 apply：持仓 300，现金扣 2760+0.69
+    assert ctx.positions[stock].quantity == 300
+    assert port.account.cash == Decimal("100000") - (Decimal("2760.0") + Decimal("0.69"))
+
+
+def test_close_sweep_terminal_status_54_canceled():
+    """/orders 已报 54 全撤 → 终态同步标 canceled。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-can-1",
+        "remark": _TEST_REMARK, "status": 54, "traded_volume": 0,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    assert db.get(LiveOrder, lo.id).status == "canceled"
+    db.close()
+
+
+def test_close_sweep_junk_57_marked_rejected():
+    """/orders 报 57 废单 → rejected（语义：柜台拒单非我方撤）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-junk-1",
+        "remark": _TEST_REMARK, "status": 57, "traded_volume": 0,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    assert db.get(LiveOrder, lo.id).status == "rejected"
+    db.close()
+
+
+def test_close_sweep_defers_when_traded_volume_ahead_of_filled():
+    """/orders 报 traded_volume > filled_quantity（/deals 回报滞后）→ 延后不 cancel，
+    不标记完成，等下轮 /deals 追上再清扫——绝不丢真实成交。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 显示已成交 300，但 /deals 还没回报（空）——成交价/量/金额未回填齐
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-lag-1",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,
+    }], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    lo.order_ref = "ref-lag-1"  # 已匹配到 ref，才能在 /orders 里按 ref 查到
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"          # 未 cancel（延后）
+    assert int(lo2.filled_quantity) == 0       # /deals 没回报，不凭空 apply
+    db.close()
+    assert ctx.positions.get(stock) is None    # 未落持仓
+    assert engine._last_close_sweep_date is None  # 不标记完成，下轮 60s 重试
+
+
+def test_close_sweep_deferred_then_completes_after_deals_catch_up():
+    """延后场景：下轮 /deals 追上回填成交 → apply 成交、剩余 canceled、标记完成。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-lag-2",
+        "remark": _TEST_REMARK, "status": 55, "traded_volume": 300,
+    }], deals=[{
+        "order_ref": "ref-lag-2", "price": 9.2, "volume": 300,
+        "amount": 2760.0, "commission": 0.69, "trade_time": "150200",
+        "trade_date": "20260824",
+    }])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    lo.order_ref = "ref-lag-2"
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 6))
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert int(lo2.filled_quantity) == 300
+    db.close()
+    assert ctx.positions[stock].quantity == 300  # 成交已 apply
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+
+
+def test_close_sweep_idempotent_same_day():
+    """同日重复清扫：第二次 no-op（不重复处理，_last_close_sweep_date 幂等）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])
+    engine, _ = _sweep_engine(factory, port, rec)
+    db = factory()
+    _submitted_order(db)
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+    # 再插一笔新 submitted（模拟清扫后又有单残留），同日第二次不应处理
+    db = factory()
+    lo2 = _submitted_order(db, bridge_order_id="b" * 32)
+    db.commit()
+    db.close()
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 10))
+
+    db = factory()
+    assert db.get(LiveOrder, lo2.id).status == "submitted"  # 同日二次不清扫
+    db.close()
 
 
 def _ss_plain_engine(factory, ping_interval=0.05):
@@ -3738,7 +4319,10 @@ def test_handle_bar_bridge_dropped_order_marks_rejected_immediately():
     # 即时 rejected（不等 180s 超时），error 回显桥侧到达确认失败原因
     assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
     assert "no order record" in events[2]["error_message"]
-    assert q.empty()
+    # 决策闸门事件：桥受理即丢弃走 BridgeOrderRejected → bridge_rejected
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_rejected"
     # DB 落库：submitted 后即 rejected，无残留 pending
     db = factory()
     lo = db.query(LiveOrder).filter(LiveOrder.status == "rejected").first()
@@ -3762,6 +4346,11 @@ def test_tick_main_expires_stale_order_without_order_ref():
     _mock_orders_deals(rec, orders=[], deals=[])  # 桥侧无任何匹配委托
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
+    # 注入"今日非交易日"日历：隔离 expire 路径——_maybe_daily_close/bars 与
+    # _maybe_close_sweep 都因非交易日提前返回，避免收盘后（墙钟≥15:05）清扫把
+    # fresh 单标 canceled 污染本测试（时间敏感，收盘后跑会误失败）。
+    from core.engine.trading_calendar import TradingCalendar
+    engine._calendar = TradingCalendar(lambda: [date(2026, 1, 1)])
     db = factory()
     stale = _submitted_order(db, quantity=600)
     stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
@@ -3780,3 +4369,1046 @@ def test_tick_main_expires_stale_order_without_order_ref():
     assert fresh2.status == "submitted"  # 未超时不动
     db.close()
 
+
+# ---------------- 修复 A+：expire 前按 remark 兜底回填 ----------------
+# 真机 2026-08-21 id54-58 同源复现：修复 A（remark 直连 /deals 回填）被 _expire_stale_orders
+# 拦截——expire 在 deals 回填之前执行并 commit，超时单先变 rejected，deals 回填阶段见
+# status=rejected 直接 continue（live_engine.py 旧逻辑）。修复 A+：_expire_stale_orders
+# 标 rejected 前，先按 remark 查 /deals 兜底一次（成交则 filled 不 reject）。
+# 同时覆盖两条调用路径：_poll_deals（deals 循环）与 _tick_main（主循环饿死场景）。
+
+def test_expire_stale_backfills_via_remark_before_rejecting():
+    """修复 A+：单已超 180s + order_ref 缺失 + /deals 有 remark 成交 → 回填 filled 不 rejected。
+
+    复现 2026-08-21 id54 场景：单 created 14:32:25，iQuant 秒成，ORDER 实时表移除 →
+    order_ref 永远 None，旧逻辑 223s 超时 rejected。但 /deals（DEAL 表）保留成交记录且带
+    m_strRemark，故 expire 标 rejected 前应先按 bridge_order_id[:20] 在 /deals 兜底回填。
+    直接调 _expire_stale_orders 验证（内部兜底）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 无本单（成交后从 ORDER 实时表移除），/deals 有 remark 命中成交
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never-matched",  # 真实 ref，但 /orders 无此单 Core 拿不到
+        "remark": _TEST_REMARK,            # 按 remark 直连匹配
+        "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)  # bridge_order_id=_TEST_OID → remark=_TEST_REMARK
+    # 回拨 created_at 10 分钟，超过 _ORDER_REF_MATCH_TIMEOUT(180s)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    # expire 自身不 commit（调用方负责，同 _poll_deals line 1535-1536 模式）
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    # 修复 A+：超时但 /deals 有 remark 成交 → 回填 filled，不 rejected
+    assert lo2.status == "filled"
+    assert lo2.filled_quantity == 600
+    assert lo2.filled_price == Decimal("9.25")
+    assert not lo2.error_message  # 超时错误未写入
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 600
+    assert trades[0].amount == Decimal("5550.0")
+    # filled 后 apply：持仓 600，现金扣 amount+commission
+    assert ctx.positions[stock].quantity == 600
+    assert port.account.cash == Decimal("100000") - (Decimal("5550.0") + Decimal("1.39"))
+    db.close()
+
+
+def test_expire_stale_rejects_when_no_deals_match():
+    """修复 A+：单已超时 + /deals 无成交 → 仍 rejected（真空单兜底也救不了）。
+
+    确保兜底不误救真空单：桥真未落单（/deals 也无成交），expire 正常标 rejected。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # /deals 无任何成交
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"
+    assert lo2.error_message  # 真空单：写入失效原因
+    db.close()
+
+
+def test_expire_stale_backfill_skips_order_without_bridge_order_id():
+    """修复 A+：超时单无 bridge_order_id（遗留单无 remark 匹配键）→ 无法兜底，仍 rejected。
+
+    无 bridge_order_id 的单没有 remark 匹配键，/deals 兜底无意义，应直接 rejected
+    （不因查 /deals 而卡住或误判）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "remark": "other-order-remark-xx",  # 别的单的 remark，本单无匹配键
+        "price": 9.25, "volume": 600, "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600, bridge_order_id=None)  # 无匹配键
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"  # 无 remark 键，兜底跳过，正常 reject
+    assert lo2.error_message
+    db.close()
+
+
+def test_expire_stale_backfill_tolerates_bridge_offline():
+    """修复 A+：兜底查 /deals 时桥离线（BridgeUnavailableError）→ 不崩，退回 rejected。
+
+    兜底不应因桥离线而抛异常中断 expire。桥离线时无法验证成交，按原逻辑 rejected
+    （下轮 /deals 恢复时若仍有问题再处理；但真空单本来就该 reject）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+
+    def respond(request):
+        # /deals 抛离线（模拟桥不可用）
+        if request.url.path == "/deals":
+            raise BridgeUnavailableError("bridge offline")
+        return httpx.Response(200, json={"ok": True, "data": []})
+
+    rec._respond = respond
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._expire_stale_orders(db)  # 不应抛异常
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "rejected"  # 桥离线无法兜底，退回 rejected
+    db.close()
+
+
+def test_poll_deals_does_not_reject_when_deals_has_remark_fill():
+    """修复 A+：_poll_deals 全链路——超时单 + /deals 有 remark 成交 → filled 不 rejected。
+
+    端到端验证：_poll_deals 内 expire 调用前的兜底生效，超时单不会被先 reject 再跳过。
+    复现今天 id54 的 _poll_deals 调用路径（非直接调 expire）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never-matched",
+        "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 600,
+        "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, stale.id)
+    assert lo2.status == "filled"  # 走全链路也不被 reject
+    assert lo2.filled_quantity == 600
+    assert ctx.positions[stock].quantity == 600
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 第一层：Core 读 /orders 的 m_nOrderStatus 同步终态。
+# 官方码（D:\iquant xtconstant.py，文档 iQuant_Python_API_Doc.html:10643）：
+#   52=部成待撤 53=部撤(终态) 54=已撤(终态) 55=部成(在途,剩余仍撮合)
+#   56=已成(终态) 57=废单(终态)
+# 关键：55 是「部成」非终态，绝不能当终态撤单——否则剩余后续成交会重复 apply/丢单。
+# ---------------------------------------------------------------------------
+
+def _order_with_ref(ref="ref-cancel-1", status=54, traded_volume=0, volume=600,
+                    remark=_TEST_REMARK, direction=48):
+    """构造一笔 /orders 返回的 BRIDGE 委托字典（含 m_nOrderStatus）。"""
+    return {
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": direction, "volume": volume, "order_ref": ref,
+        "traded_volume": traded_volume, "status": status, "remark": remark,
+        "insert_date": "20260805", "insert_time": "100000",
+    }
+
+
+def _place_order_with_ref(db, ref, quantity=600, status="submitted"):
+    """预置一笔已有 order_ref 的 LiveOrder（模拟 ref 已回填、等待成交/撤单）。"""
+    lo = _submitted_order(db, quantity=quantity, status=status)
+    lo.order_ref = ref
+    db.flush()
+    return lo
+
+
+def test_poll_deals_marks_fully_canceled_order():
+    """54 全撤 + 无成交 → canceled，无 LiveTrade、不 apply、出 order 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(status=54, traded_volume=0)],
+                       deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-cancel-1")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"
+    assert lo2.filled_quantity == 0
+    assert db.query(LiveTrade).count() == 0
+    assert ctx.positions.get("600000.SH") is None
+    assert port.account.cash == Decimal("100000")
+    db.close()
+
+
+def test_poll_deals_partial_cancel_applies_fills_then_cancels():
+    """53 部撤 + 部分成交 → 先 apply 真实成交，再 canceled（终态必须落持仓）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-pc", status=53, traded_volume=300, volume=600)],
+        deals=[{
+            "order_ref": "ref-pc", "price": 9.25, "volume": 300,
+            "amount": 2775.0, "commission": 0.69,
+            "trade_time": "150001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-pc", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "canceled"          # 部撤终态
+    assert lo2.filled_quantity == 300        # 部分成交真实落账
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 300
+    # 部撤的部分成交必须 apply（现有 partial 不 apply，终态撤单必须补上）
+    assert ctx.positions[stock].quantity == 300
+    assert port.account.cash == Decimal("100000") - (Decimal("2775.0") + Decimal("0.69"))
+    db.close()
+
+
+def test_poll_deals_cancel_defers_when_deals_lag():
+    """53 部撤但 traded_volume>0 且 /deals 尚未回报 → 不 cancel，留待下轮 /deals 追上。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    # /orders 说部撤 300，但 /deals 还没这笔（传播滞后）
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-lag", status=53, traded_volume=300, volume=600)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-lag", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"         # 不提前 cancel，等 /deals
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+
+
+def test_poll_deals_filled_not_canceled_by_status_sync():
+    """56 全成 + /deals 全成 → filled（成交回填优先），不被状态同步误 cancel。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-filled", status=56, traded_volume=600, volume=600)],
+        deals=[{
+            "order_ref": "ref-filled", "price": 9.25, "volume": 600,
+            "amount": 5550.0, "commission": 1.39,
+            "trade_time": "150001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-filled", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "filled"
+    assert ctx.positions["600000.SH"].quantity == 600
+    db.close()
+
+
+def test_poll_deals_inflight_status_stays_submitted():
+    """非终态 status（如 52 待报）→ 保持 submitted，不误判。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-inflight", status=52, traded_volume=0)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-inflight")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+
+
+def test_poll_deals_status_55_part_succ_stays_alive():
+    """55=部成（部分成交、剩余仍在撮合）→ 绝不能当终态撤单。
+
+    回归 bug（2026-08-24 官方码核对）：旧代码把 55 误当「部撤」终态，会提前 cancel
+    真实在途单，剩余成交后重复 apply/丢单。55 必须保持 partial/submitted。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    # /orders 55 部成 300，/deals 同步回报 300（剩余 300 仍在途）
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-alive", status=55, traded_volume=300, volume=600)],
+        deals=[{
+            "order_ref": "ref-alive", "price": 9.25, "volume": 300,
+            "amount": 2775.0, "commission": 0.69,
+            "trade_time": "100001", "trade_date": "20260805",
+        }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-alive", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    # 仍是在途状态，绝不 canceled
+    assert lo2.status in ("submitted", "partial")
+    assert lo2.status != "canceled"
+    assert lo2.filled_quantity == 300   # 部分成交已记录
+    # partial 不 apply（等终态/全成），所以剩余后续成交不会重复 apply
+    assert ctx.positions.get(stock) is None
+    db.close()
+
+
+def test_poll_deals_status_57_junk_marks_rejected():
+    """57=废单（终态，柜台拒单）→ rejected，无成交、不 apply。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-junk", status=57, traded_volume=0, volume=600)],
+        deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-junk", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "rejected"
+    assert lo2.filled_quantity == 0
+    assert db.query(LiveTrade).count() == 0
+    assert ctx.positions.get("600000.SH") is None
+    assert port.account.cash == Decimal("100000")
+    db.close()
+
+
+def test_poll_deals_cancel_missing_from_orders_stays_submitted():
+    """/orders 列表里查不到本单（实时表已移除）→ 不据缺席判撤，保持 submitted。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])  # 实时表无此单
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-gone")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+
+
+def test_poll_deals_cancel_bridge_offline_stays_submitted():
+    """/orders 桥离线 → 不改状态、不崩，下轮重试。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder(fail_paths={"/orders", "/deals"})
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-off")
+    db.commit()
+    db.close()
+
+    engine._poll_deals()  # 不应抛异常
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"
+    db.close()
+
+
+
+# ---- 关键状态流转日志可观测性（INFO/WARNING，低频事件，不刷屏）----
+def _log_msgs(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_order_accepted_logs_info(caplog):
+    """桥受理成功后落 logger.info（此前只发 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(strategy_id=1, period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": []})
+        if path in ("/order", "/ping", "/quote"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, bar)
+
+    assert any("order accepted" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_backfill_filled_logs_info(caplog):
+    """/deals 成交回填 -> logger.info（此前只发 SSE order/trade）。"""
+    import logging
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    deals = [{"order_ref": "ref-bf", "volume": 1000, "amount": 9000,
+              "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
+        engine._backfill_order(db, lo, deals)
+        db.commit()
+    db.close()
+    assert any("backfill" in m and "600000.SH" in m and "filled" in m
+               for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_backfill_same_partial_does_not_spam_log(caplog):
+    """5s 轮询对同一 partial 单反复回填相同成交量 -> 只首次记日志，不刷屏。"""
+    import logging
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf2",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    partial = [{"order_ref": "ref-bf2", "volume": 300, "amount": 2700,
+                "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
+        engine._backfill_order(db, lo, partial)   # 首次 partial：记日志
+        engine._backfill_order(db, lo, partial)   # 同量同状态：不重复
+        db.commit()
+    backfill_logs = [m for m in _log_msgs(caplog) if "backfill" in m]
+    assert len(backfill_logs) == 1, backfill_logs
+    assert "partial" in backfill_logs[0]
+    db.close()
+
+
+def test_expire_rejected_logs_warning(caplog):
+    """expire 超时真空单标 rejected -> logger.warning（此前只发 SSE）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._expire_stale_orders(db)
+        db.commit()
+    db.close()
+    assert any(r.levelno == logging.WARNING and "expire" in m and "rejected" in m
+               for r, m in zip(caplog.records, _log_msgs(caplog))), _log_msgs(caplog)
+
+
+def test_expire_remark_backfill_logs_info(caplog):
+    """A+ remark 兜底命中 -> logger.info（真机 id54 路径，事后可追溯）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ref-never", "remark": _TEST_REMARK,
+        "price": 9.25, "volume": 600, "amount": 5550.0, "commission": 1.39,
+        "trade_time": "150001", "trade_date": "20260805",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    stale = _submitted_order(db, quantity=600)
+    stale.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)
+    db.commit()
+    db.close()
+
+    db = factory()
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
+        engine._expire_stale_orders(db)
+        db.commit()
+    db.close()
+    assert any("remark" in m and "backfill" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_terminal_sync_canceled_logs_info(caplog):
+    """54 全撤终态同步 -> logger.info（此前只发 SSE canceled）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(status=54, traded_volume=0)], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _place_order_with_ref(db, "ref-cancel-1")
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live.order_machine"):
+        engine._poll_deals()
+    assert any("terminal" in m and "canceled" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_terminal_sync_junk_rejected_logs_warning(caplog):
+    """57 废单终态同步 -> logger.warning（柜台拒单，需关注）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[_order_with_ref(ref="ref-junk", status=57, traded_volume=0)],
+                       deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _place_order_with_ref(db, "ref-junk")
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._poll_deals()
+    assert any(r.levelno == logging.WARNING and "junk" in m and "rejected" in m
+               for r, m in zip(caplog.records, _log_msgs(caplog))), _log_msgs(caplog)
+
+
+def test_maybe_daily_close_logs_info(caplog):
+    """14:30 日终估值成功 -> logger.info（此前成功路径无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+    assert any("daily close" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_maybe_daily_bars_logs_info(caplog):
+    """14:30 日线驱动成功 -> logger.info（此前成功路径无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    rec = _Recorder(respond=_respond_quote_bars(stock, [
+        {"stime": "20260822000000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._tq_formula.compute_injected_batch =lambda **kw: {
+        stock: {"ErrorId": 0},
+    }
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
+        engine._maybe_daily_bars(now=datetime(2026, 8, 24, 14, 30))
+    assert any("daily bar" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_close_sweep_no_pending_logs_info(caplog):
+    """15:05 无残留单 -> logger.info（干净日也要有清扫跑过的痕迹）。"""
+    import logging
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    engine, _ = _sweep_engine(factory, port, rec)
+    with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
+        engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+    assert engine._last_close_sweep_date == date(2026, 8, 24)
+    assert any("no pending" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+# ===================== 风控状态转换日志补全（max_drawdown / daily_loss / 恢复 / 重启读回）=====================
+def test_max_drawdown_trigger_logs_warning(caplog):
+    """max_drawdown 熔断触发（计数+1）-> logger.warning（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    # 清风控比例：drawdown bar 不触发止损单，聚焦熔断
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._handle_bar(port, _bar(stock, "100", datetime(2026, 8, 5, 10, 0)))  # 建峰
+        engine._handle_bar(port, _bar(stock, "70", datetime(2026, 8, 5, 10, 1)))   # 回撤 30%>20% 熔断
+
+    msgs = _log_msgs(caplog)
+    assert any("max_drawdown" in m and "触发" in m and "1 次" in m for m in msgs), msgs
+
+
+def test_max_drawdown_manual_halt_logs_warning(caplog):
+    """累计 3 次转手动恢复 -> logger.warning 标明 manual（最该留痕的风控事件）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        # 第 3 次触发：前两次已累计 2，本 bar 回撤触发第 3 次 -> 转手动
+        port.risk_manager.consecutive_drawdown_triggers = 2
+        engine._breaker_count_written[1] = 2  # 模拟已落库 2，使本次递增被识别
+        engine._handle_bar(port, _bar(stock, "100", datetime(2026, 8, 5, 10, 0)))  # 建峰
+        engine._handle_bar(port, _bar(stock, "70", datetime(2026, 8, 5, 10, 1)))   # 第 3 次 -> 手动
+
+    msgs = _log_msgs(caplog)
+    assert any("max_drawdown" in m and "3 次" in m and "手动" in m for m in msgs), msgs
+
+
+def test_max_drawdown_auto_recovery_logs_info(caplog):
+    """max_drawdown 熔断次日自动恢复（非手动）-> logger.info（此前 risk_manager 内静默置 False）。
+
+    走实盘真实路径 _handle_bar（每 bar 调 update_peak）：周五触发后周一一根回升 bar 自动恢复。
+    """
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.peak_value = Decimal("100000")
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = date(2026, 8, 21)       # 周五触发
+    rm.consecutive_drawdown_triggers = 1
+    engine._breaker_count_written[1] = 1
+    # 清风控比例 + 无信号缓存：该 bar 不出单，聚焦恢复日志（恢复检测在 update_peak 后、on_bar 前）
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0"), take_profit_ratio=Decimal("0"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    stock = "600000.SH"
+    pos = Position(stock)
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 21, 9, 30))
+    port.strategies[0].positions[stock] = pos
+    port.account.cash = Decimal("0")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live.breaker"):
+        # 次日（8/24 周一）close=99 → total=99000，回撤 1%<20% 不重触发，date>trigger 自动恢复
+        engine._handle_bar(port, _bar(stock, "99", datetime(2026, 8, 24, 10, 0)))
+
+    msgs = _log_msgs(caplog)
+    assert rm.circuit_breaker_active is False
+    assert any("max_drawdown" in m and "次日自动恢复" in m for m in msgs), msgs
+
+
+def test_daily_loss_trigger_logs_warning(caplog):
+    """日内亏损熔断触发 -> logger.warning（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    port = engine.portfolios[0]
+    rm = port.risk_manager  # daily_loss_limit=0.05, initial_capital=100000
+    # 建立昨收基准：Day1 收盘 100000
+    rm.update_peak(Decimal("100000"), date(2026, 8, 21))
+
+    # Day2 盘中跌到 94000（日内亏 6000=6% ≥ 5%），update_peak 记录当日最后 total
+    rm.update_peak(Decimal("100000"), date(2026, 8, 24))  # 跨日刷新 prev_close=100000
+    rm.update_peak(Decimal("94000"), date(2026, 8, 24))
+    # _maybe_daily_close 用现金+持仓成本算 total，无持仓时即现金 → 置 94000 体现日内亏损
+    port.account.cash = Decimal("94000")
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))
+
+    msgs = _log_msgs(caplog)
+    assert any("daily_loss" in m and "触发" in m for m in msgs), msgs
+
+
+def test_daily_loss_auto_recovery_logs_info(caplog):
+    """daily_loss 暂停次日自动恢复 -> logger.info（此前 risk_manager 内静默置 False）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    rm = engine.portfolios[0].risk_manager
+    rm.daily_pause_active = True
+    rm.daily_loss_trigger_date = date(2026, 8, 21)  # 周五触发
+    # 昨收基准：恢复日 total 不再重触（94000 接近 prev_close）
+    rm.update_peak(Decimal("94000"), date(2026, 8, 21))
+    rm.update_peak(Decimal("94000"), date(2026, 8, 24))  # 跨日 prev_close=94000
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live.breaker"):
+        engine._maybe_daily_close(now=datetime(2026, 8, 24, 14, 30))  # 8/24 > 8/21 -> 恢复
+
+    msgs = _log_msgs(caplog)
+    assert rm.daily_pause_active is False
+    assert any("daily_loss" in m and "恢复" in m for m in msgs), msgs
+
+
+def test_recover_breaker_manual_logs_info(caplog):
+    """API 手动恢复熔断 -> logger.info（此前只 SSE，日志无痕）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)  # 还原内存态：count=3 -> manual_recovery=True
+    db.close()
+    assert port.risk_manager.manual_recovery is True
+    engine._breaker_count_written[1] = 3
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine.recover_breaker(1)
+
+    msgs = _log_msgs(caplog)
+    assert any("手动恢复" in m and "portfolio 1" in m for m in msgs), msgs
+
+
+def test_recover_restores_manual_breaker_logs_warning(caplog):
+    """重启 recover 读回 count>=3 转手动 -> logger.warning（此前静默，重启后卡手动无痕迹）。"""
+    import logging
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    db = factory()
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=1, portfolio_strategy_id=1
+    ).first()
+    link.circuit_breaker_count = 3
+    link.status = "circuit_broken"
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        db = factory()
+        engine.recover(db)
+        db.close()
+
+    msgs = _log_msgs(caplog)
+    assert port.risk_manager.manual_recovery is True
+    assert any("重启读回" in m and "3 次" in m and "手动" in m for m in msgs), msgs
+
+
+# ---------------- 决策闸门事件落库 + SSE（调参可观测性，#163）----------------
+def _decision_rows(factory):
+    db = factory()
+    rows = db.query(LiveDecisionEvent).order_by(LiveDecisionEvent.id).all()
+    db.close()
+    return rows
+
+
+def _drain_queue(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+def test_handle_bar_after_close_records_decision_event():
+    """收盘后拦单 → after_close_block(live_gate/block) 落 LiveDecisionEvent + SSE decision。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)  # 收盘后
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    rows = _decision_rows(factory)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.gate == "after_close_block"
+    assert ev.layer == "live_gate"
+    assert ev.action == "block"
+    assert ev.portfolio_id == 1
+    assert ev.strategy_id == 1
+    assert ev.stock_code == stock
+    assert ev.bar_time == bar_time
+    # SSE：signal + decision，无 order
+    queued = _drain_queue(q)
+    dec = [e for e in queued if e.get("type") == "decision"]
+    assert len(dec) == 1
+    assert dec[0]["gate"] == "after_close_block"
+    assert dec[0]["layer"] == "live_gate"
+    assert not any(e.get("type") == "order" for e in queued)
+    # 无 LiveOrder 落库（拦单不下单）
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_handle_bar_dup_skip_records_decision_event():
+    """同 bar 同向重驱 → 第二根记 dup_skip(block) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+
+    engine._handle_bar(port, bar)  # 首根正常落 submitted
+    engine._handle_bar(port, bar)  # 同 bar 重驱 → dup
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["dup_skip"]
+    dup = _decision_rows(factory)[0]
+    assert dup.layer == "live_gate" and dup.action == "block"
+    assert dup.stock_code == stock and dup.bar_time == bar_time
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "dup_skip" for e in queued)
+
+
+def test_handle_bar_inflight_skip_records_decision_event():
+    """同向在途单未确认 → 下一根记 inflight_skip(block) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    t1 = datetime(2026, 8, 5, 10, 0)
+    t2 = datetime(2026, 8, 5, 10, 5)
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {
+        (1, stock, t1): [{"name": "open_sig", "value": 1}],
+        (1, stock, t2): [{"name": "open_sig", "value": 1}],
+    }
+
+    engine._handle_bar(port, _bar(stock, "9.0", t1))  # 首根 submitted 在途
+    engine._handle_bar(port, _bar(stock, "9.0", t2))  # 不同 bar → 过 dup，撞 inflight
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["inflight_skip"]
+    ev = _decision_rows(factory)[0]
+    assert ev.layer == "live_gate" and ev.action == "block"
+    assert ev.stock_code == stock and ev.bar_time == t2
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "inflight_skip" for e in queued)
+
+
+def test_handle_bar_bridge_unavailable_records_decision_event():
+    """桥离线（/order 连接被拒）→ bridge_unavailable(reject) 落库 + SSE。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder(fail_paths={"/order"})
+    disp, _ = _make_dispatcher(rec, fail_paths={"/order"})
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    gates = [r.gate for r in _decision_rows(factory)]
+    assert gates == ["bridge_unavailable"]
+    ev = _decision_rows(factory)[0]
+    assert ev.layer == "live_gate" and ev.action == "reject"
+    assert ev.stock_code == stock
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "bridge_unavailable"
+               for e in queued)
+    # 订单标 rejected
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "rejected"
+    db.close()
+
+
+def test_handle_bar_no_orders_still_drains_halt_strip_event():
+    """早退路径（orders 为空）也要 drain：熔断剥 BUY 记 halted_buy_strip 落库。
+
+    熔断期 BUY 信号被 on_bar 剥掉（返回空 orders），但 halted_buy_strip 事件已记录；
+    重构后 db 会话在 orders 判定前打开、drain 放循环后，空 orders 也落库。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    # 强置日内亏损暂停（on_bar_update 只调 update_peak，不碰 daily_pause，态保持）
+    port.risk_manager.daily_pause_active = True
+    port.risk_manager.daily_loss_trigger_date = bar_time.date()
+    engine, q = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+
+    rows = _decision_rows(factory)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.gate == "halted_buy_strip"
+    assert ev.layer == "portfolio_risk" and ev.action == "strip"
+    assert ev.param_name == "daily_loss_limit"
+    assert ev.stock_code == stock and ev.bar_time == bar_time
+    # 熔断期不下单
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    queued = _drain_queue(q)
+    assert any(e.get("type") == "decision" and e.get("gate") == "halted_buy_strip"
+               for e in queued)

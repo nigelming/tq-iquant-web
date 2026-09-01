@@ -6,6 +6,7 @@ from typing import Optional
 from .event import OrderEvent, TradeEvent
 from .account import Account
 from .position import Position
+from .decision import NULL_RECORDER
 from tq_iquant_shared.constants import TradeType, SignalType
 
 
@@ -110,9 +111,25 @@ class LiveT1Checker(T1Checker):
 
 
 class ExecutionEngine:
-    def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker):
+    def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker,
+                 recorder=None):
         self._dispatcher = dispatcher
         self._t1_checker = t1_checker
+        # 决策闸门采集（调参可观测性）：默认空采集器，回测/实盘引擎注入同一实例
+        self.recorder = recorder or NULL_RECORDER
+
+    def _rec_gate(self, gate, action, order, layer, *, requested=None, final=None,
+                  param_name=None, param_value=None, actual_value=None, message=None):
+        self.recorder.record(
+            gate=gate, layer=layer, action=action,
+            portfolio_id=order.portfolio_id or 0,
+            strategy_id=order.strategy_id,
+            stock_code=order.stock_code,
+            bar_time=order.bar_time,
+            requested_qty=requested, final_qty=final,
+            param_name=param_name, param_value=param_value,
+            actual_value=actual_value, message=message,
+        )
 
     def cap_quantity(
         self,
@@ -133,7 +150,25 @@ class ExecutionEngine:
                 position.market_value if position else Decimal("0"),
             )
             if not approved or qty < 100:
+                # 资金不足：不足 1 手拒单（account.insufficient_count 已在 approve_order 内自增）
+                self._rec_gate(
+                    "insufficient_funds", "reject", order, "capital_gate",
+                    requested=order.quantity, final=0,
+                    param_name="cash", actual_value=float(account.cash),
+                    message="资金不足拒单：需 %s 元买 %d 股 @%s，可用现金 %s（缩量后 %d 股<1手）"
+                            % (order.price * order.quantity if order.price else 0,
+                               order.quantity, order.price, account.cash, qty),
+                )
                 return None
+            if qty < order.quantity:
+                # 资金够 1 手但不足额 → 缩量
+                self._rec_gate(
+                    "order_shrunk", "shrink", order, "capital_gate",
+                    requested=order.quantity, final=qty,
+                    param_name="cash", actual_value=float(account.cash),
+                    message="资金不足缩量：请求 %d 股，按可用现金 %s 缩至 %d 股 @%s"
+                            % (order.quantity, account.cash, qty, order.price),
+                )
             return qty
         if position is None or order.bar_time is None:
             return None
@@ -142,7 +177,22 @@ class ExecutionEngine:
         )
         qty = min(order.quantity, available)
         if qty < 100:
+            self._rec_gate(
+                "t1_insufficient", "block", order, "t1",
+                requested=order.quantity, final=qty,
+                param_name="available_shares", actual_value=float(available),
+                message="T+1 可卖不足：请求 %d 股，可用 %d 股，可成交量 %d <100"
+                        % (order.quantity, available, qty),
+            )
             return None
+        if qty < order.quantity:
+            self._rec_gate(
+                "t1_clamp", "clamp", order, "t1",
+                requested=order.quantity, final=qty,
+                param_name="available_shares", actual_value=float(available),
+                message="T+1 可卖钳量：请求 %d 股，可用 %d 股，实卖 %d 股"
+                        % (order.quantity, available, qty),
+            )
         return qty
 
     def execute(

@@ -18,7 +18,7 @@ from core.main import app
 from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
-    PortfolioStrategy, Strategy, LiveOrder, LiveTrade,
+    PortfolioStrategy, Strategy, LiveOrder, LiveTrade, LiveSessionPortfolio,
 )
 from core.engine.position import Position
 import core.api.live as live_api
@@ -521,10 +521,35 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
     assert row["quantity"] == 700
     assert row["avg_cost"] == 10.5
     assert row["market_value"] == pytest.approx(700 * 10.5)
+    # 归属：_add_trade 恒为 portfolio_strategy_id=1/strategy_id=1
+    assert row["portfolio_id"] == 1
+    assert row["strategy_id"] == 1
+
+
+def test_query_positions_splits_rows_by_strategy(client, mock_bridge):
+    """同票被两个子策略持有 → 停止态重放按 (组合, 子策略) 拆成两行。"""
+    c, Session = client
+    sid = _create_session(c)
+    db = Session()
+    tr1 = _add_trade(db, sid, qty=300, price="10")
+    tr2 = _add_trade(db, sid, qty=200, price="12")
+    tr2.strategy_id = 2  # 第二个子策略持有同一只票
+    db.add_all([tr1, tr2])
+    db.commit()
+    db.close()
+
+    resp = c.get("/api/live/sessions/%d/positions" % sid)
+    body = resp.json()
+    assert body["code"] == 0
+    rows = [p for p in body["data"] if p["stock_code"] == "600000.SH"]
+    assert len(rows) == 2
+    by_sid = {r["strategy_id"]: r for r in rows}
+    assert by_sid[1]["quantity"] == 300
+    assert by_sid[2]["quantity"] == 200
 
 
 def test_query_positions_uses_engine_when_running(client, mock_bridge):
-    """运行中 → /positions 读引擎内存态虚拟持仓（含未落库的当日变动）。"""
+    """运行中 → /positions 读引擎内存态虚拟持仓（含未落库的当日变动），带归属 id。"""
     c, Session = client
     db = Session()
     ps_id = _seed(db)
@@ -544,6 +569,9 @@ def test_query_positions_uses_engine_when_running(client, mock_bridge):
         row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
         assert row["quantity"] == 600
         assert row["avg_cost"] == 10.5
+        # 归属 id 与引擎内存态一致（不硬编码，测试库里 id 未必为 1）
+        assert row["portfolio_id"] == engine.portfolios[0].portfolio_id
+        assert row["strategy_id"] == engine.portfolios[0].strategies[0].strategy_id
     finally:
         c.post("/api/live/sessions/%d/stop" % sid)
 
@@ -666,4 +694,124 @@ def test_start_session_rejected_when_bridge_offline(client, monkeypatch):
     assert sid not in live_api._ENGINES
     detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
     assert detail["status"] != "running"
+
+
+# ---- §8.3 手动恢复熔断 ----
+
+def _set_breaker(Session, sid, ps_id, count=3):
+    """手动把 LiveSessionPortfolio 置为 circuit_broken + count。"""
+    db = Session()
+    try:
+        link = db.query(LiveSessionPortfolio).filter_by(
+            session_id=sid, portfolio_strategy_id=ps_id
+        ).first()
+        assert link is not None
+        link.circuit_breaker_count = count
+        link.status = "circuit_broken"
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_recover_breaker_resets_running_session(client, mock_bridge):
+    """运行中 session：POST recover → 引擎内存态 + DB 双写解除熔断。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    engine = live_api._ENGINES[sid]
+
+    # 手动置 DB + 引擎内存态为熔断
+    _set_breaker(Session, sid, ps_id, count=3)
+    port = next(p for p in engine.portfolios if p.portfolio_id == ps_id)
+    rm = port.risk_manager
+    rm.consecutive_drawdown_triggers = 3
+    rm.manual_recovery = True
+    rm.circuit_breaker_active = True
+    engine._breaker_count_written[ps_id] = 3
+
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "active"
+    assert body["data"]["circuit_breaker_count"] == 0
+    # 内存态
+    assert rm.manual_recovery is False
+    assert rm.circuit_breaker_active is False
+    assert rm.consecutive_drawdown_triggers == 0
+    assert rm.is_trading_halted() is False
+    assert engine._breaker_count_written[ps_id] == 0
+    # DB 态
+    db = Session()
+    try:
+        link = db.query(LiveSessionPortfolio).filter_by(
+            session_id=sid, portfolio_strategy_id=ps_id
+        ).first()
+        assert link.status == "active"
+        assert link.circuit_breaker_count == 0
+    finally:
+        db.close()
+
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+
+def test_recover_breaker_stopped_session_only_db(client, mock_bridge):
+    """未运行 session：POST recover → 只改 DB（引擎未运行，无内存态可重置）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    assert sid not in live_api._ENGINES  # 未 start
+    _set_breaker(Session, sid, ps_id, count=3)
+
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "active"
+    assert resp.json()["data"]["circuit_breaker_count"] == 0
+    db = Session()
+    try:
+        link = db.query(LiveSessionPortfolio).filter_by(
+            session_id=sid, portfolio_strategy_id=ps_id
+        ).first()
+        assert link.status == "active"
+        assert link.circuit_breaker_count == 0
+    finally:
+        db.close()
+
+
+def test_recover_breaker_session_not_found(client, mock_bridge):
+    """session 不存在 → 404。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    resp = c.post("/api/live/sessions/9999/portfolios/%d/recover" % ps_id)
+
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 404
+
+
+def test_recover_breaker_portfolio_not_in_session(client, mock_bridge):
+    """组合不在该 session → 404。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+
+    resp = c.post("/api/live/sessions/%d/portfolios/8888/recover" % sid)
+
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 404
 

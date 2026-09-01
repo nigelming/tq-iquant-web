@@ -31,6 +31,10 @@ tbody tr:last-child td{border-bottom:none}
 .badge-green{background:#ecfdf5;color:#065f46}
 .badge-gray{background:#f3f4f6;color:#6b7280}
 .badge-blue{background:var(--accent-light);color:var(--accent)}
+.badge-red{background:#fef2f2;color:#b91c1c}
+.badge-orange{background:#fff7ed;color:#c2410c}
+.badge-teal{background:#f0fdfa;color:#0f766e}
+.badge-purple{background:#f5f3ff;color:#6d28d9}
 .btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card-bg);color:#555;cursor:pointer;font-size:13px;transition:all .15s}
 .btn:hover{background:#f5f5f5;color:var(--text)}
 .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}

@@ -16,6 +16,7 @@ vi.mock('../api', () => ({
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
+  getLiveDecisions: vi.fn(),
   getPortfolios: vi.fn(),
 }))
 
@@ -44,7 +45,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getPortfolios } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getPortfolios } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -61,6 +62,7 @@ beforeEach(() => {
   ;(getLivePositions as any).mockResolvedValue([])
   ;(getLiveOrders as any).mockResolvedValue([])
   ;(getLiveTrades as any).mockResolvedValue([])
+  ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
   ;(getPortfolios as any).mockResolvedValue([])
 })
 
@@ -134,7 +136,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
   it('连接运行中 session → 加载三表历史', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
-      { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 },
+      { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350, portfolio_id: 1, strategy_id: 1 },
     ])
     ;(getLiveOrders as any).mockResolvedValue([
       { id: 3, stock_code: '600000.SH', trade_type: 'BUY', status: 'filled',
@@ -201,6 +203,50 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('持仓表显示序号 + 组合/子策略名,同票多子策略分多行', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 },
+      { stock_code: '600000.SH', quantity: 200, avg_cost: 12, market_value: 2400, portfolio_id: 1, strategy_id: 2 },
+    ])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [
+        { id: 1, name: '日线趋势', portfolio_id: 1 },
+        { id: 2, name: '周线低吸', portfolio_id: 1 },
+      ] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 表头含序号列
+    expect(w.text()).toContain('序号')
+    // 组合/子策略名
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('日线趋势')
+    expect(w.text()).toContain('周线低吸')
+    // 同票两行：代码单元格出现两次
+    const codeCells = w.findAll('td').filter((c) => c.text() === '600000.SH')
+    expect(codeCells.length).toBe(2)
+    w.unmount()
+  })
+
+  it('SSE 同票不同子策略 position 事件 → 两行独立 upsert', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('position', { portfolio_id: 1, strategy_id: 1, stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000 })
+    es.emit('position', { portfolio_id: 1, strategy_id: 2, stock_code: '600000.SH', quantity: 200, avg_cost: 12, market_value: 2400 })
+    await flushPromises()
+
+    const codeCells = w.findAll('td').filter((c) => c.text() === '600000.SH')
+    expect(codeCells.length).toBe(2)
+    expect(w.text()).toContain('3000')
+    expect(w.text()).toContain('2400')
+    w.unmount()
+  })
+
   it('SSE order/trade 事件 → 委托/成交表顶部插入', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
@@ -218,6 +264,47 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
     await tradesTab.trigger('click')
     expect(w.text()).toContain('1050')
+    w.unmount()
+  })
+
+  it('决策/拦截 tab → 加载历史聚合+逐事件,SSE decision 实时插入', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveDecisions as any).mockResolvedValue({
+      summary: [
+        { gate: 'insufficient_funds', layer: 'capital_gate', action: 'reject',
+          param_name: 'cash', param_value: null, count: 3,
+          first_bar_time: '2026-08-28T10:00:00', last_bar_time: '2026-08-28T13:00:00',
+          stock_count: 2, requested_qty_sum: 2000, final_qty_sum: 0 },
+      ],
+      events: [
+        { id: 1, gate: 'insufficient_funds', layer: 'capital_gate', action: 'reject',
+          stock_code: '000001.SZ', strategy_id: 1, bar_time: '2026-08-28T10:00:00',
+          param_name: 'cash', param_value: null, actual_value: null,
+          requested_qty: 1000, final_qty: 0, message: '开仓资金不足1手' },
+      ],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(getLiveDecisions).toHaveBeenCalledWith(7)
+
+    const decTab = w.findAll('button').find((b) => b.text().includes('决策/拦截'))!
+    await decTab.trigger('click')
+
+    // 聚合行：闸门中文 + 次数
+    expect(w.text()).toContain('资金不足拒单')
+    expect(w.text()).toContain('开仓资金不足1手')
+    // 历史逐事件行
+    expect(w.text()).toContain('000001.SZ')
+
+    // SSE 实时 decision 事件插入
+    const es = FakeEventSource.instances[0]
+    es.emit('decision', { gate: 'max_positions_full', layer: 'signal_gate', action: 'block',
+      stock_code: '600000.SH', strategy_id: null, param_name: 'max_positions',
+      param_value: 5, actual_value: 5, requested_qty: null, final_qty: null,
+      message: '持股数已达上限 5' })
+    await flushPromises()
+    expect(w.text()).toContain('持股数达上限')
+    expect(w.text()).toContain('600000.SH')
     w.unmount()
   })
 })

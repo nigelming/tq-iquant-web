@@ -167,6 +167,15 @@ class HttpBridgeDispatcher(OrderDispatcher):
             path += "?order_id=%s" % order_id
         return self._get_json(path)
 
+    def query_calendar(self) -> list:
+        """拉权威交易日历（桥 xtdata.get_trading_dates）。
+
+        返回 'YYYYMMDD' 字符串列表（桥侧把毫秒时间戳转成字符串，兼容 3.6）。
+        桥离线或老桥无 /calendar（HTTP 404）时抛 BridgeUnavailableError，
+        由 TradingCalendar fail-open 处理（工作日默认交易日）。
+        """
+        return self._get_json("/calendar")
+
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         """拉 1m/5m/1d bar（0009 切片3 行情通道）。
 

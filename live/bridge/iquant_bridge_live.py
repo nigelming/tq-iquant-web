@@ -43,6 +43,7 @@
 #   GET  /orders?order_id=     order query
 #   GET  /deals?order_id=      deal query
 #   GET  /quote?code=&period=&count=   1m/5m/1d bars (cached)
+#   GET  /calendar?market=SH    trading dates ["YYYYMMDD", ...] (cached, xtdata)
 #
 # Security: bridge binds 127.0.0.1 only (loopback, single-user host), so no
 # auth token is required. Defense is at the machine boundary: only local
@@ -473,6 +474,53 @@ def _df_to_bars(df):
         return []
 
 
+# ---------------- trading calendar ----------------
+_CAL_CACHE = {"ts": 0.0, "dates": []}
+_CAL_CACHE_TTL = 6 * 3600.0  # calendar is static; cache 6h
+
+
+def _ms_to_yyyymmdd(ms):
+    """Convert xtdata.get_trading_dates millisecond timestamp to YYYYMMDD.
+
+    Uses time.localtime to match xtdata.timetagToDateTime; the iQuant host runs
+    in Asia/Shanghai so localtime is the trading day.
+    """
+    try:
+        d = time.localtime(int(ms) / 1000)
+        return "%04d%02d%02d" % (d.tm_year, d.tm_mon, d.tm_mday)
+    except Exception:
+        return None
+
+
+def get_calendar(params):
+    """Authoritative trading calendar via xtdata.get_trading_dates.
+
+    Returns ["YYYYMMDD", ...]. market defaults to SH (Shanghai calendar equals
+    the A-share trading-day set, same as Shenzhen). Core caches per-year and
+    fails open when the bridge is down, so on failure return ok=False and let
+    Core degrade.
+    """
+    now = time.time()
+    if _CAL_CACHE["dates"] and now - _CAL_CACHE["ts"] <= _CAL_CACHE_TTL:
+        return {"ok": True, "data": _CAL_CACHE["dates"], "cached": True}
+    market = params.get("market", "SH")
+    try:
+        from xtquant import xtdata
+        raw = xtdata.get_trading_dates(market, "", "", -1) or []
+    except Exception as e:
+        return {"ok": False, "error": "get_trading_dates failed: %s" % e}
+    dates = []
+    for ms in raw:
+        s = _ms_to_yyyymmdd(ms)
+        if s is not None:
+            dates.append(s)
+    if not dates:
+        return {"ok": False, "error": "empty calendar"}
+    _CAL_CACHE["ts"] = now
+    _CAL_CACHE["dates"] = dates
+    return {"ok": True, "data": dates, "cached": False}
+
+
 def get_quote(params):
     code = params.get("code")
     period = params.get("period", "1m")
@@ -572,6 +620,8 @@ def _handle(method, path, headers, body):
         return _json(query_deals(params))
     if method == "GET" and path == "/quote":
         return _json(get_quote(params))
+    if method == "GET" and path == "/calendar":
+        return _json(get_calendar(params))
 
     return _json({"ok": False, "error": "unknown path %s" % path}, 404)
 

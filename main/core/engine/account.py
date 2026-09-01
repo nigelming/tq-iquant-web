@@ -1,8 +1,11 @@
 from decimal import Decimal
+import logging
 from typing import Optional
 
 from .event import TradeEvent
 from tq_iquant_shared.constants import TradeType
+
+logger = logging.getLogger(__name__)
 
 
 class Account:
@@ -52,6 +55,10 @@ class Account:
         max_qty = int(cap / price / 100) * 100
         if max_qty >= 100:
             return True, max_qty
+        logger.debug(
+            "资金拦截:不足1手拒绝（需 %s，可用 %s @ 价 %s，缩减后 %d 股）",
+            needed, cap, price, max_qty,
+        )
         self.insufficient_count += 1
         return False, 0
 

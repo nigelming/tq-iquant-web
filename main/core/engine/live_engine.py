@@ -12,9 +12,8 @@
 """
 import asyncio
 import logging
-import math
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
@@ -29,106 +28,57 @@ from .http_bridge_dispatcher import (
     BridgeUnavailableError,
     BridgeOrderRejected,
 )
-from .bar_poller import BarPoller, parse_bar_time, to_ohlcv, latest_completed_bar
-from core.models import LiveOrder, LiveTrade, LiveSessionPortfolio
+from .bar_poller import BarPoller
+# TradingCalendar 为 live 专属（仅实盘引擎及其协作者使用，回测不依赖），
+# 0010 后续迁入 live 子包；旧路径 core.engine.trading_calendar 保留 re-export shim。
+from .live.calendar import TradingCalendar
+# 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
+# re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
+# 保持 core.engine.live_engine 命名空间可见。
+from .live.timing import (
+    _CST,
+    _parse_insert_utc,
+    now_shanghai,
+    periods_on_boundary,
+)
+from .live.event_bus import EventBus
+from .live.context import EngineContext
+from .live.market_data import (
+    MarketDataService,
+    _FORMULA_META_KEYS,
+    _STARTUP_ONLY_PERIODS,
+)
+from .live.order_machine import (
+    OrderStateMachine,
+    _ORDER_REF_MATCH_TIMEOUT,
+    _ORDER_INSERT_TOLERANCE,
+    _ORDER_STATUS_FILLED,
+    _ORDER_STATUS_PARTIAL_CANCELED,
+    _ORDER_STATUS_CANCELED,
+    _ORDER_STATUS_JUNK,
+    _ORDER_STATUS_TERMINAL_CANCELED,
+    _ORDER_STATUS_TERMINAL_REJECTED,
+)
+from .live.breaker import BreakerService
+from .live.daily_closer import DailyCloser
+from .decision import DecisionRecorder
+from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
-# Asia/Shanghai 固定时区——实盘日终 (14:30) 判定/时间记录按上海时间，
-# 不依赖本机时区（Core 部署 UTC 服务器时本机 14:30 ≠ 上海 14:30，日终会哑火）。
-_CST = timezone(timedelta(hours=8))
-
-# 实盘日终判定时点（E5/E6 update_daily + C6(B/C) 1d 快照/1w/1mon 注入共用）。
-# 上海 14:30 收盘后驱动。提为常量消除魔法数字（审计 #33）。
-_DAILY_CLOSE_TIME = (14, 30)
-
 # 深交所收盘时点（上海 15:00）。收盘后禁止新下单——报不进交易所，会成待报单
 # 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
 # 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
 _MARKET_CLOSE_TIME = (15, 0)
+# _DAILY_CLOSE_TIME(14:30) / _MARKET_CLOSE_SWEEP_TIME(15:05) 与日终/收盘编排一并
+# 迁入 core.engine.live.daily_closer.DailyCloser（0010 步骤 5）；收盘新落单拦截仍留
+# 本模块（_MARKET_CLOSE_TIME，_handle_bar 内按 bar_time 判定）。
 
-# submitted 但始终匹配不到桥 order_ref 的单的失效阈值（秒）。
-# passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
-# 超过此时长判定失效，避免无限轮询陈旧单（含跨重启遗留单）。
-_ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
-# 模糊匹配（仅用于无 bridge_order_id 的遗留单）的时间窗：候选委托的柜台插入时间
-# 不得早于本单 created_at 超过此时长。挡住跨会话遗留的同代码同向同量旧单（真机 bug：
-# 新单 11:21 创建时真单尚未可查，被匹配到 09:55 的遗留单 → 回填错成交、真单丢失）。
-_ORDER_INSERT_TOLERANCE = timedelta(seconds=120)
-
-
-def _parse_insert_utc(insert_date, insert_time):
-    """桥 /orders 的 insert_date(YYYYMMDD)+insert_time(HHMMSS，上海本地) → UTC naive。
-
-    无法解析返回 None。桥 insert 时间是 Asia/Shanghai 本地 naive，Core created_at 是
-    UTC naive，比较前需换算。取前 6 位（兼容 HHMMSSsss 毫秒后缀）。
-    """
-    ds = str(insert_date or "").strip()
-    ts = str(insert_time or "").strip()
-    if len(ds) != 8 or len(ts) < 6:
-        return None
-    try:
-        local_naive = datetime.strptime(ds + ts[:6], "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    return local_naive - timedelta(hours=8)  # Asia/Shanghai → UTC
-
-
-def now_shanghai() -> datetime:
-    """当前上海时间（naive，已剥时区）。实盘固有时点判定专用。
-
-    naive 与引擎内其余 datetime（均 naive）比较一致；aware 与 naive 比较会抛 TypeError。
-    """
-    return datetime.now(tz=_CST).replace(tzinfo=None)
-
-
-# TQ 公式输出中需跳过的非变量键（同 backtest._FORMULA_META_KEYS）
-_FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
-
-# C6(C)：1w/1mon 走通达信启动/日终注入（桥端 xtdata 拉不到），_fill_signal_cache 跳过不拉桥
-_STARTUP_ONLY_PERIODS = ("1w", "1mon")
-
-
-def periods_on_boundary(bar_time: Optional[datetime]) -> List[str]:
-    """1m bar 结束时刻 → 命中的边界周期列表（可累积，只读 bar stime，不引入本机时钟）。
-
-    minute%5==0→5m、%15→15m、%30→30m、minute==0→1h。可累积：10:30 → [5m,15m,30m]，
-    11:00 → [5m,15m,30m,1h]。非边界时刻（如 10:03）→ []。
-    """
-    if bar_time is None:
-        return []
-    result: List[str] = []
-    minute = bar_time.minute
-    if minute % 5 == 0:
-        result.append("5m")
-    if minute % 15 == 0:
-        result.append("15m")
-    if minute % 30 == 0:
-        result.append("30m")
-    if minute == 0:
-        result.append("1h")
-    return result
-
-
-def _to_int(val) -> int:
-    """数值转 int（公式 trigger_value）；NaN/None/无法解析 → 0。同 backtest._to_int。"""
-    if val is None:
-        return 0
-    if isinstance(val, bool):
-        return int(val)
-    if isinstance(val, (int, float)):
-        try:
-            if math.isnan(val):
-                return 0
-        except (TypeError, ValueError):
-            pass
-        return int(val)
-    try:
-        return int(Decimal(str(val)))
-    except (ValueError, ArithmeticError):
-        return 0
+# 委托状态机/成交回填相关常量（_ORDER_REF_MATCH_TIMEOUT 等）与 OrderStateMachine 一并
+# 迁入 core.engine.live.order_machine（0010 步骤 3），此处由顶部 import re-export，保持
+# core.engine.live_engine 命名空间可见。
 
 
 class LiveEngine:
@@ -147,12 +97,28 @@ class LiveEngine:
         formula_count: int = 200,
         formula_count_by_name: Optional[Dict[str, int]] = None,
         code_period_count: Optional[Dict[tuple, int]] = None,
+        trading_calendar: Optional[TradingCalendar] = None,
     ):
-        self.session_id = session_id
-        self.portfolios = portfolios
-        self._dispatcher = dispatcher
+        # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
+        # fail-open（工作日放行），测试可注入假日历。
+        self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
         self._bar_poller = bar_poller
-        self._db_session_factory = db_session_factory
+        # 协作者共享状态容器（0010 步骤 2a）：session_id/portfolios/dispatcher/
+        # db_session_factory/code_period_count/clock 归 EngineContext，引擎上的同名
+        # 属性保留为 property 委托（见类体下方），调用点与测试直连无需改动。
+        self.ctx = EngineContext(
+            session_id=session_id,
+            portfolios=portfolios,
+            dispatcher=dispatcher,
+            db_session_factory=db_session_factory,
+            code_period_count=code_period_count,
+            clock=now_shanghai,
+        )
+        # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
+        # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
+        self._recorder = DecisionRecorder()
+        for p in portfolios:
+            p.set_recorder(self._recorder)
         self._poll_interval = poll_interval
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
@@ -160,60 +126,56 @@ class LiveEngine:
         # 实盘执行引擎：复用回测 ExecutionEngine，注入桥 dispatcher + 实盘 T+1 检查
         # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
         self._t1_checker = LiveT1Checker()
-        self._engine = ExecutionEngine(dispatcher, self._t1_checker)
+        self._engine = ExecutionEngine(dispatcher, self._t1_checker, recorder=self._recorder)
 
-        # 公式注入（0010）：tq_formula 封装内存注入链路；formula_by_strategy 预加载
-        # {strategy_id: formula_name}，避免每 bar 查库；formula_count 为注入历史根数
-        # （1m/5m 默认 200，够均线预热；不足时调大）。
-        self._tq_formula = tq_formula
-        self._formula_by_strategy: Dict[int, str] = formula_by_strategy or {}
-        self._formula_count = formula_count
-        # #27→#28：count 按公式配（Formula.formula_count），同公式恒定 → C4 去重 key
-        # (code, period, formula) 无需 count 进 key。_formula_count 作全局兜底（老调用不破）。
-        self._formula_count_by_name: Dict[str, int] = formula_count_by_name or {}
-        # 每周期预拉最大 count：该周期策略所用公式的最大 formula_count——边界/日终分发
-        # 预拉的 bars 够该周期最长公式（count 不够时注入会缺历史，信号 NaN 静默失效）。
-        self._period_count: Dict[str, int] = {}
-        # 实例所有策略的周期集合（含无公式策略，含 1d/1w/1mon）——_dispatch_period_bar
-        # 边界分发 guard 用：只拉实例确有策略的周期，挡掉 periods_on_boundary 纯算术
-        # 带出但实例无人用的周期（如 14:30 的 15m——minute%15==0 触发，却无 15m 策略，
-        # 白拉 17 只 count=200 后 period 过滤全跳过）。比 _period_count 更宽：后者只收
-        # 有公式映射的策略周期，无公式的 30m 策略靠此集合保住风控单的边界驱动。
-        self._strategy_periods: set = set()
-        for _p in portfolios:
-            for _ctx in _p.strategies:
-                self._strategy_periods.add(_ctx.period)
-                _name = self._formula_by_strategy.get(_ctx.strategy_id)
-                if not _name:
-                    continue
-                _cnt = self._formula_count_by_name.get(_name, self._formula_count)
-                if _cnt > self._period_count.get(_ctx.period, 0):
-                    self._period_count[_ctx.period] = _cnt
+        # 行情/信号协作者（0010 步骤 2b）：预热/增量 bar 缓存、公式信号注入、周期边界
+        # 分发、1w/1mon 通达信注入归 MarketDataService。on_bar 回调注入 self._handle_bar
+        # （服务不反向 import LiveEngine，周期/日终 bar 经此回调交回引擎下单/风控）；
+        # F5 可用持仓写回经 set_available_map 窄回调。引擎保留同名薄委托方法/property，
+        # 既有调用点与测试直连（engine.signal_cache={...}、engine._preheat() 等）穿透。
+        self.market_data = MarketDataService(
+            self.ctx,
+            bar_poller,
+            on_bar=self._handle_bar,
+            set_available_map=self._t1_checker.set_available_map,
+            tq_formula=tq_formula,
+            formula_by_strategy=formula_by_strategy,
+            formula_count=formula_count,
+            formula_count_by_name=formula_count_by_name,
+        )
+        # 委托状态机/成交回填协作者（0010 步骤 3）：order_ref 匹配、/deals 轮询回填、
+        # 终态同步、陈旧单失效、filled apply 归 OrderStateMachine。持有 _pending_orders/
+        # _last_backfill_time。事件发射经 self._emit 回调注入（不反向 import LiveEngine）。
+        # 引擎保留全部同名方法/属性为薄委托，既有测试直连穿透。
+        self._order_machine = OrderStateMachine(self.ctx, self._emit)
+        # 熔断编排协作者（0010 步骤 4）：每 bar update_peak/max_drawdown、日终 daily_loss、
+        # 计数持久化、3 次转手动、手动恢复、重启读回归 BreakerService。持有 _breaker_count_written。
+        # 事件发射经 self._emit 回调注入（不反向 import LiveEngine）。引擎保留同名薄委托。
+        self._breaker = BreakerService(self.ctx, self._emit)
+        # 日终/收盘时点编排协作者（0010 步骤 5）：14:30 日终估值（转 breaker）、
+        # 14:30 日线快照+1w/1mon 注入（转 market_data，经 on_bar 回调驱动）、15:05
+        # 收盘清扫（转 orders 回填/终态同步/兜底 cancel）。持有三个幂等日期标记。
+        # on_bar/emit/set_bridge_offline 经回调注入（不反向 import LiveEngine）；
+        # 引擎保留三个 _maybe_* 薄方法 + 同名可读写 property 兼容测试直连。
+        self._closer = DailyCloser(
+            self.ctx,
+            self.market_data,
+            self._breaker,
+            self._order_machine,
+            on_bar=self._handle_bar,
+            # 日历以 provider 注入：测试在构造后替换 engine._calendar，需读到最新值。
+            calendar_provider=lambda: self._calendar,
+            emit=self._emit,
+            set_bridge_offline=lambda: setattr(self, "_bridge_online", False),
+        )
 
         # 已分发过周期边界的 1m stime 集合——同根 bar 二次触发时挡掉重复周期分发。
         # BarPoller 按 code 独立判定完成：慢股票在下一轮 poll 才完成同一 stime
         # （真机 14:30 被二次驱动，15m 二次白拉）。周期分发全局重拉全 stock_codes +
         # 周期策略二次求值 = 白拉；1m 策略不受影响（每轮 bar.stocks 只含当轮新完成
         # 股票，慢股票仍在其完成那轮被驱动求值）。stime 含日期，跨日无碰撞。
+        # 属 _on_bar 编排状态（非行情数据本身），留引擎。
         self._dispatched_boundaries: set = set()
-
-        # 按 (code, period) 的预热/分发最大 count：该股票该周期所有公式 formula_count 最大值
-        # （跨组合跨策略，由 _build_engine 算好传入）。比 _period_count（全局按周期）更细：
-        # 不同股票该周期所需根数可能不同（如 C 只需 100、A 需 200），按需拉不浪费。
-        # _period_count 保留作"只知 period 不知 code"的兜底。无公式兜底 formula_count(200)。
-        self._code_period_count: Dict[tuple, int] = code_period_count or {}
-
-        # 预热缓存：(code, period) -> {"bars": [...], "last_stime": datetime, "count": int}
-        # 启动 _preheat() 填充（拉 code_period_count[(code,period)] 根历史）；
-        # 运行期 _get_bars_with_increment 读它 + 增量拉新 bar 拼接（省去每 bar 全量重拉）；
-        # 离线恢复 _tick_main 清空 → 下次走全量重建。跨 bar 生命周期（不像 df_cache 每 bar 重建）。
-        self._preheat_cache: Dict[tuple, dict] = {}
-
-        # 信号缓存：(strategy_id, stock_code, bar_time) -> [{"name": str, "value": int}]
-        # 风控信号（止损/止盈/移动止损）由 Portfolio._check_risks 直接生成，无需缓存；
-        # 公式信号（OPEN/ADD/REDUCE/CLOSE）需缓存命中才触发——_fill_signal_cache 在
-        # 每根 bar 前拉历史 → 内存注入算公式 → 填此 dict。测试可直接预置以验证下单链路。
-        self.signal_cache: Dict = {}
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -231,176 +193,230 @@ class LiveEngine:
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
         self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_online = True
-        # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
-        self._last_daily_date: Optional[date] = None
-        # C6(B/C)：14:30 日终 1d 快照 bar + 1w/1mon 注入已驱动的日期标记（每日一次）
-        self._last_daily_bar_date: Optional[date] = None
-        # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
-        # 主循环 _poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
-        # 运行中 _handle_bar 发单也计入、拒单弹出；_poll_deals 每轮回合重查 DB 同步（G7）。
-        self._pending_orders: Dict[int, "LiveOrder"] = {}
-        # G7（0011 §5.11）：最近一次 /deals 成交回报回填时点（None=尚无回填），
-        # 供 session API 桥状态并入。
-        self._last_backfill_time: Optional[datetime] = None
+        # 三个幂等日期标记已迁入 self._closer（DailyCloser，0010 步骤 5）；下列赋值经
+        # 同名 property 委托穿透到 closer 字段（初始化为 None，与 closer 默认一致）。
+        self._last_daily_date = None
+        self._last_daily_bar_date = None
+        self._last_close_sweep_date = None
+        # _pending_orders / _last_backfill_time 已迁入 self._order_machine（0010 步骤 3）；
+        # 引擎保留同名可读写 property 委托（recover 直接赋值 self._pending_orders = {...}、
+        # 测试直连 engine._pending_orders 穿透到同一份字典）。
         # F5：最近处理 bar 的强引用（多组合共享同一 bar 对象 → 每 bar 只刷一次桥可用
         # 持仓；强引用防对象 id 复用导致的漏刷）。None=尚未处理任何 bar。
         self._available_bar: Optional["BarEvent"] = None
-        # D4/H4：每组合已持久化的熔断计数（LiveSessionPortfolio.circuit_breaker_count）。
-        # recover 预置当前值；_persist_breaker_count 只在计数变化时落库（避免每 bar 写）。
-        # key=portfolio.portfolio_id。
-        self._breaker_count_written: Dict[int, int] = {}
+        # D4/H4：每组合已持久化的熔断计数（LiveSessionPortfolio.circuit_breaker_count）
+        # 已迁入 self._breaker（BreakerService，0010 步骤 4）；引擎保留同名可读写
+        # property 委托（recover 直接赋值 self._breaker_count_written[pid]=n、测试直连
+        # engine._breaker_count_written 穿透到同一份字典）。
         # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
         # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
         self._reconcile_mismatches: List[dict] = []
-        # B5：SSE 事件流——_stream_subscribers 为当前已连接客户端的订阅队列，
-        # _emit 向各队列 put_nowait 广播；stream_events 注册/退订队列。
-        # stream_ping_interval：流空闲无事件时的 ping 心跳间隔（design §5.6.10，30s）。
-        self._stream_ping_interval = stream_ping_interval
-        self._stream_subscribers: List["asyncio.Queue"] = []
+        # B5：SSE 事件总线（0010 步骤 1 抽到 core.engine.live.event_bus.EventBus）。
+        # 持有订阅队列集合、跨线程投递、ping 心跳；引擎保留 _emit/stream_events 薄委托，
+        # 并暴露 _stream_subscribers/_stream_ping_interval 兼容测试直连。
+        self._event_bus = EventBus(ping_interval=stream_ping_interval, clock=now_shanghai)
 
-    # ---------------- B5 SSE 事件流 ----------------
+    @property
+    def _stream_subscribers(self) -> List["asyncio.Queue"]:
+        """兼容测试直连（append/extend/in）：转发到 EventBus 的订阅列表。"""
+        return self._event_bus.subscribers
+
+    @property
+    def _stream_ping_interval(self) -> float:
+        return self._event_bus.ping_interval
+
+    @_stream_ping_interval.setter
+    def _stream_ping_interval(self, value: float) -> None:
+        self._event_bus.ping_interval = value
+
+    # ---- EngineContext 委托（0010 步骤 2a）----
+    # 这些字段已迁入 self.ctx；保留同名 property 让既有调用点与测试的直接赋值
+    # （engine.portfolios=[...]、engine._code_period_count={...}、engine._dispatcher=...）
+    # 穿透到同一份 ctx 对象，纯搬移不改行为。
+    @property
+    def session_id(self) -> int:
+        return self.ctx.session_id
+
+    @session_id.setter
+    def session_id(self, value: int) -> None:
+        self.ctx.session_id = value
+
+    @property
+    def portfolios(self) -> List[Portfolio]:
+        return self.ctx.portfolios
+
+    @portfolios.setter
+    def portfolios(self, value: List[Portfolio]) -> None:
+        self.ctx.portfolios = value
+        # 构造后替换组合列表（测试直连 / recover 重建）也要注入决策采集器
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            for p in value:
+                p.set_recorder(rec)
+
+    @property
+    def _dispatcher(self) -> HttpBridgeDispatcher:
+        return self.ctx.dispatcher
+
+    @_dispatcher.setter
+    def _dispatcher(self, value: HttpBridgeDispatcher) -> None:
+        self.ctx.dispatcher = value
+
+    @property
+    def _db_session_factory(self) -> Callable[[], Session]:
+        return self.ctx.db_session_factory
+
+    @_db_session_factory.setter
+    def _db_session_factory(self, value: Callable[[], Session]) -> None:
+        self.ctx.db_session_factory = value
+
+    @property
+    def _code_period_count(self) -> Dict[tuple, int]:
+        return self.ctx.code_period_count
+
+    @_code_period_count.setter
+    def _code_period_count(self, value: Dict[tuple, int]) -> None:
+        self.ctx.code_period_count = value
+
+    # ---- MarketDataService 委托（0010 步骤 2b）----
+    # 缓存/公式注入配置归 MarketDataService；保留可读写 property 让既有测试直连
+    # （engine.signal_cache={...}、engine._tq_formula.compute_injected_batch=...、
+    # engine._preheat_cache[...] = ...）穿透到同一份服务对象。
+    @property
+    def signal_cache(self) -> Dict:
+        return self.market_data.signal_cache
+
+    @signal_cache.setter
+    def signal_cache(self, value: Dict) -> None:
+        self.market_data.signal_cache = value
+
+    @property
+    def _preheat_cache(self) -> Dict[tuple, dict]:
+        return self.market_data._preheat_cache
+
+    @property
+    def _tq_formula(self):
+        return self.market_data._tq_formula
+
+    @property
+    def _formula_by_strategy(self) -> Dict[int, str]:
+        return self.market_data._formula_by_strategy
+
+    @property
+    def _formula_count(self) -> int:
+        return self.market_data._formula_count
+
+    @property
+    def _formula_count_by_name(self) -> Dict[str, int]:
+        return self.market_data._formula_count_by_name
+
+    @property
+    def _period_count(self) -> Dict[str, int]:
+        return self.market_data._period_count
+
+    @property
+    def _strategy_periods(self) -> set:
+        return self.market_data._strategy_periods
+
+    # ---- OrderStateMachine 委托（0010 步骤 3）----
+    # 在途单字典/最近回填时点归 OrderStateMachine；保留可读写 property 让 recover 的
+    # 直接赋值（self._pending_orders = {...}）与测试直连穿透到同一份对象。
+    @property
+    def _pending_orders(self) -> Dict[int, "LiveOrder"]:
+        return self._order_machine.pending_orders
+
+    @_pending_orders.setter
+    def _pending_orders(self, value: Dict[int, "LiveOrder"]) -> None:
+        self._order_machine.pending_orders = value
+
+    @property
+    def _last_backfill_time(self) -> Optional[datetime]:
+        return self._order_machine.last_backfill_time
+
+    @_last_backfill_time.setter
+    def _last_backfill_time(self, value: Optional[datetime]) -> None:
+        self._order_machine.last_backfill_time = value
+
+    # _breaker_count_written 归 BreakerService（0010 步骤 4）；返回活字典引用，
+    # 让 recover 的 self._breaker_count_written[k]=n 与测试的 engine._breaker_count_written[k]=n
+    # 穿透到同一份对象。
+    @property
+    def _breaker_count_written(self) -> Dict[int, int]:
+        return self._breaker.counts_written
+
+    @_breaker_count_written.setter
+    def _breaker_count_written(self, value: Dict[int, int]) -> None:
+        self._breaker.counts_written = value
+
+    # ---- DailyCloser 委托（0010 步骤 5）----
+    # 三个幂等日期标记归 DailyCloser；保留可读写 property 让测试直连
+    # （engine._last_daily_date = today、engine._last_close_sweep_date 读判等）穿透。
+    @property
+    def _last_daily_date(self):
+        return self._closer.last_daily_date
+
+    @_last_daily_date.setter
+    def _last_daily_date(self, value) -> None:
+        self._closer.last_daily_date = value
+
+    @property
+    def _last_daily_bar_date(self):
+        return self._closer.last_daily_bar_date
+
+    @_last_daily_bar_date.setter
+    def _last_daily_bar_date(self, value) -> None:
+        self._closer.last_daily_bar_date = value
+
+    @property
+    def _last_close_sweep_date(self):
+        return self._closer.last_close_sweep_date
+
+    @_last_close_sweep_date.setter
+    def _last_close_sweep_date(self, value) -> None:
+        self._closer.last_close_sweep_date = value
+
+    # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
     def _emit(self, event_type: str, payload: dict) -> None:
-        """向所有 SSE 订阅队列广播 {type, **payload}（signal/order/trade/position/risk）。
-
-        线程安全（审计 #3）：_emit 可能从事件线程（stream_events 消费侧、同步测试直调）
-        或 worker 线程（_loop/_deals_loop tick 内 _handle_bar/_backfill_order）被调。
-        asyncio.Queue.put_nowait 非线程安全 → worker 线程内经 call_soon_threadsafe
-        回到事件线程投递；事件线程内（或未 start、_loop_ref=None 的同步路径）直接
-        put_nowait（保留既有同步测试 get_nowait 立即可见的语义）。
-        队列积压（订阅端消费慢）→ 丢弃该事件（EventSource 断线重连后见最新状态，
-        design §5.6.10：浏览器自动重连，无需重放）。
-        """
-        ev = {"type": event_type, **payload}
-        loop = self._loop_ref
-        if loop is None:
-            # 未 start（同步测试 / start 前）：直接投递
-            self._emit_to_subscribers(ev)
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            # 事件线程内：直接投递
-            self._emit_to_subscribers(ev)
-        else:
-            # worker 线程内：回到事件线程投递（asyncio.Queue 非线程安全）
-            loop.call_soon_threadsafe(self._emit_to_subscribers, ev)
+        """向所有 SSE 订阅队列广播（委托 EventBus.emit，线程安全语义见 event_bus）。"""
+        self._event_bus.emit(event_type, payload)
 
     def _emit_to_subscribers(self, ev: dict) -> None:
-        """实际向各订阅队列 put_nowait（仅在事件线程执行）。积压 → 丢弃不阻塞。"""
-        for q in list(self._stream_subscribers):
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:
-                pass  # 积压丢弃，不阻塞引擎
+        """兼容旧调用/测试：直接向订阅队列投递（委托 EventBus）。"""
+        self._event_bus._emit_to_subscribers(ev)
 
-    async def stream_events(self) -> AsyncIterator[dict]:
-        """SSE 事件流：订阅引擎事件队列，逐条 yield；空闲超 ping 间隔 yield ping 心跳。
+    def stream_events(self) -> AsyncIterator[dict]:
+        """SSE 事件流（委托 EventBus.stream；公共签名不变，live.py 与测试仍调此方法）。
 
-        每个 /stream 连接调用一次（/stream 端点 async for 消费）。连接结束（aclose）
-        → finally 退订。引擎停止（_running=False）→ 队列空则流结束（端点侧转 ping-only）。
+        直接返回内部 async generator（不用 `async for ... yield` 包裹），这样调用方
+        aclose() 直接作用于 bus 的生成器，其 finally（退订队列）立即执行。
         """
-        q: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self._stream_subscribers.append(q)
-        try:
-            while self._running or not q.empty():
-                try:
-                    ev = await asyncio.wait_for(
-                        q.get(), timeout=self._stream_ping_interval
-                    )
-                except asyncio.TimeoutError:
-                    ev = {"type": "ping", "time": now_shanghai().isoformat()}
-                yield ev
-        finally:
-            if q in self._stream_subscribers:
-                self._stream_subscribers.remove(q)
+        return self._event_bus.stream(lambda: self._running)
 
-    # ---------------- 预热 + 增量拼接（拉取优化）----------------
+    # ---------------- 行情/信号缓存（委托 MarketDataService，0010 步骤 2b）----------------
+    # 以下方法/静态方法保留为薄委托：实现已迁到 core.engine.live.market_data.MarketDataService，
+    # 缓存（_preheat_cache/signal_cache）归服务所有。保留同名入口让既有调用点与测试直连
+    # （engine._preheat()、engine._get_bars_with_increment(...)、LiveEngine._bars_to_formula_df(...)
+    # 等）无需改动，纯搬移不改行为。
     def _preheat(self) -> None:
-        """启动预热：对每个 (code, period) 拉 code_period_count 根历史存 _preheat_cache。
-
-        只预热 _code_period_count 里的 (code,period)（实例真实有策略的，按需不浪费），
-        跳过 1d/1w/1mon（1d 不预热走日终 _maybe_daily_bars；1w/1mon 走通达信 _inject_startup_periods）。
-        单 (code,period) 拉取失败不阻断启动（log warn，运行期该 key 走 _get_bars_with_increment
-        的"缓存未命中全量补"自愈）。启动一次性同步调用，在 start() 里 _inject_startup_periods 之后。
-        """
-        for (code, period), count in self._code_period_count.items():
-            if period in ("1d", "1w", "1mon"):
-                continue
-            try:
-                bars = self._dispatcher.query_quote(code, period=period, count=count)
-            except BridgeUnavailableError:
-                logger.warning("preheat failed (bridge unavailable) %s %s", code, period)
-                continue
-            except Exception:  # noqa: BLE001
-                logger.exception("preheat failed %s %s", code, period)
-                continue
-            if not bars:
-                continue
-            self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
+        self.market_data.preheat()
 
     def _make_cache_entry(self, bars: list, count: int) -> dict:
-        """bars → 排序截断到 count 根 + 算 last_stime，构造 _preheat_cache 条目。"""
-        bars = self._sort_and_cap(bars, count)
-        return {"bars": bars, "last_stime": self._max_stime(bars), "count": count}
+        return self.market_data._make_cache_entry(bars, count)
 
     def _get_bars_with_increment(self, code: str, period: str, count: int) -> list:
-        """读预热缓存历史 + 增量拉新 bar 拼接，返回 count 根窗口（拉取优化核心）。
-
-        1) 缓存命中：增量拉 query_quote(count=INCREMENT_COUNT) 筛 stime > cache.last_stime
-           的新 bar，拼到 cache.bars 末尾，排序截断保持 count 长；无新 bar 直接返缓存（最省）。
-        2) 缓存未命中（预热失败/离线清缓存后）：全量拉 count 根回填缓存（异常/首次路径，
-           不背正常增量的负担）。
-        桥拉取抛 BridgeUnavailableError 向上传播（交 _on_bar/_dispatch_period_bar 置离线）。
-        """
-        INCREMENT_COUNT = 10  # 增量拉取根数，够覆盖正常单边界增量（1-2 根）；离线恢复走清缓存全量重建
-        cache = self._preheat_cache.get((code, period))
-        if cache is None:
-            bars = self._dispatcher.query_quote(code, period=period, count=count)
-            if bars:
-                self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
-            return bars
-        # 缓存存在但请求 count > 缓存 count：缓存历史不够长公式的窗口 → 升级全量拉 count 根
-        # （同 _fetch_cached_bars 升级语义：count 不够会缺历史，长均线 NaN 静默失效）。
-        if count > cache["count"]:
-            bars = self._dispatcher.query_quote(code, period=period, count=count)
-            if bars:
-                self._preheat_cache[(code, period)] = self._make_cache_entry(bars, count)
-            return bars
-        new_bars = self._dispatcher.query_quote(code, period=period, count=INCREMENT_COUNT)
-        last = cache["last_stime"]
-        fresh = [b for b in new_bars if self._bar_stime(b) is not None
-                 and (last is None or self._bar_stime(b) > last)]
-        if not fresh:
-            return cache["bars"]
-        merged = self._sort_and_cap(cache["bars"] + fresh, count)
-        cache["bars"] = merged
-        cache["last_stime"] = self._max_stime(merged)
-        return merged
+        return self.market_data.get_bars_with_increment(code, period, count)
 
     @staticmethod
     def _bar_stime(bar: dict) -> Optional[datetime]:
-        """bar → 结束时间 datetime（复用 parse_bar_time，兼容 stime/time/index）。"""
-        return parse_bar_time(bar)
+        return MarketDataService._bar_stime(bar)
 
     @staticmethod
     def _sort_and_cap(bars: list, count: int) -> list:
-        """按 bar stime 升序排序，截断保留最新 count 根（去重同 stime）。"""
-        timed = [(parse_bar_time(b), b) for b in bars]
-        seen: Dict[datetime, dict] = {}
-        for bt, b in timed:
-            if bt is not None and bt not in seen:
-                seen[bt] = b
-        ordered = [b for _, b in sorted(seen.items())]
-        return ordered[-count:] if count > 0 else ordered
+        return MarketDataService._sort_and_cap(bars, count)
 
     @staticmethod
     def _max_stime(bars: list) -> Optional[datetime]:
-        """bars 中最新 bar 的 stime（空 → None）。"""
-        stimes = [parse_bar_time(b) for b in bars]
-        stimes = [t for t in stimes if t is not None]
-        return max(stimes) if stimes else None
+        return MarketDataService._max_stime(bars)
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
@@ -410,6 +426,7 @@ class LiveEngine:
         self._running = True
         # 审计 #3：捕获运行中的事件循环，供 _emit 跨线程 call_soon_threadsafe 回投。
         self._loop_ref = asyncio.get_running_loop()
+        self._event_bus.bind_loop(self._loop_ref)
         # 审计 #3：stop() 会 shutdown executor（释放非 daemon worker 线程，防进程退出
         # 挂起）；若引擎被重启（同实例二次 start），旧 executor 已 shutdown → 重建一个。
         # 每次 start 重建开销可忽略（1 线程，session 生命周期内仅一次）。
@@ -458,6 +475,7 @@ class LiveEngine:
         # 审计 #3：停止后清空 loop 引用——worker 线程已不再产生 _emit；
         # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
         self._loop_ref = None
+        self._event_bus.clear_loop()
         # 审计 #3：释放单 worker 线程（ThreadPoolExecutor 默认非 daemon，不 shutdown 会
         # 在进程退出时挂起 join）。wait=False：正在跑的 tick 是 loopback HTTP，瞬间完成，
         # 不阻塞 stop；任务已 cancel，不会再提交新 tick。
@@ -531,6 +549,9 @@ class LiveEngine:
             self._maybe_daily_close()
             # C6(B/C)：14:30 日终一次 1d 快照 bar + 1w/1mon 通达信注入驱动
             self._maybe_daily_bars()
+            # 15:05 收盘清扫：交易日收盘后对仍未完结的单做确定性兜底（成交回填 +
+            # 终态同步 + 剩余按 A 股收盘未成交=撤单标 canceled）。实时轮询的权威收口。
+            self._maybe_close_sweep()
         except BridgeUnavailableError as e:
             self._bridge_online = False
             logger.warning("bridge unavailable: %s, skip this round", e)
@@ -566,131 +587,19 @@ class LiveEngine:
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
 
-    # ---------------- 日终（E5/E6）----------------
+    # ---------------- 日终/收盘时点编排（0010 步骤 5 转 DailyCloser）----------------
+    # 14:30 日终估值/日线驱动、15:05 收盘清扫的"时点判断 + 编排"已迁入
+    # core.engine.live.daily_closer.DailyCloser。下列 _maybe_* 保留为薄委托（_tick_main
+    # 与测试直连 engine._maybe_*(now=...) 穿透）；三个幂等日期标记经 property 委托到
+    # DailyCloser，测试对 engine._last_daily_date 等的直接读写穿透到同一份状态。
     def _maybe_daily_close(self, now: Optional[datetime] = None) -> None:
-        """本机时间 ≥ 14:30 且当日未算过 → 对每个组合调一次 update_daily。
-
-        日终一次：日内盈亏 daily_pnl = 当前总市值 - prev_close（昨日收盘，update_peak 跨日刷新），
-        检测 daily_loss 暂停 + 次日恢复。用上海时间（实盘固有时点，同 C6 1d 快照时点）。
-        幂等：_last_daily_date 记录当日已算，避免每轮循环重复触发。
-        """
-        if now is None:
-            now = now_shanghai()
-        if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
-            return
-        today = now.date()
-        if self._last_daily_date == today:
-            return
-        self._last_daily_date = today
-        for portfolio in self.portfolios:
-            try:
-                # 日终总市值：用组合最新现金 + 持仓市值（无最新 bar 时以当前持仓市值近似）
-                total = portfolio.account.cash
-                for ctx in portfolio.strategies:
-                    for stock_code, pos in ctx.positions.items():
-                        if pos.quantity == 0:
-                            continue
-                        # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
-                        total += pos.avg_cost * pos.quantity
-                was_paused = portfolio.risk_manager.daily_pause_active
-                portfolio.risk_manager.update_daily(
-                    total, today, portfolio.account.initial_capital
-                )
-                # B5：日内亏损熔断刚触发（daily_pause_active 变 True）→ 推送风控事件
-                if portfolio.risk_manager.daily_pause_active and not was_paused:
-                    self._emit("risk", {
-                        "portfolio_id": portfolio.portfolio_id,
-                        "rule": "daily_loss",
-                        "triggered": True,
-                        "message": "日内亏损熔断触发，当日暂停新开仓",
-                    })
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "update_daily error (portfolio %s, date %s)",
-                    portfolio.portfolio_id, today,
-                )
+        self._closer.maybe_daily_close(now)
 
     def _maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
-        """C6(B/C)：日终（≥14:30 当日一次）1d 快照 bar + 1w/1mon 通达信注入驱动。
+        self._closer.maybe_daily_bars(now)
 
-        **14:30 数据源定案**：
-          - 1d    → **iQuant 桥** /quote?period=1d（最新 forming 1d bar 的 OHLCV 快照）
-          - 1w/1mon → **通达信 TQFormula.compute**（桥端 xtdata 拉不到 1w/1mon，仅此通路）
-        与启动的去重/长度规则**一致**：
-          - 1d 长度按 _code_period_count[(code,"1d")]（该股 1d 公式最大 formula_count，
-            兜底 _period_count/全局），去重按 _sort_and_cap（stime 去重 + 截断）——同 _preheat；
-          - 1w/1mon 走与 start() 相同的 _inject_startup_periods（count=-1 全量 + 取最新信号），
-            日切 cache miss 时补注入——同启动注入。
-
-        C6(B) 1d：拉桥 /quote?period=1d → _sort_and_cap → 构造 BarEvent(period="1d")
-          → _fill_signal_cache 注入（period="1d"）→ on_bar 驱动 1d 策略。
-        C6(C) 1w/1mon：信号预填 signal_cache[(sid, code, daily_time)]，此处驱动命中预填信号。
-        幂等：_last_daily_bar_date 记录当日已触发。日切时（新 daily_time 的 1w/1mon
-        cache miss）→ 通达信补注入。用本机 Asia/Shanghai 时钟（实盘固有时点，同 E5/E6）。
-        """
-        if now is None:
-            now = now_shanghai()
-        if (now.hour, now.minute) < _DAILY_CLOSE_TIME:
-            return
-        today = now.date()
-        if self._last_daily_bar_date == today:
-            return
-        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）。数据源 **iQuant 桥**
-        # （1w/1mon 桥端 xtdata 拉不到，走通达信 _inject_startup_periods，见下 C6(C)）。
-        # 长度/去重规则 **同启动预热（_preheat）**：
-        #   长度 = 该股该周期最大 formula_count（_code_period_count[(code,"1d")]，
-        #     兜底周期级 _period_count/全局 _formula_count）——非周期级统一值；
-        #   去重 = _sort_and_cap 按 stime 排序 + 同 stime 去重 + 截断到 count 根。
-        bars_by_code: Dict[str, list] = {}
-        for code in self._bar_poller.stock_codes:
-            count = self._code_period_count.get(
-                (code, "1d"), self._period_count.get("1d", self._formula_count)
-            )
-            try:
-                bars = self._dispatcher.query_quote(
-                    code, period="1d", count=count
-                )
-            except BridgeUnavailableError:
-                self._bridge_online = False
-                logger.warning("bridge offline on daily bars (session %s)", self.session_id)
-                return
-            if bars:
-                bars_by_code[code] = self._sort_and_cap(bars, count)
-        if not bars_by_code:
-            return
-        # daily_time = 任一 code 最新 1d bar 的 stime（交易日 00:00）；解析失败用今日零点兜底
-        daily_time = parse_bar_time(next(iter(bars_by_code.values()))[-1])
-        if daily_time is None:
-            daily_time = datetime.combine(today, datetime.min.time())
-        self._last_daily_bar_date = today
-        # 日切检测：新 daily_time 的 1w/1mon cache miss → 通达信补注入
-        if self._startup_periods_missing(daily_time):
-            self._inject_startup_periods(daily_time)
-        # 1d 快照即最终值（14:30 后），每 code 取最新 forming 1d bar 的 OHLCV
-        stocks = {code: to_ohlcv(bars[-1]) for code, bars in bars_by_code.items()}
-        # C4(#28)：跨三周期共享去重缓存（key 含 period，1d/1w/1mon 互不干扰）
-        df_cache: Dict = {}
-        raw_cache: Dict = {}
-        for period in ("1d", "1w", "1mon"):
-            bar_event = BarEvent(stocks=stocks, bar_time=daily_time, period=period)
-            for portfolio in self.portfolios:
-                try:
-                    self._handle_bar(
-                        portfolio, bar_event, bars_by_code=bars_by_code,
-                        df_cache=df_cache, raw_cache=raw_cache,
-                    )
-                except BridgeUnavailableError as e:
-                    self._bridge_online = False
-                    logger.warning(
-                        "bridge unavailable on daily %s bar %s: %s",
-                        period, daily_time, e,
-                    )
-                    return
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "daily %s bar error (portfolio %s, time %s)",
-                        period, portfolio.portfolio_id, daily_time,
-                    )
+    def _maybe_close_sweep(self, now: Optional[datetime] = None) -> None:
+        self._closer.maybe_close_sweep(now)
 
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
@@ -699,7 +608,8 @@ class LiveEngine:
         边界判定只读 1m bar stime（periods_on_boundary），不引入本机时钟；
         5m/15m/30m/1h 策略在边界时点才被驱动（C6(A)），1m 节拍不再每 bar 算长周期。
         C4(#28)：df_cache/raw_cache 建在此（跨组合共享）——同 (code,period) 只 query_quote
-        一次、同 (code,period,formula) 只 compute_injected 一次（TQ 计算最贵）。
+        一次、同 (code,period,formula) 只算一次（TQ 计算最贵）；同组 (formula,period) 的
+        多 code 再合并成一次 compute_injected_batch（N set + 1 process，治 1m 全池节拍）。
         BarPoller 透传的本轮 bars（bar.bars_by_code）直接给 _handle_bar 注入复用——
         1m 判完成与算公式共用一次拉取，消除双拉（BarPoller 已拉 count=10，注入不再增量重拉）。
         """
@@ -740,6 +650,15 @@ class LiveEngine:
                     logger.exception("dispatch %s boundary %s error", period, bar.bar_time)
             self._dispatched_boundaries.add(bar.bar_time)
 
+    # 非日内周期：bar_time 按约定是当日 00:00，只判交易日，不卡 09:30–15:00 时段。
+    _DAILY_PERIODS = ("1d", "1w", "1mon")
+
+    def _trading_allowed_for(self, bt: datetime, period: str) -> bool:
+        """bar_time 是否允许下新单。日内周期判交易日+交易时段；日线及以上只判交易日。"""
+        if period in self._DAILY_PERIODS:
+            return self._calendar.is_trading_day(bt.date())
+        return self._calendar.is_trading_allowed(bt)
+
     def _handle_bar(
         self,
         portfolio: Portfolio,
@@ -758,9 +677,9 @@ class LiveEngine:
         E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测）。
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
-        portfolio.risk_manager.update_peak(portfolio.total_value(bar), bar.bar_time.date())
-        # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
-        self._persist_breaker_count(portfolio)
+        total_value = portfolio.total_value(bar)
+        # update_peak + max_drawdown 次日自动恢复检测 + H4 计数持久化归 BreakerService（0010 步骤 4）
+        self._breaker.on_bar_update(portfolio, total_value, bar.bar_time.date())
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
         # SELL 减仓上限用 m_nCanUseVolume（T+1 可用），供 cap_quantity 取数。
         if self._available_bar is not bar:
@@ -772,11 +691,11 @@ class LiveEngine:
         )
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
         orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
-        if not orders:
-            return
+        # db 会话在 on_bar 之后即开：决策闸门事件（熔断 halt/剥 BUY/风险触发）可能在无新单
+        # 时也产生，需随本 bar 落库——故不再 orders 为空就早退，drain 放 finally 收尾。
         db = self._db_session_factory()
         try:
-            for order in orders:
+            for order in (orders or []):
                 ctx = portfolio.find_strategy(order.strategy_id)
                 if ctx is None:
                     continue
@@ -802,6 +721,28 @@ class LiveEngine:
                         order.trade_type.value, order.stock_code, order.signal_name,
                         bt,
                     )
+                    self._rec_live(
+                        "after_close_block", "block", portfolio, order,
+                        message="bar_time %s >= 15:00 收盘后不下单" % bt,
+                    )
+                    continue
+                # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
+                # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
+                # 周末/节假日绝不误下，真实交易日不误挡。风控 update_peak 与 signal 事件仍
+                # 照常执行（只拦落单）。
+                # 日内周期(1m/5m...)额外卡交易时段 09:30–15:00；1d/1w/1mon 的 bar_time 按
+                # 约定是当日 00:00（由 14:30 _maybe_daily_bars 统一驱动），不套时段门，
+                # 只判交易日，否则会把 14:30 合法驱动的日线单误杀。
+                if bt is not None and not self._trading_allowed_for(bt, bar.period):
+                    logger.info(
+                        "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
+                        order.trade_type.value, order.stock_code, order.signal_name,
+                        bt, bar.period,
+                    )
+                    self._rec_live(
+                        "non_trading_block", "block", portfolio, order,
+                        message="非交易日/非交易时段 period=%s bar=%s" % (bar.period, bt),
+                    )
                     continue
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
                 pos = ctx.positions.get(order.stock_code)
@@ -812,6 +753,10 @@ class LiveEngine:
                 # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
                 capped = self._engine.cap_quantity(order, portfolio.account, pos)
                 if capped is None:
+                    logger.info(
+                        "skip order %s %s %s: cap_quantity None（资金/持仓上限拦截，不下单）",
+                        order.trade_type.value, order.stock_code, order.signal_name,
+                    )
                     continue
                 order.quantity = capped
                 # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
@@ -839,6 +784,10 @@ class LiveEngine:
                             op.upper(), order.stock_code, order.signal_name,
                             order.bar_time, dup.id,
                         )
+                        self._rec_live(
+                            "dup_skip", "block", portfolio, order,
+                            message="同 bar 同向单已存在 order=%s" % dup.id,
+                        )
                         continue
                 # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
                 # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
@@ -848,8 +797,8 @@ class LiveEngine:
                 # 卖出不被未确认的买入挡住。bar_time 不是放行理由（不同 bar 只是两次
                 # 信号时点，上一单未确认就再下同向单仍是重复）。回填确认（filled）后由
                 # portfolio.py 持仓守卫接管；rejected 释放门（被拒不会成交，必须允许重试）。
-                # 边界：无 cancelled 状态，纯撤单无成交的单会一直 submitted → 该股被门挡住；
-                # 比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
+                # 终态（filled/canceled/rejected）都不在 submitted/partial 内，正确释放门；
+                # 仅在途单占门。比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
                 op = "buy" if order.trade_type == TradeType.BUY else "sell"
                 inflight = db.query(LiveOrder).filter(
                     LiveOrder.live_session_id == self.session_id,
@@ -864,6 +813,10 @@ class LiveEngine:
                         "skip inflight %s %s %s bar=%s (order %s still %s)",
                         op.upper(), order.stock_code, order.signal_name,
                         order.bar_time, inflight.id, inflight.status,
+                    )
+                    self._rec_live(
+                        "inflight_skip", "block", portfolio, order,
+                        message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
                     )
                     continue
                 # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
@@ -890,6 +843,10 @@ class LiveEngine:
                     live_order.status = "rejected"
                     live_order.error_message = "bridge unavailable"
                     self._bridge_online = False
+                    self._rec_live(
+                        "bridge_unavailable", "reject", portfolio, order,
+                        message="桥离线（dispatcher 不可达）",
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -905,6 +862,10 @@ class LiveEngine:
                     # （此前被吞成笼统 "approval failed"，真机查不了原因）。
                     live_order.status = "rejected"
                     live_order.error_message = str(e)
+                    self._rec_live(
+                        "bridge_rejected", "reject", portfolio, order,
+                        message="桥业务拒单: %s" % str(e),
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -920,6 +881,10 @@ class LiveEngine:
                     # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
                     live_order.status = "rejected"
                     live_order.error_message = "approval failed"
+                    self._rec_live(
+                        "approval_failed", "reject", portfolio, order,
+                        message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
+                    )
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
                         "portfolio_id": portfolio.portfolio_id,
@@ -938,117 +903,98 @@ class LiveEngine:
                 if order.trade_type == TradeType.SELL:
                     self._t1_checker.consume_available(order.stock_code, order.quantity)
                 db.commit()
+                logger.info(
+                    "order accepted: id=%s %s %s %s qty=%s price=%s bar=%s (session %s)",
+                    live_order.id, order.trade_type.value, order.stock_code,
+                    order.signal_name, live_order.quantity, live_order.price,
+                    order.bar_time, self.session_id,
+                )
+            # 决策闸门事件随本 bar 统一落库 + SSE 推送（含 orders 为空时的 halt/strip 事件）。
+            self._drain_decisions(db, portfolio)
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
 
-    def _persist_breaker_count(self, portfolio: Portfolio) -> None:
-        """H4：把组合 max_drawdown 累计触发次数持久化到 LiveSessionPortfolio.circuit_breaker_count。
+    def _rec_live(
+        self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,
+        message: Optional[str] = None,
+    ) -> None:
+        """记录一条实盘专属闸门事件（收盘/日历/去重/在途/桥拒单）。"""
+        self._recorder.record(
+            gate=gate, layer="live_gate", action=action,
+            portfolio_id=portfolio.portfolio_id,
+            strategy_id=order.strategy_id,
+            stock_code=order.stock_code,
+            bar_time=order.bar_time,
+            message=message,
+        )
 
-        每 bar update_peak 后比对：计数未变则不落库（避免每 bar 写）；变化（熔断触发 / 达 3 次
-        转手动）→ 写 count，达 3 次 status 转 circuit_broken（design §8.3）。找不到 link
-        （组合未关联本 session）→ 跳过。写库失败不阻断交易，记日志。
+    def _drain_decisions(self, db, portfolio: Portfolio) -> None:
+        """把本 bar 缓冲的决策闸门事件落 LiveDecisionEvent + 推 SSE，一次 commit。
+
+        失败不影响交易主链路（仅观测）：回滚本批事件行、记异常，不抛出。
         """
-        count = portfolio.risk_manager.consecutive_drawdown_triggers
-        old = self._breaker_count_written.get(portfolio.portfolio_id)
-        if old == count:
+        events = self._recorder.drain()
+        if not events:
             return
-        # B5：计数递增（max_drawdown 熔断刚触发）→ 推送风控事件（首 bar old=None 不推）
-        if old is not None and count > old:
-            self._emit("risk", {
-                "portfolio_id": portfolio.portfolio_id,
-                "rule": "max_drawdown",
-                "triggered": True,
-                "count": count,
-                "message": "最大回撤熔断触发（累计 %d 次）" % count,
-            })
-        db = self._db_session_factory()
         try:
-            link = (
-                db.query(LiveSessionPortfolio)
-                .filter_by(
-                    session_id=self.session_id,
-                    portfolio_strategy_id=portfolio.portfolio_id,
-                )
-                .first()
-            )
-            if link is None:
-                self._breaker_count_written[portfolio.portfolio_id] = count
-                return
-            link.circuit_breaker_count = count
-            if count >= 3:
-                link.status = "circuit_broken"
+            for ev in events:
+                db.add(LiveDecisionEvent(
+                    live_session_id=self.session_id,
+                    gate=ev.gate,
+                    layer=ev.layer,
+                    action=ev.action,
+                    portfolio_id=ev.portfolio_id,
+                    strategy_id=ev.strategy_id,
+                    stock_code=ev.stock_code,
+                    bar_time=ev.bar_time,
+                    param_name=ev.param_name,
+                    param_value=ev.param_value,
+                    actual_value=ev.actual_value,
+                    requested_qty=ev.requested_qty,
+                    final_qty=ev.final_qty,
+                    message=(ev.message or "")[:200],
+                ))
+                self._emit("decision", {
+                    "portfolio_id": ev.portfolio_id,
+                    "strategy_id": ev.strategy_id,
+                    "stock_code": ev.stock_code,
+                    "gate": ev.gate,
+                    "layer": ev.layer,
+                    "action": ev.action,
+                    "param_name": ev.param_name,
+                    "param_value": ev.param_value,
+                    "actual_value": ev.actual_value,
+                    "requested_qty": ev.requested_qty,
+                    "final_qty": ev.final_qty,
+                    "message": ev.message,
+                    "bar_time": ev.bar_time.isoformat() if ev.bar_time else None,
+                })
             db.commit()
-            self._breaker_count_written[portfolio.portfolio_id] = count
         except Exception:  # noqa: BLE001
             db.rollback()
-            logger.exception("persist breaker count error (portfolio %s)", portfolio.portfolio_id)
-        finally:
-            db.close()
+            logger.exception("drain decision events failed (session %s)", self.session_id)
+
+    def _persist_breaker_count(
+        self, portfolio: Portfolio, total_value: Decimal = None
+    ) -> None:
+        """H4：薄委托 → BreakerService.persist_count（0010 步骤 4）。"""
+        self._breaker.persist_count(portfolio, total_value)
+
+    def recover_breaker(self, portfolio_id: int) -> bool:
+        """手动恢复某组合熔断（公共方法，薄委托 → BreakerService.recover，0010 步骤 4）。"""
+        return self._breaker.recover(portfolio_id)
 
     def _dispatch_period_bar(self, period: str, boundary_time: datetime) -> None:
-        """C6(A) 边界分发：period 边界到（1m stime 判定）→ 拉该周期 bar → 注入 → 驱动该周期策略。
-
-        对每 code 拉 query_quote(period, count=formula_count) 一次，既供公式注入又供 BarEvent。
-        取每 code「最新已完成 bar」（stime < 本批 latest）的 OHLCV 构造 BarEvent
-        （bar_time=boundary_time，与 1m 节拍对齐）——不用 forming 最新一根（未来函数）。
-        桥拉取抛 BridgeUnavailableError → 向上传播由 _on_bar 置离线。无完成 bar 的 code 跳过。
-
-        周期 guard：periods_on_boundary 是纯算术（minute%15==0 等），不查实例有无该周期策略，
-        会带出实例无人用的周期（如 14:30 的 15m）。此处按 _strategy_periods 过滤——实例无该
-        周期策略直接 return，避免白拉（拉完 period 过滤全跳过，不出单纯浪费）。
-        """
-        if period not in self._strategy_periods:
-            return
-        bars_by_code: Dict[str, list] = {}
-        stocks: Dict[str, dict] = {}
-        # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
-        count = self._period_count.get(period, self._formula_count)
-        for code in self._bar_poller.stock_codes:
-            # 按 (code, period) 取该股票该周期所需根数（比全局 _period_count 更细，按需）。
-            # 走预热缓存 + 增量拼接（省去每边界全量重拉 count 根）。
-            cp_count = self._code_period_count.get((code, period), count)
-            bars = self._get_bars_with_increment(code, period, cp_count)
-            if not bars:
-                continue
-            bars_by_code[code] = bars
-            cb = latest_completed_bar(bars)
-            if cb is None:
-                continue
-            stocks[code] = to_ohlcv(cb)
-        if not stocks:
-            return
-        bar_event = BarEvent(stocks=stocks, bar_time=boundary_time, period=period)
-        df_cache: Dict = {}
-        raw_cache: Dict = {}
-        for portfolio in self.portfolios:
-            self._handle_bar(
-                portfolio, bar_event, bars_by_code=bars_by_code,
-                df_cache=df_cache, raw_cache=raw_cache,
-            )
+        """C6(A) 边界分发（薄委托 → MarketDataService.dispatch_period_bar）。"""
+        self.market_data.dispatch_period_bar(period, boundary_time)
 
     # ---------------- F5：桥可用持仓（SELL 减仓上限）----------------
     def _refresh_available_map(self) -> None:
-        """F5：拉桥 /positions，按 code(instrument.exchange) 聚合 m_nCanUseVolume。
-
-        桥无该仓/拉取失败（离线）→ 空表 → get_available_shares 全量放行（券商端
-        T+1 兜底，避免误伤正常卖出；G6 处理券商拒单）。
-        """
-        try:
-            rows = self._dispatcher.query_positions()
-        except BridgeUnavailableError:
-            self._t1_checker.set_available_map({})
-            return
-        m: Dict[str, int] = {}
-        for r in rows or []:
-            inst = r.get("instrument")
-            exch = r.get("exchange")
-            avail = r.get("available")
-            if inst and exch and avail is not None:
-                m["%s.%s" % (inst, exch)] = int(avail)
-        self._t1_checker.set_available_map(m)
+        """F5：拉桥 /positions 聚合 m_nCanUseVolume（薄委托 → MarketDataService）。"""
+        self.market_data.refresh_available_map()
 
     # ---------------- 公式信号注入（0010 + C4 #28 三维去重）----------------
     def _fill_signal_cache(
@@ -1059,69 +1005,11 @@ class LiveEngine:
         df_cache: Optional[Dict] = None,
         raw_cache: Optional[Dict] = None,
     ) -> None:
-        """实盘逐 bar 算公式信号填 signal_cache。预填模式（不改 Portfolio）。
-
-        对每个策略 × bar.stocks 每只股票：
-          bridge query_quote(code, period, count=N) 拉历史+实时 bar
-          → _bars_to_formula_df 转 OHLCV DataFrame
-          → TQFormula.compute_injected 内存注入算公式
-          → _extract_latest_signal 取最后一条（当前 bar 信号）
-          → 填 signal_cache[(strategy_id, code, bar.bar_time)]
-        C6 节拍过滤：bar.period 非 None 时只注入匹配周期的策略（5m 边界 bar 不注入 1m 策略）；
-        1w/1mon（_STARTUP_ONLY_PERIODS）走通达信启动/日终注入，不拉桥。
-        bars_by_code：调用方已预拉好的 bars（边界/日终分发），避免二次拉桥。
-        C4(#28) 三维去重（单 bar 生命周期，跨组合共享）：
-          df_cache[(code, period)]   → 同 key 只 query_quote 一次（count 更大时升级重拉）
-          raw_cache[(code,period,formula)] → 同 key 只 compute_injected 一次（TQ 计算最贵）
-          count 不进 key 的前提：count 是 Formula.formula_count 公式级字段（#27），
-          同公式 count 恒定 → 同 (code,period,formula) 的 count 必然相同。
-        signal_cache key 仍带 strategy_id（隔离不变，值相同各自存一份）。
-        无 tq_formula / 策略无公式映射 / 拉取为空 / 算失败 → 跳过（该股该 bar 无公式信号）。
-        """
-        if self._tq_formula is None or not self._formula_by_strategy:
-            return
-        if df_cache is None:
-            df_cache = {}
-        if raw_cache is None:
-            raw_cache = {}
-        for ctx in portfolio.strategies:
-            formula_name = self._formula_by_strategy.get(ctx.strategy_id)
-            if not formula_name:
-                continue
-            # C6：该 bar 只注入匹配周期的策略
-            if bar.period is not None and ctx.period != bar.period:
-                continue
-            # C6(C)：1w/1mon 走通达信启动/日终注入，不拉桥
-            if ctx.period in _STARTUP_ONLY_PERIODS:
-                continue
-            period = ctx.period
-            # #27→#28：注入 count 来自 Formula.formula_count（公式级），非全局 200
-            count = self._formula_count_by_name.get(formula_name, self._formula_count)
-            for code in bar.stocks:
-                # 股票池过滤：池外股票不拉公式（多组合共享行情 bar，各策略只算自己池内）
-                if ctx.stock_pool is not None and code not in ctx.stock_pool:
-                    continue
-                try:
-                    bars = self._fetch_cached_bars(
-                        df_cache, bars_by_code, code, period, count
-                    )
-                except BridgeUnavailableError:
-                    # 拉历史失败：跳过该股（不阻断 on_bar，风控信号仍可触发）
-                    logger.warning("quote failed for formula inject %s %s", code, period)
-                    continue
-                raw_key = (code, period, formula_name)
-                if raw_key not in raw_cache:
-                    df = self._bars_to_formula_df(bars, code)
-                    raw = None
-                    if df is not None:
-                        raw = self._tq_formula.compute_injected(
-                            formula_name=formula_name, ohlcv_df=df,
-                            stocks=[code], period=period,
-                        )
-                    raw_cache[raw_key] = self._extract_latest_signal(raw, code)
-                outputs = raw_cache[raw_key]
-                if outputs:
-                    self.signal_cache[(ctx.strategy_id, code, bar.bar_time)] = outputs
+        """实盘逐 bar 算公式信号填 signal_cache（薄委托 → MarketDataService）。"""
+        self.market_data.fill_signal_cache(
+            portfolio, bar, bars_by_code=bars_by_code,
+            df_cache=df_cache, raw_cache=raw_cache,
+        )
 
     def _fetch_cached_bars(
         self,
@@ -1131,617 +1019,78 @@ class LiveEngine:
         period: str,
         count: int,
     ) -> list:
-        """拉取去重：df_cache[(code, period)] 同 key 只实际拉取一次（单 bar 生命周期）。
-
-        缓存值 (bars, used_count)。同 code+period 的公式 count 更大 → 升级重拉（过小会缺
-        历史，公式长均线 NaN 静默失效）；bars_by_code 已按该周期最大 count 预拉 → 直接复用，
-        记 used=(code,period) 最大 count，避免无谓升级重拉。
-        bars_by_code 提供的 bars **不足 count**（BarPoller 本轮拉的 count 窗口，如 10 根）
-        → 不能直接复用（拿 10 根喂 200 根窗口公式 = 长均线 NaN 静默失效），改走
-        _reuse_provided_with_cache：并入预热缓存，缓存覆盖 count 则复用、否则增量补齐。
-        底层实际拉取走 _get_bars_with_increment（预热缓存 + 增量拼接），不再直接 query_quote
-        全量——1m 算公式（bars_by_code=None）与升级重拉都受益。
-        """
-        key = (code, period)
-        cached = df_cache.get(key)
-        if cached is not None:
-            bars, used = cached
-            if count <= used:
-                return bars
-            bars = self._get_bars_with_increment(code, period, count)
-            df_cache[key] = (bars, count)
-            return bars
-        if bars_by_code is not None and code in bars_by_code:
-            provided = bars_by_code[code]
-            # 提供 bars 已覆盖公式窗口 → 直接复用（used 记该 (code,period) 最大 count，
-            # 同 bar 内更大 count 公式也直接复用不重拉）。
-            if len(provided) >= count:
-                used = max(count, self._code_period_count.get((code, period), self._formula_count))
-                df_cache[key] = (provided, used)
-                return provided
-            # 提供 bars 不足 count：
-            #   非轮询周期（5m/1d...边界分发预拉，本就按 _code_period_count 全量，桥只返
-            #   这么多历史）→ 直接复用（历史就这么多，不能无中生有）。
-            #   轮询周期（1m，BarPoller 透传，count 窗口仅判完成用）→ 并入预热缓存复用/补齐。
-            if period != self._bar_poller.period:
-                used = max(count, self._code_period_count.get((code, period), self._formula_count))
-                df_cache[key] = (provided, used)
-                return provided
-            bars = self._reuse_provided_with_cache(code, period, provided, count)
-            df_cache[key] = (bars, count)
-            return bars
-        bars = self._get_bars_with_increment(code, period, count)
-        df_cache[key] = (bars, count)
-        return bars
+        """拉取去重（单 bar 生命周期，薄委托 → MarketDataService）。"""
+        return self.market_data._fetch_cached_bars(
+            df_cache, bars_by_code, code, period, count
+        )
 
     def _reuse_provided_with_cache(self, code: str, period: str, provided: list, count: int) -> list:
-        """把调用方本轮已拉到的 bars（BarPoller 透传）并入预热缓存复用，零额外拉取。
-
-        BarPoller 每轮已拉 1m（count 窗口，如 10 根），注入若再走 _get_bars_with_increment
-        增量拉（同样 count 窗口）就是同一批 bars 的双份冗余。把本轮已拉的并入缓存后：
-          缓存历史已够 count 根（启动预热 code_period_count 根）→ 直接返回，零拉桥；
-          缓存历史不够（未预热/离线清空/请求 count 更大）→ 回退 _get_bars_with_increment
-          全量/增量补齐（同原路径，冷启动安全）。
-        """
-        cache = self._preheat_cache.get((code, period))
-        if cache is None:
-            # 冷启动/离线清空：提供 bars 量小不足公式窗口，走全量拉补缓存（含这些 bars）。
-            return self._get_bars_with_increment(code, period, count)
-        merged = self._sort_and_cap(cache["bars"] + provided, count)
-        cache["bars"] = merged
-        cache["last_stime"] = self._max_stime(merged)
-        if len(merged) >= count:
-            return merged
-        return self._get_bars_with_increment(code, period, count)
+        """BarPoller 透传 bars 并入预热缓存复用（薄委托 → MarketDataService）。"""
+        return self.market_data._reuse_provided_with_cache(code, period, provided, count)
 
     @staticmethod
     def _bars_to_formula_df(bars: list, code: str) -> Optional[dict]:
-        """桥 bar dict 列表 → {Amount/Volume/Close/Open/High/Low: pandas.DataFrame}。
-
-        桥 bar 字段：stime(yyyymmddHHMMSS)/time(时间戳)/index(历史工具) + 小写 OHLCV。
-        时间统一用 parse_bar_time（与 BarPoller 同规则），兼容 stime/time/index 各来源。
-        输出：每字段单列 DataFrame（列=[code]，行=DatetimeIndex）。
-        空 bars / 无有效时间 → None（调用方跳过）。
-        """
-        if not bars:
-            return None
-        # pandas 在此函数内首次按需 import（非顶部）：pandas 较重，且本函数仅在
-        # 公式注入路径调用；避免模块导入期无条件加载（审计 #31：math 已提顶，pandas 刻意保留 lazy）。
-        import pandas as pd
-
-        times, o, h, l, c, v, a = [], [], [], [], [], [], []
-        for b in bars:
-            t = parse_bar_time(b)
-            if t is None:
-                continue
-
-            def _num(key):
-                val = b.get(key)
-                if val is None or val == "":
-                    return 0.0
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            times.append(t)
-            o.append(_num("open"))
-            h.append(_num("high"))
-            l.append(_num("low"))
-            c.append(_num("close"))
-            v.append(int(_num("volume")))
-            a.append(_num("amount"))
-        if not times:
-            return None
-        idx = pd.DatetimeIndex(times)
-        return {
-            "Open": pd.DataFrame({"open": o}, index=idx).rename(columns={"open": code}),
-            "High": pd.DataFrame({"high": h}, index=idx).rename(columns={"high": code}),
-            "Low": pd.DataFrame({"low": l}, index=idx).rename(columns={"low": code}),
-            "Close": pd.DataFrame({"close": c}, index=idx).rename(columns={"close": code}),
-            "Volume": pd.DataFrame({"volume": v}, index=idx).rename(columns={"volume": code}),
-            "Amount": pd.DataFrame({"amount": a}, index=idx).rename(columns={"amount": code}),
-        }
+        """桥 bar dict 列表 → OHLCV DataFrame dict（薄委托 → MarketDataService）。"""
+        return MarketDataService._bars_to_formula_df(bars, code)
 
     @staticmethod
     def _extract_latest_signal(raw: Optional[dict], code: str) -> List[dict]:
-        """从 formula_process_mul_zb 返回取最后一条 bar 的信号 → [{"name", "value"}]。
-
-        raw: {stock_code: {var_name: [{"Date","Value"}, ...]}, "ErrorId", ...}
-        实盘逐 bar 算，注入 N 根算出 N 条输出，取最后一条即当前 bar 信号
-        （避开回测的索引对齐全段逻辑）。ErrorId 非 0/19 → 空。
-        """
-        if not isinstance(raw, dict) or not raw:
-            return []
-        err = raw.get("ErrorId")
-        if err is not None and str(err) not in ("0", "19"):
-            return []
-        stock_data = raw.get(code)
-        if not isinstance(stock_data, dict) or not stock_data:
-            return []
-        outputs: List[dict] = []
-        for var_name, val_list in stock_data.items():
-            if var_name in _FORMULA_META_KEYS:
-                continue
-            if not isinstance(val_list, list) or not val_list:
-                continue
-            last = val_list[-1]
-            if not isinstance(last, dict):
-                continue
-            v = last.get("Value")
-            if v is None:
-                continue
-            outputs.append({"name": var_name, "value": _to_int(v)})
-        return outputs
+        """取公式返回最后一条 bar 的信号（薄委托 → MarketDataService）。"""
+        return MarketDataService._extract_latest_signal(raw, code)
 
     def _inject_startup_periods(self, daily_time: datetime) -> None:
-        """C6(C)：1w/1mon 策略通达信注入——TQFormula.compute 自取历史 → 最新信号填 signal_cache。
-
-        key=(strategy_id, stock_code, daily_time)，与日终 _maybe_daily_bars 驱动用的
-        bar_time 一致，驱动时命中预填信号。桥端 xtdata 拉不到 1w/1mon，通达信是唯一通路。
-        start() 启动调一次；_maybe_daily_bars 检测日切 cache miss 时补调。
-        单策略/单股 compute 失败 → 跳过（不阻断其余）。
-        """
-        if self._tq_formula is None or not self._formula_by_strategy:
-            return
-        codes = list(self._bar_poller.stock_codes)
-        for portfolio in self.portfolios:
-            for ctx in portfolio.strategies:
-                if ctx.period not in _STARTUP_ONLY_PERIODS:
-                    continue
-                formula_name = self._formula_by_strategy.get(ctx.strategy_id)
-                if not formula_name:
-                    continue
-                for code in codes:
-                    try:
-                        raw = self._tq_formula.compute(
-                            formula_name, "", [code], period=ctx.period, count=-1
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.exception(
-                            "startup period compute failed %s %s", ctx.period, code
-                        )
-                        continue
-                    outputs = self._extract_latest_signal(raw, code)
-                    if outputs:
-                        self.signal_cache[(ctx.strategy_id, code, daily_time)] = outputs
+        """C6(C)：1w/1mon 通达信启动注入（薄委托 → MarketDataService）。"""
+        self.market_data.inject_startup_periods(daily_time)
 
     def _startup_periods_missing(self, daily_time: datetime) -> bool:
-        """1w/1mon 策略在 daily_time 的信号是否全部已预填（cache miss → 需补注入）。
+        """1w/1mon 信号是否全部已预填（薄委托 → MarketDataService）。"""
+        return self.market_data.startup_periods_missing(daily_time)
 
-        _maybe_daily_bars 日切检测用：新交易日的 daily_time 尚无 cache 键 → True。
-        """
-        for portfolio in self.portfolios:
-            for ctx in portfolio.strategies:
-                if ctx.period not in _STARTUP_ONLY_PERIODS:
-                    continue
-                for code in self._bar_poller.stock_codes:
-                    if (ctx.strategy_id, code, daily_time) not in self.signal_cache:
-                        return True
-        return False
-
-    # ---------------- 订单状态机 + 成交回报回填（切片5）----------------
+    # ---------------- 订单状态机 + 成交回报回填（委托 OrderStateMachine，0010 步骤 3）----------------
+    # 下列方法为薄委托：实现已迁入 core.engine.live.order_machine.OrderStateMachine。
+    # 同名方法/静态方法保留于此，既有调用点与测试直连（engine._poll_deals()、
+    # engine._backfill_order(...)、engine._match_by_remark(...) 等）穿透到协作者。
     def _persist_order_submitted(self, db: Session, order: OrderEvent) -> LiveOrder:
-        """写 LiveOrder(status=submitted)，不写 LiveTrade（回填确认成交才写）。
+        return self._order_machine.persist_order_submitted(db, order)
 
-        提交时序（G1/I4）：_handle_bar 先调本方法 + commit，再发 passorder——
-        崩在 passorder 已发、未确认窗口时 DB 至少有 submitted 记录供挂回。
-        """
-        live_order = LiveOrder(
-            live_session_id=self.session_id,
-            portfolio_strategy_id=order.portfolio_id,
-            strategy_id=order.strategy_id,
-            stock_code=order.stock_code,
-            trade_type=order.trade_type.value.lower(),  # "buy"/"sell"
-            order_type="limit",
-            price=order.price,
-            quantity=order.quantity,
-            filled_quantity=0,
-            filled_price=None,
-            status="submitted",
-            signal_name=order.signal_name or None,
-            signal_type=order.signal_type.value if order.signal_type else None,
-            bar_time=order.bar_time,
-        )
-        db.add(live_order)
-        db.flush()  # 取 live_order.id
-        return live_order
-
-    def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None) -> None:
-        """轮询桥 /orders 定位本单的 m_strOrderRef 回写（G3 匹配键）。
-
-        passorder 返回 0 无法预知 OrderRef，需从桥 /orders 列表定位本单。两层策略：
-
-        1. **remark 精确认领（主路径）**：下单时 Core 把确定性 bridge_order_id 前 20 位
-           作为 userOrderId 传给 passorder，柜台写回委托的 m_strRemark。本单已记录
-           bridge_order_id（正常路径下单成功即写）时，按 remark 全局唯一精确定位——
-           不依赖代码/方向/数量，彻底杜绝同代码同向同量旧单误绑（真机 bug 见下）。
-        2. **模糊+时间窗（遗留兜底）**：重启恢复的历史单可能无 bridge_order_id，退回
-           source=BRIDGE + 代码 + direction(48买/49卖) + volume 组合键。两个加固：
-           (a) **跳过带 remark 的候选**——它们属于已被 bridge_order_id 跟踪的单，不能
-               被遗留单冒领；
-           (b) **时间窗**：候选柜台插入时间(上海本地)换算 UTC 后不得早于本单
-               created_at 超过 _ORDER_INSERT_TOLERANCE，挡住跨会话遗留的同代码同向同量
-               旧单（真机 bug：新单 11:21 创建时真单尚未可查，被匹配到 09:55 遗留单 →
-               回填错成交 1.041、真单 1.037 丢失）。
-
-        同代码同向同量可能有多笔在途单，候选按 insert_date+insert_time 降序取最新，且
-        跳过 claimed_refs 中已被本 session 其他单占用的 order_ref。找不到 → 留 None，
-        下轮 _poll_deals 再找。
-        """
-        try:
-            orders = self._dispatcher.query_orders()
-        except BridgeUnavailableError:
-            return  # 桥离线，下轮再找
-        claimed = claimed_refs if claimed_refs is not None else set()
-        bridge_oid = live_order.bridge_order_id
-        if bridge_oid:
-            ref = self._match_by_remark(orders, bridge_oid[:20], claimed)
-        else:
-            ref = self._match_legacy_fuzzy(live_order, orders, claimed)
-        if ref is not None:
-            live_order.order_ref = ref
+    def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None,
+                             orders=None) -> None:
+        self._order_machine.try_match_order_ref(
+            live_order, claimed_refs=claimed_refs, orders=orders)
 
     @staticmethod
     def _match_by_remark(orders, expected_remark, claimed):
-        """主路径：按 m_strRemark 全局唯一精确认领本单的 order_ref。"""
-        candidates = []
-        for o in orders or []:
-            if o.get("source") != "BRIDGE":
-                continue
-            if o.get("remark") != expected_remark:
-                continue
-            ref = o.get("order_ref")
-            if ref is None or ref in claimed:
-                continue
-            candidates.append(o)
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda o: (
-                str(o.get("insert_date") or ""),
-                str(o.get("insert_time") or ""),
-            ),
-            reverse=True,
-        )
-        return candidates[0].get("order_ref")
+        return OrderStateMachine.match_by_remark(orders, expected_remark, claimed)
 
     @staticmethod
     def _match_legacy_fuzzy(live_order, orders, claimed):
-        """遗留兜底：无 bridge_order_id 的重启单用代码+方向+数量模糊匹配。
-
-        仅认无 remark 的候选（带 remark 的属于已跟踪单），且柜台插入时间须落在本单
-        created_at 的时间窗内，挡住跨会话遗留旧单。
-        """
-        code = live_order.stock_code
-        op_dir = 48 if live_order.trade_type == "buy" else 49
-        created_utc = live_order.created_at
-        # created_at 为 UTC naive；缺失则无法做时间窗校验，保守不绑定（避免重蹈误绑）。
-        if created_utc is None:
-            return None
-        earliest = created_utc - _ORDER_INSERT_TOLERANCE
-        candidates = []
-        for o in orders or []:
-            if o.get("source") != "BRIDGE":
-                continue
-            # 带 remark 的候选属于有 bridge_order_id 的在跟踪单，遗留单不得冒领。
-            if o.get("remark"):
-                continue
-            inst = o.get("instrument") or ""
-            exch = o.get("exchange") or ""
-            if "%s.%s" % (inst, exch) != code:
-                continue
-            if o.get("direction") != op_dir:
-                continue
-            if o.get("volume") != live_order.quantity:
-                continue
-            ref = o.get("order_ref")
-            if ref is None or ref in claimed:
-                continue
-            insert_utc = _parse_insert_utc(o.get("insert_date"), o.get("insert_time"))
-            if insert_utc is None or insert_utc < earliest:
-                continue  # 无法解析时间或早于创建窗口 → 视为遗留旧单，排除
-            candidates.append(o)
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda o: (
-                str(o.get("insert_date") or ""),
-                str(o.get("insert_time") or ""),
-            ),
-            reverse=True,
-        )
-        return candidates[0].get("order_ref")
+        return OrderStateMachine.match_legacy_fuzzy(live_order, orders, claimed)
 
     def _poll_deals(self) -> None:
-        """主循环每轮：查未完结 LiveOrder → 定位 OrderRef → 轮询桥 /deals → 回填（G2）。
+        self._order_machine.poll_deals()
 
-        每轮处理：未回填 order_ref 的单先尝试定位；有 order_ref 的单按 order_ref
-        过滤 /deals 成交回报，调 _backfill_order 更新状态 + 写 LiveTrade + apply。
-        桥离线/查失败 → 本轮跳过（不改状态），下轮重试。
-        """
-        db = self._db_session_factory()
-        try:
-            pending = (
-                db.query(LiveOrder)
-                .filter(
-                    LiveOrder.live_session_id == self.session_id,
-                    LiveOrder.status.in_(["submitted", "partial"]),
-                )
-                .all()
-            )
-            if not pending:
-                self._sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
-                return
-            # 1. 未回填 order_ref 的单：尝试定位。
-            # claimed_refs = 本 session 所有已占用 order_ref（历史已回填 + 本轮刚分配），
-            # 防止同代码同向同量的多笔在途单撞同一个 ref（重复回填 → 虚拟持仓虚高）。
-            claimed_refs = set(
-                r[0] for r in db.query(LiveOrder.order_ref).filter(
-                    LiveOrder.live_session_id == self.session_id,
-                    LiveOrder.order_ref.isnot(None),
-                ).all()
-            )
-            for lo in pending:
-                if lo.order_ref is None:
-                    self._try_match_order_ref(lo, claimed_refs)
-                    if lo.order_ref is not None:
-                        claimed_refs.add(lo.order_ref)
-            # 1b. 陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
-            # （抽为 _expire_stale_orders 供主循环 _tick_main 复用——deals 循环被 60s 主循环
-            # 饿死时，超时检查随主循环 60s 节拍跑，不再 440s 才生效。两处调用幂等。）
-            self._expire_stale_orders(db, pending)
-            db.commit()
-            # 2. 查 /deals 回填。两类待回填单共用一次 /deals 查询：
-            #    need_ref  = 已定位 order_ref 的单（主路径，按 order_ref 过滤 deals）
-            #    need_remark = order_ref 始终匹配不上（/orders 实时表无此单）但有
-            #                  bridge_order_id 的单 → 按 remark 直连 /deals 回填（修复 A）。
-            #    修复 A 背景（真机 2026-08-19 id45/46）：iQuant get_trade_detail_data(ORDER)
-            #    对已成交单不可靠（成交后从 ORDER 实时表移除），Core 轮询 /orders 拿不到
-            #    order_ref → 旧逻辑走到超时 rejected 且成交不回填。但 /deals（DEAL 表）保留
-            #    全部已成交记录且 DEAL 对象带 m_strRemark，故 order_ref 匹配失败的单改按
-            #    bridge_order_id[:20] 在 /deals 直连 remark 匹配回填，绕过 order_ref。
-            #    _backfill_order 本就用 live_order.id 写 LiveTrade、不依赖 order_ref，
-            #    此处只是补一条进入它的路径。
-            need_ref = [lo for lo in pending if lo.order_ref is not None]
-            need_remark = [
-                lo for lo in pending
-                if lo.order_ref is None and lo.bridge_order_id
-            ]
-            if not need_ref and not need_remark:
-                self._sync_pending_orders(db)
-                return
-            try:
-                deals = self._dispatcher.query_deals()
-            except BridgeUnavailableError:
-                return  # 桥离线，本轮跳过
-            # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
-            for lo in need_ref:
-                matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
-                if not matched:
-                    continue
-                self._backfill_order(db, lo, matched)
-            # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
-            # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
-            # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
-            for lo in need_remark:
-                if lo.status not in ("submitted", "partial"):
-                    continue  # 主路径已回填，不重复
-                expected_remark = lo.bridge_order_id[:20]
-                matched = [d for d in deals if d.get("remark") == expected_remark]
-                if not matched:
-                    continue
-                self._backfill_order(db, lo, matched)
-            db.commit()
-            # 3. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected 自然移除）
-            self._sync_pending_orders(db)
-        finally:
-            # 异常向上抛到 _deals_loop 统一记日志（不再此处静默吞），
-            # rollback 清理未提交事务，close 归还连接。
-            db.rollback()
-            db.close()
+    def _sync_terminal_order_status(self, db: Session, pending: list,
+                                    orders: Optional[list],
+                                    deals: Optional[list]) -> None:
+        self._order_machine.sync_terminal_order_status(db, pending, orders, deals)
 
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
-        """陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
-
-        created_at 为 UTC（SQLite CURRENT_TIMESTAMP），用 utcnow 比较；
-        created_at 缺失（异常数据）不过期，留给后续轮次。
-        被调用两处（幂等：已 rejected 的单 status not in (submitted,partial) 跳过）：
-          - _poll_deals（deals 循环 5s 节拍，兜底）
-          - _tick_main（主循环 60s 节拍，核心——deals 循环被单 worker 饿死时此处保证
-            180s 超时最坏 60s 延迟生效，而非现状 440s）。
-        pending 为调用方已查的 submitted/partial 列表（复用省一次查询）；None 则自查。
-        注意：调用方负责 commit（_poll_deals 在 expire 后 commit；_tick_main 自带
-        try/commit/rollback/finally close，同 _persist_breaker_count 模式）。
-        """
-        if pending is None:
-            pending = (
-                db.query(LiveOrder)
-                .filter(
-                    LiveOrder.live_session_id == self.session_id,
-                    LiveOrder.status.in_(["submitted", "partial"]),
-                )
-                .all()
-            )
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        for lo in pending:
-            if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
-                continue
-            if lo.created_at is None:
-                continue
-            age = now_utc - lo.created_at
-            if age >= _ORDER_REF_MATCH_TIMEOUT:
-                lo.status = "rejected"
-                lo.error_message = (
-                    "order match timeout: no bridge order_ref within %ds"
-                    % int(age.total_seconds())
-                )
-                self._pending_orders.pop(lo.id, None)
-                self._emit("order", {
-                    "portfolio_id": lo.portfolio_strategy_id,
-                    "order_id": lo.id,
-                    "status": "rejected",
-                    "stock_code": lo.stock_code,
-                    "error_message": lo.error_message,
-                })
+        self._order_machine.expire_stale_orders(db, pending)
 
     def _sync_pending_orders(self, db: Session) -> None:
-        """重查 DB 剩余 submitted/partial 同步在途集合（G7 计数）。
-
-        以 DB 为准：回填置 filled / 拒单置 rejected 的单自然移除，_handle_bar 新增
-        的单（已 commit）自然纳入。调用点在 _poll_deals 各出口，保证 get_session
-        读到的是最近一轮的实际在途单数。
-        """
-        remaining = (
-            db.query(LiveOrder)
-            .filter(
-                LiveOrder.live_session_id == self.session_id,
-                LiveOrder.status.in_(["submitted", "partial"]),
-            )
-            .all()
-        )
-        self._pending_orders = {lo.id: lo for lo in remaining}
+        self._order_machine.sync_pending_orders(db)
 
     def _backfill_order(self, db: Session, live_order: LiveOrder, matched_deals: list) -> None:
-        """据成交回报回填 LiveOrder + LiveTrade + apply_trade（G2/G6）。
-
-        聚合 order_ref 下全部成交：总成交量/总金额/总佣金，成交均价 = 金额/量。
-        filled（成交量 ≥ 委托量）→ status=filled + apply_trade（首次用真实价/量/佣金）；
-        partial（成交量 < 委托量）→ status=partial，写/更新 LiveTrade 但不 apply
-        （等最终 filled 或撤单，避免部分成交误动持仓）。
-        """
-        total_qty = sum(int(d.get("volume") or 0) for d in matched_deals)
-        if total_qty <= 0:
-            return  # 无实际成交（可能已撤），下轮重查
-        total_amount = sum(Decimal(str(d.get("amount") or 0)) for d in matched_deals)
-        total_commission = sum(Decimal(str(d.get("commission") or 0)) for d in matched_deals)
-        avg_price = total_amount / Decimal(total_qty)
-
-        live_order.filled_quantity = total_qty
-        live_order.filled_price = avg_price
-        live_order.status = "filled" if total_qty >= live_order.quantity else "partial"
-        self._last_backfill_time = now_shanghai()  # G7：记录最近一次回填时点
-        # B5：订单状态推送（filled/partial 都由成交回报回填推进）
-        self._emit("order", {
-            "portfolio_id": live_order.portfolio_strategy_id,
-            "order_id": live_order.id,
-            "status": live_order.status,
-            "stock_code": live_order.stock_code,
-            "filled_quantity": live_order.filled_quantity,
-            "filled_price": float(avg_price),
-        })
-
-        # 写/更新 LiveTrade（按 order_ref 聚合为一笔）
-        trade_time = self._parse_trade_time(matched_deals[-1])
-        existing = (
-            db.query(LiveTrade)
-            .filter(LiveTrade.live_order_id == live_order.id)
-            .first()
-        )
-        if existing:
-            existing.price = avg_price
-            existing.quantity = total_qty
-            existing.amount = total_amount
-            existing.commission = total_commission
-            existing.trade_time = trade_time
-            trade_rec = existing
-        else:
-            trade_rec = LiveTrade(
-                live_session_id=self.session_id,
-                live_order_id=live_order.id,
-                portfolio_strategy_id=live_order.portfolio_strategy_id,
-                strategy_id=live_order.strategy_id,
-                stock_code=live_order.stock_code,
-                trade_type=live_order.trade_type,
-                price=avg_price,
-                quantity=total_qty,
-                amount=total_amount,
-                commission=total_commission,
-                stamp_duty=Decimal("0"),  # 首期 0：DEAL 印花税字段待真机验证
-                trade_time=trade_time,
-            )
-            db.add(trade_rec)
-        db.flush()  # 取 trade_rec.id（B5 trade 事件用）
-        # B5：成交回报推送
-        self._emit("trade", {
-            "portfolio_id": live_order.portfolio_strategy_id,
-            "trade_id": trade_rec.id,
-            "stock_code": trade_rec.stock_code,
-            "trade_type": trade_rec.trade_type,
-            "price": float(avg_price),
-            "quantity": total_qty,
-            "amount": float(total_amount),
-        })
-
-        # filled：回填确认后 apply_trade（submitted 阶段未 apply，此处首次落持仓）
-        if live_order.status == "filled":
-            self._apply_filled_trade(
-                live_order, avg_price, total_qty, total_amount, total_commission
-            )
+        self._order_machine.backfill_order(db, live_order, matched_deals)
 
     @staticmethod
     def _parse_trade_time(deal: dict) -> datetime:
-        """DEAL 的 trade_date(YYYYMMDD) + trade_time(HHMMSS / HH:MM:SS) → datetime。
-
-        桥 query_deals 返回 m_strTradeTime/m_strTradeDate 原文；解析失败用 now() 兜底。
-        """
-        d = str(deal.get("trade_date") or "").strip()
-        t = str(deal.get("trade_time") or "").strip()
-        try:
-            if len(t) == 6 and t.isdigit():
-                return datetime.strptime(d + t, "%Y%m%d%H%M%S")
-            if ":" in t:
-                return datetime.strptime(d + " " + t, "%Y%m%d %H:%M:%S")
-        except (ValueError, TypeError):
-            pass
-        return now_shanghai()
+        return OrderStateMachine.parse_trade_time(deal)
 
     def _apply_filled_trade(self, live_order: LiveOrder, price: Decimal,
                             qty: int, amount: Decimal, commission: Decimal) -> None:
-        """回填确认 filled 后 apply_trade 更新虚拟持仓/现金（G6）。
-
-        仅在此处 apply——submitted 阶段不 apply，真实成交回报确认后才动虚拟账户。
-        signal_type 从 LiveOrder 取（Position.apply_trade 据此判 ADD）。
-        """
-        portfolio = next(
-            (p for p in self.portfolios if p.portfolio_id == live_order.portfolio_strategy_id),
-            None,
-        )
-        if portfolio is None:
-            return
-        ctx = portfolio.find_strategy(live_order.strategy_id)
-        if ctx is None:
-            return
-        pos = ctx.positions.get(live_order.stock_code)
-        sig_type = SignalType(live_order.signal_type) if live_order.signal_type else None
-        trade = TradeEvent(
-            strategy_id=live_order.strategy_id,
-            portfolio_id=live_order.portfolio_strategy_id,
-            stock_code=live_order.stock_code,
-            trade_type=TradeType(live_order.trade_type.upper()),
-            price=price,
-            quantity=qty,
-            amount=amount,
-            commission=commission,
-            stamp_duty=Decimal("0"),
-            trade_time=live_order.bar_time or now_shanghai(),
-            signal_type=sig_type,
-        )
-        if pos is None and trade.trade_type == TradeType.BUY:
-            pos = Position(live_order.stock_code)
-            ctx.positions[live_order.stock_code] = pos
-        portfolio.account.apply_trade(trade)
-        if pos is not None:
-            pos.apply_trade(trade)
-            # B5：持仓变化推送（filled 后真实持仓/成本；pnl 无市价标记暂为 0）
-            self._emit("position", {
-                "portfolio_id": live_order.portfolio_strategy_id,
-                "stock_code": live_order.stock_code,
-                "quantity": pos.quantity,
-                "avg_cost": float(pos.avg_cost),
-                "market_value": float(pos.avg_cost * pos.quantity),
-                "pnl": 0,
-            })
+        self._order_machine.apply_filled_trade(
+            live_order, price, qty, amount, commission)
 
     # ---------------- 持仓恢复 ----------------
     def recover(self, db: Session) -> None:
@@ -1808,24 +1157,9 @@ class LiveEngine:
                 "recover: %d pending live orders to backfill (session %s)",
                 len(pending), self.session_id,
             )
-        # D4：读回熔断计数（LiveSessionPortfolio.circuit_breaker_count）——重启后累计次数不丢。
-        # 达 3 次 → 转手动恢复（manual_recovery + circuit_breaker_active=True 停新开仓等待人工，
-        # 同 status=circuit_broken 语义）；<3 次的单日熔断当天已恢复，重启不补挂（单一计数模型，
-        # 可接受）。预置 _breaker_count_written 避免首 bar 重复落库。
-        links = (
-            db.query(LiveSessionPortfolio)
-            .filter(LiveSessionPortfolio.session_id == self.session_id)
-            .all()
-        )
-        for link in links:
-            port = ports_by_id.get(link.portfolio_strategy_id)
-            if port is None or not link.circuit_breaker_count:
-                continue
-            port.risk_manager.consecutive_drawdown_triggers = link.circuit_breaker_count
-            self._breaker_count_written[link.portfolio_strategy_id] = link.circuit_breaker_count
-            if link.circuit_breaker_count >= 3:
-                port.risk_manager.manual_recovery = True
-                port.risk_manager.circuit_breaker_active = True
+        # D4：读回熔断计数（重启不丢累计次数，达 3 次转手动恢复）归 BreakerService
+        # （0010 步骤 4）；预置 counts_written 避免首 bar 重复落库。
+        self._breaker.restore_counts(db, ports_by_id)
         # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
         self._reconcile_positions()
 

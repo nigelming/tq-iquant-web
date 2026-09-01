@@ -285,6 +285,76 @@ def test_add_signal_exceeds_max_count_skipped():
     assert orders == []
 
 
+def test_add_signal_threshold_minus_one_adds_on_rise():
+    """threshold=-1 特殊值：跳过 drop 检查，上涨也加仓。
+    预置 avg_cost=10，现价 11（涨 10%，drop=-0.1），正常阈值会拦。
+    stop_loss 抬到 0.2、take_profit 抬到 0.2 避免风控抢跑。
+    量 = add_position_ratio(0.05)×60000/11=272→200。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        add_position_ratio=Decimal("0.05"),
+        stop_loss=Decimal("0.2"),
+    )
+    ctx.strategy_risk.take_profit_ratio = Decimal("0.2")  # 现价涨10% < 20%止盈，不抢跑
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "11", datetime(2026, 7, 30, 15, 0))  # 涨 10%（drop=-0.1）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.BUY
+    assert orders[0].quantity == 200
+
+
+def test_add_signal_threshold_minus_one_adds_on_extreme_rise():
+    """threshold=-1：涨3倍（drop=-2 < -1）也加——真正"任何价格都加"。
+    现有 drop<threshold 逻辑在 drop=-2<-1 时会拦，需显式跳过分支才不拦。
+    预置 avg_cost=10，现价 30（涨200%，drop=-2）。止盈抬到 3（300%）避免抢跑。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        add_position_ratio=Decimal("0.05"),
+        stop_loss=Decimal("0.2"),
+    )
+    ctx.strategy_risk.take_profit_ratio = Decimal("3")  # 涨200% < 300% 不止盈
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "30", datetime(2026, 7, 30, 15, 0))  # 涨200%（drop=-2）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.BUY
+
+
+def test_add_signal_threshold_minus_one_still_respects_max_count():
+    """threshold=-1 时 drop 失效，但 max_add_count 加仓次数上限仍生效。
+    add_count=2 == max_add_count=2 → 即便跌够（现价 9.0 跌 10%）也不出单。"""
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_threshold=Decimal("-1"),
+        max_add_count=2, stop_loss=Decimal("0.2"),
+    )
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    pos.add_count = 2  # 已加满
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "9.0", datetime(2026, 7, 30, 15, 0))  # 跌 10%（drop 失效不看）
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert orders == []
+
+
 def test_reduce_signal_quantity_from_ratio():
     """REDUCE 量 = 持仓 × reduce_position_ratio，取 100 整数倍。
     持仓 1000 × 0.3 = 300。"""
@@ -332,6 +402,95 @@ def test_open_signal_respects_max_positions():
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
     orders = port.on_bar(bar, signal_cache=cache)
     assert orders == []
+
+
+def test_max_positions_block_logs_debug(caplog):
+    """① max_positions 拦截 → logger.debug（回测/实盘共用，DEBUG 不刷回测默认 INFO）。
+
+    实盘可调到 DEBUG 级别可见；回测默认 INFO 看不到，不污染输出。
+    目标票 000009.SZ 不在预置 5 只持仓内，避免被"本票已持仓"早退拦截。
+    """
+    import logging
+    port, ctx = _strategy_with_params(
+        "000009.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+        max_positions=5,
+    )
+    for i in range(1, 6):
+        code = f"00000{i}.SZ"
+        pos = Position(code)
+        pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+        ctx.positions[code] = pos
+    bar = BarEvent(
+        stocks={f"00000{i}.SZ": {
+            "open": Decimal("10"), "high": Decimal("11"), "low": Decimal("9"),
+            "close": Decimal("10.5"), "volume": 1000,
+        } for i in range(1, 6)} | {"000009.SZ": {
+            "open": Decimal("10"), "high": Decimal("10.6"),
+            "low": Decimal("9.9"), "close": Decimal("10.5"), "volume": 1000,
+        }},
+        bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    cache = {(1, "000009.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "max_positions" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "max_positions 拦截应打 debug 日志"
+
+
+def test_open_quantity_below_100_block_logs_debug(caplog):
+    """② OPEN 算出量 <100 → logger.debug（回测/实盘共用，DEBUG 级别）。"""
+    import logging
+    # 策略资金 60000 × ratio 0.001 = 60 / 价 10.2 = 5 → <100 拦截
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+        single_open_ratio=Decimal("0.001"),
+    )
+    bar = _bar("000001.SZ", "10.2", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "100" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "量<100 拦截应打 debug 日志"
+
+
+def test_reduce_quantity_below_100_block_logs_debug(caplog):
+    """③ REDUCE 算出量 <100 → logger.debug（回测/实盘共用，DEBUG 级别）。
+
+    持仓 300 × reduce_ratio 0.3 = 90 <100。现价 11 高于成本 10，不触发止损抢跑。
+    """
+    import logging
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "reduce_sig", "signal_type": SignalType.REDUCE, "trigger_value": 1}],
+        reduce_position_ratio=Decimal("0.3"),
+    )
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 300, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "11", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "reduce_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []
+    assert any(
+        "REDUCE" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), "REDUCE 量<100 拦截应打 debug 日志"
 
 
 def test_open_signal_ignored_when_stock_already_held():
@@ -565,6 +724,32 @@ def test_check_risks_warns_when_strategy_risk_none(caplog):
     ), "strategy_risk 未注入应触发 warning，不应静默"
 
 
+def test_halt_strips_buy_logs_debug(caplog):
+    """熔断/日内暂停期间剥掉 BUY -> logger.debug（被剥的 BUY 不进返回列表，此处是唯一可见点）。
+
+    DEBUG 级别：熔断期每 bar 每 BUY 都触发，INFO 会刷屏。SELL（止损/平仓）保留（另测）。
+    用未持仓的新票出 OPEN BUY，避免被同票 CLOSE 的 cleared 集合抑制。
+    """
+    import logging
+    port, ctx = _portfolio_with_strategy(
+        "000009.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    port.risk_manager.circuit_breaker_active = True  # 熔断中
+
+    bar = _bar("000009.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000009.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.portfolio"):
+        orders = port.on_bar(bar, signal_cache=cache)
+
+    assert orders == []  # BUY 被剥
+    assert any(
+        "剥掉" in r.message and r.levelno == logging.DEBUG
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
 def _buy(price, quantity, trade_time):
     from core.engine.event import TradeEvent
     return TradeEvent(
@@ -573,3 +758,141 @@ def _buy(price, quantity, trade_time):
         amount=Decimal(price) * quantity, commission=Decimal("0"),
         stamp_duty=Decimal("0"), trade_time=trade_time,
     )
+
+
+# ===========================================================================
+# 组合估值 total_value：残缺 bar / 停牌 必须沿用最近已知价，不能把缺席持仓当 0
+# 回归 2026-08-25：BarPoller 逐票完成发残缺 1m bar，旧 total_value 只算
+# bar.stocks 内持仓 → 总市值瞬间塌掉 → 误触发 20% max_drawdown 熔断。
+# ===========================================================================
+def _ohlcv(close):
+    return {
+        "open": Decimal(str(close)), "high": Decimal(str(close)),
+        "low": Decimal(str(close)), "close": Decimal(str(close)), "volume": 1000,
+    }
+
+
+def _portfolio_with_holdings(holdings, cash=Decimal("100000")):
+    """holdings: [(code, qty, avg_cost)]。直接构造持仓 + 指定现金，不经撮合。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1m",
+        capital_ratio=Decimal("1"), max_positions=10,
+    )
+    ctx.formula_signals = []
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.2"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    for code, qty, avg_cost in holdings:
+        pos = Position(code)
+        pos.quantity = qty
+        pos.avg_cost = Decimal(str(avg_cost))
+        ctx.positions[code] = pos
+    port.strategies.append(ctx)
+    port.account.cash = Decimal(str(cash))
+    return port
+
+
+def test_total_value_partial_bar_carries_last_known_price():
+    """残缺 1m bar（只含部分持仓）必须用最近已知价补齐缺席持仓，总市值不塌。
+
+    现金 40000 + A 1000 股@10 + B 5000 股@10 = 100000。
+    先给全量 bar（A、B 均 10）建立峰值；再给只含 A 的残缺 bar：
+    旧逻辑算 40000+10000=50000（B 当 0），新逻辑 B 沿用 10 仍 = 100000。
+    """
+    port = _portfolio_with_holdings(
+        [("000001.SZ", 1000, 10), ("600000.SH", 5000, 10)], cash=40000,
+    )
+    t1 = datetime(2026, 8, 25, 13, 46)
+    full = BarEvent(stocks={"000001.SZ": _ohlcv(10), "600000.SH": _ohlcv(10)}, bar_time=t1)
+    assert port.total_value(full) == Decimal("100000")
+
+    t2 = datetime(2026, 8, 25, 13, 47)
+    partial = BarEvent(stocks={"000001.SZ": _ohlcv(10)}, bar_time=t2)
+    assert port.total_value(partial) == Decimal("100000")  # B 沿用 10，不塌
+
+
+def test_partial_bar_does_not_false_trigger_max_drawdown():
+    """端到端回归：峰值建立后来一根残缺 bar，不应触发 20% max_drawdown。"""
+    port = _portfolio_with_holdings(
+        [("000001.SZ", 1000, 10), ("600000.SH", 5000, 10)], cash=40000,
+    )
+    rm = port.risk_manager
+    t1 = datetime(2026, 8, 25, 13, 46)
+    rm.update_peak(port.total_value(BarEvent(
+        stocks={"000001.SZ": _ohlcv(10), "600000.SH": _ohlcv(10)}, bar_time=t1,
+    )), t1.date())
+    assert rm.peak_value == Decimal("100000")
+    assert not rm.circuit_breaker_active
+
+    # 残缺 bar（只有 A）——旧逻辑 50000 对峰值 100000 回撤 50% 会误触发
+    t2 = datetime(2026, 8, 25, 13, 47)
+    rm.update_peak(port.total_value(BarEvent(
+        stocks={"000001.SZ": _ohlcv(10)}, bar_time=t2,
+    )), t2.date())
+    assert not rm.circuit_breaker_active, "残缺 bar 不应导致 max_drawdown 熔断"
+    assert rm.consecutive_drawdown_triggers == 0
+
+
+def test_total_value_suspended_stock_valued_at_last_close():
+    """持仓股全天停牌（后续 bar 完全不含该股）按最近已知收盘价估值。"""
+    port = _portfolio_with_holdings(
+        [("000001.SZ", 1000, 10), ("600000.SH", 5000, 10)], cash=40000,
+    )
+    t1 = datetime(2026, 8, 25, 9, 31)
+    port.total_value(BarEvent(
+        stocks={"000001.SZ": _ohlcv(10), "600000.SH": _ohlcv(10)}, bar_time=t1,
+    ))
+    # 盘中 B 停牌：后续若干 bar 只有 A，B 永不出现
+    for h in (9, 10, 11, 13, 14):
+        t = datetime(2026, 8, 25, h, 0)
+        val = port.total_value(BarEvent(stocks={"000001.SZ": _ohlcv(10)}, bar_time=t))
+        assert val == Decimal("100000"), f"B 停牌应按昨收估值, got {val}"
+
+
+def test_total_value_zero_close_does_not_poison_snapshot():
+    """停牌 bar close=0（TQ NaN 规整而来）不得覆盖快照里的有效价，也不得按 0 估值。
+
+    现金 40000 + A 6000 股@10 = 100000。全量 bar 建立峰值后，A 停牌 close=0：
+    若 0 污染快照，A 被估 0 → 总 40000（回撤 60%）误触发；应沿用 10。
+    """
+    port = _portfolio_with_holdings([("000001.SZ", 6000, 10)], cash=40000)
+    rm = port.risk_manager
+    t1 = datetime(2026, 8, 25, 9, 31)
+    rm.update_peak(port.total_value(BarEvent(
+        stocks={"000001.SZ": _ohlcv(10)}, bar_time=t1,
+    )), t1.date())
+
+    t2 = datetime(2026, 8, 25, 13, 0)
+    suspended = BarEvent(stocks={"000001.SZ": _ohlcv(0)}, bar_time=t2)
+    val = port.total_value(suspended)
+    assert val == Decimal("100000"), f"close=0 不应被采用, got {val}"
+    rm.update_peak(val, t2.date())
+    assert not rm.circuit_breaker_active
+
+
+def test_total_value_uses_avg_cost_before_any_quote():
+    """从未在任何 bar 出现过的持仓（有持仓无行情）按 avg_cost 估值，不按 0。"""
+    port = _portfolio_with_holdings(
+        [("000001.SZ", 1000, 10), ("600000.SH", 5000, 10)], cash=40000,
+    )
+    # 首根 bar 只有 A，B 从未报过价 → B 按 avg_cost=10 估
+    val = port.total_value(BarEvent(
+        stocks={"000001.SZ": _ohlcv(10)}, bar_time=datetime(2026, 8, 25, 9, 31),
+    ))
+    assert val == Decimal("100000")
+
+
+def test_total_value_snapshot_tracks_real_price_changes():
+    """快照必须随有效新价更新，不能冻结在 avg_cost/旧价（保证真实回撤仍能触发）。"""
+    port = _portfolio_with_holdings([("000001.SZ", 1000, 10)], cash=90000)
+    t1 = datetime(2026, 8, 25, 9, 31)
+    assert port.total_value(BarEvent(stocks={"000001.SZ": _ohlcv(10)}, bar_time=t1)) == Decimal("100000")
+    # 真实跌到 7：总市值 97000
+    t2 = datetime(2026, 8, 25, 10, 0)
+    assert port.total_value(BarEvent(stocks={"000001.SZ": _ohlcv(7)}, bar_time=t2)) == Decimal("97000")
+    # 再来残缺场景也沿用最新价 7
+    t3 = datetime(2026, 8, 25, 10, 1)
+    assert port.total_value(BarEvent(stocks={"000001.SZ": _ohlcv(7)}, bar_time=t3)) == Decimal("97000")

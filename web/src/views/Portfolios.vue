@@ -100,7 +100,7 @@ const STRATEGY_GROUPS = [
     { key: 'trailing_stop_ratio', label: '移动止损', span: 2, type: 'percent', placeholder: '3' },
   ]},
   { title: '加仓参数', fields: [
-    { key: 'add_position_threshold', label: '加仓阈值', span: 2, type: 'percent', placeholder: '5' },
+    { key: 'add_position_threshold', label: '加仓阈值', span: 2, type: 'percent', placeholder: '5（-1=任何价）' },
     { key: 'max_add_count', label: '加仓次数', span: 2, type: 'number', placeholder: '2' },
     { key: 'add_position_ratio', label: '加仓比例', span: 2, type: 'percent', placeholder: '10' },
     { key: 'reduce_position_ratio', label: '减仓比例', span: 2, type: 'percent', placeholder: '30' },
