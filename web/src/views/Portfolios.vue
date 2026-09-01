@@ -35,7 +35,7 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
 const ROLES = [
-  { value: 'independent', label: '对立' },
+  { value: 'independent', label: '独立' },
   { value: 'master', label: '主策略' },
   { value: 'slave', label: '从策略' },
 ]
@@ -134,7 +134,10 @@ function emptyPortfolioForm(): Record<string, any> {
 // 仅对 ratio 字段做 ×100 / ÷100；其他字段原值透传。文本字段保持字符串。
 function toPercent(v: string | number | null | undefined, isRatio: boolean) {
   if (!isRatio || v === null || v === undefined || v === '') return v
-  return Number(v) * 100
+  const n = Number(v)
+  // -1 是 add_position_threshold 的"任何价都加"特殊标记，不做 ×100
+  if (n === -1) return v
+  return n * 100
 }
 function fromPercent(v: string | number | null | undefined, fld: { type: string; key: string }) {
   // select 字段（trading_session/period/role/stock_pool_id 等）原值透传，
@@ -142,6 +145,8 @@ function fromPercent(v: string | number | null | undefined, fld: { type: string;
   if (fld.type !== 'number' && fld.type !== 'percent') return v
   if (v === null || v === undefined || v === '') return v
   const num = Number(v)
+  // add_position_threshold 的 -1 是"任何价都加"的特殊标记（非百分比），不除以 100
+  if (fld.key === 'add_position_threshold' && num === -1) return num
   return STRATEGY_RATIO_FIELDS.has(fld.key) || PORTFOLIO_RATIO_FIELDS.has(fld.key) ? num / 100 : num
 }
 
