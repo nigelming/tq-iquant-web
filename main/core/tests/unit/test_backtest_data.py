@@ -411,10 +411,10 @@ def _seed_db(db):
 
 
 def test_build_klines_orchestration(db_session, monkeypatch):
-    """build_klines 读股票池 + 策略周期，调 get_history_raw，转 polars。"""
+    """build_klines 读股票池 + 策略周期，调 get_history_raw（主段 + 预热段），转 polars。"""
     import pandas as pd
     db = db_session
-    ps, strat, formula = _seed_db(db)
+    ps, strat, formula = _seed_db(db)  # formula_count 用模型默认 200
 
     ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
     raw = {
@@ -425,23 +425,30 @@ def test_build_klines_orchestration(db_session, monkeypatch):
         "Volume": pd.DataFrame({"000001.SZ": [1000, 1000], "600519.SH": [200, 210]}, index=ts),
         "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0], "600519.SH": [321000.0, 339150.0]}, index=ts),
     }
-    captured = {}
+    calls = []
     def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
-        captured["stocks"] = stocks
-        captured["periods"] = periods
-        captured["start"] = start
-        captured["end"] = end
+        calls.append({
+            "stocks": list(stocks), "periods": list(periods),
+            "start": start, "end": end, "count": count,
+        })
         return {"1d": raw}
     monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
 
     klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
 
-    # 接线校验：股票池 2 只股票、周期 1d、日期 YYYYMMDD
-    assert captured["stocks"] == ["000001.SZ", "600519.SH"]
-    assert captured["periods"] == ["1d"]
-    assert captured["start"] == "20260729"
-    assert captured["end"] == "20260731"
-    # 输出校验：两股票 polars DataFrame 含 datetime
+    # 主段拉取：区间 [start, end]，count=-1
+    assert calls[0]["stocks"] == ["000001.SZ", "600519.SH"]
+    assert calls[0]["periods"] == ["1d"]
+    assert calls[0]["start"] == "20260729"
+    assert calls[0]["end"] == "20260731"
+    assert calls[0]["count"] == -1
+    # 预热段拉取：formula_count=200 根，start 空（TDX 从 end 往前数 N 根），end=start 前一天
+    assert len(calls) == 2
+    assert calls[1]["periods"] == ["1d"]
+    assert calls[1]["start"] == ""
+    assert calls[1]["end"] == "20260728"
+    assert calls[1]["count"] == 200
+    # 输出校验：两次拉取同数据 → 去重后仍 2 根 bar
     assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
     assert "datetime" in klines["000001.SZ"]["1d"].columns
     assert klines["000001.SZ"]["1d"].height == 2
@@ -601,4 +608,238 @@ def test_build_signal_cache_1h_uses_index_align(db_session, monkeypatch):
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 11, 0))] == [{"name": "open_sig", "value": -1}]
     # 午夜 key 不应存在（那是 Date 匹配的产物，1h 不该走那条）
     assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 0, 0)) not in cache
+
+
+# ---------------------------------------------------------------------------
+# 公式预热（回测优化）：回测区间首根 bar 上公式须有有效值。
+# 预热根数 = 该周期所有策略引用公式的 formula_count 最大值（与实盘 code_period_count
+# 同语义）；预热段用 TDX count 直拉（start 空 + end=start 前一天），只喂公式不进引擎。
+# ---------------------------------------------------------------------------
+def _seed_db_warmup(db):
+    """预热测试依赖链：两个 1d 策略引用不同 formula_count 公式 + 30m 策略 + 5m 策略(count=0)。"""
+    from decimal import Decimal
+    from core.models import (
+        StockPool, StockPoolStock, Formula, FormulaSignal,
+        PortfolioStrategy, Strategy,
+    )
+    pool = StockPool(code="TESTW", name="warmup_pool")
+    db.add(pool); db.flush()
+    db.add(StockPoolStock(pool_id=pool.id, stock_code="000001.SZ"))
+    db.flush()
+    f255 = Formula(name="F255", content="MA(CLOSE,255)", formula_count=255)
+    f100 = Formula(name="F100", content="MA(CLOSE,100)", formula_count=100)
+    f0 = Formula(name="F0", content="CLOSE", formula_count=0)
+    db.add(f255); db.add(f100); db.add(f0); db.flush()
+    ps = PortfolioStrategy(
+        name="ps_warm", stock_pool_id=pool.id,
+        initial_capital=Decimal("100000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(ps); db.flush()
+    for name, period, fid in [
+        ("s1", "1d", f255.id), ("s2", "1d", f100.id),
+        ("s3", "30m", f255.id), ("s4", "5m", f0.id),
+    ]:
+        db.add(Strategy(
+            portfolio_id=ps.id, name=name, formula_id=fid,
+            period=period, role="master",
+            capital_ratio=Decimal("0.6"), max_positions=5,
+            stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+            trailing_stop_ratio=Decimal("0"),
+        ))
+    db.commit()
+    return ps
+
+
+def test_warmup_counts_by_period(db_session):
+    """预热根数 = 该周期所有策略引用公式的 formula_count 最大值；count=0 不预热。"""
+    db = db_session
+    ps = _seed_db_warmup(db)
+    counts = bt_api.warmup_counts_by_period(ps, db)
+    assert counts == {"1d": 255, "30m": 255}
+
+
+def test_warmup_counts_by_period_no_db(db_session):
+    """db=None → 空 dict（build_klines 据此跳过预热拉取）。"""
+    assert bt_api.warmup_counts_by_period(object(), None) == {}
+
+
+def test_build_klines_warmup_merge(db_session, monkeypatch):
+    """build_klines 预热段按周期 count 直拉（start 空 / end=start 前一天 / count=formula_count），
+    与主段合并，klines 含预热 bar。"""
+    import pandas as pd
+    db = db_session
+    ps = _seed_db_warmup(db)
+
+    def _raw(ts, values):
+        return {
+            "Open": pd.DataFrame({"000001.SZ": values}, index=ts),
+            "High": pd.DataFrame({"000001.SZ": values}, index=ts),
+            "Low": pd.DataFrame({"000001.SZ": values}, index=ts),
+            "Close": pd.DataFrame({"000001.SZ": values}, index=ts),
+            "Volume": pd.DataFrame({"000001.SZ": [1000] * len(values)}, index=ts),
+            "Amount": pd.DataFrame({"000001.SZ": [10000.0] * len(values)}, index=ts),
+        }
+
+    ts_warm = [datetime(2026, 7, 28)]
+    ts_main = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw_warm = _raw(ts_warm, [9.9])
+    raw_main = _raw(ts_main, [10.2, 9.0])
+
+    calls = []
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        calls.append({"periods": list(periods), "start": start, "end": end, "count": count})
+        if count == -1:
+            # 主段：一次拉全部周期
+            return {"1d": raw_main, "30m": raw_main}
+        # 预热段：每周期一次 count 直拉
+        return {periods[0]: raw_warm}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+
+    klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
+
+    # 调用序列：1 次主段（全周期）+ 每周期 1 次预热段（5m 的 count=0 不拉）
+    assert len(calls) == 3
+    assert calls[0]["count"] == -1
+    warmup_calls = {c["periods"][0]: c for c in calls[1:]}
+    assert set(warmup_calls) == {"1d", "30m"}
+    for c in warmup_calls.values():
+        assert c["start"] == "" and c["end"] == "20260728" and c["count"] == 255
+
+    # 合并后含预热 bar：1d 有 3 根（07-28 预热 + 07-29/30 主段）
+    df = klines["000001.SZ"]["1d"]
+    assert df.height == 3
+    assert df["datetime"].to_list()[0] == datetime(2026, 7, 28)
+
+
+def test_merge_raw_by_period_keeps_main_on_overlap():
+    """预热段 + 主段合并：按时间升序，重叠 bar 保留主段值。"""
+    import pandas as pd
+    ts_warm = [datetime(2026, 7, 28), datetime(2026, 7, 29)]
+    ts_main = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    main = {"1d": {"Close": pd.DataFrame({"000001.SZ": [10.2, 9.0]}, index=ts_main)}}
+    warm = {"1d": {"Close": pd.DataFrame({"000001.SZ": [9.9, 99.0]}, index=ts_warm)}}
+    merged = bt_api._merge_raw_by_period(main, warm)
+    df = merged["1d"]["Close"]
+    assert list(df.index) == [datetime(2026, 7, 28), datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    assert df.loc[datetime(2026, 7, 29), "000001.SZ"] == 10.2  # 重叠 bar 主段值优先
+    assert df.loc[datetime(2026, 7, 28), "000001.SZ"] == 9.9   # 预热 bar 保留
+
+
+def test_merge_raw_by_period_fallbacks():
+    """预热段非 dict / 缺周期 / 缺字段 → 退化为仅主段。"""
+    import pandas as pd
+    ts_main = [datetime(2026, 7, 29)]
+    close = pd.DataFrame({"000001.SZ": [10.2]}, index=ts_main)
+    main = {"1d": {"Close": close}}
+    assert bt_api._merge_raw_by_period(main, None) is main
+    assert bt_api._merge_raw_by_period(main, {})["1d"] is main["1d"]
+    warm_missing_period = {"5m": {"Close": close}}
+    assert bt_api._merge_raw_by_period(main, warm_missing_period)["1d"] is main["1d"]
+    warm_missing_field = {"1d": {"Open": close}}
+    merged = bt_api._merge_raw_by_period(main, warm_missing_field)
+    assert merged["1d"]["Close"] is close
+
+
+def test_slice_klines_from_start():
+    """引擎视野切片：datetime >= start 保留；主区间无 bar 的股票整只剔除。"""
+    df_keep = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 28), datetime(2026, 7, 29)],
+        "Open": [Decimal("9.9"), Decimal("10.2")],
+    })
+    df_drop = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 27), datetime(2026, 7, 28)],
+        "Open": [Decimal("9.8"), Decimal("9.9")],
+    })
+    klines = {"000001.SZ": {"1d": df_keep}, "600519.SH": {"1d": df_drop}}
+    sliced = bt_api._slice_klines_from(klines, date(2026, 7, 29))
+    assert set(sliced.keys()) == {"000001.SZ"}
+    assert sliced["000001.SZ"]["1d"].height == 1
+    assert sliced["000001.SZ"]["1d"]["datetime"].to_list() == [datetime(2026, 7, 29)]
+
+
+def test_build_signal_cache_filters_warmup_entries(db_session, monkeypatch):
+    """传 start：预热段（start 之前）的信号条目被过滤，cache 只留主区间；
+    公式引擎仍拿到含预热段的全量时间范围。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    klines = {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 28), datetime(2026, 7, 29), datetime(2026, 7, 30)],
+        "Open": [Decimal("9.9"), Decimal("10"), Decimal("10.2")],
+        "High": [Decimal("10"), Decimal("10.3"), Decimal("10.5")],
+        "Low": [Decimal("9.8"), Decimal("9.9"), Decimal("8.9")],
+        "Close": [Decimal("9.95"), Decimal("10.2"), Decimal("9.0")],
+        "Volume": [1000, 1000, 1000],
+    })}}
+
+    captured = {}
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        captured["start_time"] = start_time
+        captured["end_time"] = end_time
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260728", "Value": 1},   # 预热段 → 应被过滤
+                    {"Date": "20260729", "Value": -1},
+                    {"Date": "20260730", "Value": 1},
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db, start=date(2026, 7, 29))
+
+    # 公式引擎拿到含预热段的全量时间范围（首 bar 起公式即有效）
+    assert captured["start_time"] == "20260728"
+    assert captured["end_time"] == "20260730"
+    # start 之前的预热信号不进 cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 28)) not in cache
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "open_sig", "value": -1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 30))] == [{"name": "open_sig", "value": 1}]
+
+
+def test_build_signal_cache_minute_warmup_align_then_filter(db_session, monkeypatch):
+    """分钟级含预热：索引对齐必须基于全量时间轴（含预热 bar），过滤在转换后按 bar_time 做。
+    若先切片再对齐，预热 bar 占用的索引会把主区间信号整体串位。"""
+    from core.models import Strategy
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Strategy).filter_by(id=strat.id).update({"period": "5m"})
+    db.commit()
+
+    # 全量时间轴：07-28 14:55（预热）+ 07-29 09:35/09:40（主区间）
+    klines = {"000001.SZ": {"5m": pl.DataFrame({
+        "datetime": [
+            datetime(2026, 7, 28, 14, 55),
+            datetime(2026, 7, 29, 9, 35),
+            datetime(2026, 7, 29, 9, 40),
+        ],
+        "Open": [Decimal("9.9"), Decimal("10"), Decimal("10.2")],
+        "High": [Decimal("10"), Decimal("10.3"), Decimal("10.5")],
+        "Low": [Decimal("9.8"), Decimal("9.9"), Decimal("8.9")],
+        "Close": [Decimal("9.95"), Decimal("10.2"), Decimal("9.0")],
+        "Volume": [1000, 1000, 1000],
+    })}}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        # TQ 真机语义：3 条输出按 bar 顺序，Date 只标到日
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260728", "Value": 9},   # → 预热 bar → 应被过滤
+                    {"Date": "20260729", "Value": 1},   # → 09:35
+                    {"Date": "20260729", "Value": -1},  # → 09:40
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db, start=date(2026, 7, 29))
+
+    # 主区间信号值不串位（若对齐用了切片后时间轴，这里会拿到 9/-1 或错位值）
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 28, 14, 55)) not in cache
 

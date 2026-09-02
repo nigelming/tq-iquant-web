@@ -119,7 +119,7 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
 
     # patch 数据获取层（避开真实 TQ/TDX）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
 
@@ -174,7 +174,7 @@ def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkey
     ps, _ = _seed(db_session)
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
 
@@ -199,7 +199,7 @@ def test_run_backtest_exception_marks_failed_and_reraises(db_session, monkeypatc
         raise RuntimeError("polars panic: str cannot be int")
 
     monkeypatch.setattr(svc, "build_klines", _boom)
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
 
@@ -225,7 +225,7 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
     """完整详情：record + snapshots + trades + evaluations + 策略层四件套齐全。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     trade = SimpleNamespace(
@@ -270,7 +270,7 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     """存在返回 True；record + trades/snapshots/evaluations 全清。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     trade = SimpleNamespace(
@@ -329,7 +329,7 @@ def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch)
     """result["decisions"] 逐行落 backtest_decision_events；详情带聚合统计 + 明细。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     fake_result = {
@@ -370,7 +370,7 @@ def test_delete_record_cascades_decisions(db_session, monkeypatch):
     """删除回测记录时 decision 事件一并清空。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     fake_result = {
@@ -393,7 +393,7 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     created_at 相等，故断言非递增而非严格递减——避免对亚秒分辨率过约束）。"""
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     svc.run_backtest(db_session, ps, _req(name="r1"))

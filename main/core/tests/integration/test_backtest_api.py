@@ -105,7 +105,7 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     stock = "000001.SZ"
     # monkeypatch 数据获取层：返回 mock klines / signal_cache / open_prices
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -164,7 +164,7 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 
     stock = "000001.SZ"
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -199,7 +199,7 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 def _mock_data(monkeypatch):
     """统一 mock 数据获取层，供多测试复用。"""
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -390,7 +390,7 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
 
     # mock 三层全返回空 — 模拟 TQ 拉不到行情
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
 
     payload = {
@@ -468,7 +468,7 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
     db.close()
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     payload = _post_payload(ps_id, "conflict_test")
 
@@ -510,7 +510,7 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200

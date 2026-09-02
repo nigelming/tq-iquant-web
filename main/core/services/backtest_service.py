@@ -13,10 +13,11 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 故测试零改动。纯重构，行为不变。
 """
 
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
 
+import pandas as pd
 import polars as pl
 from sqlalchemy.orm import Session
 
@@ -159,12 +160,95 @@ def _convert_market_data_multi(raw_by_period: dict, stocks: list) -> dict:
     return result
 
 
+def warmup_counts_by_period(ps, db: Session = None) -> Dict[str, int]:
+    """各周期公式预热根数：{period: max(formula_count)}。
+
+    取该周期所有策略引用公式的 formula_count 最大值（与实盘 code_period_count
+    同语义：凑满 formula_count 根数据，公式输出有效值）。formula_count<=0 或
+    公式缺失的策略跳过。返回空 dict 表示无需预热。
+
+    回测主区间首根 bar 前需 formula_count-1 根历史即可让公式生效
+    （有效值条件含当前 bar 本身），按 formula_count 拉取多 1 根富余。
+    """
+    if db is None:
+        return {}
+    counts: Dict[str, int] = {}
+    for strat in _portfolio_strategies(ps, db):
+        if strat.formula_id is None:
+            continue
+        formula = db.get(Formula, strat.formula_id)
+        if formula is None:
+            continue
+        cnt = formula.formula_count or 0
+        if cnt <= 0:
+            continue
+        prev = counts.get(strat.period, 0)
+        counts[strat.period] = max(prev, cnt)
+    return counts
+
+
+def _merge_raw_by_period(main_raw: dict, warm_raw: dict) -> dict:
+    """预热段 + 主段原始行情合并：{period: {field: pandas.DataFrame}}。
+
+    逐周期逐字段 pandas.concat → index 去重（保留主段值）→ 按时间升序。
+    预热段缺周期/缺字段/非 dict 时退化为仅主段。
+    """
+    if not isinstance(main_raw, dict):
+        return main_raw
+    if not isinstance(warm_raw, dict):
+        return main_raw
+    merged: dict = {}
+    for period, fields in main_raw.items():
+        warm_fields = warm_raw.get(period)
+        if not isinstance(fields, dict) or not isinstance(warm_fields, dict):
+            merged[period] = fields
+            continue
+        mf: dict = {}
+        for field, df in fields.items():
+            wdf = warm_fields.get(field)
+            if not isinstance(df, pd.DataFrame) or not isinstance(wdf, pd.DataFrame):
+                mf[field] = df
+                continue
+            comb = pd.concat([wdf, df])
+            # 去重保留后出现的（= 主段值），再按时间升序
+            comb = comb[~comb.index.duplicated(keep="last")]
+            mf[field] = comb.sort_index()
+        merged[period] = mf
+    return merged
+
+
+def _slice_klines_from(klines: dict, start: date) -> dict:
+    """引擎视野切片：只保留 datetime >= start 的 bar（预热段不进引擎时间轴）。
+
+    预热 bar 只喂公式（build_signal_cache 用全量 klines），引擎的
+    时间轴/成交/快照/熔断/评估全部只看 [start, end]。
+    """
+    start_ts = datetime(start.year, start.month, start.day)
+    result: dict = {}
+    for code, periods in klines.items():
+        per: dict = {}
+        for period, df in periods.items():
+            if "datetime" not in df.columns:
+                continue
+            sliced = df.filter(pl.col("datetime") >= start_ts)
+            if sliced.height > 0:
+                per[period] = sliced
+        if per:
+            result[code] = per
+    return result
+
+
 def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
-    """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}。
+    """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}（含公式预热段）。
 
     股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
     需要 db 查股票池；若未传 db，返回空（无法定位股票）。
-    流程：get_history_raw（原始 TQ 行情）→ _convert_market_data_multi（转引擎 polars）。
+    流程：主段 get_history_raw（start~end，count=-1）→ 每周期预热段 count 直拉
+    （start 空 + end=start 前一天 + count=formula_count，TDX 消化交易日/停牌差异）→
+    _merge_raw_by_period 合并 → _convert_market_data_multi（转引擎 polars）。
+
+    返回值含预热 bar（早于 start）；引擎视野由调用方 _slice_klines_from 切回主区间，
+    预热段只喂 build_signal_cache。
     """
     stocks = _pool_stocks(ps, db)
     if not stocks:
@@ -177,6 +261,21 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
         stocks=stocks, periods=periods,
         start=start_str, end=end_str, dividend_type="front", count=-1,
     )
+    warmup_counts = warmup_counts_by_period(ps, db)
+    if warmup_counts:
+        # 预热段：每周期一次 count 直拉，end=start 前一天（重叠 bar 合并时去重）
+        warm_end = (start - timedelta(days=1)).strftime("%Y%m%d")
+        warm_raw: dict = {}
+        for period, cnt in warmup_counts.items():
+            if period not in periods:
+                continue
+            part = tq.get_history_raw(
+                stocks=stocks, periods=[period],
+                start="", end=warm_end, dividend_type="front", count=cnt,
+            )
+            if isinstance(part, dict):
+                warm_raw.update(part)
+        raw_by_period = _merge_raw_by_period(raw_by_period, warm_raw)
     return _convert_market_data_multi(raw_by_period, stocks)
 
 
@@ -345,7 +444,7 @@ def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
     return result
 
 
-def build_signal_cache(ps, klines: dict, db: Session = None) -> dict:
+def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
     对每个策略：读 Formula（公式名）+ FormulaSignal（信号配置），
@@ -354,6 +453,10 @@ def build_signal_cache(ps, klines: dict, db: Session = None) -> dict:
     分钟级（5m/15m/30m/60m）：TQ 公式输出 Date 只标到日（丢时分），按输出条目顺序
     对齐 klines 时间轴（_convert_formula_output 的 bar_times_by_code）。
     日线：按 Date 匹配（1:1 对齐）。
+
+    start（回测开始日期）：klines 若含公式预热段（早于 start 的 bar），分钟级
+    索引对齐必须基于全量时间轴（先对齐再过滤，否则索引串位）；转换完成后过滤掉
+    bar_time < start 的预热条目，cache 只留主区间。start=None 不过滤（兼容单测）。
     """
     if db is None:
         return {}
@@ -362,7 +465,7 @@ def build_signal_cache(ps, klines: dict, db: Session = None) -> dict:
         return {}
     strategies = _portfolio_strategies(ps, db)
     tq_formula = TQFormula()
-    # 分钟级时间轴（所有策略共用同一 klines 时间轴）
+    # 分钟级时间轴（所有策略共用同一 klines 时间轴，含预热段——与喂入公式引擎的数据同源）
     bar_times_by_code = _bar_times_by_code(klines)
     cache: dict = {}
     for strat in strategies:
@@ -381,6 +484,9 @@ def build_signal_cache(ps, klines: dict, db: Session = None) -> dict:
         bt = bar_times_by_code if period in _MINUTE_PERIODS else None
         entries = _convert_formula_output(raw, strat.id, stocks, bar_times_by_code=bt)
         cache.update(entries)
+    if start is not None:
+        start_ts = datetime(start.year, start.month, start.day)
+        cache = {k: v for k, v in cache.items() if k[2] >= start_ts}
     return cache
 
 
@@ -834,12 +940,16 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t0 = datetime.now()
         portfolio = _assemble_portfolio(ps, strategies, db)
         t1 = datetime.now()
-        klines = build_klines(ps, req.start_date, req.end_date, db)
+        # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
+        klines_full = build_klines(ps, req.start_date, req.end_date, db)
         t2 = datetime.now()
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
-        _log_kline_summary(record_id, klines)
-        signal_cache = build_signal_cache(ps, klines, db)
+        _log_kline_summary(record_id, klines_full)
+        # 信号计算喂全量（含预热段，分钟级索引对齐与喂入数据同源），start 起的条目才进 cache
+        signal_cache = build_signal_cache(ps, klines_full, db, start=req.start_date)
         t3 = datetime.now()
+        # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
+        klines = _slice_klines_from(klines_full, req.start_date)
         open_prices = build_open_prices(ps, klines)
         t4 = datetime.now()
         benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
