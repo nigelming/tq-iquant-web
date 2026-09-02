@@ -86,6 +86,7 @@ class Portfolio:
         bar: BarEvent,
         signal_cache: Optional[Dict] = None,
         period: Optional[str] = None,
+        inflight_opens: Optional[Dict[int, set]] = None,
     ) -> List[OrderEvent]:
         """处理一根 bar：取信号 + 风控检查 + 优先级排序 → 返回待执行订单列表。
 
@@ -94,12 +95,20 @@ class Portfolio:
         风控清仓后公式信号不再执行。
         period：C6 按周期节拍驱动——非 None 时只处理 period 相同的策略
         （实盘 5m 边界 bar 不触发 1m 策略，避免风控单串周期）；None=全部（回测/旧调用）。
+        inflight_opens：strategy_id → 在途未成交 BUY 的股票集合（实盘引擎从
+        _pending_orders 注入）。OPEN 闸门把在途单也计入 max_positions；
+        回测不传（上一 bar 队列已在成交步全部落账/丢弃），本 bar 内
+        排队的 OPEN 由内部累计跟踪。
         """
+        # 工作副本：本 bar 处理过程中每排一个 OPEN 就地登记，同 bar 后续信号可见
+        inflight: Dict[int, set] = {
+            sid: set(codes) for sid, codes in (inflight_opens or {}).items()
+        }
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
                 continue
-            orders.extend(self._process_strategy(ctx, bar, signal_cache))
+            orders.extend(self._process_strategy(ctx, bar, signal_cache, inflight))
         # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
         # §88：熔断期间不清仓，仅暂停新开仓。DEBUG——熔断期每 bar 每 BUY 都会触发，
         # INFO 会刷屏；DEBUG 供排查"为何 BUY 信号没下单"（被剥的 BUY 不进返回列表，
@@ -132,7 +141,8 @@ class Portfolio:
         return orders
 
     def _process_strategy(
-        self, ctx: StrategyContext, bar: BarEvent, signal_cache
+        self, ctx: StrategyContext, bar: BarEvent, signal_cache,
+        inflight: Dict[int, set],
     ) -> List[OrderEvent]:
         signals = ctx.get_signal(bar, signal_cache=signal_cache)
         # 风控检查：对每只持仓股票检查止损/止盈/移动止损
@@ -149,7 +159,7 @@ class Portfolio:
             if sig.stock_code in cleared:
                 # 该股票已清仓，跳过后续公式信号（风控信号不会重复，仍跳过）
                 continue
-            order = self._signal_to_order(ctx, sig, bar)
+            order = self._signal_to_order(ctx, sig, bar, inflight)
             if order is None:
                 continue
             orders.append(order)
@@ -237,7 +247,8 @@ class Portfolio:
         return risks
 
     def _signal_to_order(
-        self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent
+        self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent,
+        inflight: Optional[Dict[int, set]] = None,
     ) -> Optional[OrderEvent]:
         """信号转 OrderEvent。下单量按策略表参数计算（非硬编码）。
         - 全平类（CLOSE/止损/止盈/移动止损）：量 = 持仓全量
@@ -303,20 +314,32 @@ class Portfolio:
                           message="OPEN 信号时本票已持仓 %d 股（加仓走 ADD），忽略开仓"
                                   % pos.quantity)
                 return None
-            # 受 max_positions 约束：已达上限不开新仓
+            # 在途单计入（max_positions 超开修复，回测 id7 实测根因）：held 只数已成交
+            # 持仓，同 bar 齐发的 OPEN / 实盘 submitted 未成交单不占位 → 超开后闸门
+            # 永久拦截。inflight 含本 bar 已排队 + 上层注入的在途未成交 BUY。
+            # 在途票若已持有（ADD 在途）不重复占位——held 已含它。
+            # 同票在途重复 OPEN 不在此拦：实盘由 _handle_bar 的 inflight_skip 闸拦
+            # （同向在途单未确认），回测上一 bar 队列已全部落账/丢弃不会重复。
+            inflight_codes = (inflight or {}).get(ctx.strategy_id, set())
             held = sum(1 for p in ctx.positions.values() if p.quantity > 0)
-            if held >= ctx.max_positions:
+            held_codes = {c for c, p in ctx.positions.items() if p.quantity > 0}
+            effective = held + len(inflight_codes - held_codes)
+            if effective >= ctx.max_positions:
                 logger.debug(
-                    "OPEN 拦截:max_positions 已满（持有 %d >= 上限 %d，%s 不开新仓）",
-                    held, ctx.max_positions, sig.stock_code,
+                    "OPEN 拦截:max_positions 已满（持有 %d + 在途 %d >= 上限 %d，%s 不开新仓）",
+                    held, len(inflight_codes - held_codes), ctx.max_positions, sig.stock_code,
                 )
                 self._rec("max_positions_full", "signal_gate", "block", ctx, sig, bar,
                           param_name="max_positions",
                           param_value=float(ctx.max_positions),
-                          actual_value=float(held),
-                          message="持股数已达上限 %d（当前持有 %d 只），%s 不开新仓"
-                                  % (ctx.max_positions, held, sig.stock_code))
+                          actual_value=float(effective),
+                          message="持股数已达上限 %d（持有 %d 只 + 在途 %d 只），%s 不开新仓"
+                                  % (ctx.max_positions, held,
+                                     len(inflight_codes - held_codes), sig.stock_code))
                 return None
+            # 本 bar 排队登记：同 bar 后续 OPEN 信号按已占用空位计数
+            if inflight is not None:
+                inflight.setdefault(ctx.strategy_id, set()).add(sig.stock_code)
             quantity = int(ctx.single_open_ratio * strategy_fund / close / 100) * 100
             if quantity < 100:
                 logger.debug(

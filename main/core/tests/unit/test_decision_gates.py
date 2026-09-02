@@ -457,3 +457,78 @@ class TestNullRecorderDefault:
         eng = ExecutionEngine(None, LiveT1Checker())  # 不传 recorder
         assert eng.cap_quantity(_order(TradeType.BUY, 1000, price="10"), acc, None) is None
         assert acc.insufficient_count == 1
+
+
+# ===========================================================================
+# OPEN 闸门 × 在途单：max_positions 须计入「已排队/在途未成交」的买入
+# ===========================================================================
+# 根因（回测 id7 实测）：闸门 held 只数已成交持仓（quantity>0），首日信号齐发
+# 10 只 OPEN 全排队 → 次日全部成交 → 持仓 10 超上限 5，此后 max_positions_full
+# 永久拦截，策略 3 年只卖不买。回测/实盘共用本层，修一次两路同时生效。
+class TestOpenGateInflight:
+    def test_intra_bar_burst_limited_by_max_positions(self):
+        """同 bar 多只 OPEN 信号：本 bar 已排队的 OPEN 也计入，不超 max_positions。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, max_positions=2)
+        t = datetime(2026, 1, 4, 15, 0)
+        codes = ["000001.SZ", "000002.SZ", "000003.SZ"]
+        bar = _bar({c: _ohlcv(10) for c in codes}, t)
+        cache = {(1, c, t): [{"name": "open_sig", "value": 1}] for c in codes}
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        orders = port.on_bar(bar, signal_cache=cache)
+        assert [o.stock_code for o in orders] == ["000001.SZ", "000002.SZ"]
+        ev = _find(r.drain(), "max_positions_full")
+        assert ev.action == "block" and ev.actual_value == 2
+        assert ev.stock_code == "000003.SZ"
+
+    def test_inflight_opens_param_counts_toward_cap(self):
+        """上层注入的在途未成交 BUY（实盘 submitted/partial）计入 max_positions。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, max_positions=2)
+        _hold(ctx, "000001.SZ", 10)  # 已成交持仓 1 只
+        t = datetime(2026, 1, 4, 15, 0)
+        codes = ["000002.SZ", "000003.SZ"]
+        bar = _bar({c: _ohlcv(10) for c in codes}, t)
+        cache = {(1, c, t): [{"name": "open_sig", "value": 1}] for c in codes}
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        orders = port.on_bar(bar, signal_cache=cache, inflight_opens={1: {"600001.SH"}})
+        # 持仓 1 + 在途 1 = 上限 2 → 全部拦
+        assert orders == []
+        ev = _find(r.drain(), "max_positions_full")
+        assert ev.actual_value == 2
+
+    def test_inflight_same_stock_not_double_counted(self):
+        """同票在途 OPEN 再来信号：共享层不拦（实盘由 inflight_skip 闸拦），
+        但该票在途只占一个坑——计入 max_positions 而非翻倍。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, max_positions=1)
+        t = datetime(2026, 1, 4, 15, 0)
+        bar = _bar({"600001.SH": _ohlcv(10)}, t)
+        cache = {(1, "600001.SH", t): [{"name": "open_sig", "value": 1}]}
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        orders = port.on_bar(bar, signal_cache=cache, inflight_opens={1: {"600001.SH"}})
+        # 上限 1 已被在途占满 → 闸门拦（实盘还有 inflight_skip 二道兜底）
+        assert orders == []
+        ev = _find(r.drain(), "max_positions_full")
+        assert ev.actual_value == 1
+
+    def test_inflight_already_held_not_double_counted(self):
+        """在途票若已持有（ADD 在途场景）不重复占位：held 已含它，不再 +1。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, max_positions=2)
+        _hold(ctx, "000001.SZ", 10)  # 持仓 1 只；在途的是它的 ADD 买入
+        t = datetime(2026, 1, 4, 15, 0)
+        bar = _bar({"000002.SZ": _ohlcv(10)}, t)
+        cache = {(1, "000002.SZ", t): [{"name": "open_sig", "value": 1}]}
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        orders = port.on_bar(bar, signal_cache=cache, inflight_opens={1: {"000001.SZ"}})
+        # 1 held（在途票已计入）+ 0 新增 → 仍有 1 个空位给 000002.SZ
+        assert [o.stock_code for o in orders] == ["000002.SZ"]

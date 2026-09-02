@@ -690,7 +690,18 @@ class LiveEngine:
             df_cache=df_cache, raw_cache=raw_cache,
         )
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
-        orders = portfolio.on_bar(bar, signal_cache=self.signal_cache, period=bar.period)
+        # 在途单注入（OPEN 闸门 × max_positions）：_pending_orders 里的未成交 BUY
+        # （submitted/partial）尚未落持仓（submitted 只建 quantity=0 的 Position），
+        # 闸门 held 只数已成交——不注入则连续 bar 齐发 OPEN 超开/同票重复开仓。
+        # partial 未 apply（只记账），整单仍在途，计入正确。
+        inflight_opens: Dict[int, set] = {}
+        for lo in self._pending_orders.values():
+            if lo.trade_type == "buy":
+                inflight_opens.setdefault(lo.strategy_id, set()).add(lo.stock_code)
+        orders = portfolio.on_bar(
+            bar, signal_cache=self.signal_cache, period=bar.period,
+            inflight_opens=inflight_opens or None,
+        )
         # db 会话在 on_bar 之后即开：决策闸门事件（熔断 halt/剥 BUY/风险触发）可能在无新单
         # 时也产生，需随本 bar 落库——故不再 orders 为空就早退，drain 放 finally 收尾。
         db = self._db_session_factory()

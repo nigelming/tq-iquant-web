@@ -437,3 +437,29 @@ def test_strategy_snapshots_additivity_with_suspended_stock():
     holdings_sum = sum((s["market_value"] for s in snaps), Decimal("0"))
     assert holdings_sum == port.total_value(suspended) - port.account.cash
     assert port.total_value(suspended) == Decimal("100000")
+
+
+def test_run_first_day_signal_burst_respects_max_positions():
+    """首日 10 只股票齐发 OPEN（回测 id7 实测场景）：max_positions=5 → 次日只成交 5 笔。
+
+    修复前：闸门 held 只算已成交持仓（首日 0 只），10 单全排队全成交 → 持仓 10
+    超上限，此后 OPEN 被 max_positions_full 永久拦截，策略只卖不买。
+    """
+    codes = ["%06d.SZ" % i for i in range(1, 11)]
+    klines = {}
+    for c in codes:
+        klines.update(_klines(c, [
+            (datetime(2026, 1, 4), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+            (datetime(2026, 1, 5), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+        ]))
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, c, datetime(2026, 1, 4)): [{"name": "open_sig", "value": 1}]
+        for c in codes
+    }
+    engine = BacktestEngine()
+    result = engine.run(port, klines=klines, signal_cache=cache)
+
+    buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
+    assert len(buys) == 5  # max_positions=5，不超开
+    assert len({t.stock_code for t in buys}) == 5

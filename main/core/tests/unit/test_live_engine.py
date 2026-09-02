@@ -1421,11 +1421,11 @@ def test_handle_bar_tracks_pending_orders():
 
 
 # ---------------- 跨重启去重门（D6：BUY 同 bar_time 已有未完结单则跳过）----------------
-def _seed_buy_submitted(db, bar_time, status="submitted", portfolio_strategy_id=1, strategy_id=1, trade_type="buy"):
+def _seed_buy_submitted(db, bar_time, status="submitted", portfolio_strategy_id=1, strategy_id=1, trade_type="buy", stock_code="600000.SH"):
     """预置一笔 LiveOrder（模拟重启前同一 bar 已下过的单）。trade_type 可 buy/sell。"""
     lo = LiveOrder(
         live_session_id=1, portfolio_strategy_id=portfolio_strategy_id, strategy_id=strategy_id,
-        stock_code="600000.SH", trade_type=trade_type, order_type="limit",
+        stock_code=stock_code, trade_type=trade_type, order_type="limit",
         price=Decimal("9.3"), quantity=600, filled_quantity=0,
         filled_price=None, status=status, signal_name="open_sig",
         signal_type="OPEN", bar_time=bar_time,
@@ -5412,3 +5412,63 @@ def test_handle_bar_no_orders_still_drains_halt_strip_event():
     queued = _drain_queue(q)
     assert any(e.get("type") == "decision" and e.get("gate") == "halted_buy_strip"
                for e in queued)
+
+
+# ---------------- OPEN 闸门 × 在途单（max_positions 计入 submitted/partial BUY）----------------
+def test_handle_bar_inflight_buy_counts_toward_max_positions():
+    """在途 BUY（submitted 未成交）计入 max_positions：上限 1、已有在途 → 新 OPEN 拦截。
+
+    根因：闸门 held 只数已成交持仓（quantity>0），submitted 单只建 Position(quantity=0)
+    不计入 → 连续 bar 齐发 OPEN 超开（与回测 id7 同根因，共用 Portfolio.on_bar）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    ctx.max_positions = 1
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    # 预置一只在途 BUY（09:55 下单未成交，买的是另一只票）
+    db = factory()
+    _seed_buy_submitted(db, bar_time=datetime(2026, 8, 5, 9, 55), stock_code="000001.SZ")
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert engine.pending_orders_count == 1
+
+    engine.signal_cache = {(1, "600000.SH", bar_time): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar("600000.SH", "9.3", bar_time))
+
+    # max_positions=1 已被在途占满 → 不下新单
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    db.close()
+
+
+def test_handle_bar_inflight_dup_open_skipped_across_bars():
+    """同票在途 BUY 未成交、下一 bar 电平信号再发 OPEN → 不重复下单。
+
+    D6 去重门只拦同 bar_time，跨 bar 的重复 OPEN 靠在途注入拦（否则双重建仓）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _seed_buy_submitted(db, bar_time=datetime(2026, 8, 5, 9, 55))  # 600000.SH 在途
+    db.commit()
+    db.close()
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    engine.signal_cache = {(1, "600000.SH", bar_time): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar("600000.SH", "9.3", bar_time))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 1  # 未重复下单
+    db.close()
