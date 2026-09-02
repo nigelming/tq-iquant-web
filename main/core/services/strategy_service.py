@@ -145,14 +145,17 @@ def create_portfolio(db: Session, req) -> dict:
 
 
 def update_portfolio(db: Session, pid: int, req) -> dict | None:
-    """更新组合 + 子策略全量替换。None=不存在。req 已校验合法。"""
+    """更新组合字段（name/资金/费率/风控等），不动子策略。None=不存在。req 已校验合法。
+
+    子策略不在此全量替换：前端编辑弹窗只发 strategies: []（全量替换曾把子策略
+    清空，2026-09 实测）；且删旧建新会换 strategy id，破坏 backtest_trades 等历史
+    引用。子策略增删改走独立端点 POST/PUT/DELETE /api/portfolios/{pid}/strategies。
+    req.strategies 在此被忽略（前端编辑弹窗恒传 []）。
+    """
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if p is None:
         return None
     _apply_portfolio_fields(p, req)
-    # 子表全量替换（同 formulas.py 模式）：删旧建新
-    db.query(Strategy).filter(Strategy.portfolio_id == pid).delete()
-    _create_strategies_two_step(db, pid, req.strategies)
     db.commit()
     db.refresh(p)
     return serialize_portfolio(db, p)

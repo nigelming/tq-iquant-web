@@ -441,35 +441,42 @@ def test_create_portfolio_slave_master_not_master_role(client):
 
 
 # ---------------------------------------------------------------------------
-# PUT /api/portfolios/{pid} — 编辑（子表全量替换）
+# PUT /api/portfolios/{pid} — 编辑（只更新组合字段，子策略不受影响）
 # ---------------------------------------------------------------------------
-def test_update_portfolio_replaces_strategies(client):
+def test_update_portfolio_preserves_strategies(client):
+    """编辑组合不得动子策略（原「子表全量替换」的 bug：前端编辑弹窗只发
+    strategies: []，一保存子策略全被清空；即使传回也换 strategy id 破坏
+    backtest_trades 等历史引用）。子策略走独立 CRUD 端点管理。"""
     c, Session = client
     db = Session()
     pid = _seed_portfolio(db, strategies=[("S1", "independent", None), ("S2", "independent", None)])
+    old_ids = [s.id for s in db.query(Strategy).filter(Strategy.portfolio_id == pid).all()]
     db.close()
 
-    # 编辑为 3 个全新子策略
-    payload = _create_payload(name="PS1", stock_pool_id=1, strategies=[
-        {"name": "NEW1", "formula_id": 1, "period": "1d", "role": "independent",
-         "capital_ratio": 0.6, "max_positions": 5},
-        {"name": "NEW2", "formula_id": 1, "period": "5m", "role": "independent",
-         "capital_ratio": 0.4, "max_positions": 5},
-        {"name": "NEW3", "formula_id": 1, "period": "30m", "role": "independent",
-         "capital_ratio": 0.5, "max_positions": 5},
-    ])
+    # 前端编辑弹窗实际发送的形态：strategies=[]
+    payload = _create_payload(name="PS1-renamed", stock_pool_id=1, strategies=[])
     body = c.put(f"/api/portfolios/{pid}", json=payload).json()
     assert body["code"] == 0
-    strategies = body["data"]["strategies"]
-    assert len(strategies) == 3
-    names = {s["name"] for s in strategies}
-    assert names == {"NEW1", "NEW2", "NEW3"}
+    assert body["data"]["name"] == "PS1-renamed"
 
-    # 旧的 S1/S2 删干净
+    # 子策略原样保留（数量、名字、id 都不变）
     db = Session()
-    assert db.query(Strategy).filter(Strategy.portfolio_id == pid).count() == 3
-    assert db.query(Strategy).filter(Strategy.name.in_(["S1", "S2"])).count() == 0
+    strategies = db.query(Strategy).filter(Strategy.portfolio_id == pid).all()
+    assert {s.name for s in strategies} == {"S1", "S2"}
+    assert sorted(s.id for s in strategies) == sorted(old_ids)
     db.close()
+
+    # 即使误传 strategies 也不生效（忽略，不走删旧建新）
+    payload2 = _create_payload(name="PS1-renamed2", stock_pool_id=1, strategies=[
+        {"name": "NEW1", "formula_id": 1, "period": "1d", "role": "independent",
+         "capital_ratio": 0.6, "max_positions": 5},
+    ])
+    body2 = c.put(f"/api/portfolios/{pid}", json=payload2).json()
+    assert body2["code"] == 0
+    db = Session()
+    names = {s.name for s in db.query(Strategy).filter(Strategy.portfolio_id == pid).all()}
+    db.close()
+    assert names == {"S1", "S2"}
 
 
 def test_update_portfolio_not_found(client):
