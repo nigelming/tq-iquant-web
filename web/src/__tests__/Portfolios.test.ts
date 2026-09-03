@@ -318,6 +318,17 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     expect(args[1].max_positions).toBe(5)           // 数量不转
   })
 
+  it('新建子策略默认加仓阈值为 -1（任何价都加）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await expandFirst(w)
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+
+    const input = w.find('input[data-field="add_position_threshold"]')
+    expect(Number((input.element as HTMLInputElement).value)).toBe(-1)
+  })
+
   it('加仓阈值填 -1（任何价都加）→ 提交保持 -1，不除以 100', async () => {
     ;(createStrategy as any).mockResolvedValue({ id: 20 })
     const w = mount(Portfolios)

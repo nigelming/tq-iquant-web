@@ -113,7 +113,7 @@ function emptyStrategyForm(): Record<string, any> {
     master_strategy_id: null, capital_ratio: 0.6, max_positions: 5,
     single_open_ratio: 0.1,
     stop_loss_ratio: 0.05, take_profit_ratio: 0.15, trailing_stop_ratio: 0.03,
-    add_position_threshold: 0.05, max_add_count: 2,
+    add_position_threshold: -1, max_add_count: 2,  // -1=任何价都加（页面默认即跳过回撤检查）
     add_position_ratio: 0.1, reduce_position_ratio: 0.3,
   }
 }
