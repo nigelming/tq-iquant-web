@@ -70,7 +70,14 @@ RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW second
 RATE_WINDOW = 10                  # rate-limit window (seconds)
 QUOTE_CACHE_TTL = 1               # quote cache refresh interval (seconds)
 QUOTE_COUNT = 10                  # default bar count for /quote
-HISTORY_DAYS = 30                 # history depth to download before pulling bars
+HISTORY_DAYS = 30                 # history depth floor (calendar days) for downloads
+# bars per trading day per period -- used to size the download window so that
+# `count` bars can actually be served (30x500 needs ~63 trading days, a flat
+# 30-day window only ever yields ~176 bars -- found 2026-09-03).
+BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "1h": 4, "1d": 1}
+EMPTY_READ_RETRIES = 3            # reads after a fresh download before giving up
+EMPTY_RETRY_INTERVAL = 0.5        # seconds between empty reads
+DOWNLOAD_MIN_INTERVAL = 5         # skip re-download within this many seconds
 PLACED_MAX = 5000                 # _placed idempotency cache cap; oldest evicted past this (audit #32)
 # ==========================================
 
@@ -80,7 +87,8 @@ _placed = OrderedDict()            # order_id -> result (idempotency), capped at
 _placing = set()                  # in-flight order_ids
 _requests = []                    # rate-limit timestamps
 _quote_cache = {}                 # (code, period, count) -> (ts, bars)
-_downloaded = set()               # (code, period) already history-downloaded
+_has_data = set()                 # (code, period) read non-empty at least once this session
+_last_download = {}               # (code, period) -> ts of last download_history_data
 _last_log = {}                    # (kind, code, period) -> ts, throttle repeated diagnostics
 # quote fetch summary window: count successes per period, flush one summary line
 # per SUMMARY_INTERVAL instead of one line per fetch (a poll over 17 codes x N
@@ -432,14 +440,52 @@ def _history_start(days=HISTORY_DAYS):
     return (_dt.date.today() - _dt.timedelta(days=days)).strftime("%Y%m%d")
 
 
+def _history_days(period, count):
+    """Download window (calendar days) big enough to actually serve `count` bars.
+
+    Trading days needed = ceil(count / bars-per-day); x1.5 for weekends/holidays
+    plus 7 days of margin, floored at HISTORY_DAYS so small counts keep the old
+    shallow window.
+    """
+    bpd = BARS_PER_DAY.get(period, 1)
+    need = -(-count // bpd)  # ceil, py3.6-safe
+    return max(HISTORY_DAYS, need * 3 // 2 + 7)
+
+
+def _read_bars_with_retry(read_fn, code, period):
+    """Read local bars; short-retry when this (code, period) never returned data.
+
+    download_history_data lands on disk with a delay (2026-09-03: first pull of
+    178 ETFs x 30m was all empty, data arrived over the following minute), so a
+    read right after the download often sees nothing. Retries only apply while
+    the session has NEVER read data for this (code, period) -- steady state pays
+    zero retry cost and genuinely dataless codes don't slow every poll.
+    """
+    tries = EMPTY_READ_RETRIES if (code, period) not in _has_data else 1
+    for i in range(tries):
+        res = read_fn()
+        df = (res or {}).get(code)
+        if df is not None and len(df) > 0:
+            _has_data.add((code, period))
+            return df
+        if i < tries - 1:
+            time.sleep(EMPTY_RETRY_INTERVAL)
+    return None
+
+
 def _fetch_quote(code, period, count):
     # 1) try xtquant.xtdata: can pull any stock, not tied to current symbol
     try:
         from xtquant import xtdata
-        xtdata.download_history_data(code, period, _history_start(), "")
-        res = xtdata.get_market_data_ex([], [code], period=period, count=count)
-        df = (res or {}).get(code)
-        if df is not None and len(df) > 0:
+        now = time.time()
+        if now - _last_download.get((code, period), 0) >= DOWNLOAD_MIN_INTERVAL:
+            xtdata.download_history_data(code, period,
+                                         _history_start(_history_days(period, count)), "")
+            _last_download[(code, period)] = now
+        df = _read_bars_with_retry(
+            lambda: xtdata.get_market_data_ex([], [code], period=period, count=count),
+            code, period)
+        if df is not None:
             # success: counted into the rolling 60s summary, not printed per-fetch
             # (per-fetch otherwise floods ~80 lines per 60s poll, ~30k+/day).
             _record_quote_ok(period, len(df))
@@ -454,9 +500,10 @@ def _fetch_quote(code, period, count):
     if fn is None:
         return None
     try:
-        res = fn([], [code], period=period, count=count, dividend_type="none")
-        df = (res or {}).get(code)
-        if df is not None and len(df) > 0:
+        df = _read_bars_with_retry(
+            lambda: fn([], [code], period=period, count=count, dividend_type="none"),
+            code, period)
+        if df is not None:
             _record_quote_ok(period, len(df))
         return df
     except Exception as e:

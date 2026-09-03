@@ -42,6 +42,9 @@ def _reset_state():
     br._placing.clear()
     br._requests.clear()
     br._quote_cache.clear()
+    br._has_data.clear()
+    br._last_download.clear()
+    sys.modules.pop("xtquant", None)
     # 清掉可能注入的 fake（从模块命名空间移除，回到 _iq 找不到）
     for name in ("passorder", "get_trade_detail_data", "get_market_data_ex", "download_history_data"):
         br.__dict__.pop(name, None)
@@ -337,3 +340,115 @@ def test_quote_cache_hit_within_ttl():
     assert d1["data"] == d2["data"]      # bar 数据一致
     assert d2["cached"] is True          # 第二次命中缓存
     assert len(calls) == 1               # get_market_data_ex 只调一次
+
+
+# ---------------- 下载窗口 / 读空重试（2026-09-03 首拉 178 只 ETF 30m 全 empty 复盘） ----------------
+def _install_fake_xtquant():
+    """注入 fake xtquant 模块——桥内 `from xtquant import xtdata` 按名字查 sys.modules。"""
+    import types
+
+    class FakeXtdata(object):
+        def __init__(self):
+            self.downloads = []
+            self.read_results = []   # 每次读弹出队首；耗尽后重复最后一项
+            self.reads = 0
+            self.df = _make_fake_df()
+
+        def download_history_data(self, code, period, start, end):
+            self.downloads.append((code, period, start, end))
+
+        def get_market_data_ex(self, *a, **k):
+            self.reads += 1
+            if len(self.read_results) > 1:
+                return self.read_results.pop(0)
+            if self.read_results:
+                return self.read_results[0]
+            return {"600000.SH": self.df}
+
+    fake = FakeXtdata()
+    mod = types.ModuleType("xtquant")
+    mod.xtdata = fake
+    sys.modules["xtquant"] = mod
+    return fake
+
+
+def test_history_days_scales_with_period_and_count():
+    """下载窗口按 (period, count)放大：30m×500 根 ≈ 63 个交易日 → ~100 自然日。
+
+    旧逻辑恒 HISTORY_DAYS=30（≈22 个交易日 ≈176 根 30m），预热要 500 根永远拉不满。
+    小 count 走 HISTORY_DAYS 兜底，不无谓加大下载窗口。
+    """
+    assert br._history_days("30m", 500) >= 100
+    assert br._history_days("1m", 10) == br.HISTORY_DAYS
+    assert br._history_days("1d", 10) == br.HISTORY_DAYS
+
+
+def test_fetch_quote_xtdata_downloads_scaled_window():
+    fake = _install_fake_xtquant()
+    try:
+        st, data = _resp("GET", "/quote?code=600000.SH&period=30m&count=500", {}, b"")
+        assert data["ok"] is True
+        assert len(fake.downloads) == 1
+        code, period, start, end = fake.downloads[0]
+        assert (code, period) == ("600000.SH", "30m")
+        assert start == br._history_start(br._history_days("30m", 500))
+    finally:
+        sys.modules.pop("xtquant", None)
+
+
+def test_fetch_quote_retries_when_first_read_empty():
+    """首拉读空重试：download_history_data 落盘有延迟（真机 178 只 ETF 首轮全
+    empty、60s 后陆续到位），下载后立即读会读空——短重试把数据等回来。"""
+    fake = _install_fake_xtquant()
+    fake.read_results = [{}, {}, {"600000.SH": _make_fake_df()}]
+    br.EMPTY_RETRY_INTERVAL = 0      # 测试不真睡
+    try:
+        st, data = _resp("GET", "/quote?code=600000.SH&period=30m&count=500", {}, b"")
+        assert data["ok"] is True
+        assert len(data["data"]["600000.SH"]) == 2
+        assert fake.reads == 3       # 空×2 → 重试到第 3 次读到
+    finally:
+        sys.modules.pop("xtquant", None)
+
+
+def test_fetch_quote_no_retry_once_session_has_data():
+    """会话内该 (code, period) 读到过数据后不再重试——稳态零重试开销，
+    真没数据（停牌/新代码）也不拖慢每轮拉取。"""
+    fake = _install_fake_xtquant()
+    fake.read_results = [{}]         # 恒空
+    br.EMPTY_RETRY_INTERVAL = 0
+    br._has_data.add(("600000.SH", "30m"))
+    try:
+        st, data = _resp("GET", "/quote?code=600000.SH&period=30m&count=500", {}, b"")
+        assert data["ok"] is False   # 读空 → 无数据
+        assert fake.reads == 1       # 只读一次，不重试
+    finally:
+        sys.modules.pop("xtquant", None)
+
+
+def test_fetch_quote_download_dedup_within_interval():
+    """同 (code, period) 在 DOWNLOAD_MIN_INTERVAL 内不重复触发下载
+    （真机 download 走客户端数据通道，同轮双拉浪费且加剧落盘延迟）。"""
+    fake = _install_fake_xtquant()
+    br.DOWNLOAD_MIN_INTERVAL = 1000
+    try:
+        _resp("GET", "/quote?code=600000.SH&period=1m&count=10", {}, b"")
+        # 换 count 避开 1s 读缓存；同 (code, period) 仍不应重下
+        _resp("GET", "/quote?code=600000.SH&period=1m&count=20", {}, b"")
+        assert len(fake.downloads) == 1
+    finally:
+        sys.modules.pop("xtquant", None)
+
+
+def test_fetch_quote_fallback_retries_when_first_empty():
+    """ContextInfo 兜底路径同样受读空重试保护（同源本地数据，落盘延迟一致）。"""
+    br.EMPTY_RETRY_INTERVAL = 0
+    results = [{}, {"600000.SH": _make_fake_df()}]
+
+    def fake_fn(*a, **k):
+        return results.pop(0) if results else {}
+
+    br.get_market_data_ex = fake_fn
+    st, data = _resp("GET", "/quote?code=600000.SH&period=1m&count=10", {}, b"")
+    assert data["ok"] is True
+    assert len(data["data"]["600000.SH"]) == 2
