@@ -56,3 +56,6 @@ main/data/*.sqlite3
 
 # Draft docs (local working notes, not for commit)
 docs/draft/
+
+# One-off diagnostics (local only, not for commit)
+live/bridge/diag_*.py
