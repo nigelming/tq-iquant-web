@@ -166,3 +166,51 @@ def test_recovery_days_from_snapshots():
     assert result["max_recovery_days"] == 2
 
     # 后向兼容：不传 trades 时仍然可用
+
+def test_intraday_bars_volatility_uses_daily_returns():
+    """30m 等日内周期回测：一天多根 bar（同日多快照），收益统计按日聚合。
+
+    日收益序列取「每日最后一根 bar 的净值」（日收盘），per-bar 收益不得直接
+    当日记收益年化——否则 vol 低估 ~√每日bar数、Sharpe 虚高（回测"30"实测
+    Sharpe 9.17 根因）。
+    """
+    import math
+    # 4 个交易日 × 每日 2 根 bar：日内波动小（+100），日间波动大
+    closes = [100000, 100100,   # day1 收盘 100100
+              110000, 110100,   # day2 收盘 110100
+              99000, 99100,     # day3 收盘 99100
+              108900, 109000]   # day4 收盘 109000
+    dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
+    snapshots = []
+    for d, (a, b) in zip(dates, [closes[i:i + 2] for i in range(0, 8, 2)]):
+        snapshots.append(_snap(a, d))
+        snapshots.append(_snap(b, d))
+
+    ev = Evaluator().evaluate(snapshots)
+
+    # 日收益序列（每日收盘）：110100/100100-1, 99100/110100-1, 109000/99100-1
+    daily = [110100 / 100100 - 1, 99100 / 110100 - 1, 109000 / 99100 - 1]
+    mean = sum(daily) / 3
+    var = sum((r - mean) ** 2 for r in daily) / 3
+    expected_vol = math.sqrt(var * 252)
+    assert ev["volatility"] == Decimal(str(expected_vol)).quantize(Decimal("0.0001"))
+
+    # Sharpe 用同一日频口径：sharpe = (annual - rf) / vol
+    total = 109000 / 100000 - 1
+    years = 3 / 365.25
+    annual = (1 + total) ** (1 / years) - 1
+    expected_sharpe = (annual - 0.02) / expected_vol
+    assert ev["sharpe_ratio"] == Decimal(str(expected_sharpe)).quantize(Decimal("0.0001"))
+
+
+def test_intraday_bars_daily_returns_not_per_bar():
+    """对照：若按 per-bar 收益计算，vol 会明显不同（此测固化按日聚合的口径）。"""
+    # 20 个交易日，每日两根 bar：首根 100000、收盘 120000——per-bar 口径
+    # 每 2 根就有一次 +20% 收益（vol > 0），按日口径每日收盘相等 → 日收益全 0
+    snapshots = []
+    for i in range(20):
+        d = date(2024, 1, 2 + i)
+        snapshots.append(_snap(100000, d))
+        snapshots.append(_snap(120000, d))
+    ev = Evaluator().evaluate(snapshots)
+    assert ev["volatility"] == Decimal("0.0000")  # 每日收盘相等 → 日收益 0

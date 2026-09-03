@@ -24,10 +24,7 @@ class Evaluator:
         end_val = values[-1]
         total_return = (end_val - start_val) / start_val
 
-        daily_returns = []
-        for i in range(1, n):
-            dr = (values[i] - values[i - 1]) / values[i - 1]
-            daily_returns.append(float(dr))
+        daily_returns = self._daily_returns(snapshots, values)
 
         days = (snapshots[-1]["snap_date"] - snapshots[0]["snap_date"]).days
         years = max(days / 365.25, 1 / 365.25)
@@ -123,6 +120,31 @@ class Evaluator:
             "return_stability": Decimal(str(r2)).quantize(Decimal("0.0001")),
         }
         return result
+
+    # ========================================================================
+    # 日频聚合（bar 频回测按日期统计）
+    # ========================================================================
+    @staticmethod
+    def _daily_returns(snapshots: List[dict], values: List[Decimal]) -> List[float]:
+        """日收益序列：每日取同日最后一根 bar 的净值（日收盘），相邻日环比。
+
+        30m 等日内周期一天多根 bar，per-bar 收益不能直接当日记收益做年化统计
+        （vol 低估 ~√每日bar数、Sharpe 虚高，2026-09 回测"30"实测根因）。
+        快照按时间序传入，同日相邻；日线回测一天一根，行为不变。
+        """
+        daily_values: List[Decimal] = []
+        last_date = None
+        for s, v in zip(snapshots, values):
+            if last_date is None or s["snap_date"] > last_date:
+                daily_values.append(v)
+                last_date = s["snap_date"]
+            else:
+                daily_values[-1] = v
+        returns: List[float] = []
+        for i in range(1, len(daily_values)):
+            dr = (daily_values[i] - daily_values[i - 1]) / daily_values[i - 1]
+            returns.append(float(dr))
+        return returns
 
     # ========================================================================
     # 交易指标：FIFO 匹配计算 P&L
