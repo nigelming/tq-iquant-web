@@ -384,16 +384,39 @@ def test_history_days_scales_with_period_and_count():
 
 
 def test_fetch_quote_xtdata_downloads_scaled_window():
+    """合成周期（30m）下载的是基础周期 5m——真机诊断（2026-09-03）：
+    30m/1h/15m 是合成周期，直接 download 报 ErrorID 200006 且永远静默失败；
+    下载基础周期 5m 后 30m/1h 立即可读。窗口按 count×合成比率（30m=6×5m）放大。"""
     fake = _install_fake_xtquant()
     try:
         st, data = _resp("GET", "/quote?code=600000.SH&period=30m&count=500", {}, b"")
         assert data["ok"] is True
         assert len(fake.downloads) == 1
         code, period, start, end = fake.downloads[0]
-        assert (code, period) == ("600000.SH", "30m")
-        assert start == br._history_start(br._history_days("30m", 500))
+        assert (code, period) == ("600000.SH", "5m")
+        assert start == br._history_start(br._history_days("5m", 500 * 6))
     finally:
         sys.modules.pop("xtquant", None)
+
+
+def test_fetch_quote_base_period_downloads_itself():
+    """基础周期（1m/5m/1d）仍下载自身，不受合成映射影响。"""
+    fake = _install_fake_xtquant()
+    try:
+        _resp("GET", "/quote?code=600000.SH&period=1m&count=10", {}, b"")
+        code, period, start, end = fake.downloads[0]
+        assert (code, period) == ("600000.SH", "1m")
+        assert start == br._history_start(br._history_days("1m", 10))
+    finally:
+        sys.modules.pop("xtquant", None)
+
+
+def test_synth_base_mapping():
+    """合成周期 → 基础周期映射表：15m/30m/1h 由 5m 合成，1w/1mon 由 1d 合成。"""
+    assert br.SYNTH_BASE == {"15m": "5m", "30m": "5m", "1h": "5m",
+                             "1w": "1d", "1mon": "1d"}
+    for synth, base in br.SYNTH_BASE.items():
+        assert base in ("1m", "5m", "1d")   # 只有这三个（+tick）是存储周期
 
 
 def test_fetch_quote_retries_when_first_read_empty():

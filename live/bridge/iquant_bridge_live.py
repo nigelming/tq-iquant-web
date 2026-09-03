@@ -75,6 +75,13 @@ HISTORY_DAYS = 30                 # history depth floor (calendar days) for down
 # `count` bars can actually be served (30x500 needs ~63 trading days, a flat
 # 30-day window only ever yields ~176 bars -- found 2026-09-03).
 BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "1h": 4, "1d": 1}
+# iQuant/xtquant only STORES tick/1m/5m/1d as base periods; 15m/30m/1h/1w/1mon
+# are SYNTHESIZED from them and CANNOT be downloaded (ErrorID 200006, real-machine
+# diag 2026-09-03: 30m download silently failed for 149/178 ETFs). Downloading the
+# base period makes the synthesized bars readable (verified: 5m -> 30m/1h fresh).
+SYNTH_BASE = {"15m": "5m", "30m": "5m", "1h": "5m", "1w": "1d", "1mon": "1d"}
+# base-period bars behind each synthesized bar, for sizing the download window
+SYNTH_RATIO = {"15m": 3, "30m": 6, "1h": 12, "1w": 5, "1mon": 22}
 EMPTY_READ_RETRIES = 3            # reads after a fresh download before giving up
 EMPTY_RETRY_INTERVAL = 0.5        # seconds between empty reads
 DOWNLOAD_MIN_INTERVAL = 5         # skip re-download within this many seconds
@@ -478,7 +485,16 @@ def _fetch_quote(code, period, count):
     try:
         from xtquant import xtdata
         now = time.time()
-        if now - _last_download.get((code, period), 0) >= DOWNLOAD_MIN_INTERVAL:
+        base = SYNTH_BASE.get(period)
+        if base is not None:
+            # synthesized period: download its base (30m/1h <- 5m, 1w/1mon <- 1d)
+            bkey = (code, base)
+            if now - _last_download.get(bkey, 0) >= DOWNLOAD_MIN_INTERVAL:
+                need_base = count * SYNTH_RATIO.get(period, 1)
+                xtdata.download_history_data(code, base,
+                                             _history_start(_history_days(base, need_base)), "")
+                _last_download[bkey] = now
+        elif now - _last_download.get((code, period), 0) >= DOWNLOAD_MIN_INTERVAL:
             xtdata.download_history_data(code, period,
                                          _history_start(_history_days(period, count)), "")
             _last_download[(code, period)] = now
