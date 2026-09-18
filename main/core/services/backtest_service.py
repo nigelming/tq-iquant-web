@@ -780,7 +780,6 @@ def build_return_buckets(snaps: list) -> dict:
     每日净值取同日最后一条（日内多 bar 回测取日收盘），与 Evaluator._daily_returns 口径一致。
     """
     from collections import OrderedDict
-    from decimal import Decimal
 
     # --- 日净值序列（同日末条去重）---
     daily_map: OrderedDict = OrderedDict()
