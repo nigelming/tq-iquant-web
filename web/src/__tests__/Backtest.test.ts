@@ -356,3 +356,44 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('600000.SH')
   })
 })
+
+// --- 收益分布区块测试 ---
+describe('Backtest.vue — 收益分布区块', () => {
+  const mockDetailWithReturns = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [{
+        year: 2026,
+        daily_returns: [0.01, -0.005, 0.003, 0.02, -0.01],
+        monthly_returns: [0.01, -0.005],
+        annual_return: 0.02,
+      }],
+    },
+  }
+  const mockDetailNoReturns = { ...mockDetail, returns_buckets: null }
+
+  it('有 returns_buckets 时渲染收益分布标题', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailWithReturns)
+    const w = mount(Backtest)
+    await flushPromises()
+    // 点击查看进入详情
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('收益分布')
+  })
+
+  it('returns_buckets 为 null 时不渲染收益分布区块', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailNoReturns)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).not.toContain('收益分布')
+  })
+})
