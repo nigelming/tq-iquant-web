@@ -769,6 +769,114 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
     }
 
 
+def build_return_buckets(snaps: list) -> dict:
+    """从组合级每日快照构建月度矩阵 + 年度统计，供热力图/箱线图/年柱使用。
+
+    snaps: BacktestDailySnapshot ORM 列表（按 snap_date 升序）。
+    返回: {
+        "monthly_matrix": {"years": [...], "months": [...], "matrix": [[...]], "text": [[...]]},
+        "yearly": [{"year": int, "daily_returns": [...], "monthly_returns": [...], "annual_return": float}, ...],
+    }
+    每日净值取同日最后一条（日内多 bar 回测取日收盘），与 Evaluator._daily_returns 口径一致。
+    """
+    from collections import OrderedDict
+    from decimal import Decimal
+
+    # --- 日净值序列（同日末条去重）---
+    daily_map: OrderedDict = OrderedDict()
+    for s in snaps:
+        d = s.snap_date
+        v = float(s.total_value) if s.total_value is not None else 0.0
+        daily_map[d] = v  # 同日覆盖，保留最后一条
+    dates = list(daily_map.keys())
+    values = list(daily_map.values())
+    if len(dates) < 2:
+        return {"monthly_matrix": {"years": [], "months": [], "matrix": [], "text": []}, "yearly": []}
+
+    # --- 日收益序列 ---
+    daily_returns = []
+    for i in range(1, len(values)):
+        prev = values[i - 1]
+        daily_returns.append((values[i] - prev) / prev if prev != 0 else 0.0)
+    daily_dates = dates[1:]
+
+    # --- 月度收益：按月末净值 pct_change ---
+    # 按 (year, month) 分组，取组内最后一个日净值
+    monthly_vals: OrderedDict = OrderedDict()  # (year, month) → 日净值
+    for d, v in daily_map.items():
+        key = (d.year, d.month)
+        monthly_vals[key] = v  # 同月覆盖，保留月末最后一条
+    month_keys = list(monthly_vals.keys())
+    month_vals = list(monthly_vals.values())
+    monthly_returns = {}
+    for i in range(1, len(month_keys)):
+        key = month_keys[i]
+        prev_val = month_vals[i - 1]
+        cur_val = month_vals[i]
+        monthly_returns[key] = (cur_val - prev_val) / prev_val if prev_val != 0 else 0.0
+
+    # 构建年/月矩阵
+    all_years = sorted(set(k[0] for k in month_keys))
+    all_months = list(range(1, 13))
+    matrix = []  # matrix[i][j] = 百分比数值或 None
+    text = []
+    for y in all_years:
+        row_z = []
+        row_t = []
+        for m in all_months:
+            val = monthly_returns.get((y, m))
+            if val is not None:
+                row_z.append(round(val * 100, 2))
+                row_t.append(f"{val * 100:+.2f}%")
+            else:
+                row_z.append(None)
+                row_t.append("")
+        matrix.append(row_z)
+        text.append(row_t)
+
+    monthly_matrix = {
+        "years": all_years,
+        "months": [f"{m}月" for m in all_months],
+        "matrix": matrix,
+        "text": text,
+    }
+
+    # --- 年度统计：日收益按年分组（覆盖净值存在的每一年，含无收益的起点/残年）---
+    yearly_map: OrderedDict = OrderedDict()
+    for d in dates:
+        yearly_map.setdefault(d.year, [])
+    for d, dr in zip(daily_dates, daily_returns):
+        yearly_map[d.year].append(dr)
+
+    yearly = []
+    for year in sorted(yearly_map.keys()):
+        rets = yearly_map[year]
+        # 月收益按月分组（从 daily_returns + dates）
+        monthly_by_year: dict = {}
+        for d, dr in zip(daily_dates, daily_returns):
+            if d.year == year:
+                monthly_by_year.setdefault(d.month, []).append(dr)
+        monthly_rets = []
+        for m in sorted(monthly_by_year.keys()):
+            mr = 1.0
+            for r in monthly_by_year[m]:
+                mr *= (1 + r)
+            monthly_rets.append(mr - 1.0)
+        # 年度累计收益（复利）
+        annual = 1.0
+        for r in rets:
+            annual *= (1 + r)
+        annual_return = annual - 1.0 if rets else None
+        yearly.append({
+            "year": year,
+            "daily_returns": rets,
+            "monthly_returns": monthly_rets,
+            "annual_return": annual_return,
+        })
+
+    return {"monthly_matrix": monthly_matrix, "yearly": yearly}
+
+
 # ---------------------------------------------------------------------------
 # 查询（路由层调，返回纯 dict；不存在返回 None / False 由路由转 err(404)）
 # ---------------------------------------------------------------------------
