@@ -958,6 +958,9 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         _serialize_decision_summary(s) for s in summarize_decisions(decision_rows)
     ]
 
+    # ---- 收益分布桶（月度热力图 / 年度箱线图）----
+    returns_buckets = build_return_buckets(snaps)
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -967,6 +970,7 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         "strategy_snapshots": strategy_snapshots,
         "decision_summary": decision_summary,
         "decisions": [_serialize_decision(d) for d in decision_rows],
+        "returns_buckets": returns_buckets,
     }
 
 

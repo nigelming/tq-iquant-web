@@ -409,3 +409,49 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     assert recs[0]["created_at"] >= recs[1]["created_at"]
     names = {r["name"] for r in recs}
     assert names == {"r1", "r2"}
+
+
+class TestReturnBucketsInDetail:
+    """get_record_detail 返回 returns_buckets 字段。"""
+
+    def test_detail_includes_returns_buckets(self, db_session):
+        """构造最小快照记录，验证 detail 响应含 returns_buckets。"""
+        from datetime import date as D
+
+        # _seed 返回 (ps, strat.id)，需显式创建 BacktestRecord
+        ps, strat_id = _seed(db_session)
+        rec = BacktestRecord(
+            portfolio_strategy_id=ps.id, name="rb_test",
+            start_date=D(2024, 1, 15), end_date=D(2024, 1, 16),
+            status="completed", progress=100,
+        )
+        db_session.add(rec)
+        db_session.flush()
+        rec_id = rec.id
+
+        # 插入 2 天组合快照（target_id=组合 id，与持久化口径一致）
+        db_session.add_all([
+            BacktestDailySnapshot(
+                backtest_record_id=rec_id, target_type="portfolio",
+                target_id=ps.id,
+                snap_date=D(2024, 1, 15), total_value="100.00",
+                cash="100.00", market_value="0.00",
+            ),
+            BacktestDailySnapshot(
+                backtest_record_id=rec_id, target_type="portfolio",
+                target_id=ps.id,
+                snap_date=D(2024, 1, 16), total_value="101.00",
+                cash="101.00", market_value="0.00",
+            ),
+        ])
+        db_session.commit()
+
+        result = svc.get_record_detail(db_session, rec_id)
+        assert "returns_buckets" in result
+        rb = result["returns_buckets"]
+        assert "monthly_matrix" in rb
+        assert "yearly" in rb
+        assert len(rb["yearly"]) >= 1
+        yr = rb["yearly"][0]
+        assert yr["year"] == 2024
+        assert len(yr["daily_returns"]) >= 1
