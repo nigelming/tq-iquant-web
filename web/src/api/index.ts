@@ -210,6 +210,28 @@ export interface DecisionData {
   events: DecisionEventItem[]
 }
 
+// 月度收益热力图矩阵（年度×12月）
+export interface BacktestMonthlyMatrix {
+  years: number[]
+  months: string[]           // ["1月", "2月", ..., "12月"]
+  matrix: (number | null)[][] // matrix[yearIdx][monthIdx] = 月收益% 或 null
+  text: string[][]           // 同 shape，格式 "+1.23%"
+}
+
+// 年度统计（日收益分箱 + 月收益 + 年累计）
+export interface BacktestYearlyStats {
+  year: number
+  daily_returns: number[]    // 该年日收益（小数）
+  monthly_returns: number[]  // 该年月收益（小数）
+  annual_return: number | null  // 年度累计收益（小数，复利；无收益年份为 null）
+}
+
+// 收益分布桶（月度热力图 + 年度箱线图数据源）
+export interface BacktestReturnsBucket {
+  monthly_matrix: BacktestMonthlyMatrix
+  yearly: BacktestYearlyStats[]
+}
+
 // 回测详情（GET /backtest/records/{id}）— 对齐 backtest.get_record
 export interface BacktestDetailItem {
   record: BacktestRecordItem
@@ -220,6 +242,7 @@ export interface BacktestDetailItem {
   strategy_snapshots: BacktestStrategySnapshotItem[]
   decision_summary: DecisionSummaryItem[]  // 风控与拦截统计（调参可观测性）
   decisions: DecisionEventItem[]           // 逐闸门事件（下钻）
+  returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
 }
 
 export async function getStockPools() {
