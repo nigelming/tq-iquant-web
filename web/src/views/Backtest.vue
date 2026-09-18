@@ -32,6 +32,16 @@ const drawdownChartEl = ref<HTMLDivElement | null>(null)
 let equityChart: echarts.ECharts | null = null
 let drawdownChart: echarts.ECharts | null = null
 
+// 收益分布图（heatmap + box×2 + bar）
+const monthlyHeatEl = ref<HTMLDivElement | null>(null)
+const dailyBoxEl = ref<HTMLDivElement | null>(null)
+const monthlyBoxEl = ref<HTMLDivElement | null>(null)
+const annualBarEl = ref<HTMLDivElement | null>(null)
+let monthlyHeatChart: echarts.ECharts | null = null
+let dailyBoxChart: echarts.ECharts | null = null
+let monthlyBoxChart: echarts.ECharts | null = null
+let annualBarChart: echarts.ECharts | null = null
+
 // 交易明细分页
 const currentPage = ref(1)
 const pageSize = 20
@@ -287,6 +297,26 @@ const portfolioReturnPct = computed(() => {
   return vals.map((v) => base > 0 ? ((v - base) / base) * 100 : 0)
 })
 
+// ===== 收益分布（月度热力图 / 年度箱线图 / 年收益柱状图）=====
+const returnsBuckets = computed(() => detail.value?.returns_buckets ?? null)
+const hasReturnsBuckets = computed(() => {
+  const rb = returnsBuckets.value
+  return rb && rb.monthly_matrix.years.length > 0 && rb.yearly.length > 0
+})
+
+// ECharts boxplot 五数摘要计算（min / Q1 / median / Q3 / max）
+function boxplotData(arr: number[]): [number, number, number, number, number] | null {
+  if (arr.length < 5) return null
+  const sorted = [...arr].sort((a, b) => a - b)
+  const q = (p: number) => {
+    const idx = (sorted.length - 1) * p
+    const lo = Math.floor(idx)
+    const hi = Math.ceil(idx)
+    return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo)
+  }
+  return [sorted[0], q(0.25), q(0.5), q(0.75), sorted[sorted.length - 1]]
+}
+
 // ===== 交易明细分页 =====
 const totalPages = computed(() => Math.max(1, Math.ceil((detail.value?.trades || []).length / pageSize)))
 const paginatedTrades = computed(() => {
@@ -342,6 +372,10 @@ const selectedEvents = computed<DecisionEventItem[]>(() => {
 function initCharts() {
   initEquityChart()
   initDrawdownChart()
+  initMonthlyHeatChart()
+  initDailyBoxChart()
+  initMonthlyBoxChart()
+  initAnnualBarChart()
 }
 
 function initEquityChart() {
@@ -432,9 +466,133 @@ function initDrawdownChart() {
   })
 }
 
+function initMonthlyHeatChart() {
+  if (!monthlyHeatEl.value || !hasReturnsBuckets.value) return
+  monthlyHeatChart?.dispose()
+  monthlyHeatChart = echarts.init(monthlyHeatEl.value)
+  const { years, months, matrix, text } = returnsBuckets.value!.monthly_matrix
+  // 展开为 [rowIdx, colIdx, value] 三元组，跳过 null
+  const data: [number, number, number][] = []
+  matrix.forEach((row, ri) => {
+    row.forEach((val, ci) => {
+      if (val !== null) data.push([ci, ri, val])
+    })
+  })
+  const absMax = Math.max(...data.map((d) => Math.abs(d[2])), 5)
+  monthlyHeatChart.setOption({
+    tooltip: {
+      formatter: (params: any) => {
+        const [ci, ri] = params.data
+        return `${years[ri]}年${months[ci]}<br/>收益率: ${text[ri][ci]}`
+      },
+    },
+    grid: { left: 60, right: 80, top: 30, bottom: 30 },
+    xAxis: {
+      type: 'category', data: months,
+      axisLabel: { fontSize: 11 },
+      splitArea: { show: true },
+    },
+    yAxis: {
+      type: 'category', data: years.map(String),
+      inverse: true,
+      axisLabel: { fontSize: 11 },
+    },
+    visualMap: {
+      min: -absMax, max: absMax,
+      calculable: true,
+      orient: 'vertical', right: 0, top: 'center',
+      inRange: { color: ['#ef4444', '#fef3c7', '#10b981'] },
+      text: ['+', '-'],
+      textStyle: { fontSize: 11 },
+    },
+    series: [{
+      type: 'heatmap', data,
+      label: {
+        show: true,
+        formatter: (params: any) => {
+          const [ci, ri] = params.data
+          return text[ri]?.[ci] || ''
+        },
+        fontSize: 10,
+      },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.3)' } },
+    }],
+  })
+}
+
+function initDailyBoxChart() {
+  if (!dailyBoxEl.value || !hasReturnsBuckets.value) return
+  dailyBoxChart?.dispose()
+  dailyBoxChart = echarts.init(dailyBoxEl.value)
+  const { yearly } = returnsBuckets.value!
+  const categories = yearly.map((y) => String(y.year))
+  const boxData = yearly.map((y) => boxplotData(y.daily_returns.map((r) => r * 100))).filter(Boolean)
+  if (boxData.length === 0) return
+  dailyBoxChart.setOption({
+    tooltip: { trigger: 'item' },
+    grid: { left: 60, right: 20, top: 40, bottom: 30 },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value', name: '日收益率(%)' },
+    series: [{
+      type: 'boxplot', data: boxData,
+      itemStyle: { color: '#dbeafe', borderColor: '#3b82f6' },
+    }],
+  })
+}
+
+function initMonthlyBoxChart() {
+  if (!monthlyBoxEl.value || !hasReturnsBuckets.value) return
+  monthlyBoxChart?.dispose()
+  monthlyBoxChart = echarts.init(monthlyBoxEl.value)
+  const { yearly } = returnsBuckets.value!
+  const categories = yearly.map((y) => String(y.year))
+  const boxData = yearly.map((y) => boxplotData(y.monthly_returns.map((r) => r * 100))).filter(Boolean)
+  if (boxData.length === 0) return
+  monthlyBoxChart.setOption({
+    tooltip: { trigger: 'item' },
+    grid: { left: 60, right: 20, top: 40, bottom: 30 },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value', name: '月收益率(%)' },
+    series: [{
+      type: 'boxplot', data: boxData,
+      itemStyle: { color: '#d1fae5', borderColor: '#10b981' },
+    }],
+  })
+}
+
+function initAnnualBarChart() {
+  if (!annualBarEl.value || !hasReturnsBuckets.value) return
+  annualBarChart?.dispose()
+  annualBarChart = echarts.init(annualBarEl.value)
+  const { yearly } = returnsBuckets.value!
+  const data = yearly.map((y) => {
+    const ar = y.annual_return ?? 0
+    return {
+      value: +(ar * 100).toFixed(2),
+      name: String(y.year),
+      itemStyle: { color: ar >= 0 ? '#10b981' : '#ef4444' },
+    }
+  })
+  annualBarChart.setOption({
+    tooltip: { trigger: 'axis' },
+    grid: { left: 60, right: 20, top: 40, bottom: 30 },
+    xAxis: { type: 'category', data: yearly.map((y) => String(y.year)) },
+    yAxis: { type: 'value', name: '年收益率(%)' },
+    series: [{
+      type: 'bar', data,
+      label: { show: true, position: 'top', formatter: '{c}%', fontSize: 11 },
+      barMaxWidth: 40,
+    }],
+  })
+}
+
 function handleResize() {
   equityChart?.resize()
   drawdownChart?.resize()
+  monthlyHeatChart?.resize()
+  dailyBoxChart?.resize()
+  monthlyBoxChart?.resize()
+  annualBarChart?.resize()
 }
 
 onMounted(() => {
@@ -445,6 +603,10 @@ onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
   equityChart?.dispose()
   drawdownChart?.dispose()
+  monthlyHeatChart?.dispose()
+  dailyBoxChart?.dispose()
+  monthlyBoxChart?.dispose()
+  annualBarChart?.dispose()
 })
 </script>
 
@@ -578,6 +740,31 @@ onUnmounted(() => {
     <div class="chart-box">
       <div ref="drawdownChartEl" class="chart-container"></div>
     </div>
+
+    <!-- 收益分布（月度热力图 / 年度箱线图 / 年收益柱状图） -->
+    <template v-if="hasReturnsBuckets">
+      <div class="section-title">收益分布</div>
+
+      <div class="section-title" style="font-size:14px">月度收益热力图</div>
+      <div class="chart-box">
+        <div ref="monthlyHeatEl" class="chart-container" style="min-height:240px"></div>
+      </div>
+
+      <div class="section-title" style="font-size:14px">年度日收益箱线图</div>
+      <div class="chart-box">
+        <div ref="dailyBoxEl" class="chart-container" style="min-height:260px"></div>
+      </div>
+
+      <div class="section-title" style="font-size:14px">各年月收益箱线图</div>
+      <div class="chart-box">
+        <div ref="monthlyBoxEl" class="chart-container" style="min-height:260px"></div>
+      </div>
+
+      <div class="section-title" style="font-size:14px">各年年收益柱状图</div>
+      <div class="chart-box">
+        <div ref="annualBarEl" class="chart-container" style="min-height:260px"></div>
+      </div>
+    </template>
 
     <!-- 风控与拦截统计（调参可观测性：信号→成交链路上每个闸门触发/拦截了多少次） -->
     <div class="section-title">
