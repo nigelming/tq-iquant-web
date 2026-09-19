@@ -298,6 +298,17 @@ const portfolioReturnPct = computed(() => {
   return vals.map((v) => base > 0 ? ((v - base) / base) * 100 : 0)
 })
 
+// 超额收益 = 组合累计收益率% − 基准累计收益率%（逐点）；基准 null 处超额也为 null
+const excessCurve = computed<Array<number | null>>(() => {
+  const p = portfolioReturnPct.value
+  const b = benchmarkCurve.value
+  return p.map((pv, i) => {
+    const bv = b[i]
+    if (bv === null || bv === undefined) return null
+    return Number((pv - bv).toFixed(4))
+  })
+})
+
 // ===== 收益分布（月度热力图 / 年度箱线图 / 年收益柱状图）=====
 const returnsBuckets = computed(() => detail.value?.returns_buckets ?? null)
 const hasReturnsBuckets = computed(() => {
@@ -418,9 +429,21 @@ function initEquityChart() {
       itemStyle: { color: '#9ca3af' },
     })
   }
+  // 超额收益曲线（金色，区别组合紫/策略自动色/基准灰虚线）；无基准数据则不画
+  if (hasBenchmark.value) {
+    series.push({
+      name: '超额收益（相对基准）', type: 'line', data: excessCurve.value, smooth: true,
+      symbol: 'none',
+      lineStyle: { width: 1.5, color: '#f59e0b' },
+      itemStyle: { color: '#f59e0b' },
+    })
+  }
 
   const legendData = ['组合', ...strategyCurves.value.map((s) => s.name)]
-  if (hasBenchmark.value) legendData.push('基准')
+  if (hasBenchmark.value) {
+    legendData.push('基准')
+    legendData.push('超额收益（相对基准）')
+  }
 
   equityChart.setOption({
     tooltip: {

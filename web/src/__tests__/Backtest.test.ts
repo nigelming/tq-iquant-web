@@ -601,3 +601,40 @@ describe('Backtest.vue — 回撤曲线红涨绿跌', () => {
     expect(series.itemStyle.color).toBe('#10b981')
   })
 })
+
+// --- 回测报告 — 净值曲线超额收益 ---
+describe('Backtest.vue — 净值曲线超额收益（相对基准）', () => {
+  it('有基准数据时净值曲线含超额收益线（组合%−基准%）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const option = (init as any).mock.results[0].value.setOption.mock.calls[0][0]
+    expect(option.legend.data).toContain('超额收益（相对基准）')
+    const excess = option.series.find((s: any) => s.name === '超额收益（相对基准）')
+    expect(excess).toBeTruthy()
+    expect(excess.type).toBe('line')
+    expect(excess.itemStyle.color).toBe('#f59e0b')
+    // 手算：组合收益% [0,1,-1] − 基准% [0,2,1] = [0,-1,-2]
+    expect(excess.data).toEqual([0, -1, -2])
+  })
+
+  it('无基准数据（benchmark_value 全 null）时不画超额收益线', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      snapshots: mockDetail.snapshots.map((s: any) => ({ ...s, benchmark_value: null })),
+    })
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const option = (init as any).mock.results[0].value.setOption.mock.calls[0][0]
+    expect(option.legend.data).not.toContain('超额收益（相对基准）')
+    expect(option.series.find((s: any) => s.name === '超额收益（相对基准）')).toBeUndefined()
+  })
+})
