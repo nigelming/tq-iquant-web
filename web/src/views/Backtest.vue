@@ -458,11 +458,11 @@ function initDrawdownChart() {
       name: '回撤', type: 'line', data: drawdownCurve.value, smooth: true,
       areaStyle: {
         color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(239, 68, 68, 0.3)' },
-          { offset: 1, color: 'rgba(239, 68, 68, 0.05)' },
+          { offset: 0, color: 'rgba(16, 185, 129, 0.3)' },
+          { offset: 1, color: 'rgba(16, 185, 129, 0.05)' },
         ]),
       },
-      itemStyle: { color: '#ef4444' },
+      itemStyle: { color: '#10b981' }, // A股红涨绿跌：回撤=跌幅→绿
     }],
   })
 }

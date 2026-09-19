@@ -583,3 +583,21 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     // 颜色改动（positive→#ef4444、danger 保持 #ef4444）由实现步骤的显式 CSS 修改 + 最终构建验证保证。
   })
 })
+
+// --- 回测报告 — 回撤曲线 A股红涨绿跌 ---
+describe('Backtest.vue — 回撤曲线红涨绿跌', () => {
+  it('回撤曲线（跌幅）为绿色', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dd = options.find((o: any) => o.yAxis?.name === '回撤(%)')
+    expect(dd).toBeTruthy()
+    const series = dd.series.find((s: any) => s.name === '回撤')
+    expect(series.itemStyle.color).toBe('#10b981')
+  })
+})
