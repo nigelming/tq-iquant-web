@@ -270,8 +270,8 @@ const drawdownCurve = computed(() => {
   let peak = vals[0] ?? 0
   return vals.map((v) => {
     if (v > peak) peak = v
-    // 用百分比表示回撤（负值）
-    return peak > 0 ? -((peak - v) / peak) * 100 : 0
+    // 用百分比表示回撤（负值），round 到 4 位小数
+    return peak > 0 ? Number((-(peak - v) / peak * 100).toFixed(4)) : 0
   })
 })
 
@@ -449,7 +449,7 @@ function initDrawdownChart() {
   drawdownChart?.dispose()
   drawdownChart = echarts.init(drawdownChartEl.value)
   drawdownChart.setOption({
-    tooltip: { trigger: 'axis', formatter: '{b}<br />回撤: {c}%' },
+    tooltip: { trigger: 'axis', formatter: (p: any) => `${p[0].axisValue}<br />回撤: ${Number(p[0].value).toFixed(4)}%` },
     grid: { left: '3%', right: '4%', bottom: '3%', top: '10%', containLabel: true },
     xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
     yAxis: { type: 'value', name: '回撤(%)', max: 0 },
@@ -501,7 +501,8 @@ function initMonthlyHeatChart() {
       min: -absMax, max: absMax,
       calculable: true,
       orient: 'vertical', right: 0, top: 'center',
-      inRange: { color: ['#ef4444', '#fef3c7', '#10b981'] },
+      // A 股红涨绿跌：负收益（min）绿 → 零（中）黄 → 正收益（max）红
+      inRange: { color: ['#10b981', '#fef3c7', '#ef4444'] },
       text: ['+', '-'],
       textStyle: { fontSize: 11 },
     },
@@ -526,10 +527,19 @@ function initDailyBoxChart() {
   dailyBoxChart = echarts.init(dailyBoxEl.value)
   const { yearly } = returnsBuckets.value!
   const categories = yearly.map((y) => String(y.year))
-  const boxData = yearly.map((y) => boxplotData(y.daily_returns.map((r) => r * 100))).filter(Boolean)
+  const boxData = yearly
+    .map((y) => y.daily_returns.map((r) => Number((r * 100).toFixed(4))))
+    .map(boxplotData)
+    .filter(Boolean)
   if (boxData.length === 0) return
   dailyBoxChart.setOption({
-    tooltip: { trigger: 'item' },
+    tooltip: {
+      trigger: 'item',
+      formatter: (p: any) => {
+        const [min, q1, med, q3, max] = p.value
+        return `${categories[p.dataIndex]}年<br/>最小: ${min.toFixed(4)}%<br/>Q1: ${q1.toFixed(4)}%<br/>中位: ${med.toFixed(4)}%<br/>Q3: ${q3.toFixed(4)}%<br/>最大: ${max.toFixed(4)}%`
+      },
+    },
     grid: { left: 60, right: 20, top: 40, bottom: 30 },
     xAxis: { type: 'category', data: categories },
     yAxis: { type: 'value', name: '日收益率(%)' },
@@ -546,10 +556,19 @@ function initMonthlyBoxChart() {
   monthlyBoxChart = echarts.init(monthlyBoxEl.value)
   const { yearly } = returnsBuckets.value!
   const categories = yearly.map((y) => String(y.year))
-  const boxData = yearly.map((y) => boxplotData(y.monthly_returns.map((r) => r * 100))).filter(Boolean)
+  const boxData = yearly
+    .map((y) => y.monthly_returns.map((r) => Number((r * 100).toFixed(4))))
+    .map(boxplotData)
+    .filter(Boolean)
   if (boxData.length === 0) return
   monthlyBoxChart.setOption({
-    tooltip: { trigger: 'item' },
+    tooltip: {
+      trigger: 'item',
+      formatter: (p: any) => {
+        const [min, q1, med, q3, max] = p.value
+        return `${categories[p.dataIndex]}年<br/>最小: ${min.toFixed(4)}%<br/>Q1: ${q1.toFixed(4)}%<br/>中位: ${med.toFixed(4)}%<br/>Q3: ${q3.toFixed(4)}%<br/>最大: ${max.toFixed(4)}%`
+      },
+    },
     grid: { left: 60, right: 20, top: 40, bottom: 30 },
     xAxis: { type: 'category', data: categories },
     yAxis: { type: 'value', name: '月收益率(%)' },
@@ -570,7 +589,8 @@ function initAnnualBarChart() {
     return {
       value: +(ar * 100).toFixed(2),
       name: String(y.year),
-      itemStyle: { color: ar >= 0 ? '#10b981' : '#ef4444' },
+      // A 股红涨绿跌：正收益红、负收益绿
+      itemStyle: { color: ar >= 0 ? '#ef4444' : '#10b981' },
     }
   })
   annualBarChart.setOption({

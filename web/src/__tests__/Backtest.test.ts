@@ -397,3 +397,143 @@ describe('Backtest.vue — 收益分布区块', () => {
     expect(w.text()).not.toContain('收益分布')
   })
 })
+
+// --- 收益分布图表 A 股红涨绿跌配色 ---
+describe('Backtest.vue — 收益分布 A 股红涨绿跌配色', () => {
+  const mockDetailCN = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        // 含正收益（0.5/1.0/0.8）与负收益（-0.2）→ 正应红、负应绿
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [
+        { year: 2025, daily_returns: [0.01, -0.01, 0.02, -0.02, 0.03], monthly_returns: [0.02, -0.01, 0.015, -0.03, 0.01], annual_return: -0.05 },
+        { year: 2026, daily_returns: [0.01, -0.005, 0.003, 0.02, -0.01], monthly_returns: [0.01, -0.005, 0.02, -0.01, 0.004], annual_return: 0.02 },
+      ],
+    },
+  }
+
+  it('月度热力图 visualMap 正收益红、负收益绿（inRange 终点=红）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailCN)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const heat = options.find((o: any) => o.series?.[0]?.type === 'heatmap')
+    expect(heat).toBeTruthy()
+    const colors = heat.visualMap?.inRange?.color
+    expect(colors).toHaveLength(3)
+    // A 股惯例：涨（正值）红、跌（负值）绿 → 渐变序列负端绿、正端红
+    expect(colors[0]).toBe('#10b981')  // 负收益端（min）→ 绿
+    expect(colors[2]).toBe('#ef4444')  // 正收益端（max）→ 红
+  })
+
+  it('年收益柱状图正收益红、负收益绿', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailCN)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const barOpt = options.find((o: any) => o.series?.[0]?.type === 'bar')
+    expect(barOpt).toBeTruthy()
+    const data = barOpt.series[0].data
+    expect(data).toHaveLength(2)
+    const byName = Object.fromEntries(data.map((d: any) => [d.name, d.itemStyle.color]))
+    expect(byName['2025']).toBe('#10b981')  // 年收益 -5% → 绿
+    expect(byName['2026']).toBe('#ef4444')  // 年收益 +2% → 红
+  })
+})
+
+// --- 图表数值精度测试（回撤曲线 / 日收益箱线 / 月收益箱线 → 4 位小数）---
+describe('Backtest.vue — 图表数值精度', () => {
+  // 构造含多位小数的 daily/monthly 收益，验证 ×100 后仍被 round 到 4 位
+  const mockDetailPrecision = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [{
+        year: 2026,
+        // 含 5~7 位小数 → ×100 后仍有 5 位以上，断言 boxData 值已是 4 位
+        daily_returns: [0.001234567, -0.005432, 0.0033333, 0.02, -0.01],
+        monthly_returns: [0.001234567, -0.005432, 0.02, -0.01, 0.004],
+        annual_return: 0.02,
+      }],
+    },
+  }
+  // 回撤由 mockDetail.snapshots 算：peak=101000 时 99000 → -(2000/101000)*100 ≈ -1.980198...
+  // 断言每个回撤/箱线值 round 到 4 位（值 === Number(v.toFixed(4))）
+  const assert4Decimals = (values: number[]) => {
+    for (const v of values) {
+      expect(Number(v.toFixed(4))).toBe(v)
+    }
+  }
+
+  it('回撤曲线数据 round 到 4 位小数', async () => {
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dd = options.find((o: any) => o.yAxis?.name === '回撤(%)')
+    expect(dd).toBeTruthy()
+    const data = dd.series.find((s: any) => s.name === '回撤').data
+    assert4Decimals(data)
+    // tooltip formatter 也输出 4 位百分比（含 toFixed(4)）
+    expect(String(dd.tooltip.formatter)).toContain('toFixed(4)')
+  })
+
+  it('年度日收益箱线图五数摘要 round 到 4 位小数', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailPrecision)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    expect(box).toBeTruthy()
+    const boxData = box.series[0].data
+    expect(Array.isArray(boxData)).toBe(true)
+    expect(boxData.length).toBe(1)  // 一个年份
+    for (const five of boxData) {
+      assert4Decimals(five)
+    }
+  })
+
+  it('各年月收益箱线图五数摘要 round 到 4 位小数', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailPrecision)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const box = options.find((o: any) => o.yAxis?.name === '月收益率(%)')
+    expect(box).toBeTruthy()
+    const boxData = box.series[0].data
+    expect(Array.isArray(boxData)).toBe(true)
+    expect(boxData.length).toBe(1)
+    for (const five of boxData) {
+      assert4Decimals(five)
+    }
+  })
+})
