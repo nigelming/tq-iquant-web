@@ -557,13 +557,17 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     expect(w.text()).toContain('正收益策略')
     expect(w.text()).toContain('负收益策略')
 
-    // 组合整体卡：总收益 5.00%（正）→ text-red
-    const allRows = w.findAll('.metric-row')
-    const posRow = allRows.find(r => r.text().includes('5.00%'))!
+    // 组合整体卡（.portfolio-card）总收益行：总收益 5.00%（正）→ valueClass → text-red
+    // 注意：不能全量 findAll('.metric-row') 后 find('5.00%')——DOM 顺序上 .strategy-card 在前，
+    // 首个命中会是正收益策略卡的总收益行；且 includes('5.00%') 也会误匹配 '-5.00%'。
+    // 故限定在 .portfolio-card 内按标签定位总收益行，并对值做精确断言。
+    const portfolioRows = w.findAll('.portfolio-card .metric-row')
+    const posRow = portfolioRows.find(r => r.find('.metric-label').text() === '总收益')!
+    expect(posRow.find('span:last-child').text()).toBe('5.00%')
     expect(posRow.find('span:last-child').classes()).toContain('text-red')
-    // 负收益策略卡：总收益 -3.00%（负）→ 任一 .strategy-card 内含该值且值为 text-green
+    // 负收益策略卡：总收益 -3.00%（负）→ 精确匹配该值且值为 text-green
     const negCard = w.findAll('.strategy-card').find(c => c.text().includes('-3.00%'))!
-    const negSpan = negCard.findAll('span').find(s => s.text().includes('-3.00%'))!
+    const negSpan = negCard.findAll('span').find(s => s.text() === '-3.00%')!
     expect(negSpan.classes()).toContain('text-green')
   })
 
@@ -598,6 +602,7 @@ describe('Backtest.vue — 回撤曲线红涨绿跌', () => {
     const dd = options.find((o: any) => o.yAxis?.name === '回撤(%)')
     expect(dd).toBeTruthy()
     const series = dd.series.find((s: any) => s.name === '回撤')
+    expect(series).toBeTruthy()
     expect(series.itemStyle.color).toBe('#10b981')
   })
 })
@@ -617,6 +622,9 @@ describe('Backtest.vue — 净值曲线超额收益（相对基准）', () => {
     const excess = option.series.find((s: any) => s.name === '超额收益（相对基准）')
     expect(excess).toBeTruthy()
     expect(excess.type).toBe('line')
+    expect(excess.smooth).toBe(true)
+    expect(excess.symbol).toBe('none')
+    expect(excess.lineStyle).toEqual({ width: 1.5, color: '#f59e0b' })
     expect(excess.itemStyle.color).toBe('#f59e0b')
     // 手算：组合收益% [0,1,-1] − 基准% [0,2,1] = [0,-1,-2]
     expect(excess.data).toEqual([0, -1, -2])
