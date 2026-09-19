@@ -167,9 +167,10 @@ function num(v: number | null | undefined, digits = 4): string {
   return Number(v).toFixed(digits)
 }
 // 按值正负着色
+// A 股红涨绿跌：正收益→红、负收益→绿
 function valueClass(v: number | null | undefined): string {
   if (v === null || v === undefined) return ''
-  return Number(v) >= 0 ? 'text-green' : 'text-red'
+  return Number(v) >= 0 ? 'text-red' : 'text-green'
 }
 
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
@@ -955,8 +956,8 @@ onUnmounted(() => {
 }
 .summary-card .title { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
 .summary-card .value { font-size: 22px; font-weight: 700; color: #333; }
-.summary-card.positive { border-left-color: #10b981; }
-.summary-card.danger { border-left-color: #ef4444; }
+.summary-card.positive { border-left-color: #ef4444; } /* 正收益 → 红（A股红涨绿跌） */
+.summary-card.danger { border-left-color: #ef4444; }   /* 最大回撤 → 风险警示红，保持不变 */
 
 /* 整体表现 6 渐变卡 */
 .stats-grid {

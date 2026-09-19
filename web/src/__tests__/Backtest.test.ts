@@ -537,3 +537,49 @@ describe('Backtest.vue — 图表数值精度', () => {
     }
   })
 })
+
+// --- 回测报告 — 策略对比/摘要卡红涨绿跌 ---
+describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
+  it('策略对比收益指标正红负绿（valueClass 反转）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      strategy_evaluations: [
+        { strategy_id: 1, strategy_name: '正收益策略', total_return: 0.05, annual_return: 0.08 },
+        { strategy_id: 2, strategy_name: '负收益策略', total_return: -0.03, annual_return: -0.05 },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('策略对比分析')
+    expect(w.text()).toContain('正收益策略')
+    expect(w.text()).toContain('负收益策略')
+
+    // 组合整体卡：总收益 5.00%（正）→ text-red
+    const allRows = w.findAll('.metric-row')
+    const posRow = allRows.find(r => r.text().includes('5.00%'))!
+    expect(posRow.find('span:last-child').classes()).toContain('text-red')
+    // 负收益策略卡：总收益 -3.00%（负）→ 任一 .strategy-card 内含该值且值为 text-green
+    const negCard = w.findAll('.strategy-card').find(c => c.text().includes('-3.00%'))!
+    const negSpan = negCard.findAll('span').find(s => s.text().includes('-3.00%'))!
+    expect(negSpan.classes()).toContain('text-green')
+  })
+
+  it('摘要卡结构：positive（总收益/年化收益）+ danger（最大回撤）存在且各自取值', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const positive = w.find('.summary-card.positive')
+    expect(positive.exists()).toBe(true)
+    expect(positive.text()).toContain('总收益')
+    const danger = w.find('.summary-card.danger')
+    expect(danger.exists()).toBe(true)
+    expect(danger.text()).toContain('最大回撤')
+    // 注意：SFC scoped 样式在 vitest(happy-dom) 不注入，边框色无法经 getComputedStyle 断言；
+    // 颜色改动（positive→#ef4444、danger 保持 #ef4444）由实现步骤的显式 CSS 修改 + 最终构建验证保证。
+  })
+})
