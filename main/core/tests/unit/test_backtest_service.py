@@ -455,3 +455,42 @@ class TestReturnBucketsInDetail:
         yr = rb["yearly"][0]
         assert yr["year"] == 2024
         assert len(yr["daily_returns"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# build_benchmark_data：自定义基准代码
+# ---------------------------------------------------------------------------
+def test_build_benchmark_data_uses_custom_benchmark_index(monkeypatch):
+    """ps.benchmark_index 为自定义代码时，用该代码（而非默认 000300.SH）拉指数日线，
+    返回 {日期: 收盘价 Decimal}。防止回退为硬编码默认基准。"""
+    import pandas as pd
+
+    captured = {}
+
+    class _FakeTQ:
+        def get_history_raw(self, stocks, periods, start="", end="",
+                            dividend_type="front", count=100):
+            captured["stocks"] = stocks
+            captured["periods"] = periods
+            captured["start"] = start
+            captured["end"] = end
+            close = pd.DataFrame(
+                {"000905.SH": [6000.0, 6060.0, 6030.0]},
+                index=pd.to_datetime(["2026-07-29", "2026-07-30", "2026-07-31"]),
+            )
+            return {"1d": {"Close": close}}
+
+    monkeypatch.setattr(svc, "TQData", lambda: _FakeTQ())
+    ps = SimpleNamespace(benchmark_index="000905.SH")
+
+    result = svc.build_benchmark_data(ps, date(2026, 7, 29), date(2026, 7, 31))
+
+    assert captured["stocks"] == ["000905.SH"]
+    assert captured["periods"] == ["1d"]
+    assert captured["start"] == "20260729"
+    assert captured["end"] == "20260731"
+    assert result == {
+        date(2026, 7, 29): Decimal("6000.0"),
+        date(2026, 7, 30): Decimal("6060.0"),
+        date(2026, 7, 31): Decimal("6030.0"),
+    }
