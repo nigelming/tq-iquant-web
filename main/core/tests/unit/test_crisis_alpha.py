@@ -97,6 +97,19 @@ def test_quadrant_on_flat_upward_benchmark_has_no_down_weeks():
     assert q["down_avg_b"] == 0.0
 
 
+def test_quadrant_zero_crisis_week_return_keeps_source_nan_quirk():
+    an = _analyzer(
+        [-0.10, -0.10, 0.05, 0.05, 0.05, 0.05],
+        [0.0, -0.02, 0.03, 0.03, 0.03, 0.03],
+    )
+    q = an.quadrant_analysis()
+    assert q["n_down"] == 2
+    assert q["counts"]["逆势上涨"] > 0
+    assert q["up_rate"] == pytest.approx(0.5)
+    assert math.isnan(q["win_avg"])
+    assert math.isnan(q["odds"])
+
+
 def test_condition_tests_two_deep_thresholds():
     an = _analyzer(WEEKS_B, WEEKS_S)
     rows = an.condition_tests()
