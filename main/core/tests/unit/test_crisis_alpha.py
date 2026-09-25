@@ -181,3 +181,168 @@ def test_nav_normalizes_each_series_to_one():
     assert b_nav.iloc[0] == pytest.approx(1.0)
     assert len(s_nav) == len(an.s_orig_nav)
     assert len(b_nav) == len(an.b_orig_nav)
+
+
+def test_deep_drawdown_events_peak_to_trough_single_event():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    events = an.deep_drawdown_events()
+    assert len(events) == 1
+    ev = events[0]
+    assert str(ev["start"].date()) == "2024-01-05"
+    assert str(ev["end"].date()) == "2024-02-02"
+    assert ev["benchmark_ret"] == pytest.approx(-0.3439)
+    assert ev["strategy_ret"] == pytest.approx(-0.17313088)
+    assert ev["excess"] == pytest.approx(ev["strategy_ret"] - ev["benchmark_ret"])
+    assert ev["hedged"] is False
+    assert ev["verdict"] == "同步下跌"
+    assert ev["max_dd"] == pytest.approx(-0.3439)
+    assert ev["days"] == 28
+
+
+def test_deep_drawdown_events_flags_hedged_event():
+    b = [-0.10] * 6
+    s = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02]
+    an = _analyzer(b, s)
+    events = an.deep_drawdown_events()
+    assert len(events) == 1
+    assert events[0]["hedged"] is True
+    assert events[0]["verdict"] == "逆势对冲"
+    assert events[0]["excess"] > 0
+
+
+def test_deep_drawdown_events_empty_when_shallow():
+    an = _analyzer([-0.002] * 12, [0.0] * 12)
+    dd = an.b_full_nav / an.b_full_nav.cummax() - 1
+    assert float(dd.min()) > -0.05
+    assert an.deep_drawdown_events() == []
+
+
+def test_drawdown_shade_spans_merges_contiguous_region():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    spans = an.drawdown_shade_spans()
+    assert len(spans) == 1
+    dd = an.b_full_nav / an.b_full_nav.cummax() - 1
+    deep_days = dd[dd < -0.05]
+    assert str(deep_days.index[0].date()) == "2024-01-10"
+    assert str(deep_days.index[-1].date()) == "2024-03-29"
+    assert spans == [(deep_days.index[0], deep_days.index[-1])]
+
+
+def test_drawdown_shade_spans_empty_when_no_deep_drawdown():
+    an = _analyzer([-0.002] * 12, [0.0] * 12)
+    dd = an.b_full_nav / an.b_full_nav.cummax() - 1
+    assert float(dd.min()) > -0.05
+    assert an.drawdown_shade_spans() == []
+
+
+def test_rolling_correlation_needs_full_window():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    assert len(an.rolling_correlation()) == 0
+    window = 4
+    assert len(an.rolling_correlation(window=window)) == 8
+    raw = an.s_week_ret.rolling(window).corr(an.b_week_ret)
+    full_windows = raw.iloc[window - 1 :]
+    assert len(full_windows) == 9
+    assert int(full_windows.isna().sum()) == 1
+    assert len(an.expanding_correlation()) == 5
+    min_periods = 2
+    raw_expanding = an.s_week_ret.expanding(min_periods=min_periods).corr(an.b_week_ret)
+    nan_positions = [i for i, value in enumerate(raw_expanding) if pd.isna(value)]
+    assert nan_positions == [0, 1, 2]
+    assert len(an.expanding_correlation(min_periods=min_periods)) == len(raw_expanding) - len(nan_positions)
+
+
+def test_cost_analysis_up_week_price_and_tail_correlation():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    cost = an.cost_analysis()
+    assert cost["n_up"] == 6
+    assert cost["drag"] == pytest.approx(1 / 6)
+    assert cost["sync_up"] == pytest.approx(5 / 6)
+    b_up = [WEEKS_B[i] for i in (4, 5, 6, 7, 9, 11)]
+    s_up = [WEEKS_S[i] for i in (4, 5, 6, 7, 9, 11)]
+    assert cost["elasticity"] == pytest.approx(
+        (sum(s_up) / 6) / (sum(b_up) / 6)
+    )
+    b_down = [WEEKS_B[i] for i in (0, 1, 2, 3, 8, 10)]
+    s_down = [WEEKS_S[i] for i in (0, 1, 2, 3, 8, 10)]
+    assert cost["tail_corr"] == pytest.approx(
+        float(pd.Series(s_down).corr(pd.Series(b_down)))
+    )
+    assert -1.0 <= cost["q1_corr"] <= 1.0
+
+
+def test_cost_analysis_zero_when_no_up_weeks():
+    b = [-0.01, -0.02, -0.01, -0.03, -0.02, -0.01, -0.02, -0.01, -0.03, -0.02, -0.01, -0.02]
+    s = [0.01, -0.01, 0.02, -0.02, 0.01, 0.03, -0.01, 0.02, -0.03, 0.01, 0.02, -0.01]
+    an = _analyzer(b, s)
+    cost = an.cost_analysis()
+    assert cost["n_up"] == 0
+    assert cost["drag"] == 0.0
+    assert cost["sync_up"] == 0.0
+    assert cost["elasticity"] == 0.0
+
+
+def test_performance_stats_cumulative_annual_vol_mdd_and_corr():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    perf = an.performance_stats()
+    assert set(perf) == {"s", "b", "corr", "start", "end"}
+    for side in ("s", "b"):
+        assert set(perf[side]) == {"cum", "ann", "vol", "mdd"}
+        assert perf[side]["mdd"] <= 0
+        assert perf[side]["vol"] >= 0
+    assert perf["s"]["cum"] == pytest.approx(
+        float(an.s_orig_nav.iloc[-1] / an.s_orig_nav.iloc[0] - 1)
+    )
+    assert perf["b"]["cum"] == pytest.approx(
+        float(an.b_orig_nav.iloc[-1] / an.b_orig_nav.iloc[0] - 1)
+    )
+    assert -1.0 <= perf["corr"] <= 1.0
+
+
+def test_monthly_analysis_state_buckets_and_hedge_ratio():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    mo = an.monthly_analysis()
+    assert set(mo["states"]) == {"大涨", "小涨", "小跌", "大跌"}
+    assert mo["states"]["大涨"]["n"] == 1
+    assert mo["states"]["大跌"]["n"] == 1
+    assert mo["states"]["小涨"]["n"] == 0
+    assert mo["states"]["小跌"]["n"] == 0
+    assert mo["states"]["大涨"]["win_rate"] == pytest.approx(1.0)
+    assert mo["states"]["大跌"]["win_rate"] == pytest.approx(0.0)
+    assert mo["n_down_month"] == 1
+    assert mo["hedge_ratio"] == pytest.approx(0.0)
+    assert len(mo["big_down"]) == 1
+
+
+def test_monthly_analysis_flat_upward_benchmark_lands_in_small_up():
+    an = _analyzer([0.001] * 12, [0.001] * 12)
+    mo = an.monthly_analysis()
+    assert mo["states"]["小涨"]["n"] == 2
+    assert mo["states"]["大涨"]["n"] == 0
+    assert mo["states"]["小跌"]["n"] == 0
+    assert mo["states"]["大跌"]["n"] == 0
+    assert mo["n_down_month"] == 0
+    assert mo["hedge_ratio"] == 0.0
+    assert len(mo["big_down"]) == 0
+
+
+def test_annual_stats_single_partial_year():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    rows = an.annual_stats()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["年份"] == 2024
+    assert row["下跌周"] == 6
+    assert row["危机Alpha"] == pytest.approx(2 / 6)
+    assert row["完整"] is False
+    assert row["策略收益"] == pytest.approx(math.prod(1 + r for r in WEEKS_S) - 1)
+    assert row["基准收益"] == pytest.approx(math.prod(1 + r for r in WEEKS_B) - 1)
+
+
+def test_annual_stats_marks_full_year_when_40_plus_weeks():
+    weeks = 41
+    b = ([-0.01] * (weeks // 2)) + ([0.01] * (weeks - weeks // 2))
+    s = ([0.01] * (weeks // 2)) + ([0.01] * (weeks - weeks // 2))
+    an = _analyzer(b, s)
+    rows = an.annual_stats()
+    assert rows[0]["完整"] is True

@@ -229,3 +229,218 @@ class CrisisAlphaAnalyzer:
     def down_week_df(self) -> pd.DataFrame:
         df = self.weekly_detail_df()
         return df[df["基准收益"] < 0].sort_index(ascending=False)
+
+    def deep_drawdown_events(self, threshold: Optional[float] = None) -> List[dict]:
+        thr = DEEP_DD_THRESHOLD if threshold is None else threshold
+        b_nav = self.b_full_nav / self.b_full_nav.iloc[0]
+        dd = b_nav / b_nav.cummax() - 1
+        in_dd = dd < -1e-10
+        events = []
+        idx = b_nav.index
+        arr = in_dd.values
+        i = 0
+        n_arr = len(arr)
+        while i < n_arr:
+            if not arr[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n_arr and arr[j + 1]:
+                j += 1
+            peak_pos = i - 1
+            if peak_pos < 0:
+                i = j + 1
+                continue
+            peak_date = idx[peak_pos]
+            seg = b_nav.iloc[i : j + 1]
+            trough_date = seg.idxmin()
+            min_dd = float(seg.loc[trough_date] / b_nav.loc[peak_date] - 1)
+            if min_dd < thr:
+                b_ret = float(
+                    self.b_full_nav.loc[trough_date] / self.b_full_nav.loc[peak_date] - 1
+                )
+                s_ret = float(
+                    self.s_full_nav.loc[trough_date] / self.s_full_nav.loc[peak_date] - 1
+                )
+                hedged = s_ret > 0
+                events.append(
+                    {
+                        "start": peak_date,
+                        "end": trough_date,
+                        "benchmark_ret": b_ret,
+                        "strategy_ret": s_ret,
+                        "excess": s_ret - b_ret,
+                        "hedged": hedged,
+                        "verdict": "逆势对冲" if hedged else "同步下跌",
+                        "max_dd": min_dd,
+                        "days": int((trough_date - peak_date).days),
+                    }
+                )
+            i = j + 1
+        return events
+
+    def drawdown_shade_spans(self, threshold: Optional[float] = None) -> List[tuple]:
+        thr = DEEP_DD_THRESHOLD if threshold is None else threshold
+        dd = self.drawdown_series("b")
+        mask = dd < thr
+        spans = []
+        if not mask.any():
+            return spans
+        idx = mask.index
+        arr = mask.values
+        i = 0
+        n_arr = len(arr)
+        while i < n_arr:
+            if not arr[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n_arr and arr[j + 1]:
+                j += 1
+            spans.append((idx[i], idx[j]))
+            i = j + 1
+        return spans
+
+    def rolling_correlation(self, window: Optional[int] = None) -> pd.Series:
+        w = window or ROLLING_CORR_WINDOW
+        return self.s_week_ret.rolling(w).corr(self.b_week_ret).dropna()
+
+    def expanding_correlation(self, min_periods: int = 8) -> pd.Series:
+        return self.s_week_ret.expanding(min_periods=min_periods).corr(
+            self.b_week_ret
+        ).dropna()
+
+    def cost_analysis(self) -> dict:
+        s = self.s_week_ret
+        b = self.b_week_ret
+        up = b > 0
+        n_up = int(up.sum())
+        if n_up:
+            drag = float((s[up] < 0).mean())
+            sync_up = float((s[up] > 0).mean())
+            b_up_mean = float(b[up].mean())
+            elasticity = float(s[up].mean() / b_up_mean) if abs(b_up_mean) > 1e-12 else 0.0
+        else:
+            drag = 0.0
+            sync_up = 0.0
+            elasticity = 0.0
+        down = b < 0
+        if int(down.sum()) >= 5:
+            tail_corr = float(s[down].corr(b[down]))
+        else:
+            tail_corr = 0.0
+        q1_cut = b.quantile(0.25)
+        q1_mask = b <= q1_cut
+        if int(q1_mask.sum()) >= 5:
+            q1_corr = float(s[q1_mask].corr(b[q1_mask]))
+        else:
+            q1_corr = 0.0
+        return {
+            "drag": drag,
+            "sync_up": sync_up,
+            "elasticity": elasticity,
+            "tail_corr": tail_corr,
+            "q1_corr": q1_corr,
+            "n_up": n_up,
+        }
+
+    def performance_stats(self) -> dict:
+        s_nav, b_nav = self._nav()
+        days = max((s_nav.index[-1] - s_nav.index[0]).days, 1)
+        years = days / 365.25
+
+        def _stats(nav: pd.Series, week_ret: pd.Series) -> dict:
+            cum = float(nav.iloc[-1] / nav.iloc[0] - 1)
+            ann = (
+                float((nav.iloc[-1] / nav.iloc[0]) ** (1 / years) - 1)
+                if years > 0
+                else 0.0
+            )
+            vol = float(week_ret.std() * math.sqrt(WEEKS_PER_YEAR))
+            dd = nav / nav.cummax() - 1
+            mdd = float(dd.min())
+            return {"cum": cum, "ann": ann, "vol": vol, "mdd": mdd}
+
+        return {
+            "s": _stats(s_nav, self.s_week_ret),
+            "b": _stats(b_nav, self.b_week_ret),
+            "corr": float(self.s_week_ret.corr(self.b_week_ret)),
+            "start": s_nav.index[0],
+            "end": s_nav.index[-1],
+        }
+
+    def monthly_analysis(self) -> dict:
+        s_m = self.s_month_ret
+        b_m = self.b_month_ret
+        big = MONTH_BIG_MOVE
+        states = pd.Series(index=b_m.index, dtype="object")
+        states[b_m <= -big] = "大跌"
+        states[(b_m > -big) & (b_m < 0)] = "小跌"
+        states[(b_m >= 0) & (b_m < big)] = "小涨"
+        states[b_m >= big] = "大涨"
+        out = {}
+        for state in ("大涨", "小涨", "小跌", "大跌"):
+            mask = states == state
+            n = int(mask.sum())
+            if n == 0:
+                out[state] = {"n": 0, "s_avg": 0.0, "b_avg": 0.0, "win_rate": 0.0}
+            else:
+                out[state] = {
+                    "n": n,
+                    "s_avg": float(s_m[mask].mean()),
+                    "b_avg": float(b_m[mask].mean()),
+                    "win_rate": float((s_m[mask] > 0).mean()),
+                }
+        m_labels = _classify_crisis(b_m.values, s_m.values)
+        down_mask = (b_m.values < 0).tolist()
+        hedged = [lbl in _HEDGE_CATS for lbl, is_down in zip(m_labels, down_mask) if is_down]
+        hedge_ratio = _mean([1.0 if h else 0.0 for h in hedged]) if hedged else 0.0
+        big_mask = (b_m <= -big).tolist()
+        big_down = pd.DataFrame(
+            {
+                "日期": [i for i, flag in zip(s_m.index, big_mask) if flag],
+                "基准": [float(v) for v, flag in zip(b_m.values, big_mask) if flag],
+                "策略": [float(v) for v, flag in zip(s_m.values, big_mask) if flag],
+            }
+        )
+        if len(big_down):
+            big_down = big_down.sort_values("日期", ascending=False)
+        return {
+            "states": out,
+            "hedge_ratio": hedge_ratio,
+            "n_down_month": int(sum(down_mask)),
+            "big_down": big_down,
+        }
+
+    def annual_stats(self) -> List[dict]:
+        rows = []
+        s_g = self.s_week_ret.groupby(self.s_week_ret.index.year)
+        b_g = self.b_week_ret.groupby(self.b_week_ret.index.year)
+        lab_g = self.week_labels.groupby(self.week_labels.index.year)
+        years = sorted(set(s_g.groups.keys()) & set(b_g.groups.keys()))
+        for yr in years:
+            s_y = s_g.get_group(yr)
+            b_y = b_g.get_group(yr)
+            lab_y = lab_g.get_group(yr)
+            down = (b_y < 0).tolist()
+            n_down = int(sum(down))
+            if n_down:
+                flags = [
+                    1.0 if lbl in _HEDGE_CATS else 0.0
+                    for lbl, is_down in zip(lab_y.tolist(), down)
+                    if is_down
+                ]
+                alpha = _mean(flags)
+            else:
+                alpha = 1.0
+            rows.append(
+                {
+                    "年份": int(yr),
+                    "下跌周": n_down,
+                    "危机Alpha": alpha,
+                    "策略收益": float((1 + s_y).prod() - 1),
+                    "基准收益": float((1 + b_y).prod() - 1),
+                    "完整": len(b_y) >= FULL_YEAR_WEEKS,
+                }
+            )
+        return rows
