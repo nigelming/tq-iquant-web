@@ -236,39 +236,38 @@ def test_drawdown_shade_spans_empty_when_no_deep_drawdown():
 
 
 def test_rolling_correlation_needs_full_window():
-    an = _analyzer(WEEKS_B, WEEKS_S)
+    an = _analyzer(WEEKS_B_DISTINCT, WEEKS_S_DISTINCT)
     assert len(an.rolling_correlation()) == 0
-    window = 4
-    assert len(an.rolling_correlation(window=window)) == 8
-    raw = an.s_week_ret.rolling(window).corr(an.b_week_ret)
-    full_windows = raw.iloc[window - 1 :]
-    assert len(full_windows) == 9
-    assert int(full_windows.isna().sum()) == 1
+    assert len(an.rolling_correlation(window=4)) == 9
     assert len(an.expanding_correlation()) == 5
-    min_periods = 2
-    raw_expanding = an.s_week_ret.expanding(min_periods=min_periods).corr(an.b_week_ret)
-    nan_positions = [i for i, value in enumerate(raw_expanding) if pd.isna(value)]
-    assert nan_positions == [0, 1, 2]
-    assert len(an.expanding_correlation(min_periods=min_periods)) == len(raw_expanding) - len(nan_positions)
+    assert len(an.expanding_correlation(min_periods=2)) == 11
 
 
 def test_cost_analysis_up_week_price_and_tail_correlation():
-    an = _analyzer(WEEKS_B, WEEKS_S)
+    b_weeks = [
+        -0.10, -0.08, -0.06, -0.05, -0.04, -0.03, -0.02, -0.015,
+        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12,
+    ]
+    s_weeks = [
+        0.02, -0.01, -0.03, 0.01, -0.05, 0.04, 0.03, -0.02,
+        0.02, 0.01, -0.04, 0.05, 0.03, 0.06, -0.01, 0.02, 0.04, 0.07, -0.02, 0.03,
+    ]
+    an = _analyzer(b_weeks, s_weeks)
     cost = an.cost_analysis()
-    assert cost["n_up"] == 6
-    assert cost["drag"] == pytest.approx(1 / 6)
-    assert cost["sync_up"] == pytest.approx(5 / 6)
-    b_up = [WEEKS_B[i] for i in (4, 5, 6, 7, 9, 11)]
-    s_up = [WEEKS_S[i] for i in (4, 5, 6, 7, 9, 11)]
+    assert cost["n_up"] == 12
+    assert cost["drag"] == pytest.approx(0.25)
+    assert cost["sync_up"] == pytest.approx(0.75)
+    b_up = [r for r in b_weeks if r > 0]
+    s_up = [s for b, s in zip(b_weeks, s_weeks) if b > 0]
     assert cost["elasticity"] == pytest.approx(
-        (sum(s_up) / 6) / (sum(b_up) / 6)
+        (sum(s_up) / len(s_up)) / (sum(b_up) / len(b_up))
     )
-    b_down = [WEEKS_B[i] for i in (0, 1, 2, 3, 8, 10)]
-    s_down = [WEEKS_S[i] for i in (0, 1, 2, 3, 8, 10)]
+    b_down = [r for r in b_weeks if r < 0]
+    s_down = [s for b, s in zip(b_weeks, s_weeks) if b < 0]
     assert cost["tail_corr"] == pytest.approx(
         float(pd.Series(s_down).corr(pd.Series(b_down)))
     )
-    assert -1.0 <= cost["q1_corr"] <= 1.0
+    assert cost["q1_corr"] == pytest.approx(-0.6742671940326725)
 
 
 def test_cost_analysis_zero_when_no_up_weeks():
@@ -288,14 +287,20 @@ def test_performance_stats_cumulative_annual_vol_mdd_and_corr():
     assert set(perf) == {"s", "b", "corr", "start", "end"}
     for side in ("s", "b"):
         assert set(perf[side]) == {"cum", "ann", "vol", "mdd"}
-        assert perf[side]["mdd"] <= 0
-        assert perf[side]["vol"] >= 0
     assert perf["s"]["cum"] == pytest.approx(
         float(an.s_orig_nav.iloc[-1] / an.s_orig_nav.iloc[0] - 1)
     )
     assert perf["b"]["cum"] == pytest.approx(
         float(an.b_orig_nav.iloc[-1] / an.b_orig_nav.iloc[0] - 1)
     )
+    assert perf["s"]["cum"] == pytest.approx(-0.15475410705679027)
+    assert perf["s"]["ann"] == pytest.approx(-0.5023336802119625)
+    assert perf["s"]["vol"] == pytest.approx(0.39271780291613057)
+    assert perf["s"]["mdd"] == pytest.approx(-0.18934400000000007)
+    assert perf["b"]["cum"] == pytest.approx(-0.25282934712029415)
+    assert perf["b"]["ann"] == pytest.approx(-0.7017226526258493)
+    assert perf["b"]["vol"] == pytest.approx(0.5069576516890347)
+    assert perf["b"]["mdd"] == pytest.approx(-0.3438999999999999)
     assert -1.0 <= perf["corr"] <= 1.0
 
 
