@@ -3,11 +3,12 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
-  deleteBacktestRecord,
+  deleteBacktestRecord, recomputeCrisisAlpha,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
+  CrisisAlphaData,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -41,6 +42,83 @@ let monthlyHeatChart: echarts.ECharts | null = null
 let dailyBoxChart: echarts.ECharts | null = null
 let monthlyBoxChart: echarts.ECharts | null = null
 let annualBarChart: echarts.ECharts | null = null
+
+const crisisAlphaSectionEl = ref<HTMLDivElement | null>(null)
+const recomputing = ref(false)
+const recomputeMsg = ref('')
+
+const CRISIS_COLORS: Record<string, string> = {
+  逆势上涨: '#d6403a', 跌得少: '#f0a429', 跟着跌: '#9dc88d', 跌更多: '#1f6e4f',
+}
+const CRISIS_SCORE_COLORS: Record<string, string> = {
+  卓越: '#d6403a', 优秀: '#f0a429', 一般: '#b0a890',
+}
+
+const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
+const caStatus = computed(() => crisisAlpha.value?.status ?? null)
+const caSkipped = computed(() => crisisAlpha.value?.skipped_benchmarks || [])
+const ca = computed<CrisisAlphaData | null>(() => {
+  const item = crisisAlpha.value
+  if (!item || item.status !== 'completed' || !item.data) return null
+  return item.data
+})
+
+const caKpis = computed(() => {
+  const d = ca.value
+  if (!d) return []
+  const q = d.quadrant
+  const s = d.performance.s
+  return [
+    {
+      label: '危机Alpha占比',
+      value: pct1(q.alpha_ratio),
+      sub: `逆势上涨+跌得少 / 下跌周 · ${d.alpha_rating}`,
+      color: CRISIS_COLORS.逆势上涨,
+    },
+    {
+      label: '综合危机保护评分',
+      value: num(d.score.total_score, 1),
+      sub: d.score.rating,
+      color: CRISIS_SCORE_COLORS[d.score.rating] || '#6b7280',
+    },
+    {
+      label: '下跌周逆势上涨比例',
+      value: pct1(q.up_rate),
+      sub: `${q.counts.逆势上涨 ?? 0} / ${q.n_down} 周`,
+      color: CRISIS_COLORS.逆势上涨,
+    },
+    {
+      label: '策略累计收益',
+      value: pct1(s.cum),
+      sub: `年化 ${pct1(s.ann)} ｜ MDD ${pct1(s.mdd)}`,
+      color: '#1f3a68',
+    },
+  ]
+})
+
+async function recomputeCa() {
+  const id = currentRecord.value?.id
+  if (!id) return
+  recomputing.value = true
+  recomputeMsg.value = ''
+  try {
+    const res = await recomputeCrisisAlpha(id)
+    recomputeMsg.value = res.status === 'completed'
+      ? '重新计算完成'
+      : `重新计算未完成：${res.error || res.status}`
+    detail.value = await getBacktestDetail(id)
+    await nextTick()
+    initCharts()
+  } catch (e) {
+    recomputeMsg.value = `重新计算失败：${errMsg(e)}`
+  } finally {
+    recomputing.value = false
+  }
+}
+
+function initCrisisAlphaCharts() {
+  if (!ca.value) return
+}
 
 // 交易明细分页
 const currentPage = ref(1)
@@ -139,6 +217,12 @@ async function openDetail(id: number) {
   initCharts()
 }
 
+function scrollToSection(anchor: string) {
+  if (anchor === 'crisis-alpha') {
+    crisisAlphaSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
+  }
+}
+
 async function onDelete(id: number) {
   if (!confirm('确定删除该回测记录？删除后不可恢复。')) return
   try {
@@ -230,8 +314,8 @@ const summaryCards = computed(() => {
   ]
 })
 
-// 整体表现 6 渐变卡
-const overallStats = computed<Array<{ label: string; value: string }>>(() => {
+// 整体表现 8 渐变卡
+const overallStats = computed<Array<{ label: string; value: string; anchor?: string }>>(() => {
   const e = detail.value?.evaluations
   if (!e) return []
   const ca = detail.value?.crisis_alpha
@@ -246,10 +330,12 @@ const overallStats = computed<Array<{ label: string; value: string }>>(() => {
     {
       label: '危机Alpha占比',
       value: cd ? `${pct1(cd.quadrant.alpha_ratio)} · ${cd.alpha_rating}` : '—',
+      anchor: 'crisis-alpha',
     },
     {
       label: '综合危机保护评分',
       value: cd ? `${num(cd.score.total_score, 1)} · ${cd.score.rating}` : '—',
+      anchor: 'crisis-alpha',
     },
   ]
 })
@@ -403,6 +489,7 @@ function initCharts() {
   initDailyBoxChart()
   initMonthlyBoxChart()
   initAnnualBarChart()
+  initCrisisAlphaCharts()
 }
 
 function initEquityChart() {
@@ -756,10 +843,69 @@ onUnmounted(() => {
     <!-- 整体表现指标 -->
     <div class="section-title">整体表现指标</div>
     <div class="stats-grid">
-      <div v-for="s in overallStats" :key="s.label" class="stat-card">
+      <div v-for="s in overallStats" :key="s.label" class="stat-card"
+           :class="{ clickable: !!s.anchor }"
+           @click="s.anchor && scrollToSection(s.anchor)">
         <div class="value">{{ s.value }}</div>
         <div class="label">{{ s.label }}</div>
       </div>
+    </div>
+
+    <div ref="crisisAlphaSectionEl" class="ca-section">
+      <div class="section-title">🌪️ 危机Alpha 专题分析</div>
+
+      <div v-if="caStatus === null" class="card" style="padding:12px">
+        <p style="color:#6b7280;margin:0 0 8px">本次回测未包含危机Alpha分析。</p>
+        <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
+          {{ recomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="caStatus === 'failed'" class="card" style="padding:12px">
+        <p style="color:#c0392b;margin:0 0 8px">危机Alpha分析失败：{{ crisisAlpha?.error || '未知原因' }}</p>
+        <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
+          {{ recomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="caStatus === 'insufficient'" class="card" style="padding:12px">
+        <p style="color:#6b7280;margin:0">样本不足：{{ crisisAlpha?.error || '共同交易日不足 30 天' }}</p>
+      </div>
+
+      <template v-else>
+        <div class="ca-banner">
+          <div class="t">{{ ca?.strategy_name }} · 危机Alpha专项分析</div>
+          <div class="d">
+            {{ ca?.strategy_name }} 在 A 股宽基系统性下跌阶段的对冲能力评估
+          </div>
+          <div class="d">
+            数据区间 {{ ca?.performance.start }} ~ {{ ca?.performance.end }} ｜ 主基准：{{ ca?.benchmark_name }}
+            ｜ 周频 {{ ca?.n_weeks }} 个收益周 ｜ 下跌 {{ ca?.quadrant.n_down }} 周
+          </div>
+        </div>
+
+        <div class="ca-kpi-grid">
+          <div v-for="k in caKpis" :key="k.label" class="ca-kpi">
+            <div class="v" :style="{ color: k.color }">{{ k.value }}</div>
+            <div class="l">{{ k.label }}</div>
+            <div class="s">{{ k.sub }}</div>
+          </div>
+        </div>
+
+        <div class="ca-status">
+          <span>统计口径：策略与主基准共同交易日内的周频收益</span>
+          <span v-if="caSkipped.length">已跳过基准：{{ caSkipped.join('、') }}</span>
+          <span v-if="crisisAlpha?.computed_at">
+            计算于 {{ crisisAlpha?.computed_at?.replace('T', ' ').slice(0, 19) }}
+          </span>
+          <button class="btn btn-sm" :disabled="recomputing" @click="recomputeCa">
+            {{ recomputing ? '计算中…' : '重新计算' }}
+          </button>
+          <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+        </div>
+      </template>
     </div>
 
     <!-- 策略对比分析 -->
@@ -1018,6 +1164,7 @@ onUnmounted(() => {
 }
 .stat-card .value { font-size: 22px; font-weight: 700; }
 .stat-card .label { font-size: 12px; opacity: 0.9; margin-top: 6px; }
+.stat-card.clickable { cursor: pointer; }
 
 /* 策略对比 */
 .strategy-comparison {
@@ -1178,6 +1325,56 @@ onUnmounted(() => {
 .drill-close { cursor: pointer; color: #9ca3af; font-weight: 400; font-size: 12px; }
 .drill-close:hover { color: #ef4444; }
 
+.ca-section { scroll-margin-top: 16px; }
+.ca-banner {
+  background: #1f3a68;
+  border-radius: 12px;
+  padding: 18px 24px;
+  color: #fff;
+  margin-bottom: 6px;
+}
+.ca-banner .t { font-size: 20px; font-weight: 800; }
+.ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
+.ca-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin: 14px 0 10px;
+}
+.ca-kpi {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 16px 10px;
+  text-align: center;
+}
+.ca-kpi .v { font-size: 26px; font-weight: 800; }
+.ca-kpi .l { font-size: 13px; color: #6b7280; margin-top: 6px; }
+.ca-kpi .s { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+.ca-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+.ca-msg { font-size: 12px; color: #1f3a68; }
+.ca-sub { font-size: 14px; font-weight: 700; color: #333; margin: 14px 0 8px; }
+.ca-note { font-size: 12px; color: #6b7280; margin: 6px 0 10px; }
+.ca-tags { margin: 10px 0; }
+.ca-tag {
+  display: inline-block;
+  border-radius: 14px;
+  padding: 5px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  margin-right: 8px;
+}
+.ca-chart { width: 100%; min-height: 400px; }
+
 /* 分页 */
 .pagination {
   display: flex;
@@ -1202,10 +1399,12 @@ onUnmounted(() => {
 @media (max-width: 1200px) {
   .stats-grid { grid-template-columns: repeat(3, 1fr); }
   .summary-section { grid-template-columns: repeat(2, 1fr); }
+  .ca-kpi-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 768px) {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .summary-section { grid-template-columns: 1fr; }
   .risk-metrics { grid-template-columns: 1fr; }
+  .ca-kpi-grid { grid-template-columns: 1fr; }
 }
 </style>

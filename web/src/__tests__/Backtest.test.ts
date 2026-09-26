@@ -27,8 +27,10 @@ vi.mock('echarts', () => {
 import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
-  deleteBacktestRecord,
+  deleteBacktestRecord, recomputeCrisisAlpha,
 } from '../api'
+
+const scrollTargets: any[] = []
 
 const mockRecords = [
   {
@@ -64,6 +66,10 @@ const mockDetail = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  scrollTargets.length = 0
+  ;(Element.prototype as any).scrollIntoView = vi.fn(function (this: any) {
+    scrollTargets.push(this)
+  })
   ;(getBacktestRecords as any).mockResolvedValue(mockRecords)
   ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
   ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
@@ -789,5 +795,108 @@ describe('Backtest.vue — 危机Alpha 上提到整体表现指标（8 卡）', 
     const cards = w.findAll('.stats-grid .stat-card')
     expect(cards[6].find('.value').text()).toBe('—')
     expect(cards[7].find('.value').text()).toBe('—')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha section 骨架', () => {
+  it('crisis_alpha=null：显示未计算提示 + 重新计算按钮', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    expect(w.find('.ca-section').exists()).toBe(true)
+    expect(w.text()).toContain('🌪️ 危机Alpha 专题分析')
+    expect(w.text()).toContain('本次回测未包含危机Alpha分析')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(1)
+  })
+
+  it('status=failed：显示失败原因 + 重新计算按钮', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: '主基准指数无数据（TQ 取数失败或代码不被支持）',
+        skipped_benchmarks: ['中证全指', '中证500'], computed_at: '2026-09-25T10:00:00',
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.text()).toContain('主基准指数无数据')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(1)
+  })
+
+  it('status=insufficient：显示样本不足说明且无重算按钮', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'insufficient',
+        error: '策略与基准共同交易日不足30天（12），无法分析',
+        skipped_benchmarks: [], computed_at: '2026-09-25T10:00:00',
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.text()).toContain('样本不足')
+    expect(w.text()).toContain('30')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(0)
+  })
+
+  it('status=completed：4 张 KPI 卡 + 状态条（跳过基准 + 计算时间 + 重新计算）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const kpis = w.findAll('.ca-kpi')
+    expect(kpis.length).toBe(4)
+    expect(kpis[0].text()).toContain('危机Alpha占比')
+    expect(kpis[0].text()).toContain('66.7%')
+    expect(kpis[1].text()).toContain('综合危机保护评分')
+    expect(kpis[1].text()).toContain('72.3')
+    expect(kpis[2].text()).toContain('下跌周逆势上涨比例')
+    expect(kpis[2].text()).toContain('3 / 6 周')
+    expect(kpis[3].text()).toContain('策略累计收益')
+    expect(kpis[3].text()).toContain('年化 6.0%')
+    expect(kpis[3].text()).toContain('MDD -5.0%')
+    const status = w.find('.ca-status').text()
+    expect(status).toContain('已跳过基准：中证全指、科创50')
+    expect(status).toContain('2026-09-25 10:00:00')
+    expect(w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算')).length).toBe(1)
+  })
+
+  it('点击重新计算 → 调 recomputeCrisisAlpha → 成功后重载详情并渲染 KPI', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(recomputeCrisisAlpha).toHaveBeenCalledWith(1)
+    expect(getBacktestDetail).toHaveBeenCalledTimes(2)
+    expect(w.find('.ca-msg').text()).toContain('重新计算完成')
+    expect(w.findAll('.ca-kpi').length).toBe(4)
+    expect(w.text()).toContain('66.7%')
+  })
+
+  it('重算返回 failed：显示失败原因，不抛错', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'failed', error: '主基准指数无数据', computed_at: null,
+    })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-msg').text()).toContain('主基准指数无数据')
+  })
+
+  it('重算接口抛错：显示失败提示', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockRejectedValue(new Error('boom'))
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-msg').text()).toContain('重新计算失败')
+  })
+
+  it('点击危机卡滚动到危机Alpha section', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.findAll('.stats-grid .stat-card')[6].trigger('click')
+    expect(scrollTargets.length).toBe(1)
+    expect(String(scrollTargets[0].className)).toContain('ca-section')
   })
 })
