@@ -240,12 +240,12 @@ export interface CrisisAlphaQuadrant {
   up_rate: number
   alpha_ratio: number
   follow_ratio: number
-  odds: number
+  odds: number | null
   counts: Record<string, number>
   avg_ret: Record<string, number>
   down_avg_s: number
   down_avg_b: number
-  win_avg: number
+  win_avg: number | null
   loss_avg: number
 }
 
@@ -304,22 +304,22 @@ export interface CrisisAlphaCost {
   drag: number
   sync_up: number
   elasticity: number
-  tail_corr: number
-  q1_corr: number
+  tail_corr: number | null
+  q1_corr: number | null
   n_up: number
 }
 
 export interface CrisisAlphaPerfSide {
   cum: number
   ann: number
-  vol: number
+  vol: number | null
   mdd: number
 }
 
 export interface CrisisAlphaPerformance {
   s: CrisisAlphaPerfSide
   b: CrisisAlphaPerfSide
-  corr: number
+  corr: number | null
   start: string
   end: string
 }
