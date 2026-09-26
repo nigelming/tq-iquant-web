@@ -902,7 +902,15 @@ function pctSigned(v: number | null | undefined, digits = 2): string {
 }
 
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
-function buildMetrics(m: BacktestEvaluationItem | null | undefined) {
+// 指标行；group 非空时为分组标题（跨两列渲染），label/value/cls 为空
+interface MetricRow {
+  group?: string
+  label?: string
+  value?: string
+  cls?: string
+}
+function _group(name: string): MetricRow { return { group: name } }
+function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[] {
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
     ? m.annual_return / m.volatility : null
@@ -925,6 +933,34 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined) {
     { label: '平均持仓天数', value: num(m.avg_holding_days, 1), cls: 'text-blue' },
     { label: 'Ulcer指数', value: num(m.ulcer_index, 2), cls: 'text-orange' },
     { label: '收益稳定性', value: num(m.return_stability, 2), cls: 'text-blue' },
+
+    // —— regime-alpha suite：基准相对 / 磨损仓位 / 持仓结构 / 路径质量 ——
+    _group('基准相对'),
+    { label: 'Beta', value: num(m.beta, 2), cls: 'text-blue' },
+    { label: 'Jensen Alpha', value: pctSigned(m.jensen_alpha), cls: valueClass(m.jensen_alpha) },
+    { label: '年化超额收益', value: pctSigned(m.excess_annual_return), cls: valueClass(m.excess_annual_return) },
+    { label: '跟踪误差', value: pct(m.tracking_error), cls: 'text-blue' },
+    { label: '信息比率', value: num(m.information_ratio, 2), cls: valueClass(m.information_ratio) },
+    { label: '上行捕获率', value: pct1(m.up_capture_ratio), cls: 'text-blue' },
+    { label: '下行捕获率', value: pct1(m.down_capture_ratio), cls: 'text-blue' },
+    { label: '超额最大回撤', value: pct(m.excess_max_drawdown), cls: valueClass(m.excess_max_drawdown) },
+
+    _group('磨损与仓位'),
+    { label: '年化换手率', value: num(m.annual_turnover, 2), cls: 'text-blue' },
+    { label: '交易成本占比', value: pct1(m.total_cost_ratio), cls: 'text-orange' },
+    { label: '平均仓位利用率', value: pct1(m.avg_position_utilization), cls: 'text-blue' },
+    { label: '空仓日占比', value: pct1(m.empty_days_ratio), cls: 'text-orange' },
+
+    _group('持仓结构'),
+    { label: '最大单票权重', value: pct1(m.max_single_weight), cls: 'text-orange' },
+    { label: 'HHI 集中度', value: num(m.hhi, 3), cls: 'text-orange' },
+
+    _group('路径质量'),
+    { label: '最长连亏天数', value: num(m.max_consecutive_loss_days, 0), cls: 'text-orange' },
+    { label: '最差日收益', value: pctSigned(m.worst_daily_return), cls: valueClass(m.worst_daily_return) },
+    { label: '最差周收益', value: pctSigned(m.worst_weekly_return), cls: valueClass(m.worst_weekly_return) },
+    { label: '收益偏度', value: num(m.return_skewness, 2), cls: 'text-blue' },
+    { label: '收益峰度', value: num(m.return_kurtosis, 2), cls: 'text-blue' },
   ]
 }
 
@@ -1856,20 +1892,26 @@ onUnmounted(() => {
         <div v-for="sc in strategyCards" :key="sc.strategy_id" class="strategy-card">
           <h3>{{ sc.strategy_name }}</h3>
           <div class="risk-metrics">
-            <div v-for="m in sc.metrics" :key="m.label" class="metric-row">
-              <span class="metric-label">{{ m.label }}</span>
-              <span :class="m.cls">{{ m.value }}</span>
-            </div>
+            <template v-for="m in sc.metrics" :key="m.group ?? m.label">
+              <div v-if="m.group" class="metric-group">{{ m.group }}</div>
+              <div v-else class="metric-row">
+                <span class="metric-label">{{ m.label }}</span>
+                <span :class="m.cls">{{ m.value }}</span>
+              </div>
+            </template>
           </div>
         </div>
         <!-- 组合整体卡 -->
         <div class="strategy-card portfolio-card">
           <h3>组合整体</h3>
           <div class="risk-metrics">
-            <div v-for="m in portfolioMetrics" :key="m.label" class="metric-row">
-              <span class="metric-label">{{ m.label }}</span>
-              <span :class="m.cls">{{ m.value }}</span>
-            </div>
+            <template v-for="m in portfolioMetrics" :key="m.group ?? m.label">
+              <div v-if="m.group" class="metric-group">{{ m.group }}</div>
+              <div v-else class="metric-row">
+                <span class="metric-label">{{ m.label }}</span>
+                <span :class="m.cls">{{ m.value }}</span>
+              </div>
+            </template>
           </div>
         </div>
       </div>
@@ -2144,6 +2186,18 @@ onUnmounted(() => {
 }
 .metric-label { color: #666; }
 .metric-row span:last-child { font-weight: 600; }
+/* 指标分组标题（基准相对/磨损与仓位/持仓结构/路径质量），跨两列 */
+.metric-group {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #4a5568;
+  border-left: 3px solid #667eea;
+  background: #eef1fb;
+  border-radius: 3px;
+}
 
 .text-green { color: #10b981; font-weight: 600; }
 .text-red { color: #ef4444; font-weight: 600; }

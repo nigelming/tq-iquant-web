@@ -896,3 +896,117 @@ def test_total_value_snapshot_tracks_real_price_changes():
     # 再来残缺场景也沿用最新价 7
     t3 = datetime(2026, 8, 25, 10, 1)
     assert port.total_value(BarEvent(stocks={"000001.SZ": _ohlcv(7)}, bar_time=t3)) == Decimal("97000")
+
+
+# ===========================================================================
+# 持仓明细 positions_detail（Task 3 / FR-4）：快照携带 code/quantity/可卖/市值/成本
+# 只增字段，供回测落 positions_json；实盘不调用 Portfolio.snapshot，不受影响。
+# ===========================================================================
+def _portfolio_with_lots(holdings, cash=Decimal("100000")):
+    """holdings: [(code, qty, avg_cost, buy_date)]，建立带 T+1 分桶的持仓。"""
+    from datetime import date as _date
+    port = _portfolio_with_holdings(
+        [(c, q, cost) for c, q, cost, _ in holdings], cash=cash,
+    )
+    ctx = port.strategies[0]
+    ctx.positions = {}
+    for code, qty, avg_cost, buy_date in holdings:
+        pos = Position(code)
+        pos.quantity = qty
+        pos.avg_cost = Decimal(str(avg_cost))
+        pos.buy_time = datetime(buy_date.year, buy_date.month, buy_date.day, 10, 0)
+        pos._lots[buy_date] = qty
+        ctx.positions[code] = pos
+    return port, ctx
+
+
+def test_snapshot_positions_detail_fields_and_t1():
+    """T-1 日买入 1000@10：买入当日可卖 0，次日收盘 10.5 → 可卖 1000、市值 10500。"""
+    port, _ = _portfolio_with_lots(
+        [("000001.SZ", 1000, 10, datetime(2026, 7, 29).date())], cash=90000,
+    )
+    # 买入当日（2026-07-29）：T+1 可卖 0，按当日收盘 10 估值
+    snap_d0 = port.snapshot(
+        datetime(2026, 7, 29).date(), Decimal("100000"),
+        _bar("000001.SZ", "10", datetime(2026, 7, 29, 15, 0)),
+    )
+    p0 = snap_d0["positions"][0]
+    assert p0["stock_code"] == "000001.SZ"
+    assert p0["quantity"] == 1000
+    assert p0["sellable_quantity"] == 0
+    assert Decimal(p0["market_value"]) == Decimal("10000")
+    assert Decimal(p0["cost_value"]) == Decimal("10000")
+
+    # 次日：可卖 1000，市值按最新收盘 10.5
+    snap_d1 = port.snapshot(
+        datetime(2026, 7, 30).date(), Decimal("100500"),
+        _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0)),
+    )
+    p1 = snap_d1["positions"][0]
+    assert p1["sellable_quantity"] == 1000
+    assert Decimal(p1["market_value"]) == Decimal("10500")
+    assert Decimal(p1["cost_value"]) == Decimal("10000")
+
+
+def test_snapshot_positions_empty_list_when_flat():
+    """无持仓 → positions 为 []（键存在，空仓日计入 HHI）。"""
+    port, _ = _portfolio_with_lots([], cash=100000)
+    snap = port.snapshot(
+        datetime(2026, 7, 30).date(), Decimal("100000"),
+        _bar("000001.SZ", "10", datetime(2026, 7, 30, 15, 0)),
+    )
+    assert snap["positions"] == []
+    # 既有字段不受影响
+    assert set(snap) >= {"snap_date", "total_value", "cash", "market_value", "positions"}
+
+
+def test_positions_detail_aggregates_same_code_across_strategies():
+    """组合层：两策略持同一只票 → 聚合成一条，数量/可卖/市值/成本相加，按代码排序。"""
+    port, ctx1 = _portfolio_with_lots(
+        [("000001.SZ", 1000, 10, datetime(2026, 7, 29).date())], cash=80000,
+    )
+    ctx2 = StrategyContext(
+        strategy_id=2, period="1d",
+        capital_ratio=Decimal("0.4"), max_positions=5,
+    )
+    pos2 = Position("000001.SZ")
+    pos2.quantity = 1000
+    pos2.avg_cost = Decimal("10")
+    pos2.buy_time = datetime(2026, 7, 29, 10, 0)
+    pos2._lots[datetime(2026, 7, 29).date()] = 1000
+    ctx2.positions["000001.SZ"] = pos2
+    port.strategies.append(ctx2)
+
+    port.snapshot(
+        datetime(2026, 7, 30).date(), Decimal("100000"),
+        _bar("000001.SZ", "10", datetime(2026, 7, 30, 15, 0)),
+    )
+    detail = port.positions_detail(datetime(2026, 7, 30).date())
+    assert len(detail) == 1
+    assert detail[0]["quantity"] == 2000
+    assert detail[0]["sellable_quantity"] == 2000
+    assert Decimal(detail[0]["market_value"]) == Decimal("20000")
+    assert Decimal(detail[0]["cost_value"]) == Decimal("20000")
+
+
+def test_positions_detail_per_strategy_ctx_is_isolated():
+    """策略层：ctx 过滤只出该策略持仓。"""
+    port, ctx1 = _portfolio_with_lots(
+        [("000001.SZ", 1000, 10, datetime(2026, 7, 29).date())], cash=80000,
+    )
+    ctx2 = StrategyContext(
+        strategy_id=2, period="1d",
+        capital_ratio=Decimal("0.4"), max_positions=5,
+    )
+    pos2 = Position("600000.SH")
+    pos2.quantity = 500
+    pos2.avg_cost = Decimal("20")
+    pos2.buy_time = datetime(2026, 7, 29, 10, 0)
+    pos2._lots[datetime(2026, 7, 29).date()] = 500
+    ctx2.positions["600000.SH"] = pos2
+    port.strategies.append(ctx2)
+
+    d1 = port.positions_detail(datetime(2026, 7, 30).date(), ctx=ctx1)
+    d2 = port.positions_detail(datetime(2026, 7, 30).date(), ctx=ctx2)
+    assert [p["stock_code"] for p in d1] == ["000001.SZ"]
+    assert [p["stock_code"] for p in d2] == ["600000.SH"]

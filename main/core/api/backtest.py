@@ -47,6 +47,7 @@ from core.services.backtest_service import (  # noqa: E402
     delete_record as _svc_delete_record,
     run_backtest as _svc_run_backtest,
     recompute_crisis_alpha as _svc_recompute_crisis_alpha,
+    recompute_evaluation as _svc_recompute_evaluation,
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
 from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
@@ -80,6 +81,15 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
 @router.post("/records/{record_id}/crisis-alpha/recompute")
 def recompute_record_crisis_alpha(record_id: int, db: Session = Depends(get_db)):
     result = _svc_recompute_crisis_alpha(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/evaluations/recompute")
+def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
+    """离线重算组合级评估（不重跑回测），供老记录补算基准相对等新增指标。"""
+    result = _svc_recompute_evaluation(db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)

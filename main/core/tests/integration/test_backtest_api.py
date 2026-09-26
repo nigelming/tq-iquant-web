@@ -544,6 +544,29 @@ def test_post_recompute_crisis_alpha_not_found(client):
     assert body["code"] == 404
 
 
+def test_post_recompute_evaluation_returns_payload(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    monkeypatch.setattr(
+        bt_api, "_svc_recompute_evaluation",
+        lambda db, rid: {"status": "ok", "evaluations": {"beta": 0.5}},
+    )
+    body = c.post(f"/api/backtest/records/{record_id}/evaluations/recompute").json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "ok"
+    assert body["data"]["evaluations"]["beta"] == 0.5
+
+
+def test_post_recompute_evaluation_not_found(client):
+    c, _ = client
+    body = c.post("/api/backtest/records/999999/evaluations/recompute").json()
+    assert body["code"] == 404
+
+
 def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     c, Session = client
     db = Session()

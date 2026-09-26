@@ -202,5 +202,7 @@ class BacktestEngine:
                 "total_value": total_value,
                 "cash": allocated_cash,
                 "market_value": market_value,
+                # 策略层持仓明细（只含本策略，供 strategy 维度 positions_json）
+                "positions": portfolio.positions_detail(snap_date, ctx=ctx),
             })
         return snaps

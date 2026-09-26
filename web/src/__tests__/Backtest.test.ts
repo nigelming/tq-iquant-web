@@ -578,6 +578,66 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     expect(negSpan.classes()).toContain('text-green')
   })
 
+  it('新增评估指标：四分组标题与值渲染，null 值显 —', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      evaluations: {
+        ...mockDetail.evaluations,
+        beta: 0.85, jensen_alpha: 0.062, excess_annual_return: 0.041,
+        tracking_error: 0.073, information_ratio: 0.56,
+        up_capture_ratio: 0.92, down_capture_ratio: 0.71,
+        excess_max_drawdown: -0.032,
+        annual_turnover: 3.25, total_cost_ratio: 0.002,
+        avg_position_utilization: 0.64, empty_days_ratio: 0.1,
+        max_single_weight: null, hhi: null,
+        max_consecutive_loss_days: 4, worst_daily_return: -0.025,
+        worst_weekly_return: -0.041, return_skewness: -0.3, return_kurtosis: 1.2,
+      },
+      strategy_evaluations: [
+        { strategy_id: 1, strategy_name: '唯一策略', total_return: 0.05 },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    // 四个分组标题渲染
+    for (const g of ['基准相对', '磨损与仓位', '持仓结构', '路径质量']) {
+      expect(w.find('.portfolio-card').text()).toContain(g)
+    }
+
+    const rows = w.findAll('.portfolio-card .metric-row')
+    const rowValue = (label: string) =>
+      rows.find(r => r.find('.metric-label').text() === label)!.find('span:last-child').text()
+    // 基准相对
+    expect(rowValue('Beta')).toBe('0.85')
+    expect(rowValue('Jensen Alpha')).toBe('+6.20%')
+    expect(rowValue('年化超额收益')).toBe('+4.10%')
+    expect(rowValue('跟踪误差')).toBe('7.30%')
+    expect(rowValue('信息比率')).toBe('0.56')
+    expect(rowValue('上行捕获率')).toBe('92.0%')
+    expect(rowValue('下行捕获率')).toBe('71.0%')
+    expect(rowValue('超额最大回撤')).toBe('-3.20%')
+    // 磨损与仓位
+    expect(rowValue('年化换手率')).toBe('3.25')
+    expect(rowValue('交易成本占比')).toBe('0.2%')
+    expect(rowValue('平均仓位利用率')).toBe('64.0%')
+    expect(rowValue('空仓日占比')).toBe('10.0%')
+    // 结构：无持仓明细（positions_json 老记录）→ null 显 —
+    expect(rowValue('最大单票权重')).toBe('—')
+    expect(rowValue('HHI 集中度')).toBe('—')
+    // 路径
+    expect(rowValue('最长连亏天数')).toBe('4')
+    expect(rowValue('最差日收益')).toBe('-2.50%')
+    expect(rowValue('最差周收益')).toBe('-4.10%')
+    expect(rowValue('收益偏度')).toBe('-0.30')
+    expect(rowValue('收益峰度')).toBe('1.20')
+
+    // 分组标题不是普通指标行（不占 metric-row）
+    expect(w.findAll('.portfolio-card .metric-group').length).toBe(4)
+  })
+
   it('摘要卡结构：positive（总收益/年化收益）+ danger（最大回撤）存在且各自取值', async () => {
     const w = mount(Backtest)
     await flushPromises()

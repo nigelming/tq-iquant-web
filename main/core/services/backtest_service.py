@@ -28,6 +28,7 @@ from core.models import (
     BacktestDecisionEvent, BacktestCrisisAlpha,
 )
 from core.engine.backtest_engine import BacktestEngine
+from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
@@ -618,6 +619,101 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
     }
 
 
+# 评估指标落库字段（运行落库与离线重算共用，避免两处漂移）
+_EVALUATION_FIELDS = (
+    "total_return", "annual_return", "max_drawdown", "volatility",
+    "sharpe_ratio", "sortino_ratio", "calmar_ratio", "win_rate",
+    "profit_factor", "total_trades", "benchmark_return", "avg_holding_days",
+    "var_95", "cvar_95", "avg_recovery_days", "max_recovery_days",
+    "ulcer_index", "return_stability",
+    "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
+    "information_ratio", "up_capture_ratio", "down_capture_ratio",
+    "excess_max_drawdown",
+    "annual_turnover", "total_cost_ratio", "avg_position_utilization",
+    "empty_days_ratio", "max_single_weight", "hhi",
+    "max_consecutive_loss_days", "worst_daily_return", "worst_weekly_return",
+    "return_skewness", "return_kurtosis",
+)
+
+
+def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
+    """从 DB 快照 + 成交离线重算组合级评估并 upsert（老记录补新增指标用）。
+
+    不重跑回测、不触碰行情；相对指标依赖快照 benchmark_value（老记录已落该列）。
+    策略层评估无基准值，重算不会带来新字段，故只更新组合级行。
+    记录不存在返回 None（路由 404）；快照不足返回 failed 状态。
+    """
+    from types import SimpleNamespace
+
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if len(snaps) < 2:
+        return {"status": "failed", "error": "组合日快照不足 2 条，无法重算评估"}
+
+    snap_dicts = [
+        {
+            "snap_date": s.snap_date,
+            "total_value": s.total_value,
+            "cash": s.cash,
+            "market_value": s.market_value,
+            "benchmark_value": s.benchmark_value,
+            # 仅新回测有 positions_json；"[]" 也是有效负载（空仓日计入 HHI）
+            "positions": json.loads(s.positions_json) if s.positions_json else None,
+        }
+        for s in snaps
+    ]
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestTrade.bar_time)
+        .all()
+    )
+    trade_objs = [
+        SimpleNamespace(
+            strategy_id=t.strategy_id,
+            stock_code=t.stock_code,
+            # Evaluator FIFO 只读 trade_type.value
+            trade_type=SimpleNamespace(value=t.trade_type),
+            price=t.price,
+            quantity=t.quantity,
+            amount=t.amount,
+            commission=t.commission,
+            stamp_duty=t.stamp_duty,
+            trade_time=t.bar_time,
+        )
+        for t in trades
+    ]
+    ev = Evaluator().evaluate(snap_dicts, trades=trade_objs)
+    if not ev:
+        return {"status": "failed", "error": "快照序列无法产出评估结果"}
+
+    row = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestEvaluation(
+            backtest_record_id=record_id,
+            target_type="portfolio",
+            target_id=rec.portfolio_strategy_id,
+        )
+        db.add(row)
+    for f in _EVALUATION_FIELDS:
+        setattr(row, f, ev.get(f))
+    db.commit()
+
+    return {"status": "ok", "evaluations": _serialize_evaluation(row)}
+
+
 
 # --- 公式信号 ---
 # TQ 公式输出中需跳过的非变量键
@@ -844,30 +940,18 @@ def _persist_result(
             daily_return=snap.get("daily_return"),
             cumulative_return=snap.get("cumulative_return"),
             benchmark_value=snap.get("benchmark_value"),
+            # 新回测才有 positions 键；空仓写 "[]"（有效负载），老引擎结果为 None
+            positions_json=(
+                json.dumps(snap["positions"], default=str)
+                if snap.get("positions") is not None else None
+            ),
         ))
     ev = result.get("evaluations") or {}
     db.add(BacktestEvaluation(
         backtest_record_id=record_id,
         target_type="portfolio",
         target_id=ps_id,
-        total_return=ev.get("total_return"),
-        annual_return=ev.get("annual_return"),
-        max_drawdown=ev.get("max_drawdown"),
-        volatility=ev.get("volatility"),
-        sharpe_ratio=ev.get("sharpe_ratio"),
-        sortino_ratio=ev.get("sortino_ratio"),
-        calmar_ratio=ev.get("calmar_ratio"),
-        win_rate=ev.get("win_rate"),
-        profit_factor=ev.get("profit_factor"),
-        total_trades=ev.get("total_trades"),
-        benchmark_return=ev.get("benchmark_return"),
-        avg_holding_days=ev.get("avg_holding_days"),
-        var_95=ev.get("var_95"),
-        cvar_95=ev.get("cvar_95"),
-        avg_recovery_days=ev.get("avg_recovery_days"),
-        max_recovery_days=ev.get("max_recovery_days"),
-        ulcer_index=ev.get("ulcer_index"),
-        return_stability=ev.get("return_stability"),
+        **{f: ev.get(f) for f in _EVALUATION_FIELDS},
     ))
 
     # ---- 策略层快照 + 评估 ----
@@ -883,30 +967,17 @@ def _persist_result(
                 total_value=snap["total_value"],
                 cash=snap.get("cash", Decimal("0")),
                 market_value=snap.get("market_value", Decimal("0")),
+                positions_json=(
+                    json.dumps(snap["positions"], default=str)
+                    if snap.get("positions") is not None else None
+                ),
             ))
     for sid, sev in strategy_evals.items():
         db.add(BacktestEvaluation(
             backtest_record_id=record_id,
             target_type="strategy",
             target_id=sid,
-            total_return=sev.get("total_return"),
-            annual_return=sev.get("annual_return"),
-            max_drawdown=sev.get("max_drawdown"),
-            volatility=sev.get("volatility"),
-            sharpe_ratio=sev.get("sharpe_ratio"),
-            sortino_ratio=sev.get("sortino_ratio"),
-            calmar_ratio=sev.get("calmar_ratio"),
-            win_rate=sev.get("win_rate"),
-            profit_factor=sev.get("profit_factor"),
-            total_trades=sev.get("total_trades"),
-            benchmark_return=sev.get("benchmark_return"),
-            avg_holding_days=sev.get("avg_holding_days"),
-            var_95=sev.get("var_95"),
-            cvar_95=sev.get("cvar_95"),
-            avg_recovery_days=sev.get("avg_recovery_days"),
-            max_recovery_days=sev.get("max_recovery_days"),
-            ulcer_index=sev.get("ulcer_index"),
-            return_stability=sev.get("return_stability"),
+            **{f: sev.get(f) for f in _EVALUATION_FIELDS},
         ))
 
     # ---- 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条，调参可观测性）----
@@ -1045,6 +1116,25 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "max_recovery_days": e.max_recovery_days,
         "ulcer_index": _f(e.ulcer_index),
         "return_stability": _f(e.return_stability),
+        "beta": _f(e.beta),
+        "jensen_alpha": _f(e.jensen_alpha),
+        "excess_annual_return": _f(e.excess_annual_return),
+        "tracking_error": _f(e.tracking_error),
+        "information_ratio": _f(e.information_ratio),
+        "up_capture_ratio": _f(e.up_capture_ratio),
+        "down_capture_ratio": _f(e.down_capture_ratio),
+        "excess_max_drawdown": _f(e.excess_max_drawdown),
+        "annual_turnover": _f(e.annual_turnover),
+        "total_cost_ratio": _f(e.total_cost_ratio),
+        "avg_position_utilization": _f(e.avg_position_utilization),
+        "empty_days_ratio": _f(e.empty_days_ratio),
+        "max_single_weight": _f(e.max_single_weight),
+        "hhi": _f(e.hhi),
+        "max_consecutive_loss_days": e.max_consecutive_loss_days,
+        "worst_daily_return": _f(e.worst_daily_return),
+        "worst_weekly_return": _f(e.worst_weekly_return),
+        "return_skewness": _f(e.return_skewness),
+        "return_kurtosis": _f(e.return_kurtosis),
     }
 
 

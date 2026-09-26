@@ -173,6 +173,44 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
         backtest_record_id=rec.id, target_type="portfolio").count() == 1
 
 
+def test_run_backtest_persists_positions_json(db_session, monkeypatch):
+    """新回测：快照 positions 明细落 positions_json；空仓日落 "[]" 而非 NULL。"""
+    ps, _ = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, k: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+
+    snapshots = [
+        {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
+         "cash": Decimal("100000"), "market_value": Decimal("0"),
+         "positions": []},
+        {"snap_date": date(2026, 7, 30), "total_value": Decimal("100000"),
+         "cash": Decimal("90000"), "market_value": Decimal("10000"),
+         "positions": [{
+             "stock_code": "000001.SZ", "quantity": 1000, "sellable_quantity": 1000,
+             "market_value": "10000.0", "cost_value": "10000.0",
+         }]},
+    ]
+    fake_result = {
+        "trades": [], "snapshots": snapshots,
+        "evaluations": {"total_return": Decimal("0")},
+        "strategy_snapshots": {}, "strategy_evaluations": {},
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+    result = svc.run_backtest(db_session, ps, _req())
+
+    rows = db_session.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=result["record_id"], target_type="portfolio",
+    ).order_by(BacktestDailySnapshot.snap_date).all()
+    assert rows[0].positions_json == "[]"  # 空仓日是有效负载
+    payload = json.loads(rows[1].positions_json)
+    assert payload[0]["stock_code"] == "000001.SZ"
+    assert payload[0]["quantity"] == 1000
+    assert payload[0]["sellable_quantity"] == 1000
+
+
 def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkeypatch):
     """空行情保护：TQ 拉不到 K 线 → 标 failed 并写明原因，返回零计数，不抛异常。"""
     ps, _ = _seed(db_session)
@@ -852,6 +890,114 @@ def test_recompute_crisis_alpha_without_snapshots_returns_failed(db_session):
     out = svc.recompute_crisis_alpha(db_session, rec.id)
     assert out["status"] == "failed"
     assert "无组合日快照" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# recompute_evaluation：离线从 DB 快照/成交重算评估（老记录补基准相对指标）
+# ---------------------------------------------------------------------------
+def _seed_linear_snapshots(db, rec, ps, n_days=25):
+    """25 日线性序列入库：rs=0.5*rb+0.0003，rb 循环 ±1%/±2%（同 evaluator 测试）。
+
+    快照列仅 Numeric(15,2)，基准则放大到百万点级以压低 2 位小数舍入噪声
+    （服务测试只验证接线，数学精度已在 evaluator 单测固化）。
+    """
+    from datetime import timedelta
+    rb_seq = [0.01, -0.01, 0.02, -0.02]
+    vs, vb = 100_000_000.0, 10_000_000.0
+    for i in range(n_days):
+        db.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=date(2024, 1, 1) + timedelta(days=i),
+            total_value=Decimal(str(round(vs, 2))),
+            cash=Decimal("0"), market_value=Decimal(str(round(vs, 2))),
+            benchmark_value=Decimal(str(round(vb, 2))),
+        ))
+        rb = rb_seq[i % 4]
+        vs *= 1 + 0.5 * rb + 0.0003
+        vb *= 1 + rb
+    db.commit()
+
+
+def test_recompute_evaluation_fills_relative_metrics(db_session):
+    rec, ps = _seed_record(db_session)
+    _seed_linear_snapshots(db_session, rec, ps)
+    db_session.add(BacktestTrade(
+        backtest_record_id=rec.id, strategy_id=1, signal_name="", signal_type="OPEN",
+        stock_code="000001.SZ", trade_type="BUY",
+        price=Decimal("10"), quantity=1000, amount=Decimal("10000"),
+        commission=Decimal("5"), stamp_duty=Decimal("0"),
+        bar_time=datetime(2024, 1, 1, 10, 0),
+    ))
+    db_session.commit()
+
+    out = svc.recompute_evaluation(db_session, rec.id)
+    assert out["status"] == "ok"
+    assert out["evaluations"]["beta"] == pytest.approx(0.5, abs=1e-3)
+    assert out["evaluations"]["excess_annual_return"] == pytest.approx(0.0756, abs=2e-3)
+    assert out["evaluations"]["up_capture_ratio"] == pytest.approx(0.52, abs=1e-2)
+    assert out["evaluations"]["total_trades"] == 1
+
+    row = db_session.query(BacktestEvaluation).filter_by(
+        backtest_record_id=rec.id, target_type="portfolio").one()
+    assert float(row.beta) == pytest.approx(0.5, abs=1e-3)
+
+
+def test_recompute_evaluation_updates_existing_row_in_place(db_session):
+    rec, ps = _seed_record(db_session)
+    _seed_linear_snapshots(db_session, rec, ps)
+    # 老评估行：新指标列全 NULL（模拟老记录）
+    db_session.add(BacktestEvaluation(
+        backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+        total_return=Decimal("0.1"), beta=None,
+    ))
+    db_session.commit()
+
+    out = svc.recompute_evaluation(db_session, rec.id)
+    assert out["status"] == "ok"
+    rows = db_session.query(BacktestEvaluation).filter_by(
+        backtest_record_id=rec.id, target_type="portfolio").all()
+    assert len(rows) == 1  # upsert，不新增
+    assert rows[0].beta == Decimal("0.5000")
+
+
+def test_recompute_evaluation_none_for_missing_record(db_session):
+    assert svc.recompute_evaluation(db_session, 9999) is None
+
+
+def test_recompute_evaluation_failed_without_snapshots(db_session):
+    rec, _ = _seed_record(db_session)
+    out = svc.recompute_evaluation(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "快照不足" in out["error"]
+
+
+def test_recompute_evaluation_reads_positions_json(db_session):
+    """positions_json（仅新回测有）经重算进入 HHI / 最大单票权重。"""
+    from datetime import timedelta
+    rec, ps = _seed_record(db_session)
+    for i in range(24):
+        holdings = (
+            [{"stock_code": "A", "market_value": 60000},
+             {"stock_code": "B", "market_value": 40000}]
+            if i % 2 == 0
+            else [{"stock_code": "A", "market_value": 100000}]
+        )
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=date(2024, 1, 1) + timedelta(days=i),
+            total_value=Decimal("100000"),
+            cash=Decimal("0"), market_value=Decimal("100000"),
+            benchmark_value=Decimal("1000"),
+            positions_json=json.dumps(holdings),
+        ))
+    db_session.commit()
+
+    out = svc.recompute_evaluation(db_session, rec.id)
+    assert out["status"] == "ok"
+    assert out["evaluations"]["hhi"] == 0.76
+    assert out["evaluations"]["max_single_weight"] == 1.0
+    # 基准恒定 → 相对指标仍为 None（互不干扰）
+    assert out["evaluations"]["beta"] is None
 
 
 def test_get_record_detail_includes_crisis_alpha(db_session, monkeypatch):

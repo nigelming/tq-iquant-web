@@ -154,6 +154,28 @@ export interface BacktestEvaluationItem {
   max_recovery_days: number | null
   ulcer_index: number | null
   return_stability: number | null
+  // 基准相对 8 指标（regime-alpha suite）
+  beta: number | null
+  jensen_alpha: number | null
+  excess_annual_return: number | null
+  tracking_error: number | null
+  information_ratio: number | null
+  up_capture_ratio: number | null
+  down_capture_ratio: number | null
+  excess_max_drawdown: number | null
+  // 磨损/仓位/结构 6 指标
+  annual_turnover: number | null
+  total_cost_ratio: number | null
+  avg_position_utilization: number | null
+  empty_days_ratio: number | null
+  max_single_weight: number | null
+  hhi: number | null
+  // 路径 5 指标
+  max_consecutive_loss_days: number | null
+  worst_daily_return: number | null
+  worst_weekly_return: number | null
+  return_skewness: number | null
+  return_kurtosis: number | null
 }
 
 // 策略评估（详情内嵌，含 strategy_id/name）— 对齐 backtest get_record strategy_evaluations
