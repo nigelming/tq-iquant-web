@@ -761,6 +761,11 @@ async function mountDetail(detailPayload: any) {
   const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
   await viewBtn.trigger('click')
   await flushPromises()
+  const caHeader = w.find('.ca-header')
+  if (caHeader.exists()) {
+    await caHeader.trigger('click')
+    await flushPromises()
+  }
   return w
 }
 
@@ -1221,5 +1226,67 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
     await flushPromises()
     expect(w.findAll('.ca-chart').length).toBe(9)
     expect(w.text()).toContain('重新计算完成')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha section 折叠', () => {
+  async function mountCollapsed(detailPayload: any) {
+    ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  it('进入详情默认折叠：标题可见，KPI/图表/模块均不渲染', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.find('.ca-header').exists()).toBe(true)
+    expect(w.text()).toContain('🌪️ 危机Alpha 专题分析')
+    expect(w.find('.ca-caret').classes()).not.toContain('open')
+    expect(w.findAll('.ca-kpi').length).toBe(0)
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.text()).not.toContain('一、核心结论')
+  })
+
+  it('点击标题展开：渲染 KPI/9 图表/12 模块，箭头旋转', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-caret').classes()).toContain('open')
+    expect(w.findAll('.ca-kpi').length).toBe(4)
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(w.text()).toContain('十二、全部下跌周明细（6 周）')
+  })
+
+  it('展开后再次点击折叠', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.find('.ca-caret').classes()).not.toContain('open')
+  })
+
+  it('折叠态点危机卡：自动展开内容并滚动到 section', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    await w.findAll('.stats-grid .stat-card')[6].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(scrollTargets.length).toBe(1)
+    expect(String(scrollTargets[0].className)).toContain('ca-section')
+  })
+
+  it('crisis_alpha=null 折叠态：展开后才显示重新计算按钮', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: null })
+    expect(w.text()).not.toContain('本次回测未包含危机Alpha分析')
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('本次回测未包含危机Alpha分析')
+    expect(w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算')).length).toBe(1)
   })
 })
