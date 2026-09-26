@@ -308,11 +308,6 @@ def build_open_prices(ps, klines: dict) -> dict:
 def build_index_close_series(
     codes: List[str], start: date, end: date
 ) -> Dict[str, Dict[date, Decimal]]:
-    """批量拉多个指数的日线收盘：{code: {date: close}}。
-
-    一次 get_history_raw 取全部 code（主基准 + 6 宽基），按 code 拆分。
-    TQ 异常/无数据返回空 dict；单个 code 缺列则该 code 不出现在结果里（视作跳过）。
-    """
     wanted = [c for c in dict.fromkeys(codes) if c]
     if not wanted:
         return {}
@@ -359,11 +354,6 @@ def build_index_close_series(
 def build_benchmark_data(
     ps, start: date, end: date, db: Session = None
 ) -> Dict[date, Decimal]:
-    """拉基准指数收盘价：{snap_date: close_value}。
-
-    基准代码取 ps.benchmark_index（默认 000300.SH），委托 build_index_close_series
-    批量取数（单 code）。取数失败/无数据返回空 dict（前端据此隐藏基准线）。
-    """
     index_code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
     return build_index_close_series([index_code], start, end).get(index_code, {})
 
@@ -441,7 +431,6 @@ def compute_and_store_crisis_alpha(
     start: date,
     end: date,
 ) -> BacktestCrisisAlpha:
-    """算 12 模块结果并落库（独立事务）。主基准缺数→failed，共同交易日不足→insufficient。"""
     benchmark_code = _crisis_benchmark_code(ps)
     benchmark_name = _crisis_benchmark_name(benchmark_code)
     codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
@@ -490,7 +479,6 @@ def safe_compute_crisis_alpha(
     start: date,
     end: date,
 ) -> Optional[BacktestCrisisAlpha]:
-    """compute_and_store 的兜底包装：任何异常都只落 failed 行，绝不向回测主链路抛出。"""
     try:
         return compute_and_store_crisis_alpha(db, record_id, ps, snapshots, start, end)
     except Exception as exc:
@@ -507,7 +495,6 @@ def safe_compute_crisis_alpha(
 
 
 def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
-    """从库内组合日快照重算并覆盖写（旧回测补算入口）。记录不存在返回 None。"""
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
         return None
