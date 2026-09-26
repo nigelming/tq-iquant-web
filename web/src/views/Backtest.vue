@@ -478,26 +478,36 @@ function initCaPieChart() {
   const p = caPie.value
   caPieChart?.dispose()
   caPieChart = echarts.init(caPieEl.value)
+  const total = p.values.reduce((a, b) => a + b, 0) || 1
+  const names = p.labels.map((lb) => String(lb).split('  ')[0])
+  const pctByName: Record<string, string> = {}
+  names.forEach((nm, i) => {
+    pctByName[nm] = `${((p.values[i] / total) * 100).toFixed(1)}%`
+  })
   caPieChart.setOption({
     tooltip: { trigger: 'item', formatter: '{b}: {c}周' },
-    legend: { bottom: 0, textStyle: { fontSize: 12 } },
+    legend: {
+      orient: 'vertical', right: 12, top: 'center',
+      icon: 'roundRect', itemWidth: 15, itemHeight: 15, itemGap: 16,
+      textStyle: { fontSize: 13, color: '#374151' },
+      formatter: (name: string) => `${name}   ${pctByName[name] ?? ''}`,
+    },
     series: [{
       type: 'pie',
-      radius: ['62%', '84%'],
-      center: ['50%', '46%'],
+      radius: ['48%', '80%'],
+      center: ['30%', '50%'],
       sort: false,
       itemStyle: { borderColor: '#fff', borderWidth: 2 },
-      label: { show: true, position: 'inner', color: '#fff', fontSize: 12,
-        formatter: (x: any) => String(x.name).split('  ')[0] },
+      label: { show: false },
       labelLine: { show: false },
-      data: p.labels.map((lb, i) => ({
-        name: lb, value: p.values[i], itemStyle: { color: p.colors[i] },
+      data: names.map((nm, i) => ({
+        name: nm, value: p.values[i], itemStyle: { color: p.colors[i] },
       })),
     }],
     graphic: [
-      { type: 'text', left: 'center', top: '38%',
+      { type: 'text', left: '30%', top: '38%',
         style: { text: `${p.alpha}%`, fontSize: 30, fontWeight: 800, fill: '#d6403a', textAlign: 'center' } },
-      { type: 'text', left: 'center', top: '56%',
+      { type: 'text', left: '30%', top: '56%',
         style: { text: '危机Alpha', fontSize: 13, fill: '#1f3a68', textAlign: 'center' } },
     ],
   })
@@ -1590,7 +1600,7 @@ onUnmounted(() => {
 
         <div class="section-title" style="font-size:14px">三、危机Alpha四档分类</div>
         <div class="chart-box">
-          <div ref="caPieEl" class="ca-chart"></div>
+          <div ref="caPieEl" class="ca-chart" style="min-height:440px"></div>
         </div>
         <div class="table-container">
           <table>
