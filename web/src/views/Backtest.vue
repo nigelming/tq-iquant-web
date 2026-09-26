@@ -380,6 +380,16 @@ const caDownRows = computed(() => (ca.value?.down_weeks ?? []).map((r) => ({
   color: CRISIS_COLORS[r.分类] || '#111827',
 })))
 
+// ===== 模块十二：下跌周明细分页（与交易明细同款）=====
+const caDownPage = ref(1)
+const caDownPageSize = 20
+const caDownTotalPages = computed(() => Math.max(1, Math.ceil(caDownRows.value.length / caDownPageSize)))
+const pagedCaDownRows = computed(() => {
+  const page = Math.min(caDownPage.value, caDownTotalPages.value)
+  const start = (page - 1) * caDownPageSize
+  return caDownRows.value.slice(start, start + caDownPageSize)
+})
+
 function caBenchmarkWarnText(br: CrisisAlphaBenchmarkResolution): string {
   const used = br.benchmark_name
   const live = br.live_benchmark_name
@@ -816,6 +826,7 @@ async function openDetail(id: number) {
   }
   currentRecord.value = detail.value?.record || null
   currentPage.value = 1
+  caDownPage.value = 1
   selectedKey.value = null
   caCollapsed.value = true
   // 等 DOM 渲染后初始化图表
@@ -1819,7 +1830,7 @@ onUnmounted(() => {
           <table class="ca-down-table">
             <thead><tr><th>日期</th><th>基准</th><th>策略</th><th>超额</th><th>分类</th></tr></thead>
             <tbody>
-              <tr v-for="r in caDownRows" :key="r.日期">
+              <tr v-for="r in pagedCaDownRows" :key="r.日期">
                 <td>{{ r.日期 }}</td>
                 <td class="text-green">{{ r.基准 }}</td>
                 <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
@@ -1828,6 +1839,11 @@ onUnmounted(() => {
               </tr>
             </tbody>
           </table>
+          <div v-if="caDownRows.length > caDownPageSize" class="pagination">
+            <button :disabled="caDownPage === 1" @click="caDownPage--" class="page-btn">上一页</button>
+            <span class="page-info">第 {{ Math.min(caDownPage, caDownTotalPages) }} / {{ caDownTotalPages }} 页</span>
+            <button :disabled="caDownPage >= caDownTotalPages" @click="caDownPage++" class="page-btn">下一页</button>
+          </div>
         </div>
       </template>
       </template>

@@ -1205,6 +1205,35 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
     expect(text.indexOf('2024-01-26')).toBeLessThan(text.indexOf('2024-01-05'))
   })
 
+  it('十二：下跌周超 20 行时分页（每页 20 条，可上下翻页）', async () => {
+    const ca25: any = JSON.parse(JSON.stringify(crisisAlphaCompleted))
+    ca25.data.down_weeks = Array.from({ length: 25 }, (_, i) => ({
+      日期: `2024-${String(Math.floor(i / 5) + 1).padStart(2, '0')}-${String((i % 5) + 5).padStart(2, '0')}`,
+      基准收益: -0.01, 策略收益: -0.005, 超额: 0.005, 分类: '跌得少',
+    }))
+    ca25.data.quadrant.n_down = 25
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: ca25 })
+    expect(w.text()).toContain('十二、全部下跌周明细（25 周）')
+
+    const pageInfo = () => w.find('.ca-down-table').element.parentElement?.querySelector('.page-info')?.textContent
+    const pager = () => w.find('.ca-down-table').element.parentElement?.querySelector('.pagination')
+    expect(pager()).toBeTruthy()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(20)
+    expect(pageInfo()).toContain('第 1 / 2 页')
+
+    const btns = () => w.findAll('.pagination button')
+    expect(btns()[0].attributes('disabled')).toBeDefined()
+    await btns()[1].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(5)
+    expect(pageInfo()).toContain('第 2 / 2 页')
+    expect(btns()[1].attributes('disabled')).toBeDefined()
+
+    await btns()[0].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(20)
+  })
+
   it('四档配色为红/橙/浅绿/深绿（与红涨绿跌一致）', async () => {
     const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
     const html = w.html()
