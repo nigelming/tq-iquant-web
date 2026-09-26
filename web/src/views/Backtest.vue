@@ -173,6 +173,11 @@ function valueClass(v: number | null | undefined): string {
   return Number(v) >= 0 ? 'text-red' : 'text-green'
 }
 
+function pct1(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  return `${(Number(v) * 100).toFixed(1)}%`
+}
+
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
 function buildMetrics(m: BacktestEvaluationItem | null | undefined) {
   if (!m) return []
@@ -226,9 +231,11 @@ const summaryCards = computed(() => {
 })
 
 // 整体表现 6 渐变卡
-const overallStats = computed(() => {
+const overallStats = computed<Array<{ label: string; value: string }>>(() => {
   const e = detail.value?.evaluations
   if (!e) return []
+  const ca = detail.value?.crisis_alpha
+  const cd = ca?.status === 'completed' ? ca.data : null
   return [
     { label: '总收益', value: pct(e.total_return) },
     { label: '年化收益', value: pct(e.annual_return) },
@@ -236,6 +243,14 @@ const overallStats = computed(() => {
     { label: '年化波动率', value: pct(e.volatility) },
     { label: '夏普比率', value: num(e.sharpe_ratio, 2) },
     { label: '卡玛比率', value: num(e.calmar_ratio, 2) },
+    {
+      label: '危机Alpha占比',
+      value: cd ? `${pct1(cd.quadrant.alpha_ratio)} · ${cd.alpha_rating}` : '—',
+    },
+    {
+      label: '综合危机保护评分',
+      value: cd ? `${num(cd.score.total_score, 1)} · ${cd.score.rating}` : '—',
+    },
   ]
 })
 
@@ -982,10 +997,10 @@ onUnmounted(() => {
 .summary-card.positive { border-left-color: #ef4444; } /* 正收益 → 红（A股红涨绿跌） */
 .summary-card.danger { border-left-color: #ef4444; }   /* 最大回撤 → 风险警示红，保持不变 */
 
-/* 整体表现 6 渐变卡 */
+/* 整体表现 8 渐变卡 */
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 14px;
   margin-bottom: 8px;
 }

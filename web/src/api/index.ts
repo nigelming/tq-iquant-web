@@ -232,6 +232,168 @@ export interface BacktestReturnsBucket {
   yearly: BacktestYearlyStats[]
 }
 
+export interface CrisisAlphaQuadrant {
+  n_crisis: number
+  n_down: number
+  n_total: number
+  hit_rate: number
+  up_rate: number
+  alpha_ratio: number
+  follow_ratio: number
+  odds: number
+  counts: Record<string, number>
+  avg_ret: Record<string, number>
+  down_avg_s: number
+  down_avg_b: number
+  win_avg: number
+  loss_avg: number
+}
+
+export interface CrisisAlphaCondition {
+  threshold: number
+  n: number
+  b_avg: number
+  s_avg: number
+  up_rate: number
+}
+
+export interface CrisisAlphaWeekRow {
+  日期: string
+  基准?: number
+  策略?: number
+  基准收益?: number
+  策略收益?: number
+  超额?: number
+  分类: string
+}
+
+export interface CrisisAlphaEvent {
+  start: string
+  end: string
+  benchmark_ret: number
+  strategy_ret: number
+  excess: number
+  hedged: boolean
+  verdict: string
+  max_dd: number
+  days: number
+}
+
+export interface CrisisAlphaPoint {
+  date: string
+  value: number | null
+}
+
+export interface CrisisAlphaMonthState {
+  n: number
+  s_avg: number
+  b_avg: number
+  win_rate: number
+}
+
+export interface CrisisAlphaAnnual {
+  年份: number
+  下跌周: number
+  危机Alpha: number
+  策略收益: number
+  基准收益: number
+  完整: boolean
+}
+
+export interface CrisisAlphaCost {
+  drag: number
+  sync_up: number
+  elasticity: number
+  tail_corr: number
+  q1_corr: number
+  n_up: number
+}
+
+export interface CrisisAlphaPerfSide {
+  cum: number
+  ann: number
+  vol: number
+  mdd: number
+}
+
+export interface CrisisAlphaPerformance {
+  s: CrisisAlphaPerfSide
+  b: CrisisAlphaPerfSide
+  corr: number
+  start: string
+  end: string
+}
+
+export interface CrisisAlphaDimension {
+  维度: string
+  类型: string
+  权重: number
+  得分: number
+  评级: string
+  贡献: number
+}
+
+export interface CrisisAlphaScore {
+  total_score: number
+  rating: string
+  dimensions: CrisisAlphaDimension[]
+}
+
+export interface CrisisAlphaMultiBench {
+  key: string
+  name: string
+  code: string
+  alpha_ratio: number
+  n_down: number
+  up_rate: number
+  is_main: boolean
+}
+
+export interface CrisisAlphaNav {
+  dates: string[]
+  strategy: (number | null)[]
+  benchmark: (number | null)[]
+  shade_spans: string[][]
+}
+
+export interface CrisisAlphaData {
+  strategy_name: string
+  benchmark_code: string
+  benchmark_name: string
+  alpha_rating: string
+  n_weeks: number
+  quadrant: CrisisAlphaQuadrant
+  conditions: CrisisAlphaCondition[]
+  extreme_top: CrisisAlphaWeekRow[]
+  deep_dd_events: CrisisAlphaEvent[]
+  rolling_corr: CrisisAlphaPoint[]
+  expanding_corr: CrisisAlphaPoint[]
+  monthly: {
+    states: Record<string, CrisisAlphaMonthState>
+    hedge_ratio: number
+    n_down_month: number
+    big_down: Array<{ 日期: string; 基准: number; 策略: number }>
+  }
+  annual: CrisisAlphaAnnual[]
+  cost: CrisisAlphaCost
+  performance: CrisisAlphaPerformance
+  score: CrisisAlphaScore
+  weekly_detail: CrisisAlphaWeekRow[]
+  down_weeks: CrisisAlphaWeekRow[]
+  nav: CrisisAlphaNav
+  multi_bench: CrisisAlphaMultiBench[]
+}
+
+export interface BacktestCrisisAlphaItem {
+  status: 'completed' | 'insufficient' | 'failed'
+  error: string | null
+  skipped_benchmarks: string[]
+  computed_at: string | null
+  benchmark_code: string
+  benchmark_name: string
+  data: CrisisAlphaData | null
+}
+
 // 回测详情（GET /backtest/records/{id}）— 对齐 backtest.get_record
 export interface BacktestDetailItem {
   record: BacktestRecordItem
@@ -243,6 +405,7 @@ export interface BacktestDetailItem {
   decision_summary: DecisionSummaryItem[]  // 风控与拦截统计（调参可观测性）
   decisions: DecisionEventItem[]           // 逐闸门事件（下钻）
   returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
+  crisis_alpha: BacktestCrisisAlphaItem | null
 }
 
 export async function getStockPools() {
@@ -493,6 +656,15 @@ export async function getBacktestDetail(id: number) {
 
 export async function deleteBacktestRecord(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/backtest/records/${id}`)
+  return res.data.data
+}
+
+export async function recomputeCrisisAlpha(id: number) {
+  const res = await api.post<ApiResponse<{
+    status: string
+    error: string | null
+    computed_at: string | null
+  }>>(`/backtest/records/${id}/crisis-alpha/recompute`)
   return res.data.data
 }
 

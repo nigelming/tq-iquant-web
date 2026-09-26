@@ -7,6 +7,7 @@ vi.mock('../api', () => ({
   runBacktest: vi.fn(),
   getPortfolios: vi.fn(),
   deleteBacktestRecord: vi.fn(),
+  recomputeCrisisAlpha: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -644,5 +645,149 @@ describe('Backtest.vue — 净值曲线超额收益（相对基准）', () => {
     const option = (init as any).mock.results[0].value.setOption.mock.calls[0][0]
     expect(option.legend.data).not.toContain('超额收益（相对基准）')
     expect(option.series.find((s: any) => s.name === '超额收益（相对基准）')).toBeUndefined()
+  })
+})
+
+const crisisAlphaCompleted = {
+  status: 'completed',
+  error: null,
+  skipped_benchmarks: ['中证全指', '科创50'],
+  computed_at: '2026-09-25T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    strategy_name: '稳健组合',
+    benchmark_code: '000300.SH',
+    benchmark_name: '沪深300',
+    alpha_rating: '优秀',
+    n_weeks: 12,
+    quadrant: {
+      n_crisis: 6, n_down: 6, n_total: 12,
+      hit_rate: 0.5, up_rate: 0.5, alpha_ratio: 0.6667, follow_ratio: 0.3333, odds: 1.2,
+      counts: { 逆势上涨: 3, 跌得少: 1, 跟着跌: 1, 跌更多: 1 },
+      avg_ret: { 逆势上涨: 0.02, 跌得少: -0.03, 跟着跌: -0.08, 跌更多: -0.15 },
+      down_avg_s: -0.0283, down_avg_b: -0.07, win_avg: 0.02, loss_avg: 0.08,
+    },
+    conditions: [
+      { threshold: -0.03, n: 4, b_avg: -0.06, s_avg: -0.01, up_rate: 0.5 },
+      { threshold: -0.05, n: 2, b_avg: -0.09, s_avg: 0.0, up_rate: 0.5 },
+    ],
+    extreme_top: [
+      { 日期: '2024-02-02', 基准: -0.12, 策略: 0.01, 超额: 0.13, 分类: '逆势上涨' },
+      { 日期: '2024-02-09', 基准: -0.1, 策略: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-26', 基准: -0.1, 策略: -0.08, 超额: 0.02, 分类: '跌得少' },
+    ],
+    deep_dd_events: [
+      { start: '2024-01-12', end: '2024-02-02', benchmark_ret: -0.12, strategy_ret: 0.01, excess: 0.13, hedged: true, verdict: '逆势对冲', max_dd: -0.14, days: 21 },
+      { start: '2024-02-16', end: '2024-02-23', benchmark_ret: -0.08, strategy_ret: -0.09, excess: -0.01, hedged: false, verdict: '同步下跌', max_dd: -0.09, days: 7 },
+    ],
+    rolling_corr: [
+      { date: '2024-01-05', value: 0.4 },
+      { date: '2024-01-12', value: 0.3 },
+      { date: '2024-01-19', value: 0.2 },
+    ],
+    expanding_corr: [
+      { date: '2023-12-29', value: 0.6 },
+      { date: '2024-01-05', value: 0.4 },
+    ],
+    monthly: {
+      states: {
+        大涨: { n: 1, s_avg: 0.03, b_avg: 0.06, win_rate: 1 },
+        小涨: { n: 2, s_avg: 0.01, b_avg: 0.02, win_rate: 0.5 },
+        小跌: { n: 3, s_avg: -0.01, b_avg: -0.02, win_rate: 0.3333 },
+        大跌: { n: 1, s_avg: 0.005, b_avg: -0.07, win_rate: 1 },
+      },
+      hedge_ratio: 0.5,
+      n_down_month: 4,
+      big_down: [{ 日期: '2024-02-29', 基准: -0.07, 策略: 0.005 }],
+    },
+    annual: [
+      { 年份: 2024, 下跌周: 6, 危机Alpha: 0.6667, 策略收益: 0.05, 基准收益: -0.08, 完整: false },
+    ],
+    cost: { drag: 0.25, sync_up: 0.75, elasticity: 0.4, tail_corr: -0.2, q1_corr: -0.15, n_up: 4 },
+    performance: {
+      s: { cum: 0.05, ann: 0.06, vol: 0.12, mdd: -0.05 },
+      b: { cum: -0.08, ann: -0.09, vol: 0.2, mdd: -0.15 },
+      corr: 0.25,
+      start: '2024-01-01',
+      end: '2024-03-29',
+    },
+    score: {
+      total_score: 72.3,
+      rating: '优秀',
+      dimensions: [
+        { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 78.7, 评级: '优秀', 贡献: 15.7 },
+        { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 65.0, 评级: '一般', 贡献: 9.8 },
+        { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 85.0, 评级: '卓越', 贡献: 10.2 },
+      ],
+    },
+    weekly_detail: [
+      { 日期: '2024-01-05', 基准收益: -0.1, 策略收益: 0.02, 超额: 0.12, 分类: '逆势上涨' },
+      { 日期: '2024-01-12', 基准收益: -0.1, 策略收益: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-19', 基准收益: -0.1, 策略收益: -0.06, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-26', 基准收益: -0.1, 策略收益: -0.12, 超额: -0.02, 分类: '跌更多' },
+      { 日期: '2024-02-02', 基准收益: 0.05, 策略收益: 0.03, 超额: -0.02, 分类: '跟着跌' },
+      { 日期: '2024-02-09', 基准收益: 0.05, 策略收益: -0.01, 超额: -0.06, 分类: '跟着跌' },
+    ],
+    down_weeks: [
+      { 日期: '2024-01-26', 基准收益: -0.1, 策略收益: -0.12, 超额: -0.02, 分类: '跌更多' },
+      { 日期: '2024-01-19', 基准收益: -0.1, 策略收益: -0.06, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-12', 基准收益: -0.1, 策略收益: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-05', 基准收益: -0.1, 策略收益: 0.02, 超额: 0.12, 分类: '逆势上涨' },
+    ],
+    nav: {
+      dates: ['2024-01-01', '2024-02-01', '2024-03-29'],
+      strategy: [1, 1.03, 1.05],
+      benchmark: [1, 0.95, 0.92],
+      shade_spans: [['2024-01-12', '2024-02-02']],
+    },
+    multi_bench: [
+      { key: 'main', name: '沪深300', code: '000300.SH', alpha_ratio: 0.6667, n_down: 6, up_rate: 0.5, is_main: true },
+      { key: 'csi500', name: '中证500', code: '000905.SH', alpha_ratio: 0.6, n_down: 6, up_rate: 0.45, is_main: false },
+    ],
+  },
+}
+
+async function mountDetail(detailPayload: any) {
+  ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+  const w = mount(Backtest)
+  await flushPromises()
+  const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+  await viewBtn.trigger('click')
+  await flushPromises()
+  return w
+}
+
+describe('Backtest.vue — 危机Alpha 上提到整体表现指标（8 卡）', () => {
+  it('crisis_alpha 为 null：共 8 张卡，危机两卡为 —', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards.length).toBe(8)
+    const labels = cards.map((c) => c.find('.label').text())
+    expect(labels[6]).toBe('危机Alpha占比')
+    expect(labels[7]).toBe('综合危机保护评分')
+    expect(cards[6].find('.value').text()).toBe('—')
+    expect(cards[7].find('.value').text()).toBe('—')
+  })
+
+  it('status=completed：显示「占比 · 评级」与「评分 · 评级」', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards[6].find('.value').text()).toBe('66.7% · 优秀')
+    expect(cards[7].find('.value').text()).toBe('72.3 · 优秀')
+  })
+
+  it('status=failed：危机两卡降级为 —', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: '主基准指数无数据', skipped_benchmarks: [],
+        computed_at: '2026-09-25T10:00:00', benchmark_code: '000300.SH',
+        benchmark_name: '沪深300', data: null,
+      },
+    })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards[6].find('.value').text()).toBe('—')
+    expect(cards[7].find('.value').text()).toBe('—')
   })
 })
