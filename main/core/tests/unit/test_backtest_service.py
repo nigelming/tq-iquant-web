@@ -13,10 +13,12 @@ monkeypatch 目标统一是 backtest_service 模块（与阶段 3 后集成测�
 不依赖 HTTP TestClient，不依赖真实 TQ/TDX。
 """
 
+import json
 from datetime import datetime, date
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pandas as pd
 import polars as pl
 import pytest
 from sqlalchemy import create_engine
@@ -28,6 +30,7 @@ from core.models import (
     PortfolioStrategy, Strategy, BacktestRecord,
     BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent,
+    BacktestCrisisAlpha,
 )
 from core.services import backtest_service as svc
 
@@ -122,6 +125,7 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     # patch 引擎：返回受控 result（避免构造真实 Trade 对象）
     trade = SimpleNamespace(
@@ -177,6 +181,7 @@ def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkey
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     result = svc.run_backtest(db_session, ps, _req(name="empty"))
 
@@ -202,6 +207,7 @@ def test_run_backtest_exception_marks_failed_and_reraises(db_session, monkeypatc
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     with pytest.raises(RuntimeError, match="polars panic"):
         svc.run_backtest(db_session, ps, _req(name="boom"))
@@ -228,6 +234,7 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
         strategy_id=strat_id, signal_name="open_sig",
         signal_type=SimpleNamespace(value="OPEN"), stock_code="000001.SZ",
@@ -273,6 +280,7 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
         strategy_id=strat_id, signal_name="open_sig",
         signal_type=SimpleNamespace(value="OPEN"), stock_code="000001.SZ",
@@ -332,6 +340,7 @@ def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch)
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
         "trades": [], "snapshots": [], "evaluations": {},
         "strategy_snapshots": {}, "strategy_evaluations": {},
@@ -373,6 +382,7 @@ def test_delete_record_cascades_decisions(db_session, monkeypatch):
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
         "trades": [], "snapshots": [], "evaluations": {},
         "strategy_snapshots": {}, "strategy_evaluations": {},
@@ -396,6 +406,7 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     svc.run_backtest(db_session, ps, _req(name="r1"))
     svc.run_backtest(db_session, ps, _req(name="r2"))
 
@@ -494,3 +505,343 @@ def test_build_benchmark_data_uses_custom_benchmark_index(monkeypatch):
         date(2026, 7, 30): Decimal("6060.0"),
         date(2026, 7, 31): Decimal("6030.0"),
     }
+
+
+_CA_WEEKS_B = [-0.10, -0.10, -0.10, -0.10, 0.05, 0.05, 0.05, 0.05, -0.04, 0.04, -0.08, 0.02]
+_CA_WEEKS_S = [0.02, -0.02, -0.06, -0.12, 0.03, 0.06, -0.01, 0.04, -0.03, 0.02, -0.09, 0.01]
+
+
+def _ca_daily_points(weekly_returns, start="2024-01-01"):
+    dates = pd.bdate_range(start=start, periods=len(weekly_returns) * 5)
+    points = {}
+    idx = 0
+    level = 100.0
+    for r in weekly_returns:
+        base = level
+        for _ in range(5):
+            level = base * (1 + r * (_ + 1) / 5)
+            points[dates[idx].date()] = level
+            idx += 1
+    return points
+
+
+def _seed_record(db):
+    ps, _ = _seed(db)
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps.id, name="ca_test",
+        start_date=date(2024, 1, 1), end_date=date(2024, 3, 31),
+        status="completed", progress=100,
+    )
+    db.add(rec)
+    db.commit()
+    return rec, ps
+
+
+class _FakeIndexTQ:
+    def __init__(self, frames):
+        self.frames = frames
+        self.calls = []
+
+    def get_history_raw(self, stocks, periods, start="", end="",
+                        dividend_type="front", count=100):
+        self.calls.append({
+            "stocks": list(stocks), "periods": list(periods), "start": start,
+            "end": end, "dividend_type": dividend_type, "count": count,
+        })
+        rows = {}
+        for code in stocks:
+            series = self.frames.get(code)
+            if not series:
+                continue
+            for d, v in series.items():
+                rows.setdefault(d, {})[code] = v
+        keys = sorted(rows)
+        frame = pd.DataFrame([rows[d] for d in keys], index=keys)
+        return {"1d": {"Close": frame}}
+
+
+def _ca_snapshots(points):
+    return [{"snap_date": d, "total_value": v} for d, v in points.items()]
+
+
+def _ca_decimal_frames(points):
+    return {d: Decimal(str(v)) for d, v in points.items()}
+
+
+def test_build_index_close_series_batches_codes_and_skips_missing(monkeypatch):
+    days = [date(2026, 1, 5), date(2026, 1, 6)]
+    fake = _FakeIndexTQ({
+        "000300.SH": {days[0]: 3000.0, days[1]: 3010.0},
+        "000905.SH": {days[0]: 5000.0, days[1]: 4990.0},
+    })
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.build_index_close_series(
+        ["000300.SH", "000905.SH", "000985.CSI"], date(2026, 1, 1), date(2026, 1, 31)
+    )
+    assert set(out) == {"000300.SH", "000905.SH"}
+    assert float(out["000300.SH"][days[0]]) == pytest.approx(3000.0)
+    assert float(out["000905.SH"][days[1]]) == pytest.approx(4990.0)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["stocks"] == ["000300.SH", "000905.SH", "000985.CSI"]
+    assert call["periods"] == ["1d"]
+    assert call["start"] == "20260101"
+    assert call["end"] == "20260131"
+    assert call["dividend_type"] == "front"
+    assert call["count"] == -1
+
+
+def test_build_index_close_series_swallows_tq_error(monkeypatch):
+    class _Boom:
+        def get_history_raw(self, **kw):
+            raise RuntimeError("tdx down")
+
+    monkeypatch.setattr(svc, "TQData", lambda: _Boom())
+    assert svc.build_index_close_series(
+        ["000300.SH"], date(2026, 1, 1), date(2026, 1, 31)
+    ) == {}
+
+
+def test_build_index_close_series_empty_codes_skips_tq(monkeypatch):
+    def _boom(**kw):
+        raise AssertionError("不应调用 TQ")
+
+    monkeypatch.setattr(svc, "TQData", lambda: SimpleNamespace(get_history_raw=_boom))
+    assert svc.build_index_close_series([], date(2026, 1, 1), date(2026, 1, 31)) == {}
+    assert svc.build_index_close_series([""], date(2026, 1, 1), date(2026, 1, 31)) == {}
+
+
+def test_build_benchmark_data_returns_empty_on_tq_error(monkeypatch):
+    class _Boom:
+        def get_history_raw(self, **kw):
+            raise RuntimeError("tdx down")
+
+    monkeypatch.setattr(svc, "TQData", lambda: _Boom())
+    ps = SimpleNamespace(benchmark_index="000300.SH")
+    assert svc.build_benchmark_data(ps, date(2026, 1, 1), date(2026, 1, 31)) == {}
+
+
+def test_build_benchmark_data_uses_default_code_when_unset(monkeypatch):
+    fake = _FakeIndexTQ({"000300.SH": {date(2026, 1, 5): 3000.0}})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.build_benchmark_data(
+        SimpleNamespace(benchmark_index=None), date(2026, 1, 1), date(2026, 1, 31)
+    )
+    assert fake.calls[0]["stocks"] == ["000300.SH"]
+    assert list(out) == [date(2026, 1, 5)]
+
+
+def test_compute_and_store_crisis_alpha_completed(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    fake = _FakeIndexTQ({
+        "000300.SH": _ca_decimal_frames(bm_pts),
+        "000905.SH": _ca_decimal_frames(bm_pts),
+    })
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    row = svc.compute_and_store_crisis_alpha(
+        db_session, rec.id, ps, _ca_snapshots(nav_pts),
+        date(2024, 1, 1), date(2024, 3, 31),
+    )
+    assert row.status == "completed"
+    assert row.benchmark_code == "000300.SH"
+    assert row.benchmark_name == "沪深300"
+    assert row.error is None
+    data = json.loads(row.payload_json)
+    assert data["n_weeks"] == 12
+    assert data["alpha_rating"] == "较弱"
+    assert data["strategy_name"] == ps.name
+    assert [r["name"] for r in data["multi_bench"]] == ["沪深300", "中证500"]
+    assert [r["is_main"] for r in data["multi_bench"]] == [True, False]
+    assert len(data["nav"]["dates"]) == 65
+    assert len(data["weekly_detail"]) == 12
+    skipped = json.loads(row.skipped_benchmarks_json)
+    assert "中证500" not in skipped
+    assert set(skipped) == {"中证全指", "中证1000", "创业板指", "科创50"}
+    assert row.computed_at is not None
+
+
+def test_compute_and_store_crisis_alpha_insufficient_when_common_days_short(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    pts = _ca_daily_points([0.0, 0.01, 0.01])
+    fake = _FakeIndexTQ({"000300.SH": _ca_decimal_frames(pts)})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    row = svc.compute_and_store_crisis_alpha(
+        db_session, rec.id, ps, _ca_snapshots(pts),
+        date(2024, 1, 1), date(2024, 1, 31),
+    )
+    assert row.status == "insufficient"
+    assert "共同交易日不足" in row.error
+    assert row.payload_json is None
+
+
+def test_compute_and_store_crisis_alpha_failed_when_main_benchmark_missing(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    fake = _FakeIndexTQ({"000905.SH": _ca_decimal_frames(bm_pts)})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    row = svc.compute_and_store_crisis_alpha(
+        db_session, rec.id, ps, _ca_snapshots(nav_pts),
+        date(2024, 1, 1), date(2024, 3, 31),
+    )
+    assert row.status == "failed"
+    assert "主基准" in row.error
+    assert "沪深300" in json.loads(row.skipped_benchmarks_json)
+    assert row.payload_json is None
+
+
+def test_compute_and_store_crisis_alpha_upserts_single_row(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    fake = _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    args = (
+        db_session, rec.id, ps, _ca_snapshots(nav_pts),
+        date(2024, 1, 1), date(2024, 3, 31),
+    )
+    svc.compute_and_store_crisis_alpha(*args)
+    svc.compute_and_store_crisis_alpha(*args)
+    rows = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).all()
+    assert len(rows) == 1
+
+
+def test_safe_compute_crisis_alpha_swallows_and_marks_failed(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(svc, "compute_and_store_crisis_alpha", _boom)
+    row = svc.safe_compute_crisis_alpha(
+        db_session, rec.id, ps, [], date(2024, 1, 1), date(2024, 3, 31)
+    )
+    assert row is not None
+    assert row.status == "failed"
+    assert "boom" in row.error
+
+
+def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkeypatch):
+    ps, strat_id = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    snapshots = [
+        {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
+         "cash": Decimal("100000"), "market_value": Decimal("0")},
+        {"snap_date": date(2026, 7, 30), "total_value": Decimal("100995"),
+         "cash": Decimal("99995"), "market_value": Decimal("1000")},
+    ]
+    fake_result = {
+        "trades": [], "snapshots": snapshots,
+        "evaluations": {"total_return": Decimal("0.00995")},
+        "strategy_snapshots": {}, "strategy_evaluations": {},
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+
+    result = svc.run_backtest(db_session, ps, _req())
+    rec = db_session.get(BacktestRecord, result["record_id"])
+    assert rec.status == "completed"
+    assert rec.progress == 100
+    assert db_session.query(BacktestCrisisAlpha).count() == 0
+
+
+def test_run_backtest_calls_crisis_alpha_after_main_commit(db_session, monkeypatch):
+    ps, _ = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    snapshots = [
+        {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
+         "cash": Decimal("100000"), "market_value": Decimal("0")},
+        {"snap_date": date(2026, 7, 30), "total_value": Decimal("100995"),
+         "cash": Decimal("99995"), "market_value": Decimal("1000")},
+    ]
+    fake_result = {
+        "trades": [], "snapshots": snapshots,
+        "evaluations": {"total_return": Decimal("0.00995")},
+        "strategy_snapshots": {}, "strategy_evaluations": {},
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+    seen = {}
+
+    def _capture(db, record_id, ps_arg, snaps, start, end):
+        seen["record_id"] = record_id
+        seen["status_at_call"] = db.get(BacktestRecord, record_id).status
+        seen["snapshot_count"] = len(snaps)
+        seen["start"] = start
+        seen["end"] = end
+
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", _capture)
+    result = svc.run_backtest(db_session, ps, _req())
+    assert seen["record_id"] == result["record_id"]
+    assert seen["status_at_call"] == "completed"
+    assert seen["snapshot_count"] == 2
+    assert seen["start"] == _req().start_date
+    assert seen["end"] == _req().end_date
+
+
+def test_recompute_crisis_alpha_rebuilds_from_db_snapshots(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    for d, v in nav_pts.items():
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(round(v, 2))),
+            cash=Decimal("0"), market_value=Decimal("0"),
+        ))
+    db_session.commit()
+    fake = _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    assert out["status"] == "completed"
+    assert out["error"] is None
+    assert out["computed_at"] is not None
+    row = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).one()
+    data = json.loads(row.payload_json)
+    assert data["n_weeks"] == 12
+    assert len(data["nav"]["dates"]) == 65
+
+
+def test_recompute_crisis_alpha_returns_none_for_missing_record(db_session):
+    assert svc.recompute_crisis_alpha(db_session, 9999) is None
+
+
+def test_recompute_crisis_alpha_without_snapshots_returns_failed(db_session):
+    rec, _ = _seed_record(db_session)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "无组合日快照" in out["error"]
+
+
+def test_get_record_detail_includes_crisis_alpha(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    fake = _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    svc.compute_and_store_crisis_alpha(
+        db_session, rec.id, ps, _ca_snapshots(nav_pts),
+        date(2024, 1, 1), date(2024, 3, 31),
+    )
+    detail = svc.get_record_detail(db_session, rec.id)
+    ca = detail["crisis_alpha"]
+    assert ca["status"] == "completed"
+    assert ca["benchmark_code"] == "000300.SH"
+    assert ca["data"]["n_weeks"] == 12
+    assert "中证全指" in ca["skipped_benchmarks"]
+    assert ca["computed_at"] is not None
+
+
+def test_get_record_detail_crisis_alpha_is_null_without_row(db_session):
+    rec, _ = _seed_record(db_session)
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert detail["crisis_alpha"] is None
