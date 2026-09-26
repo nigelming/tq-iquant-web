@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -11,6 +12,7 @@ from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, BacktestRecord,
     BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
+    BacktestCrisisAlpha,
 )
 import core.api.backtest as bt_api
 import core.services.backtest_service as svc
@@ -210,6 +212,8 @@ def _mock_data(monkeypatch):
             datetime(2026, 7, 31): Decimal("9.0"),
         }
     })
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
 
 def _post_backtest(c, ps_id):
@@ -515,4 +519,66 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0
+
+
+def test_post_recompute_crisis_alpha_returns_status(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    monkeypatch.setattr(
+        bt_api, "_svc_recompute_crisis_alpha",
+        lambda db, rid: {"status": "completed", "error": None, "computed_at": "2026-09-25T10:00:00"},
+    )
+    body = c.post(f"/api/backtest/records/{record_id}/crisis-alpha/recompute").json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "completed"
+    assert body["data"]["computed_at"] == "2026-09-25T10:00:00"
+
+
+def test_post_recompute_crisis_alpha_not_found(client):
+    c, _ = client
+    body = c.post("/api/backtest/records/999999/crisis-alpha/recompute").json()
+    assert body["code"] == 404
+
+
+def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    monkeypatch.setattr(
+        bt_api, "_svc_recompute_crisis_alpha",
+        lambda db, rid: {"status": "completed", "error": None, "computed_at": "2026-09-25T10:00:00"},
+    )
+    db = Session()
+    db.add(BacktestCrisisAlpha(
+        backtest_record_id=record_id,
+        benchmark_code="000300.SH",
+        benchmark_name="PROBE_BENCH",
+        status="insufficient",
+        error="probe error text",
+        skipped_benchmarks_json=json.dumps(["000905.SH", "399006.SZ"]),
+        payload_json=json.dumps({"total_score": 3}),
+        computed_at=datetime(2026, 9, 25, 10, 0, 0),
+    ))
+    db.commit()
+    db.close()
+
+    c.post(f"/api/backtest/records/{record_id}/crisis-alpha/recompute")
+    body = c.get(f"/api/backtest/records/{record_id}").json()
+    assert body["code"] == 0
+    ca = body["data"]["crisis_alpha"]
+    assert ca is not None
+    assert ca["status"] == "insufficient"
+    assert ca["benchmark_code"] == "000300.SH"
+    assert ca["benchmark_name"] == "PROBE_BENCH"
+    assert ca["skipped_benchmarks"] == ["000905.SH", "399006.SZ"]
+    assert ca["error"] == "probe error text"
+    assert ca["computed_at"] == "2026-09-25T10:00:00"
+    assert ca["data"] == {"total_score": 3}
 
