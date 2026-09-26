@@ -6,11 +6,15 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
+from core.engine import crisis_alpha as ca_mod
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, CRISIS_CATS, CRISIS_COLORS, CrisisAlphaAnalyzer,
     _classify_crisis, _frame_records, _rating, alpha_rating,
     build_crisis_alpha_payload, sanitize_for_json,
 )
+
+_ALIGN_TAIL = [0.03, -0.04, -0.02, 0.05, -0.06, 0.04, 0.02, -0.03, 0.06, -0.01, 0.03, -0.05]
+_ALIGN_HEAD = [-0.08] * 13
 
 WEEKS_B = [-0.10, -0.10, -0.10, -0.10, 0.05, 0.05, 0.05, 0.05, -0.04, 0.04, -0.08, 0.02]
 WEEKS_S = [0.02, -0.02, -0.06, -0.12, 0.03, 0.06, -0.01, 0.04, -0.03, 0.02, -0.09, 0.01]
@@ -441,7 +445,7 @@ def test_frame_records_puts_index_into_date_key():
 def test_build_payload_aligns_nav_and_flags_main_benchmark():
     s_nav = _series_from_weekly([0.0] + WEEKS_S)
     b_nav = _series_from_weekly([0.0] + WEEKS_B)
-    payload = build_crisis_alpha_payload(
+    payload, skipped = build_crisis_alpha_payload(
         s_nav,
         "000300.SH",
         "沪深300",
@@ -449,6 +453,7 @@ def test_build_payload_aligns_nav_and_flags_main_benchmark():
         {"000300.SH": b_nav, "000905.SH": b_nav * 1.01},
         "组合A",
     )
+    assert skipped == []
     assert payload["strategy_name"] == "组合A"
     assert payload["benchmark_code"] == "000300.SH"
     assert payload["benchmark_name"] == "沪深300"
@@ -480,10 +485,55 @@ def test_build_payload_ignores_unusable_extra_benchmarks():
     s_nav = _series_from_weekly([0.0] + WEEKS_S)
     b_nav = _series_from_weekly([0.0] + WEEKS_B)
     short = b_nav.iloc[:10]
-    payload = build_crisis_alpha_payload(
-        s_nav, "000300.SH", "沪深300", b_nav, {"000905.SH": short}, "组合A"
+    payload, skipped = build_crisis_alpha_payload(
+        s_nav, "000300.SH", "沪深300", b_nav,
+        {"000905.SH": short, "000852.SH": pd.Series(dtype=float)},
+        "组合A",
     )
     assert [r["name"] for r in payload["multi_bench"]] == ["沪深300"]
+    assert skipped == ["中证500"]
+
+
+def test_build_payload_clips_secondary_benchmark_to_main_weekly_window():
+    nav = _series_from_weekly([0.0] + _ALIGN_HEAD + [0.0] * len(_ALIGN_TAIL))
+    wide = _series_from_weekly([0.0] + _ALIGN_HEAD + _ALIGN_TAIL)
+    main = wide[
+        (wide.index >= pd.Timestamp("2024-04-01"))
+        & (wide.index <= pd.Timestamp("2024-06-30"))
+    ]
+    assert len(nav) == 130 and len(wide) == 130
+    assert len(main) == 65
+    payload, skipped = build_crisis_alpha_payload(
+        nav, "000300.SH", "沪深300", main, {"000905.SH": wide}, "组合A",
+    )
+    assert skipped == []
+    assert payload["n_weeks"] == 12
+    main_row, wide_row = payload["multi_bench"]
+    assert main_row["n_down"] == 6
+    assert main_row["alpha_ratio"] == pytest.approx(1.0)
+    assert wide_row["n_down"] == main_row["n_down"]
+    assert wide_row["n_down"] != 19
+    assert wide_row["alpha_ratio"] == pytest.approx(1.0)
+    assert wide_row["up_rate"] == pytest.approx(1.0)
+
+
+def test_build_payload_survives_non_value_error_from_secondary_benchmark(monkeypatch):
+    real = ca_mod.CrisisAlphaAnalyzer
+
+    def _boom(nav, price, strategy_name="策略", benchmark_name="基准"):
+        if benchmark_name == "中证500":
+            raise KeyError("pandas internals")
+        return real(nav, price, strategy_name=strategy_name, benchmark_name=benchmark_name)
+
+    monkeypatch.setattr(ca_mod, "CrisisAlphaAnalyzer", _boom)
+    s_nav = _series_from_weekly([0.0] + WEEKS_S)
+    b_nav = _series_from_weekly([0.0] + WEEKS_B)
+    payload, skipped = ca_mod.build_crisis_alpha_payload(
+        s_nav, "000300.SH", "沪深300", b_nav,
+        {"000905.SH": b_nav * 1.01}, "组合A",
+    )
+    assert [r["name"] for r in payload["multi_bench"]] == ["沪深300"]
+    assert skipped == ["中证500"]
 
 
 def test_sanitize_converts_non_json_types():

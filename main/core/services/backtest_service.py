@@ -423,6 +423,14 @@ def _upsert_crisis_alpha(
     return row
 
 
+def _merge_crisis_skipped(base: List[str], extra: List[str]) -> List[str]:
+    out = list(base)
+    for name in extra:
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def compute_and_store_crisis_alpha(
     db: Session,
     record_id: int,
@@ -439,12 +447,13 @@ def compute_and_store_crisis_alpha(
         spec["name"] for spec in CRISIS_BENCHMARKS if spec["code"] not in closes
     ]
     main_closes = closes.get(benchmark_code) or {}
+    payload_skipped: List[str] = []
     if not main_closes:
         return _upsert_crisis_alpha(
             db, record_id, benchmark_code, benchmark_name,
             status="failed",
             error="主基准指数无数据（TQ 取数失败或代码不被支持）",
-            skipped=skipped,
+            skipped=_merge_crisis_skipped(skipped, payload_skipped),
         )
     benchmark_closes = {}
     for spec in CRISIS_BENCHMARKS:
@@ -452,7 +461,7 @@ def compute_and_store_crisis_alpha(
         if got:
             benchmark_closes[spec["code"]] = _to_close_series(got)
     try:
-        payload = build_crisis_alpha_payload(
+        payload, payload_skipped = build_crisis_alpha_payload(
             _crisis_nav_from_snapshots(snapshots),
             benchmark_code,
             benchmark_name,
@@ -463,11 +472,13 @@ def compute_and_store_crisis_alpha(
     except ValueError as exc:
         return _upsert_crisis_alpha(
             db, record_id, benchmark_code, benchmark_name,
-            status="insufficient", error=str(exc), skipped=skipped,
+            status="insufficient", error=str(exc),
+            skipped=_merge_crisis_skipped(skipped, payload_skipped),
         )
     return _upsert_crisis_alpha(
         db, record_id, benchmark_code, benchmark_name,
-        status="completed", skipped=skipped, payload=payload,
+        status="completed", payload=payload,
+        skipped=_merge_crisis_skipped(skipped, payload_skipped),
     )
 
 

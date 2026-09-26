@@ -692,6 +692,28 @@ def test_compute_and_store_crisis_alpha_failed_when_main_benchmark_missing(db_se
     assert row.payload_json is None
 
 
+def test_compute_and_store_crisis_alpha_reports_dropped_secondary_benchmark(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    short_pts = dict(list(bm_pts.items())[:10])
+    fake = _FakeIndexTQ({
+        "000300.SH": _ca_decimal_frames(bm_pts),
+        "000905.SH": _ca_decimal_frames(short_pts),
+    })
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    row = svc.compute_and_store_crisis_alpha(
+        db_session, rec.id, ps, _ca_snapshots(nav_pts),
+        date(2024, 1, 1), date(2024, 3, 31),
+    )
+    assert row.status == "completed"
+    data = json.loads(row.payload_json)
+    assert [r["name"] for r in data["multi_bench"]] == ["沪深300"]
+    skipped = json.loads(row.skipped_benchmarks_json)
+    assert "中证500" in skipped
+    assert set(skipped) == {"中证500", "中证全指", "中证1000", "创业板指", "科创50"}
+
+
 def test_compute_and_store_crisis_alpha_upserts_single_row(db_session, monkeypatch):
     rec, ps = _seed_record(db_session)
     nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)

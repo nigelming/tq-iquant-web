@@ -1,7 +1,7 @@
 import math
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -593,7 +593,7 @@ def build_crisis_alpha_payload(
     main_closes: pd.Series,
     benchmark_closes: Dict[str, pd.Series],
     strategy_name: str,
-) -> dict:
+) -> Tuple[dict, List[str]]:
     an = CrisisAlphaAnalyzer(
         strategy_nav, main_closes,
         strategy_name=strategy_name, benchmark_name=main_name,
@@ -610,18 +610,29 @@ def build_crisis_alpha_payload(
             "is_main": True,
         }
     ]
+    skipped: List[str] = []
+    win_lo = an.b_week_ret.index.min()
+    win_hi = an.b_week_ret.index.max()
+
+    def _in_window(src: pd.Series) -> pd.Series:
+        idx = pd.to_datetime(src.index).normalize()
+        return src[(idx >= win_lo) & (idx <= win_hi)]
+
+    nav_win = _in_window(strategy_nav)
     for spec in CRISIS_BENCHMARKS:
         if spec["code"] == main_code:
             continue
         series = benchmark_closes.get(spec["code"])
         if series is None or len(series) == 0:
             continue
+        price_win = _in_window(series)
         try:
             an_b = CrisisAlphaAnalyzer(
-                strategy_nav, series,
+                nav_win, price_win,
                 strategy_name=strategy_name, benchmark_name=spec["name"],
             )
-        except (TypeError, ValueError):
+        except Exception:
+            skipped.append(spec["name"])
             continue
         q = an_b.quadrant_analysis()
         multi_rows.append(
@@ -672,4 +683,4 @@ def build_crisis_alpha_payload(
         },
         "multi_bench": multi_rows,
     }
-    return sanitize_for_json(payload)
+    return sanitize_for_json(payload), skipped
