@@ -559,7 +559,7 @@ def sanitize_for_json(value: Any) -> Any:
     if isinstance(value, int):
         return value
     if isinstance(value, Decimal):
-        return float(value)
+        return sanitize_for_json(float(value))
     if value is pd.NaT:
         return None
     if isinstance(value, pd.Timestamp):

@@ -376,12 +376,21 @@ def test_composite_score_shape_weights_and_contributions():
     assert sum(d["权重"] for d in sc["dimensions"]) == pytest.approx(1.0)
     for d in sc["dimensions"]:
         assert 0.0 <= d["得分"] <= 100.0
-        assert d["贡献"] == pytest.approx(round(d["得分"] * d["权重"], 1), abs=0.05)
         assert d["评级"] in {"卓越", "优秀", "一般"}
-    assert sc["total_score"] == pytest.approx(
-        sum(d["得分"] * d["权重"] for d in sc["dimensions"]), abs=0.05
+    assert [d["得分"] for d in sc["dimensions"]] == pytest.approx(
+        [30.3, 49.2, 38.6, 0.0, 15.0, 0.0, 50.0, 95.6, 14.2]
     )
+    assert [d["贡献"] for d in sc["dimensions"]] == pytest.approx(
+        [6.1, 7.4, 4.6, 0.0, 1.5, 0.0, 5.0, 5.7, 0.7]
+    )
+    assert sc["total_score"] == pytest.approx(31.0)
     assert sc["rating"] in {"卓越", "优秀", "一般"}
+    b_w = [-0.08, -0.06, -0.05, -0.04, 0.02, 0.04, 0.06, 0.10, 0.12, -0.07, 0.08, 0.03]
+    s_w = [0.02, -0.01, -0.03, -0.02, 0.04, 0.03, 0.02, 0.015, -0.004, 0.01, -0.008, -0.012]
+    cost_dims = {
+        d["维度"]: d["得分"] for d in _analyzer(b_w, s_w).composite_score()["dimensions"]
+    }
+    assert cost_dims["上涨周代价"] == pytest.approx(54.1)
 
 
 def test_composite_score_neutral_fallbacks_without_deep_weeks_or_events():
@@ -489,6 +498,8 @@ def test_sanitize_converts_non_json_types():
             "ts": pd.Timestamp("2024-03-22"),
             "nat": pd.NaT,
             "dec": Decimal("2.50"),
+            "dec_nan": Decimal("NaN"),
+            "dec_inf": Decimal("Infinity"),
             "d": date(2024, 1, 2),
             "series": pd.Series(
                 [1.0, 2.0], index=pd.to_datetime(["2024-01-05", "2024-01-12"])
@@ -509,6 +520,8 @@ def test_sanitize_converts_non_json_types():
     assert out["ts"] == "2024-03-22"
     assert out["nat"] is None
     assert out["dec"] == pytest.approx(2.5)
+    assert out["dec_nan"] is None
+    assert out["dec_inf"] is None
     assert out["d"] == "2024-01-02"
     assert out["flag"] is True
     assert out["series"] == [
