@@ -1,5 +1,7 @@
 import math
-from typing import List, Optional, Sequence
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -444,3 +446,230 @@ class CrisisAlphaAnalyzer:
                 }
             )
         return rows
+
+    def composite_score(self, multi_bench_alpha_ratios: Optional[List[float]] = None) -> dict:
+        q = self.quadrant_analysis()
+        cost = self.cost_analysis()
+        events = self.deep_drawdown_events()
+        top = self.extreme_drops_top_n()
+        mo = self.monthly_analysis()
+        tests = self.condition_tests()
+        corr = float(self.s_week_ret.corr(self.b_week_ret))
+        r = q["alpha_ratio"]
+        s_alpha = _clip(50 + (r - 0.5) * 118)
+        deep_items = [t for t in tests if t["n"] > 0]
+        if deep_items:
+            up_part = _mean([t["up_rate"] for t in deep_items])
+            alpha_part_vals = []
+            for t in deep_items:
+                mask = self.b_week_ret < t["threshold"]
+                lab = self.week_labels[mask]
+                alpha_part_vals.append(
+                    _mean([1.0 if lbl in _HEDGE_CATS else 0.0 for lbl in lab.tolist()])
+                )
+            alpha_part = _mean(alpha_part_vals)
+            s_deep = _clip(30 + up_part * 45 + alpha_part * 30)
+        else:
+            s_deep = 50.0
+        s_tail = _clip(50 - cost["tail_corr"] * 175)
+        if events:
+            s_dd = _clip(
+                100 * _mean([1.0 if e["hedged"] else 0.0 for e in events])
+            )
+        else:
+            s_dd = 50.0
+        if multi_bench_alpha_ratios:
+            m = _mean(multi_bench_alpha_ratios)
+            s_multi = _clip(40 + (m - 0.5) * 150)
+        else:
+            s_multi = _clip(40 + (r - 0.5) * 150)
+        s_month = _clip(100 * mo["hedge_ratio"])
+        if len(top):
+            beat = float((top["策略"] > top["基准"]).mean())
+            upr = float((top["策略"] > 0).mean())
+            s_extreme = _clip(60 * beat + 40 * upr)
+        else:
+            s_extreme = 50.0
+        sc_sync = _clip((cost["sync_up"] - 0.3) / 0.6 * 100)
+        sc_elas = _clip(cost["elasticity"] / 0.3 * 100)
+        s_cost = _clip(0.4 * sc_sync + 0.6 * sc_elas)
+        s_low = _clip(50 - corr * 50)
+        dims_raw = [
+            ("危机Alpha占比", "核心", 0.20, s_alpha),
+            ("深跌周抗跌性", "核心", 0.15, s_deep),
+            ("下尾负相关", "对冲", 0.12, s_tail),
+            ("回撤独立性", "对冲", 0.12, s_dd),
+            ("多宽基一致性", "稳健", 0.10, s_multi),
+            ("月度危机Alpha", "稳健", 0.10, s_month),
+            ("极端事件保护", "核心", 0.10, s_extreme),
+            ("上涨周代价", "代价", 0.06, s_cost),
+            ("整体低相关", "对冲", 0.05, s_low),
+        ]
+        dimensions = []
+        for name, typ, weight, score in dims_raw:
+            score_r = round(score, 1)
+            dimensions.append(
+                {
+                    "维度": name,
+                    "类型": typ,
+                    "权重": weight,
+                    "得分": score_r,
+                    "评级": _rating(score_r),
+                    "贡献": round(score_r * weight, 1),
+                }
+            )
+        total = round(sum(d["得分"] * d["权重"] for d in dimensions), 1)
+        return {"total_score": total, "rating": _rating(total), "dimensions": dimensions}
+
+    def summary(self, multi_bench_alpha_ratios: Optional[List[float]] = None) -> dict:
+        return {
+            "strategy": self.strategy_name,
+            "benchmark": self.benchmark_name,
+            "n_weeks": int(len(self.b_week_ret)),
+            "quadrant": self.quadrant_analysis(),
+            "extreme_top": self.extreme_drops_top_n(),
+            "deep_dd_events": self.deep_drawdown_events(),
+            "rolling_corr": self.rolling_correlation(),
+            "monthly": self.monthly_analysis(),
+            "annual": self.annual_stats(),
+            "cost": self.cost_analysis(),
+            "performance": self.performance_stats(),
+            "conditions": self.condition_tests(),
+            "score": self.composite_score(multi_bench_alpha_ratios),
+            "weekly_detail": self.weekly_detail_df(),
+        }
+
+
+def _frame_records(df: pd.DataFrame) -> List[dict]:
+    out = []
+    for idx, row in zip(df.index, df.to_dict(orient="records")):
+        rec = {"日期": idx}
+        rec.update(row)
+        out.append(rec)
+    return out
+
+
+def sanitize_for_json(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, pd.Series):
+        return [
+            {"date": sanitize_for_json(idx), "value": sanitize_for_json(v)}
+            for idx, v in value.items()
+        ]
+    if isinstance(value, pd.DataFrame):
+        return sanitize_for_json(_frame_records(value))
+    if isinstance(value, dict):
+        return {str(k): sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_json(v) for v in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return sanitize_for_json(item())
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def build_crisis_alpha_payload(
+    strategy_nav: pd.Series,
+    main_code: str,
+    main_name: str,
+    main_closes: pd.Series,
+    benchmark_closes: Dict[str, pd.Series],
+    strategy_name: str,
+) -> dict:
+    an = CrisisAlphaAnalyzer(
+        strategy_nav, main_closes,
+        strategy_name=strategy_name, benchmark_name=main_name,
+    )
+    q_main = an.quadrant_analysis()
+    multi_rows = [
+        {
+            "key": "main",
+            "name": main_name,
+            "code": main_code,
+            "alpha_ratio": q_main["alpha_ratio"],
+            "n_down": q_main["n_down"],
+            "up_rate": q_main["up_rate"],
+            "is_main": True,
+        }
+    ]
+    for spec in CRISIS_BENCHMARKS:
+        if spec["code"] == main_code:
+            continue
+        series = benchmark_closes.get(spec["code"])
+        if series is None or len(series) == 0:
+            continue
+        try:
+            an_b = CrisisAlphaAnalyzer(
+                strategy_nav, series,
+                strategy_name=strategy_name, benchmark_name=spec["name"],
+            )
+        except (TypeError, ValueError):
+            continue
+        q = an_b.quadrant_analysis()
+        multi_rows.append(
+            {
+                "key": spec["key"],
+                "name": spec["name"],
+                "code": spec["code"],
+                "alpha_ratio": q["alpha_ratio"],
+                "n_down": q["n_down"],
+                "up_rate": q["up_rate"],
+                "is_main": False,
+            }
+        )
+    summary = an.summary([row["alpha_ratio"] for row in multi_rows])
+    s_nav, b_nav = an._nav()
+    s_map = {idx: float(v) for idx, v in s_nav.items()}
+    b_map = {idx: float(v) for idx, v in b_nav.items()}
+    dates = sorted(set(s_map) | set(b_map))
+    payload = {
+        "strategy_name": strategy_name,
+        "benchmark_code": main_code,
+        "benchmark_name": main_name,
+        "alpha_rating": alpha_rating(summary["quadrant"]["alpha_ratio"]),
+        "n_weeks": summary["n_weeks"],
+        "quadrant": summary["quadrant"],
+        "conditions": summary["conditions"],
+        "extreme_top": _frame_records(summary["extreme_top"]),
+        "deep_dd_events": summary["deep_dd_events"],
+        "rolling_corr": summary["rolling_corr"],
+        "expanding_corr": an.expanding_correlation(),
+        "monthly": {
+            "states": summary["monthly"]["states"],
+            "hedge_ratio": summary["monthly"]["hedge_ratio"],
+            "n_down_month": summary["monthly"]["n_down_month"],
+            "big_down": _frame_records(summary["monthly"]["big_down"]),
+        },
+        "annual": summary["annual"],
+        "cost": summary["cost"],
+        "performance": summary["performance"],
+        "score": summary["score"],
+        "weekly_detail": _frame_records(summary["weekly_detail"]),
+        "down_weeks": _frame_records(an.down_week_df()),
+        "nav": {
+            "dates": dates,
+            "strategy": [s_map.get(d) for d in dates],
+            "benchmark": [b_map.get(d) for d in dates],
+            "shade_spans": [[s, e] for s, e in an.drawdown_shade_spans()],
+        },
+        "multi_bench": multi_rows,
+    }
+    return sanitize_for_json(payload)

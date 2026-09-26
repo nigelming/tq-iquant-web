@@ -1,17 +1,23 @@
+import json
 import math
+from datetime import date
+from decimal import Decimal
 
 import pandas as pd
 import pytest
 
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, CRISIS_CATS, CRISIS_COLORS, CrisisAlphaAnalyzer,
-    _classify_crisis, _rating, alpha_rating,
+    _classify_crisis, _frame_records, _rating, alpha_rating,
+    build_crisis_alpha_payload, sanitize_for_json,
 )
 
 WEEKS_B = [-0.10, -0.10, -0.10, -0.10, 0.05, 0.05, 0.05, 0.05, -0.04, 0.04, -0.08, 0.02]
 WEEKS_S = [0.02, -0.02, -0.06, -0.12, 0.03, 0.06, -0.01, 0.04, -0.03, 0.02, -0.09, 0.01]
 WEEKS_B_DISTINCT = [-0.10, -0.09, -0.08, -0.07, 0.05, 0.06, 0.05, 0.04, -0.04, 0.03, -0.11, 0.02]
 WEEKS_S_DISTINCT = [0.01, -0.01, -0.02, -0.03, 0.04, 0.05, 0.03, 0.02, -0.01, 0.01, -0.05, 0.01]
+WEEKS_B_SHALLOW = [-0.02, 0.015, -0.025, 0.018, -0.012, 0.008, -0.022, 0.026, -0.016, 0.011, 0.024, -0.007]
+WEEKS_S_SHALLOW = [0.011, -0.006, 0.014, -0.009, 0.019, -0.004, 0.007, -0.013, 0.016, -0.005, 0.010, -0.008]
 
 
 def _series_from_weekly(weekly_returns, start="2024-01-01", days_per_week=5):
@@ -351,3 +357,174 @@ def test_annual_stats_marks_full_year_when_40_plus_weeks():
     an = _analyzer(b, s)
     rows = an.annual_stats()
     assert rows[0]["完整"] is True
+
+
+def test_composite_score_shape_weights_and_contributions():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    sc = an.composite_score()
+    assert len(sc["dimensions"]) == 9
+    assert [d["维度"] for d in sc["dimensions"]] == [
+        "危机Alpha占比", "深跌周抗跌性", "下尾负相关", "回撤独立性",
+        "多宽基一致性", "月度危机Alpha", "极端事件保护", "上涨周代价", "整体低相关",
+    ]
+    assert [d["类型"] for d in sc["dimensions"]] == [
+        "核心", "核心", "对冲", "对冲", "稳健", "稳健", "核心", "代价", "对冲",
+    ]
+    assert [d["权重"] for d in sc["dimensions"]] == [
+        0.20, 0.15, 0.12, 0.12, 0.10, 0.10, 0.10, 0.06, 0.05,
+    ]
+    assert sum(d["权重"] for d in sc["dimensions"]) == pytest.approx(1.0)
+    for d in sc["dimensions"]:
+        assert 0.0 <= d["得分"] <= 100.0
+        assert d["贡献"] == pytest.approx(round(d["得分"] * d["权重"], 1), abs=0.05)
+        assert d["评级"] in {"卓越", "优秀", "一般"}
+    assert sc["total_score"] == pytest.approx(
+        sum(d["得分"] * d["权重"] for d in sc["dimensions"]), abs=0.05
+    )
+    assert sc["rating"] in {"卓越", "优秀", "一般"}
+
+
+def test_composite_score_neutral_fallbacks_without_deep_weeks_or_events():
+    an = _analyzer(WEEKS_B_SHALLOW, WEEKS_S_SHALLOW)
+    assert float(an.drawdown_series("b").min()) > -0.05
+    assert float(an.b_week_ret.min()) > -0.03
+    assert an.b_week_ret.std() > 0.0 and an.s_week_ret.std() > 0.0
+    dims = {d["维度"]: d for d in an.composite_score()["dimensions"]}
+    assert dims["深跌周抗跌性"]["得分"] == pytest.approx(50.0)
+    assert dims["回撤独立性"]["得分"] == pytest.approx(50.0)
+
+
+def test_composite_score_multi_benchmark_ratios_drive_fifth_dimension():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    base = {d["维度"]: d["得分"] for d in an.composite_score()["dimensions"]}
+    boosted = {
+        d["维度"]: d["得分"]
+        for d in an.composite_score(multi_bench_alpha_ratios=[1.0] * 6)["dimensions"]
+    }
+    assert base["多宽基一致性"] == pytest.approx(15.0)
+    assert boosted["多宽基一致性"] == pytest.approx(100.0)
+    assert base["深跌周抗跌性"] == pytest.approx(boosted["深跌周抗跌性"])
+
+
+def test_summary_exposes_all_module_inputs():
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    s = an.summary()
+    assert set(s) == {
+        "strategy", "benchmark", "n_weeks", "quadrant", "extreme_top",
+        "deep_dd_events", "rolling_corr", "monthly", "annual", "cost",
+        "performance", "conditions", "score", "weekly_detail",
+    }
+    assert s["n_weeks"] == 12
+
+
+def test_frame_records_puts_index_into_date_key():
+    df = pd.DataFrame(
+        {"基准": [-0.1, -0.2]},
+        index=pd.to_datetime(["2024-01-12", "2024-01-19"]),
+    )
+    assert _frame_records(df) == [
+        {"日期": pd.Timestamp("2024-01-12"), "基准": -0.1},
+        {"日期": pd.Timestamp("2024-01-19"), "基准": -0.2},
+    ]
+
+
+def test_build_payload_aligns_nav_and_flags_main_benchmark():
+    s_nav = _series_from_weekly([0.0] + WEEKS_S)
+    b_nav = _series_from_weekly([0.0] + WEEKS_B)
+    payload = build_crisis_alpha_payload(
+        s_nav,
+        "000300.SH",
+        "沪深300",
+        b_nav,
+        {"000300.SH": b_nav, "000905.SH": b_nav * 1.01},
+        "组合A",
+    )
+    assert payload["strategy_name"] == "组合A"
+    assert payload["benchmark_code"] == "000300.SH"
+    assert payload["benchmark_name"] == "沪深300"
+    assert payload["n_weeks"] == 12
+    assert payload["alpha_rating"] == "较弱"
+    nav = payload["nav"]
+    assert len(nav["dates"]) == 65
+    assert len(nav["strategy"]) == 65
+    assert len(nav["benchmark"]) == 65
+    assert nav["strategy"][0] == pytest.approx(1.0)
+    assert nav["benchmark"][0] == pytest.approx(1.0)
+    assert nav["dates"][0] == "2024-01-01"
+    assert nav["dates"][-1] == "2024-03-29"
+    assert len(nav["shade_spans"]) == 1
+    assert len(payload["multi_bench"]) == 2
+    assert payload["multi_bench"][0]["is_main"] is True
+    assert payload["multi_bench"][0]["name"] == "沪深300"
+    assert payload["multi_bench"][1]["is_main"] is False
+    assert payload["multi_bench"][1]["name"] == "中证500"
+    assert len(payload["down_weeks"]) == 6
+    assert payload["down_weeks"][0]["日期"] > payload["down_weeks"][-1]["日期"]
+    assert len(payload["weekly_detail"]) == 12
+    assert set(payload["weekly_detail"][0]) == {"日期", "基准收益", "策略收益", "超额", "分类"}
+    assert payload["score"]["total_score"] > 0
+    json.dumps(payload, allow_nan=False)
+
+
+def test_build_payload_ignores_unusable_extra_benchmarks():
+    s_nav = _series_from_weekly([0.0] + WEEKS_S)
+    b_nav = _series_from_weekly([0.0] + WEEKS_B)
+    short = b_nav.iloc[:10]
+    payload = build_crisis_alpha_payload(
+        s_nav, "000300.SH", "沪深300", b_nav, {"000905.SH": short}, "组合A"
+    )
+    assert [r["name"] for r in payload["multi_bench"]] == ["沪深300"]
+
+
+def test_sanitize_converts_non_json_types():
+    np_float = pd.DataFrame({"a": [1.5]})["a"].values[0]
+    np_int = pd.DataFrame({"a": [3]})["a"].values[0]
+    out = sanitize_for_json(
+        {
+            "nan": float("nan"),
+            "inf": float("inf"),
+            "ninf": float("-inf"),
+            "np_f": np_float,
+            "np_i": np_int,
+            "ts": pd.Timestamp("2024-03-22"),
+            "nat": pd.NaT,
+            "dec": Decimal("2.50"),
+            "d": date(2024, 1, 2),
+            "series": pd.Series(
+                [1.0, 2.0], index=pd.to_datetime(["2024-01-05", "2024-01-12"])
+            ),
+            "frame": pd.DataFrame(
+                {"基准": [-0.1, -0.2]},
+                index=pd.to_datetime(["2024-01-05", "2024-01-12"]),
+            ),
+            "nested": [{"x": float("nan")}, [float("inf")]],
+            "flag": True,
+        }
+    )
+    assert out["nan"] is None
+    assert out["inf"] is None
+    assert out["ninf"] is None
+    assert out["np_f"] == 1.5 and isinstance(out["np_f"], float)
+    assert out["np_i"] == 3 and isinstance(out["np_i"], int)
+    assert out["ts"] == "2024-03-22"
+    assert out["nat"] is None
+    assert out["dec"] == pytest.approx(2.5)
+    assert out["d"] == "2024-01-02"
+    assert out["flag"] is True
+    assert out["series"] == [
+        {"date": "2024-01-05", "value": 1.0},
+        {"date": "2024-01-12", "value": 2.0},
+    ]
+    assert out["frame"] == [
+        {"日期": "2024-01-05", "基准": pytest.approx(-0.1)},
+        {"日期": "2024-01-12", "基准": pytest.approx(-0.2)},
+    ]
+    assert out["nested"] == [{"x": None}, [None]]
+    json.dumps(out, allow_nan=False)
+
+
+def test_sanitize_passes_through_plain_values():
+    assert sanitize_for_json({"a": 1, "b": "x", "c": [1, 2]}) == {
+        "a": 1, "b": "x", "c": [1, 2],
+    }
+    assert sanitize_for_json(None) is None
