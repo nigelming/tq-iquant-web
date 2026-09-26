@@ -977,3 +977,249 @@ describe('Backtest.vue — 危机Alpha section 骨架', () => {
     expect(String(scrollTargets[0].className)).toContain('ca-section')
   })
 })
+
+function caTableByHeader(w: any, header: string) {
+  return w.findAll('table').find((t: any) => t.find('thead').text().includes(header))!
+}
+
+describe('Backtest.vue — 危机Alpha 模块一~六', () => {
+  it('渲染模块一~六标题（含 TOP 数量与下跌周数）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    for (const t of [
+      '一、核心结论', '二、产品与基准走势', '三、危机Alpha四档分类',
+      '四、极端下跌周 TOP3', '五、全周期四象限分布', '六、深度回撤事件独立性',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
+  })
+
+  it('核心结论段落含下跌周均值 / 相关系数 / 回撤事件对冲数 + 两个评级标签', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('在 6 个沪深300下跌周中')
+    expect(text).toContain('66.7%')
+    expect(text).toContain('50.0%')
+    expect(text).toContain('-2.83%')
+    expect(text).toContain('-7.00%')
+    expect(text).toContain('0.250')
+    expect(text).toContain('最深的 2 次基准回撤中有 1 次逆势录得正收益')
+    expect(text).toContain('危机Alpha 66.7% · 优秀')
+    expect(text).toContain('综合评分 72.3 · 优秀')
+  })
+
+  it('二：净值走势图容器 + 绩效表（5 行，含相关系数解读）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    const text = w.text()
+    for (const t of ['累计收益', '年化收益', '年化波动', '最大回撤', '相关系数']) {
+      expect(text).toContain(t)
+    }
+    expect(text).toContain('低/负相关，对冲属性显著')
+  })
+
+  it('三：分类统计表（4 档 + 危机Alpha合计）与深跌周条件检验（2 行）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    for (const t of ['逆势上涨', '跌得少', '跟着跌', '跌更多', '危机Alpha合计']) {
+      expect(text).toContain(t)
+    }
+    expect(text).toContain('深跌周条件检验（更严苛）')
+    expect(text).toContain('沪深300周跌 >3%')
+    expect(text).toContain('沪深300周跌 >5%')
+    expect(w.findAll('.ca-cond-table tbody tr').length).toBe(2)
+  })
+
+  it('四：TOP3 说明含逆势正收益周数与跑赢周数', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('沪深300跌幅最大的 3 周中')
+    expect(text).toContain('1 周逆势录得正收益')
+    // fixture 3 周 extreme_top 全部 策略>基准（0.01>-0.12 / -0.02>-0.10 / -0.08>-0.10）→ 3 周跑赢
+    expect(text).toContain('3 周跑赢基准')
+  })
+
+  it('五：四象限图 4 档分类 + 四象限标注（象限文字是 chart graphic，不进 DOM）', async () => {
+    const { init } = await import('echarts')
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.text()).toContain('左上象限（股跌+策略涨）即')
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const sc = options.find((o: any) => o.xAxis?.name === '基准周收益(%)')
+    expect(sc).toBeTruthy()
+    expect(sc.series.map((s: any) => s.name)).toEqual(['逆势上涨', '跌得少', '跟着跌', '跌更多'])
+    const texts = sc.graphic.map((g: any) => g.style.text)
+    expect(texts.some((t: string) => t.includes('股跌+稳健组合涨'))).toBe(true)
+    expect(texts.some((t: string) => t.includes('股涨+稳健组合跌'))).toBe(true)
+    expect(texts).toContain('同涨')
+    expect(texts).toContain('同跌')
+  })
+
+  it('六：事件表 2 行 + 回撤独立性说明', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(w.findAll('.ca-event-table tbody tr').length).toBe(2)
+    expect(text).toContain('2024-01-12')
+    expect(text).toContain('2024-02-02')
+    expect(text).toContain('✓ 逆势对冲')
+    expect(text).toContain('✗ 同步下跌')
+    expect(text).toContain('回撤独立性 50%')
+  })
+
+  it('无数据时（status=failed）不渲染 12 模块与图表容器', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: 'x', skipped_benchmarks: [],
+        computed_at: null, benchmark_code: '000300.SH',
+        benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.findAll('.ca-kpi').length).toBe(0)
+    expect(w.text()).not.toContain('一、核心结论')
+  })
+
+  it('三：分类表平均周收益按符号着色（正红负绿，合计行不着色）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const table = caTableByHeader(w, '平均周收益')
+    const cell = (cat: string) => {
+      const row = table.findAll('tbody tr').find((r: any) => r.findAll('td')[0].text() === cat)!
+      return row.findAll('td')[3]
+    }
+    expect(cell('逆势上涨').text()).toBe('+2.00%')
+    expect(cell('逆势上涨').classes()).toContain('text-red')
+    expect(cell('跌得少').text()).toBe('-3.00%')
+    expect(cell('跌得少').classes()).toContain('text-green')
+    expect(cell('跟着跌').classes()).toContain('text-green')
+    expect(cell('跌更多').classes()).toContain('text-green')
+    expect(cell('危机Alpha合计').text()).toBe('—')
+    expect(cell('危机Alpha合计').classes()).not.toContain('text-red')
+    expect(cell('危机Alpha合计').classes()).not.toContain('text-green')
+  })
+
+  it('三：条件检验策略平均按符号着色（股票平均列固定绿）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-cond-table tbody tr')
+    const sAvg = (i: number) => rows[i].findAll('td')[3]
+    const bAvg = (i: number) => rows[i].findAll('td')[2]
+    expect(sAvg(0).text()).toBe('-1.00%')
+    expect(sAvg(0).classes()).toContain('text-green')
+    expect(sAvg(1).text()).toBe('+0.00%')
+    expect(sAvg(1).classes()).toContain('text-red')
+    expect(bAvg(0).classes()).toContain('text-green')
+    expect(bAvg(1).classes()).toContain('text-green')
+  })
+
+  it('六：事件表策略/超额两列各自按符号着色（可正可负独立）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-event-table tbody tr')
+    const cell = (i: number, idx: number) => rows[i].findAll('td')[idx]
+    expect(cell(0, 3).text()).toBe('+1.00%')
+    expect(cell(0, 3).classes()).toContain('text-red')
+    expect(cell(0, 4).text()).toBe('+13.00%')
+    expect(cell(0, 4).classes()).toContain('text-red')
+    expect(cell(1, 3).text()).toBe('-9.00%')
+    expect(cell(1, 3).classes()).toContain('text-green')
+    expect(cell(1, 4).text()).toBe('-1.00%')
+    expect(cell(1, 4).classes()).toContain('text-green')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
+  it('渲染模块七~十二标题，累计 9 个图表容器', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    for (const t of [
+      '七、多宽基一致性', '八、月度视角', '九、动态相关性与年度趋势',
+      '十、代价检验（上涨周表现）', '十一、综合危机保护评分', '十二、全部下跌周明细（6 周）',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
+    expect(w.findAll('.ca-chart').length).toBe(9)
+  })
+
+  it('12 个模块标题按源顺序渲染', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const titles = [
+      '一、核心结论', '二、产品与基准走势', '三、危机Alpha四档分类', '四、极端下跌周 TOP3',
+      '五、全周期四象限分布', '六、深度回撤事件独立性', '七、多宽基一致性', '八、月度视角',
+      '九、动态相关性与年度趋势', '十、代价检验（上涨周表现）', '十一、综合危机保护评分',
+      '十二、全部下跌周明细（6 周）',
+    ]
+    const text = w.text()
+    let last = -1
+    for (const t of titles) {
+      const i = text.indexOf(t)
+      expect(i, `标题缺失或顺序错误: ${t}`).toBeGreaterThan(last)
+      last = i
+    }
+  })
+
+  it('七：多宽基明细表含主基准标记与 2 个基准', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('沪深300（主基准）')
+    expect(text).toContain('中证500')
+    expect(w.findAll('.ca-multi-table tbody tr').length).toBe(2)
+  })
+
+  it('八：月度 4 状态表 + 大跌月明细（1 行）+ 月度对冲比例', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    for (const t of ['大涨', '小涨', '小跌', '大跌']) expect(text).toContain(t)
+    expect(text).toContain('大跌月明细（股票月跌 >5%）')
+    expect(w.findAll('.ca-bigdown-table tbody tr').length).toBe(1)
+    expect(text).toContain('下跌月份共 50.0% 实现危机对冲（月度口径）')
+  })
+
+  it('九：年度表带 * 标记（非完整年）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.text()).toContain('2024*')
+    expect(w.text()).toContain('标 * 的年度为数据区间首尾的非完整年度')
+  })
+
+  it('十：代价检验 5 行', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-cost-table tbody tr').length).toBe(5)
+    const text = w.text()
+    for (const t of ['上涨周拖后腿比例', '上涨周同步上涨比例', '收益弹性比', '下尾相关（下跌周内）', 'Q1分位相关（最差25%周）']) {
+      expect(text).toContain(t)
+    }
+  })
+
+  it('十一：评分维度表 3 行 + 综合评分行', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-dim-table tbody tr')
+    expect(rows.length).toBe(4)
+    expect(w.text()).toContain('综合评分')
+  })
+
+  it('十二：下跌周明细表按日期倒序（2024-01-26 在 2024-01-05 之前）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-down-table tbody tr')
+    expect(rows.length).toBe(4)
+    const text = w.text()
+    expect(text.indexOf('2024-01-26')).toBeLessThan(text.indexOf('2024-01-05'))
+  })
+
+  it('四档配色为红/橙/浅绿/深绿（与红涨绿跌一致）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const html = w.html()
+    expect(html).toContain('#d6403a')
+    expect(html).toContain('#f0a429')
+    expect(html).toContain('#9dc88d')
+    expect(html).toContain('#1f6e4f')
+  })
+
+  it('重算后重新初始化 9 个危机Alpha 图表', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const before = w.findAll('.ca-chart').length
+    expect(before).toBe(9)
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(w.text()).toContain('重新计算完成')
+  })
+})

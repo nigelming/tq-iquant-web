@@ -56,6 +56,7 @@ const CRISIS_SCORE_COLORS: Record<string, string> = {
   卓越: '#d6403a', 优秀: '#f0a429', 一般: '#b0a890',
 }
 const CRISIS_CATS = ['逆势上涨', '跌得少', '跟着跌', '跌更多']
+const MONTH_STATES = ['大涨', '小涨', '小跌', '大跌']
 
 const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
@@ -99,6 +100,282 @@ const caKpis = computed(() => {
   ]
 })
 
+const caPerfRows = computed(() => {
+  const d = ca.value
+  if (!d) return []
+  const s = d.performance.s
+  const b = d.performance.b
+  const corr = d.performance.corr
+  return [
+    { 指标: '累计收益', 策略: pct1(s.cum), 基准: pct1(b.cum) },
+    { 指标: '年化收益', 策略: pct1(s.ann), 基准: pct1(b.ann) },
+    { 指标: '年化波动', 策略: pct1(s.vol), 基准: pct1(b.vol) },
+    { 指标: '最大回撤', 策略: pct1(s.mdd), 基准: pct1(b.mdd) },
+    {
+      指标: '相关系数',
+      策略: '—',
+      基准: corr !== null && corr < 0.3
+        ? `${num(corr, 3)}（低/负相关，对冲属性显著）`
+        : num(corr, 3),
+    },
+  ]
+})
+
+const caCatRows = computed(() => {
+  const d = ca.value
+  if (!d) return []
+  const q = d.quadrant
+  const n = Math.max(q.n_down, 1)
+  const rows: Array<{
+    分类: string
+    周数: number
+    占比: string
+    平均周收益: string
+    avg: number | null
+    color: string
+  }> = CRISIS_CATS.map((c) => ({
+    分类: c,
+    周数: q.counts[c] ?? 0,
+    占比: pct1((q.counts[c] ?? 0) / n),
+    平均周收益: pctSigned(q.avg_ret[c] ?? 0),
+    avg: q.avg_ret[c] ?? 0,
+    color: CRISIS_COLORS[c],
+  }))
+  rows.push({
+    分类: '危机Alpha合计',
+    周数: (q.counts.逆势上涨 ?? 0) + (q.counts.跌得少 ?? 0),
+    占比: pct1(q.alpha_ratio),
+    平均周收益: '—',
+    avg: null,
+    color: '#111827',
+  })
+  return rows
+})
+
+const caCondRows = computed((): Array<{
+  条件: string
+  周数: number
+  股票平均: string
+  策略平均: string
+  s_avg: number | null
+  收涨比例: string
+}> => {
+  const d = ca.value
+  if (!d) return []
+  return d.conditions.map((t) => ({
+    条件: `${d.benchmark_name}周跌 >${(Math.abs(t.threshold) * 100).toFixed(0)}%`,
+    周数: t.n,
+    股票平均: pctSigned(t.b_avg),
+    策略平均: pctSigned(t.s_avg),
+    s_avg: t.s_avg,
+    收涨比例: pct1(t.up_rate),
+  }))
+})
+
+const caPie = computed(() => {
+  const d = ca.value
+  if (!d) return null
+  const q = d.quadrant
+  const values = CRISIS_CATS.map((c) => q.counts[c] ?? 0)
+  if (values.reduce((a, b) => a + b, 0) === 0) return null
+  const n = Math.max(q.n_down, 1)
+  return {
+    labels: CRISIS_CATS.map((c, i) => `${c}  ${(values[i] / n * 100).toFixed(1)}%`),
+    shortLabels: CRISIS_CATS.map((c) => `${c} ${values[CRISIS_CATS.indexOf(c)]}周`),
+    values,
+    colors: CRISIS_CATS.map((c) => CRISIS_COLORS[c]),
+    alpha: (q.alpha_ratio * 100).toFixed(1),
+  }
+})
+
+const caTop = computed(() => {
+  const rows = ca.value?.extreme_top ?? []
+  if (!rows.length) return null
+  return {
+    labels: rows.map((r) => String(r.日期).slice(2)),
+    b: rows.map((r) => +((r.基准 ?? 0) * 100).toFixed(4)),
+    s: rows.map((r) => +((r.策略 ?? 0) * 100).toFixed(4)),
+  }
+})
+const caTopStat = computed(() => {
+  const rows = ca.value?.extreme_top ?? []
+  return {
+    n: rows.length,
+    up: rows.filter((r) => (r.策略 ?? 0) > 0).length,
+    beat: rows.filter((r) => (r.策略 ?? 0) > (r.基准 ?? 0)).length,
+  }
+})
+
+const caScatter = computed(() => {
+  const d = ca.value
+  if (!d) return null
+  return CRISIS_CATS.map((cat) => ({
+    name: cat,
+    color: CRISIS_COLORS[cat],
+    data: d.weekly_detail
+      .filter((r) => r.分类 === cat)
+      .map((r) => [
+        +(((r.基准收益 ?? 0)) * 100).toFixed(4),
+        +(((r.策略收益 ?? 0)) * 100).toFixed(4),
+      ]),
+  })).filter((s) => s.data.length > 0)
+})
+
+const caEventRows = computed((): Array<{
+  回撤起点: string
+  回撤低点: string
+  基准: string
+  策略: string
+  超额: string
+  strategy_ret: number | null
+  excess: number | null
+  结果: string
+  hedged: boolean
+}> => (ca.value?.deep_dd_events ?? []).map((e) => ({
+  回撤起点: e.start,
+  回撤低点: e.end,
+  基准: pctSigned(e.benchmark_ret),
+  策略: pctSigned(e.strategy_ret),
+  超额: pctSigned(e.excess),
+  strategy_ret: e.strategy_ret,
+  excess: e.excess,
+  结果: `${e.hedged ? '✓ ' : '✗ '}${e.verdict}`,
+  hedged: e.hedged,
+})))
+const caEventStat = computed(() => {
+  const ev = ca.value?.deep_dd_events ?? []
+  const hedged = ev.filter((e) => e.hedged).length
+  return { n: ev.length, hedged, pct: ev.length ? Math.round(hedged / ev.length * 100) : 0 }
+})
+
+const caMultiRows = computed(() => (ca.value?.multi_bench ?? []).map((m) => ({
+  基准: `${m.name}${m.is_main ? '（主基准）' : ''}`,
+  下跌周数: m.n_down,
+  危机Alpha: pct1(m.alpha_ratio),
+  逆势上涨比例: pct1(m.up_rate),
+})))
+const caMultiSeries = computed(() => {
+  const rows = ca.value?.multi_bench ?? []
+  if (rows.length < 2) return null
+  return {
+    labels: rows.map((m) => `${m.name}${m.is_main ? '（主基准）' : ''}`),
+    values: rows.map((m) => +(m.alpha_ratio * 100).toFixed(4)),
+    colors: rows.map((m) => (m.is_main ? '#d6403a' : '#f0a429')),
+    main: +(((ca.value?.quadrant.alpha_ratio ?? 0)) * 100).toFixed(4),
+  }
+})
+
+const caMonthRows = computed(() => {
+  const d = ca.value
+  if (!d) return []
+  return MONTH_STATES.map((s) => {
+    const st = d.monthly.states[s]
+    return {
+      市场状态: s,
+      月数: st?.n ?? 0,
+      股票月均: pctSigned(st?.b_avg ?? 0, 1),
+      策略月均: pctSigned(st?.s_avg ?? 0),
+      正收益比例: pct1(st?.win_rate ?? 0),
+    }
+  })
+})
+const caBigDownRows = computed(() => (ca.value?.monthly.big_down ?? []).map((r) => ({
+  月份: String(r.日期).slice(0, 7),
+  基准: pctSigned(r.基准, 1),
+  策略: pctSigned(r.策略),
+})))
+const caMonthSeries = computed(() => {
+  const d = ca.value
+  if (!d) return null
+  return {
+    labels: MONTH_STATES.map((s) => `${s}（${d.monthly.states[s]?.n ?? 0}月）`),
+    b: MONTH_STATES.map((s) => +(((d.monthly.states[s]?.b_avg ?? 0)) * 100).toFixed(4)),
+    s: MONTH_STATES.map((s) => +(((d.monthly.states[s]?.s_avg ?? 0)) * 100).toFixed(4)),
+  }
+})
+
+const caCorrRows = computed(() => {
+  const d = ca.value
+  if (!d) return null
+  const rc = d.rolling_corr
+  if (!rc.length) return null
+  const first = rc[0].date
+  const early = d.expanding_corr.filter((p) => p.date < first)
+  const dates: string[] = []
+  const seen = new Set<string>()
+  for (const p of [...early, ...rc]) {
+    if (!seen.has(p.date)) { seen.add(p.date); dates.push(p.date) }
+  }
+  const pos = new Map(dates.map((v, i) => [v, i]))
+  const earlyData: (number | null)[] = new Array(dates.length).fill(null)
+  for (const p of early) earlyData[pos.get(p.date)!] = p.value
+  const rcData: (number | null)[] = new Array(dates.length).fill(null)
+  for (const p of rc) rcData[pos.get(p.date)!] = p.value
+  if (early.length) earlyData[pos.get(first)!] = rc[0].value
+  return { dates, earlyData, rcData }
+})
+const caAnnualRows = computed(() => (ca.value?.annual ?? []).map((r) => ({
+  年度: `${r.年份}${r.完整 ? '' : '*'}`,
+  下跌周: r.下跌周,
+  危机Alpha: pct1(r.危机Alpha),
+  策略收益: pctSigned(r.策略收益, 1),
+  基准收益: pctSigned(r.基准收益, 1),
+  完整: r.完整,
+})))
+const caAnnualSeries = computed(() => {
+  const rows = ca.value?.annual ?? []
+  if (!rows.length) return null
+  return {
+    labels: rows.map((r) => `${r.年份}${r.完整 ? '' : '*'}`),
+    values: rows.map((r) => +(r.危机Alpha * 100).toFixed(4)),
+    colors: rows.map((r) => (r.危机Alpha * 100 >= 85 ? '#d6403a' : '#f0a429')),
+    main: +(((ca.value?.quadrant.alpha_ratio ?? 0)) * 100).toFixed(4),
+  }
+})
+
+const caCostRows = computed(() => {
+  const d = ca.value
+  if (!d) return []
+  const c = d.cost
+  const n = d.strategy_name
+  return [
+    { 指标: '上涨周拖后腿比例', 数值: pct1(c.drag), 解读: `股票上涨时${n}为负的周次占比，属低β配置型策略的正常代价` },
+    { 指标: '上涨周同步上涨比例', 数值: pct1(c.sync_up), 解读: `股票上涨时${n}跟随上涨的周次占比` },
+    { 指标: '收益弹性比', 数值: num(c.elasticity, 2), 解读: `${n}上涨周均收益 / 股票上涨周均收益，值低说明不依赖股市β` },
+    { 指标: '下尾相关（下跌周内）', 数值: num(c.tail_corr, 2), 解读: '下跌情境下相关性为负，越跌越对冲' },
+    { 指标: 'Q1分位相关（最差25%周）', 数值: num(c.q1_corr, 3), 解读: '极端下跌时相关性为负，尾部对冲有效' },
+  ]
+})
+
+const caDimRows = computed(() => (ca.value?.score.dimensions ?? []).map((x) => ({
+  维度: x.维度,
+  类型: x.类型,
+  权重: `${(x.权重 * 100).toFixed(0)}%`,
+  得分: num(x.得分, 1),
+  评级: x.评级,
+  贡献: num(x.贡献, 1),
+})))
+const caDimSeries = computed(() => {
+  const dims = ca.value?.score.dimensions ?? []
+  if (!dims.length) return null
+  const sorted = [...dims].sort((a, b) => b.得分 - a.得分)
+  return {
+    names: sorted.map((x) => x.维度),
+    values: sorted.map((x) => Math.max(x.得分, 3)),
+    raw: sorted.map((x) => x.得分),
+    colors: sorted.map((x) => CRISIS_SCORE_COLORS[x.评级] || '#b0a890'),
+  }
+})
+
+const caDownRows = computed(() => (ca.value?.down_weeks ?? []).map((r) => ({
+  日期: r.日期,
+  基准: pctSigned(r.基准收益 ?? 0),
+  策略: pctSigned(r.策略收益 ?? 0),
+  超额: pctSigned(r.超额 ?? 0),
+  分类: r.分类,
+  color: CRISIS_COLORS[r.分类] || '#111827',
+})))
+
 function caBenchmarkWarnText(br: CrisisAlphaBenchmarkResolution): string {
   const used = br.benchmark_name
   const live = br.live_benchmark_name
@@ -139,6 +416,272 @@ async function recomputeCa() {
 
 function initCrisisAlphaCharts() {
   if (!ca.value) return
+  initCaNavChart()
+  initCaPieChart()
+  initCaTopChart()
+  initCaScatterChart()
+  initCaMultiChart()
+  initCaMonthChart()
+  initCaCorrChart()
+  initCaAnnualChart()
+  initCaDimChart()
+}
+
+function initCaNavChart() {
+  if (!caNavEl.value || !ca.value) return
+  const d = ca.value
+  const nav = d.nav
+  caNavChart?.dispose()
+  caNavChart = echarts.init(caNavEl.value)
+  const mark = nav.shade_spans.length
+    ? [{
+        silent: true,
+        itemStyle: { color: 'rgba(214,64,58,0.08)' },
+        data: nav.shade_spans.map(([s, e]) => [{ xAxis: s }, { xAxis: e }]),
+      }]
+    : undefined
+  caNavChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { data: [d.strategy_name, d.benchmark_name], bottom: 0 },
+    grid: { left: 56, right: 24, bottom: 34, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: nav.dates, boundaryGap: false },
+    yAxis: {
+      type: 'value', name: '累计净值(起点=1.0)', scale: true,
+      axisLabel: { formatter: (v: number) => v.toFixed(2) },
+      splitLine: { lineStyle: { type: 'dashed' } },
+    },
+    series: [
+      {
+        name: d.strategy_name, type: 'line', data: nav.strategy, smooth: true, symbol: 'none',
+        lineStyle: { color: '#d6403a', width: 2.2 }, itemStyle: { color: '#d6403a' },
+        markArea: mark,
+        markLine: {
+          silent: true, symbol: 'none', label: { show: false },
+          lineStyle: { color: '#9ca3af', type: 'dashed' },
+          data: [{ yAxis: 1 }],
+        },
+      },
+      {
+        name: d.benchmark_name, type: 'line', data: nav.benchmark, smooth: true, symbol: 'none',
+        lineStyle: { color: '#4a7ec4', width: 1.8 }, itemStyle: { color: '#4a7ec4' },
+      },
+    ],
+  })
+}
+
+function initCaPieChart() {
+  if (!caPieEl.value || !caPie.value) return
+  const p = caPie.value
+  caPieChart?.dispose()
+  caPieChart = echarts.init(caPieEl.value)
+  caPieChart.setOption({
+    tooltip: { trigger: 'item', formatter: '{b}: {c}周' },
+    legend: { orient: 'vertical', right: 12, top: 'center', textStyle: { fontSize: 12 } },
+    series: [{
+      type: 'pie',
+      radius: ['55%', '75%'],
+      center: ['38%', '50%'],
+      sort: false,
+      itemStyle: { borderColor: '#fff', borderWidth: 2 },
+      label: { show: true, position: 'inner', color: '#fff', fontSize: 12,
+        formatter: (x: any) => String(x.name).split('  ')[0] },
+      labelLine: { show: false },
+      data: p.labels.map((lb, i) => ({
+        name: lb, value: p.values[i], itemStyle: { color: p.colors[i] },
+      })),
+    }],
+    graphic: [
+      { type: 'text', left: '30%', top: '42%',
+        style: { text: `${p.alpha}%`, fontSize: 28, fontWeight: 800, fill: '#d6403a', textAlign: 'center' } },
+      { type: 'text', left: '31%', top: '60%',
+        style: { text: '危机Alpha', fontSize: 13, fill: '#1f3a68', textAlign: 'center' } },
+    ],
+  })
+}
+
+function initCaTopChart() {
+  if (!caTopEl.value || !caTop.value) return
+  const t = caTop.value
+  caTopChart?.dispose()
+  caTopChart = echarts.init(caTopEl.value)
+  caTopChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { data: ['基准周收益', '策略周收益'], top: 0 },
+    grid: { left: 52, right: 24, bottom: 40, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: t.labels },
+    yAxis: { type: 'value', name: '周收益(%)' },
+    series: [
+      { name: '基准周收益', type: 'bar', data: t.b, barMaxWidth: 20, itemStyle: { color: '#2e8b57' },
+        label: { show: true, position: 'bottom', fontSize: 10, formatter: (x: any) => Number(x.value).toFixed(1) } },
+      { name: '策略周收益', type: 'bar', data: t.s, barMaxWidth: 20, itemStyle: { color: '#d6403a' },
+        label: { show: true, position: 'top', fontSize: 10, formatter: (x: any) => Number(x.value).toFixed(2) } },
+    ],
+  })
+}
+
+function initCaScatterChart() {
+  if (!caScatterEl.value || !caScatter.value) return
+  const sc = caScatter.value
+  if (!sc.length) return
+  caScatterChart?.dispose()
+  caScatterChart = echarts.init(caScatterEl.value)
+  const shortName = ca.value && ca.value.strategy_name.length > 7
+    ? `${ca.value.strategy_name.slice(0, 7)}…`
+    : (ca.value?.strategy_name || '')
+  caScatterChart.setOption({
+    tooltip: {
+      trigger: 'item',
+      formatter: (x: any) => `${x.seriesName}<br/>基准周收益 ${x.value[0]}%<br/>策略周收益 ${x.value[1]}%`,
+    },
+    legend: { orient: 'vertical', right: 12, top: 40, textStyle: { fontSize: 12 } },
+    grid: { left: 58, right: 110, bottom: 40, top: 40, containLabel: true },
+    xAxis: { type: 'value', name: '基准周收益(%)', scale: true, splitLine: { lineStyle: { type: 'dashed' } } },
+    yAxis: { type: 'value', name: '策略周收益(%)', scale: true, splitLine: { lineStyle: { type: 'dashed' } } },
+    series: sc.map((s, i) => ({
+      name: s.name, type: 'scatter', data: s.data, symbolSize: 8,
+      itemStyle: { color: s.color, opacity: 0.78 },
+      markLine: i === 0 ? {
+        silent: true, symbol: 'none', label: { show: false },
+        lineStyle: { color: '#4b5563', width: 1.2 },
+        data: [{ xAxis: 0 }, { yAxis: 0 }],
+      } : undefined,
+    })),
+    graphic: [
+      { type: 'text', left: 60, top: 46, style: { text: `危机Alpha\n（股跌+${shortName}涨）`, fill: '#d6403a', fontSize: 12 } },
+      { type: 'text', right: 150, top: 46, style: { text: '同涨', fill: '#b8860b', fontSize: 12 } },
+      { type: 'text', left: 60, bottom: 50, style: { text: '同跌', fill: '#2b6cb0', fontSize: 12 } },
+      { type: 'text', right: 130, bottom: 50, style: { text: `股涨+${shortName}跌`, fill: '#1f6e4f', fontSize: 12 } },
+    ],
+  })
+}
+
+const caNavEl = ref<HTMLDivElement | null>(null)
+const caPieEl = ref<HTMLDivElement | null>(null)
+const caTopEl = ref<HTMLDivElement | null>(null)
+const caScatterEl = ref<HTMLDivElement | null>(null)
+const caMultiEl = ref<HTMLDivElement | null>(null)
+const caMonthEl = ref<HTMLDivElement | null>(null)
+const caCorrEl = ref<HTMLDivElement | null>(null)
+const caAnnualEl = ref<HTMLDivElement | null>(null)
+const caDimEl = ref<HTMLDivElement | null>(null)
+let caNavChart: echarts.ECharts | null = null
+let caPieChart: echarts.ECharts | null = null
+let caTopChart: echarts.ECharts | null = null
+let caScatterChart: echarts.ECharts | null = null
+let caMultiChart: echarts.ECharts | null = null
+let caMonthChart: echarts.ECharts | null = null
+let caCorrChart: echarts.ECharts | null = null
+let caAnnualChart: echarts.ECharts | null = null
+let caDimChart: echarts.ECharts | null = null
+
+function initCaMultiChart() {
+  if (!caMultiEl.value || !caMultiSeries.value) return
+  const m = caMultiSeries.value
+  caMultiChart?.dispose()
+  caMultiChart = echarts.init(caMultiEl.value)
+  caMultiChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 52, right: 24, bottom: 60, top: 30, containLabel: true },
+    xAxis: { type: 'category', data: m.labels, axisLabel: { rotate: 20, fontSize: 11 } },
+    yAxis: { type: 'value', name: '危机Alpha(%)', max: 112 },
+    series: [{
+      type: 'bar', barMaxWidth: 40,
+      data: m.values.map((v, i) => ({ value: v, itemStyle: { color: m.colors[i] } })),
+      label: { show: true, position: 'top', formatter: (x: any) => `${Number(x.value).toFixed(1)}%` },
+      markLine: {
+        silent: true, symbol: 'none', label: { show: false },
+        lineStyle: { color: '#1f3a68', type: 'dashed', width: 1.4 },
+        data: [{ yAxis: m.main }],
+      },
+    }],
+  })
+}
+
+function initCaMonthChart() {
+  if (!caMonthEl.value || !caMonthSeries.value) return
+  const m = caMonthSeries.value
+  caMonthChart?.dispose()
+  caMonthChart = echarts.init(caMonthEl.value)
+  caMonthChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { data: ['基准月均', '策略月均'], top: 0 },
+    grid: { left: 52, right: 24, bottom: 40, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: m.labels },
+    yAxis: { type: 'value', name: '月均收益(%)' },
+    series: [
+      { name: '基准月均', type: 'bar', data: m.b, barMaxWidth: 26, itemStyle: { color: '#9db3d2' },
+        label: { show: true, position: 'top', fontSize: 11, formatter: (x: any) => Number(x.value).toFixed(1) } },
+      { name: '策略月均', type: 'bar', data: m.s, barMaxWidth: 26, itemStyle: { color: '#d6403a' },
+        label: { show: true, position: 'top', fontSize: 11, formatter: (x: any) => Number(x.value).toFixed(2) } },
+    ],
+  })
+}
+
+function initCaCorrChart() {
+  if (!caCorrEl.value || !caCorrRows.value) return
+  const c = caCorrRows.value
+  caCorrChart?.dispose()
+  caCorrChart = echarts.init(caCorrEl.value)
+  caCorrChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['扩展窗口相关（不足52周）', '滚动52周相关'], top: 0 },
+    grid: { left: 52, right: 24, bottom: 36, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: c.dates, boundaryGap: false },
+    yAxis: { type: 'value', name: '相关系数', min: -1.05, max: 1.05 },
+    series: [
+      { name: '扩展窗口相关（不足52周）', type: 'line', data: c.earlyData, symbol: 'none', connectNulls: true,
+        lineStyle: { color: '#9ca3af', width: 1.4, type: 'dashed' } },
+      { name: '滚动52周相关', type: 'line', data: c.rcData, symbol: 'none', connectNulls: true,
+        lineStyle: { color: '#1f3a68', width: 2 }, areaStyle: { color: 'rgba(31,58,104,0.10)' },
+        markLine: {
+          silent: true, symbol: 'none', label: { show: false },
+          lineStyle: { color: '#6b7280', type: 'dashed' },
+          data: [{ yAxis: 0 }],
+        } },
+    ],
+  })
+}
+
+function initCaAnnualChart() {
+  if (!caAnnualEl.value || !caAnnualSeries.value) return
+  const a = caAnnualSeries.value
+  caAnnualChart?.dispose()
+  caAnnualChart = echarts.init(caAnnualEl.value)
+  caAnnualChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 52, right: 24, bottom: 30, top: 30, containLabel: true },
+    xAxis: { type: 'category', data: a.labels },
+    yAxis: { type: 'value', name: '危机Alpha(%)', max: 112 },
+    series: [{
+      type: 'bar', barMaxWidth: 40,
+      data: a.values.map((v, i) => ({ value: v, itemStyle: { color: a.colors[i] } })),
+      label: { show: true, position: 'top', formatter: (x: any) => Number(x.value).toFixed(0) },
+      markLine: {
+        silent: true, symbol: 'none', label: { show: false },
+        lineStyle: { color: '#1f3a68', type: 'dashed' },
+        data: [{ yAxis: a.main }],
+      },
+    }],
+  })
+}
+
+function initCaDimChart() {
+  if (!caDimEl.value || !caDimSeries.value) return
+  const m = caDimSeries.value
+  caDimChart?.dispose()
+  caDimChart = echarts.init(caDimEl.value)
+  caDimChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: (ps: any) => `${ps[0].name}<br/>得分 ${m.raw[ps[0].dataIndex].toFixed(1)}` },
+    grid: { left: 104, right: 40, bottom: 30, top: 20, containLabel: true },
+    xAxis: { type: 'value', name: '得分(0-100)', max: 112 },
+    yAxis: { type: 'category', data: m.names, inverse: true, axisTick: { show: false } },
+    series: [{
+      type: 'bar', barMaxWidth: 22,
+      data: m.values.map((v, i) => ({ value: v, itemStyle: { color: m.colors[i] } })),
+      label: { show: true, position: 'right', formatter: (x: any) => m.raw[x.dataIndex].toFixed(0) },
+    }],
+  })
 }
 
 // 交易明细分页
@@ -764,6 +1307,15 @@ function handleResize() {
   dailyBoxChart?.resize()
   monthlyBoxChart?.resize()
   annualBarChart?.resize()
+  caNavChart?.resize()
+  caPieChart?.resize()
+  caTopChart?.resize()
+  caScatterChart?.resize()
+  caMultiChart?.resize()
+  caMonthChart?.resize()
+  caCorrChart?.resize()
+  caAnnualChart?.resize()
+  caDimChart?.resize()
 }
 
 onMounted(() => {
@@ -778,6 +1330,15 @@ onUnmounted(() => {
   dailyBoxChart?.dispose()
   monthlyBoxChart?.dispose()
   annualBarChart?.dispose()
+  caNavChart?.dispose()
+  caPieChart?.dispose()
+  caTopChart?.dispose()
+  caScatterChart?.dispose()
+  caMultiChart?.dispose()
+  caMonthChart?.dispose()
+  caCorrChart?.dispose()
+  caAnnualChart?.dispose()
+  caDimChart?.dispose()
 })
 </script>
 
@@ -929,6 +1490,281 @@ onUnmounted(() => {
             {{ recomputing ? '计算中…' : '重新计算' }}
           </button>
           <span v-if="recomputeMsg" :class="recomputeMsgClass">{{ recomputeMsg }}</span>
+        </div>
+
+        <div class="section-title" style="font-size:14px">一、核心结论</div>
+        <p class="ca-note">
+          在 {{ ca?.quadrant.n_down }} 个{{ ca?.benchmark_name }}下跌周中，{{ ca?.strategy_name }}
+          有 <strong>{{ pct1(ca?.quadrant.alpha_ratio) }}</strong> 的周次实现危机对冲（其中
+          <strong>{{ pct1(ca?.quadrant.up_rate) }}</strong> 逆势上涨、
+          <strong>{{ pct1((ca?.quadrant.counts.跌得少 ?? 0) / Math.max(ca?.quadrant.n_down ?? 1, 1)) }}</strong>
+          跌幅不足股票一半），而真正“跟着跌”或“跌更多”的周次合计仅
+          <strong>{{ pct1(ca?.quadrant.follow_ratio) }}</strong>。下跌周平均收益
+          <strong :class="valueClass(ca?.quadrant.down_avg_s)">{{ pctSigned(ca?.quadrant.down_avg_s) }}</strong>
+          （同期{{ ca?.benchmark_name }}平均 {{ pctSigned(ca?.quadrant.down_avg_b) }}），
+          与基准整体相关仅 <strong>{{ num(ca?.performance.corr, 3) }}</strong>，
+          且在最深的 {{ caEventStat.n }} 次基准回撤中有 {{ caEventStat.hedged }} 次逆势录得正收益。
+        </p>
+        <div class="ca-tags">
+          <span class="ca-tag" style="background:#d6403a">
+            危机Alpha {{ pct1(ca?.quadrant.alpha_ratio) }} · {{ ca?.alpha_rating }}
+          </span>
+          <span class="ca-tag" style="background:#f0a429">
+            综合评分 {{ num(ca?.score.total_score, 1) }} · {{ ca?.score.rating }}
+          </span>
+        </div>
+
+        <div class="section-title" style="font-size:14px">二、产品与基准走势</div>
+        <div class="chart-box">
+          <div ref="caNavEl" class="ca-chart"></div>
+        </div>
+        <p class="ca-note">
+          淡红色阴影为 {{ ca?.benchmark_name }} 深度回撤区间（自高点回撤超过 5%）；
+          危机Alpha各项统计均在策略与基准的共同交易日内计算。
+        </p>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>指标</th><th>{{ ca?.strategy_name }}</th><th>{{ ca?.benchmark_name }}</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caPerfRows" :key="r.指标">
+                <td>{{ r.指标 }}</td>
+                <td :class="valueClass(0)">{{ r.策略 }}</td>
+                <td>{{ r.基准 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">三、危机Alpha四档分类</div>
+        <div class="chart-box">
+          <div ref="caPieEl" class="ca-chart"></div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>分类</th><th>周数</th><th>占比</th><th>平均周收益</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caCatRows" :key="r.分类">
+                <td :style="{ color: r.color, fontWeight: 700 }">{{ r.分类 }}</td>
+                <td>{{ r.周数 }}</td>
+                <td>{{ r.占比 }}</td>
+                <td :class="valueClass(r.avg)">{{ r.平均周收益 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="ca-sub">深跌周条件检验（更严苛）</div>
+        <div class="table-container">
+          <table class="ca-cond-table">
+            <thead><tr><th>条件</th><th>周数</th><th>股票平均</th><th>策略平均</th><th>收涨比例</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caCondRows" :key="r.条件">
+                <td>{{ r.条件 }}</td>
+                <td>{{ r.周数 }}</td>
+                <td class="text-green">{{ r.股票平均 }}</td>
+                <td :class="valueClass(r.s_avg)">{{ r.策略平均 }}</td>
+                <td>{{ r.收涨比例 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">四、极端下跌周 TOP{{ caTopStat.n }}</div>
+        <div class="chart-box">
+          <div ref="caTopEl" class="ca-chart"></div>
+        </div>
+        <p class="ca-note">
+          {{ ca?.benchmark_name }}跌幅最大的 {{ caTopStat.n }} 周中，{{ ca?.strategy_name }}
+          有 {{ caTopStat.up }} 周逆势录得正收益，{{ caTopStat.beat }} 周跑赢基准。
+        </p>
+
+        <div class="section-title" style="font-size:14px">五、全周期四象限分布</div>
+        <div class="chart-box">
+          <div ref="caScatterEl" class="ca-chart"></div>
+        </div>
+        <p class="ca-note">左上象限（股跌+策略涨）即“危机Alpha”区。</p>
+
+        <div class="section-title" style="font-size:14px">六、深度回撤事件独立性</div>
+        <div v-if="caEventRows.length === 0" class="table-container">
+          <div class="empty-state"><p>分析区间内未触发基准深度回撤事件。</p></div>
+        </div>
+        <template v-else>
+          <div class="table-container">
+            <table class="ca-event-table">
+              <thead><tr><th>回撤起点</th><th>回撤低点</th><th>基准</th><th>策略</th><th>超额</th><th>结果</th></tr></thead>
+              <tbody>
+                <tr v-for="r in caEventRows" :key="r.回撤起点">
+                  <td>{{ r.回撤起点 }}</td>
+                  <td>{{ r.回撤低点 }}</td>
+                  <td class="text-green">{{ r.基准 }}</td>
+                  <td :class="valueClass(r.strategy_ret)">{{ r.策略 }}</td>
+                  <td :class="valueClass(r.excess)">{{ r.超额 }}</td>
+                  <td :style="{ color: r.hedged ? '#d6403a' : '#6b7280', fontWeight: 700 }">{{ r.结果 }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            基准深度回撤（&gt;5%）事件共 {{ caEventStat.n }} 次，{{ ca?.strategy_name }}
+            有 {{ caEventStat.hedged }} 次逆势录得正收益，回撤独立性 {{ caEventStat.pct }}%。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">七、多宽基一致性</div>
+        <div v-if="!caMultiSeries" class="table-container">
+          <div class="empty-state"><p>可用宽基不足 2 个，跳过多宽基一致性检验。</p></div>
+        </div>
+        <template v-else>
+          <div class="chart-box">
+            <div ref="caMultiEl" class="ca-chart"></div>
+          </div>
+          <div class="table-container">
+            <table class="ca-multi-table">
+              <thead><tr><th>基准</th><th>下跌周数</th><th>危机Alpha</th><th>逆势上涨比例</th></tr></thead>
+              <tbody>
+                <tr v-for="r in caMultiRows" :key="r.基准">
+                  <td>{{ r.基准 }}</td>
+                  <td>{{ r.下跌周数 }}</td>
+                  <td>{{ r.危机Alpha }}</td>
+                  <td>{{ r.逆势上涨比例 }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">各宽基均在同一时间窗口内统计；深色虚线为主基准的危机Alpha占比。</p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">八、月度视角</div>
+        <div class="chart-box">
+          <div ref="caMonthEl" class="ca-chart"></div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>市场状态</th><th>月数</th><th>股票月均</th><th>策略月均</th><th>正收益比例</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caMonthRows" :key="r.市场状态">
+                <td>{{ r.市场状态 }}</td>
+                <td>{{ r.月数 }}</td>
+                <td class="text-green">{{ r.股票月均 }}</td>
+                <td :class="valueClass(Number(r.策略月均))">{{ r.策略月均 }}</td>
+                <td>{{ r.正收益比例 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="ca-sub">大跌月明细（股票月跌 &gt;5%）</div>
+        <div v-if="caBigDownRows.length === 0" class="table-container">
+          <div class="empty-state"><p>分析区间内无大跌月。</p></div>
+        </div>
+        <div v-else class="table-container">
+          <table class="ca-bigdown-table">
+            <thead><tr><th>月份</th><th>基准</th><th>策略</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caBigDownRows" :key="r.月份">
+                <td>{{ r.月份 }}</td>
+                <td class="text-green">{{ r.基准 }}</td>
+                <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ca-note">下跌月份共 {{ pct1(ca?.monthly.hedge_ratio) }} 实现危机对冲（月度口径）。</p>
+
+        <div class="section-title" style="font-size:14px">九、动态相关性与年度趋势</div>
+        <div v-if="!caCorrRows" class="table-container">
+          <div class="empty-state"><p>周收益样本不足 52 周，无法计算滚动相关性。</p></div>
+        </div>
+        <template v-else>
+          <div class="chart-box">
+            <div ref="caCorrEl" class="ca-chart"></div>
+          </div>
+          <p class="ca-note">
+            实线为 52 周滚动相关系数；数据开头不足 52 周的部分以灰色虚线（扩展窗口相关）补全。0 轴以下表示两类资产反向、具对冲性。
+          </p>
+        </template>
+        <template v-if="caAnnualRows.length">
+          <div class="chart-box">
+            <div ref="caAnnualEl" class="ca-chart"></div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>年度</th><th>下跌周</th><th>危机Alpha</th><th>策略收益</th><th>基准收益</th></tr></thead>
+              <tbody>
+                <tr v-for="r in caAnnualRows" :key="r.年度">
+                  <td>{{ r.年度 }}</td>
+                  <td>{{ r.下跌周 }}</td>
+                  <td>{{ r.危机Alpha }}</td>
+                  <td :class="valueClass(Number(r.策略收益))">{{ r.策略收益 }}</td>
+                  <td :class="valueClass(Number(r.基准收益))">{{ r.基准收益 }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="caAnnualRows.some(r => !r.完整)" class="ca-note">
+            注：标 * 的年度为数据区间首尾的非完整年度（有效收益周不足 40 周），指标仅供参考。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">十、代价检验（上涨周表现）</div>
+        <div class="table-container">
+          <table class="ca-cost-table">
+            <thead><tr><th>指标</th><th>数值</th><th>解读</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caCostRows" :key="r.指标">
+                <td>{{ r.指标 }}</td>
+                <td>{{ r.数值 }}</td>
+                <td style="color:#6b7280">{{ r.解读 }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">十一、综合危机保护评分</div>
+        <div class="chart-box">
+          <div ref="caDimEl" class="ca-chart"></div>
+        </div>
+        <div class="table-container">
+          <table class="ca-dim-table">
+            <thead><tr><th>维度</th><th>类型</th><th>权重</th><th>得分</th><th>评级</th><th>贡献</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caDimRows" :key="r.维度">
+                <td>{{ r.维度 }}</td>
+                <td>{{ r.类型 }}</td>
+                <td>{{ r.权重 }}</td>
+                <td>{{ r.得分 }}</td>
+                <td :style="{ color: CRISIS_SCORE_COLORS[r.评级] || '#d6403a', fontWeight: 700 }">{{ r.评级 }}</td>
+                <td>{{ r.贡献 }}</td>
+              </tr>
+              <tr>
+                <td style="font-weight:700">综合评分</td>
+                <td>—</td>
+                <td>100%</td>
+                <td>—</td>
+                <td :style="{ color: CRISIS_SCORE_COLORS[ca?.score.rating || ''] || '#d6403a', fontWeight: 700 }">
+                  {{ ca?.score.rating }}
+                </td>
+                <td>{{ num(ca?.score.total_score, 1) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">十二、全部下跌周明细（{{ ca?.quadrant.n_down }} 周）</div>
+        <div v-if="caDownRows.length === 0" class="table-container">
+          <div class="empty-state"><p>分析区间内无基准下跌周。</p></div>
+        </div>
+        <div v-else class="table-container">
+          <table class="ca-down-table">
+            <thead><tr><th>日期</th><th>基准</th><th>策略</th><th>超额</th><th>分类</th></tr></thead>
+            <tbody>
+              <tr v-for="r in caDownRows" :key="r.日期">
+                <td>{{ r.日期 }}</td>
+                <td class="text-green">{{ r.基准 }}</td>
+                <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
+                <td :class="valueClass(Number(r.超额))">{{ r.超额 }}</td>
+                <td :style="{ color: r.color, fontWeight: 700 }">{{ r.分类 }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </template>
     </div>
