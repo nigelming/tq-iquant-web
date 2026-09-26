@@ -391,6 +391,7 @@ def test_composite_score_shape_weights_and_contributions():
         d["维度"]: d["得分"] for d in _analyzer(b_w, s_w).composite_score()["dimensions"]
     }
     assert cost_dims["上涨周代价"] == pytest.approx(54.1)
+    assert cost_dims["回撤独立性"] == pytest.approx(50.0)
 
 
 def test_composite_score_neutral_fallbacks_without_deep_weeks_or_events():
