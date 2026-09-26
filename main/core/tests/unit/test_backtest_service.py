@@ -725,12 +725,16 @@ def test_safe_compute_crisis_alpha_swallows_and_marks_failed(db_session, monkeyp
 
 
 def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkeypatch):
-    ps, strat_id = _seed(db_session)
+    ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
     monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("crisis_alpha_boom")
+
+    monkeypatch.setattr(svc, "compute_and_store_crisis_alpha", _boom)
     snapshots = [
         {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
          "cash": Decimal("100000"), "market_value": Decimal("0")},
@@ -748,7 +752,13 @@ def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkey
     rec = db_session.get(BacktestRecord, result["record_id"])
     assert rec.status == "completed"
     assert rec.progress == 100
-    assert db_session.query(BacktestCrisisAlpha).count() == 0
+    rows = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "failed"
+    assert "crisis_alpha_boom" in row.error
+    assert row.computed_at is not None
 
 
 def test_run_backtest_calls_crisis_alpha_after_main_commit(db_session, monkeypatch):
