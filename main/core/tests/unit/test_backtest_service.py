@@ -877,3 +877,213 @@ def test_get_record_detail_crisis_alpha_is_null_without_row(db_session):
     rec, _ = _seed_record(db_session)
     detail = svc.get_record_detail(db_session, rec.id)
     assert detail["crisis_alpha"] is None
+
+
+_SNAPSHOT_KEYS = {
+    "benchmark_index", "initial_capital", "max_drawdown", "daily_loss_limit",
+    "max_holdings", "min_commission", "buy_commission_rate",
+    "sell_commission_rate", "stamp_duty_rate", "slippage", "trading_session",
+    "stock_pool_id",
+}
+
+_NO_TRADES_RESULT = {
+    "trades": [], "snapshots": [], "evaluations": {},
+    "strategy_snapshots": {}, "strategy_evaluations": {},
+}
+
+
+def _patch_data_layer(monkeypatch, result=None):
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    if result is not None:
+        monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: result)
+
+
+def _seed_ca_daily_snapshots(db, rec, ps, points):
+    for d, v in points.items():
+        db.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(round(v, 2))),
+            cash=Decimal("0"), market_value=Decimal("0"),
+        ))
+    db.commit()
+
+
+def _seed_stored_ca_row(db, rec, code, name):
+    db.add(BacktestCrisisAlpha(
+        backtest_record_id=rec.id, benchmark_code=code, benchmark_name=name,
+        status="completed", skipped_benchmarks_json="[]", payload_json=None,
+        computed_at=datetime(2026, 1, 2, 3, 4, 5),
+    ))
+    db.commit()
+
+
+def test_run_backtest_writes_params_snapshot(db_session, monkeypatch):
+    ps, _ = _seed(db_session)
+    _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
+    rid = svc.run_backtest(db_session, ps, _req(name="snap"))["record_id"]
+    rec = db_session.get(BacktestRecord, rid)
+    assert rec.params_snapshot is not None
+    data = json.loads(rec.params_snapshot)
+    assert data["benchmark_index"] == ps.benchmark_index == "000300.SH"
+
+
+def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
+    ps, _ = _seed(db_session)
+    _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
+    rid = svc.run_backtest(db_session, ps, _req(name="snap_rt"))["record_id"]
+    data = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
+    assert set(data) == _SNAPSHOT_KEYS
+    assert data["benchmark_index"] == ps.benchmark_index
+    assert data["trading_session"] == ps.trading_session
+    assert int(data["max_holdings"]) == ps.max_holdings
+    assert int(data["stock_pool_id"]) == ps.stock_pool_id
+    assert Decimal(data["initial_capital"]) == ps.initial_capital
+    assert Decimal(data["max_drawdown"]) == ps.max_drawdown
+    assert Decimal(data["daily_loss_limit"]) == ps.daily_loss_limit
+    assert Decimal(data["min_commission"]) == ps.min_commission
+    assert Decimal(data["buy_commission_rate"]) == ps.buy_commission_rate
+    assert Decimal(data["sell_commission_rate"]) == ps.sell_commission_rate
+    assert Decimal(data["stamp_duty_rate"]) == ps.stamp_duty_rate
+    assert Decimal(data["slippage"]) == ps.slippage
+    assert json.dumps(data, allow_nan=False)
+
+
+def test_recompute_prefers_snapshot_benchmark(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    _seed_ca_daily_snapshots(
+        db_session, rec, ps, _ca_daily_points([0.0] + _CA_WEEKS_S))
+    rec.params_snapshot = json.dumps({"benchmark_index": "000905.SH"})
+    db_session.commit()
+    ps.benchmark_index = "000300.SH"
+    db_session.commit()
+    fake = _FakeIndexTQ({
+        "000905.SH": _ca_decimal_frames(_ca_daily_points([0.0] + _CA_WEEKS_B))})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    assert out["status"] == "completed"
+    br = out["benchmark_resolution"]
+    assert br["from_snapshot"] is True
+    assert br["benchmark_code"] == "000905.SH"
+    assert br["benchmark_name"] == "中证500"
+    assert br["live_benchmark_code"] == "000300.SH"
+    assert br["mismatch"] is True
+    row = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).one()
+    assert row.benchmark_code == "000905.SH"
+    assert row.benchmark_name == "中证500"
+    data = json.loads(row.payload_json)
+    assert data["benchmark_code"] == "000905.SH"
+    assert data["benchmark_name"] == "中证500"
+    assert "沪深300" in json.loads(row.skipped_benchmarks_json)
+
+
+def test_recompute_falls_back_to_live_when_no_snapshot(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    _seed_ca_daily_snapshots(
+        db_session, rec, ps, _ca_daily_points([0.0] + _CA_WEEKS_S))
+    assert rec.params_snapshot is None
+    fake = _FakeIndexTQ({
+        "000300.SH": _ca_decimal_frames(_ca_daily_points([0.0] + _CA_WEEKS_B))})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    assert out["status"] == "completed"
+    br = out["benchmark_resolution"]
+    assert br["from_snapshot"] is False
+    assert br["benchmark_code"] == "000300.SH"
+    assert br["benchmark_name"] == "沪深300"
+    assert br["mismatch"] is False
+    assert br["stored_benchmark_code"] is None
+    row = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).one()
+    assert row.benchmark_code == "000300.SH"
+
+
+def test_recompute_legacy_record_preserves_stored_benchmark_and_warns(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    _seed_ca_daily_snapshots(
+        db_session, rec, ps, _ca_daily_points([0.0] + _CA_WEEKS_S))
+    _seed_stored_ca_row(db_session, rec, "000300.SH", "沪深300")
+    ps.benchmark_index = "000905.SH"
+    db_session.commit()
+    fake = _FakeIndexTQ({
+        "000300.SH": _ca_decimal_frames(_ca_daily_points([0.0] + _CA_WEEKS_B))})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    assert out["status"] == "completed"
+    br = out["benchmark_resolution"]
+    assert br["from_snapshot"] is False
+    assert br["benchmark_code"] == "000300.SH"
+    assert br["benchmark_name"] == "沪深300"
+    assert br["live_benchmark_code"] == "000905.SH"
+    assert br["live_benchmark_name"] == "中证500"
+    assert br["stored_benchmark_code"] == "000300.SH"
+    assert br["stored_benchmark_name"] == "沪深300"
+    assert br["mismatch"] is True
+    row = db_session.query(BacktestCrisisAlpha).filter_by(
+        backtest_record_id=rec.id).one()
+    assert row.benchmark_code == "000300.SH"
+    assert row.benchmark_name == "沪深300"
+    assert json.loads(row.payload_json)["benchmark_code"] == "000300.SH"
+
+
+def test_recompute_snapshot_matching_live_reports_no_mismatch(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    _seed_ca_daily_snapshots(
+        db_session, rec, ps, _ca_daily_points([0.0] + _CA_WEEKS_S))
+    _seed_stored_ca_row(db_session, rec, "000300.SH", "沪深300")
+    rec.params_snapshot = json.dumps({"benchmark_index": "000300.SH"})
+    db_session.commit()
+    fake = _FakeIndexTQ({
+        "000300.SH": _ca_decimal_frames(_ca_daily_points([0.0] + _CA_WEEKS_B))})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.recompute_crisis_alpha(db_session, rec.id)
+    br = out["benchmark_resolution"]
+    assert br["from_snapshot"] is True
+    assert br["benchmark_code"] == "000300.SH"
+    assert br["live_benchmark_code"] == "000300.SH"
+    assert br["mismatch"] is False
+
+
+def test_resolve_crisis_benchmark_cases_without_db():
+    ps = SimpleNamespace(benchmark_index="000300.SH")
+    snap = SimpleNamespace(params_snapshot=json.dumps({"benchmark_index": "000905.SH"}))
+    row = SimpleNamespace(benchmark_code="000300.SH", benchmark_name="沪深300")
+    from_snap = svc.resolve_crisis_benchmark(snap, row, ps)
+    assert from_snap["benchmark_code"] == "000905.SH"
+    assert from_snap["benchmark_name"] == "中证500"
+    assert from_snap["from_snapshot"] is True
+    assert from_snap["mismatch"] is True
+    assert from_snap["stored_benchmark_code"] == "000300.SH"
+    assert from_snap["stored_benchmark_name"] == "沪深300"
+    legacy = svc.resolve_crisis_benchmark(
+        SimpleNamespace(params_snapshot=None), row, ps)
+    assert legacy["benchmark_code"] == "000300.SH"
+    assert legacy["from_snapshot"] is False
+    assert legacy["mismatch"] is False
+    assert legacy["live_benchmark_name"] == "沪深300"
+    legacy_edited = svc.resolve_crisis_benchmark(
+        SimpleNamespace(params_snapshot=None), row,
+        SimpleNamespace(benchmark_index="000905.SH"))
+    assert legacy_edited["benchmark_code"] == "000300.SH"
+    assert legacy_edited["from_snapshot"] is False
+    assert legacy_edited["mismatch"] is True
+    assert legacy_edited["live_benchmark_code"] == "000905.SH"
+    assert legacy_edited["live_benchmark_name"] == "中证500"
+    assert legacy_edited["stored_benchmark_code"] == "000300.SH"
+    fresh = svc.resolve_crisis_benchmark(SimpleNamespace(params_snapshot=None), None, ps)
+    assert fresh["benchmark_code"] == "000300.SH"
+    assert fresh["from_snapshot"] is False
+    assert fresh["mismatch"] is False
+    assert fresh["stored_benchmark_code"] is None
+    broken = svc.resolve_crisis_benchmark(
+        SimpleNamespace(params_snapshot="{not json"), row, ps)
+    assert broken["benchmark_code"] == "000300.SH"
+    assert broken["from_snapshot"] is False
+    defaulted = svc.resolve_crisis_benchmark(
+        SimpleNamespace(params_snapshot=None), None,
+        SimpleNamespace(benchmark_index=None))
+    assert defaulted["benchmark_code"] == "000300.SH"

@@ -369,6 +369,77 @@ def _crisis_benchmark_name(code: str) -> str:
     return code
 
 
+PARAMS_SNAPSHOT_FIELDS = (
+    "benchmark_index",
+    "initial_capital",
+    "max_drawdown",
+    "daily_loss_limit",
+    "max_holdings",
+    "min_commission",
+    "buy_commission_rate",
+    "sell_commission_rate",
+    "stamp_duty_rate",
+    "slippage",
+    "trading_session",
+    "stock_pool_id",
+)
+
+
+def _snapshot_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def build_params_snapshot(ps) -> str:
+    payload = {
+        field: _snapshot_value(getattr(ps, field, None))
+        for field in PARAMS_SNAPSHOT_FIELDS
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def snapshot_benchmark_code(params_snapshot) -> Optional[str]:
+    if not params_snapshot or not isinstance(params_snapshot, (str, bytes, bytearray)):
+        return None
+    try:
+        data = json.loads(params_snapshot)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = data.get("benchmark_index")
+    if isinstance(code, str) and code:
+        return code
+    return None
+
+
+def resolve_crisis_benchmark(rec, row, ps) -> dict:
+    live_code = _crisis_benchmark_code(ps)
+    stored_code = getattr(row, "benchmark_code", None) if row is not None else None
+    stored_name = getattr(row, "benchmark_name", None) if row is not None else None
+    snap_code = snapshot_benchmark_code(getattr(rec, "params_snapshot", None))
+    from_snapshot = snap_code is not None
+    if from_snapshot:
+        used_code = snap_code
+    elif stored_code:
+        used_code = stored_code
+    else:
+        used_code = live_code
+    return {
+        "from_snapshot": from_snapshot,
+        "mismatch": used_code != live_code,
+        "benchmark_code": used_code,
+        "benchmark_name": _crisis_benchmark_name(used_code),
+        "live_benchmark_code": live_code,
+        "live_benchmark_name": _crisis_benchmark_name(live_code),
+        "stored_benchmark_code": stored_code,
+        "stored_benchmark_name": stored_name,
+    }
+
+
 def _crisis_nav_from_snapshots(snapshots: List[dict]) -> pd.Series:
     points = {}
     for snap in snapshots:
@@ -438,8 +509,9 @@ def compute_and_store_crisis_alpha(
     snapshots: List[dict],
     start: date,
     end: date,
+    benchmark_code: Optional[str] = None,
 ) -> BacktestCrisisAlpha:
-    benchmark_code = _crisis_benchmark_code(ps)
+    benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
     benchmark_name = _crisis_benchmark_name(benchmark_code)
     codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
     closes = build_index_close_series(codes, start, end)
@@ -489,12 +561,16 @@ def safe_compute_crisis_alpha(
     snapshots: List[dict],
     start: date,
     end: date,
+    benchmark_code: Optional[str] = None,
 ) -> Optional[BacktestCrisisAlpha]:
     try:
-        return compute_and_store_crisis_alpha(db, record_id, ps, snapshots, start, end)
+        return compute_and_store_crisis_alpha(
+            db, record_id, ps, snapshots, start, end,
+            benchmark_code=benchmark_code,
+        )
     except Exception as exc:
         db.rollback()
-        code = _crisis_benchmark_code(ps)
+        code = benchmark_code or _crisis_benchmark_code(ps)
         try:
             return _upsert_crisis_alpha(
                 db, record_id, code, _crisis_benchmark_name(code),
@@ -520,10 +596,17 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
     ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
     if ps is None:
         return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+    existing = (
+        db.query(BacktestCrisisAlpha)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    resolution = resolve_crisis_benchmark(rec, existing, ps)
     row = safe_compute_crisis_alpha(
         db, record_id, ps,
         [{"snap_date": s.snap_date, "total_value": s.total_value} for s in snaps],
         rec.start_date, rec.end_date,
+        benchmark_code=resolution["benchmark_code"],
     )
     if row is None:
         return {"status": "failed", "error": "危机Alpha 结果落库失败"}
@@ -531,6 +614,7 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
         "status": row.status,
         "error": row.error,
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "benchmark_resolution": resolution,
     }
 
 
@@ -1257,6 +1341,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         end_date=req.end_date,
         status="running",
         progress=0,
+        params_snapshot=build_params_snapshot(ps),
     )
     db.add(rec)
     db.commit()
