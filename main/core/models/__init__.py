@@ -9,6 +9,7 @@ from .backtest_record import BacktestRecord
 from .backtest_trade import BacktestTrade
 from .backtest_daily_snapshot import BacktestDailySnapshot
 from .backtest_evaluation import BacktestEvaluation
+from .backtest_crisis_alpha import BacktestCrisisAlpha
 from .live_session import LiveSession
 from .live_session_portfolio import LiveSessionPortfolio
 from .live_order import LiveOrder
@@ -27,6 +28,7 @@ __all__ = [
     "BacktestTrade",
     "BacktestDailySnapshot",
     "BacktestEvaluation",
+    "BacktestCrisisAlpha",
     "LiveSession",
     "LiveSessionPortfolio",
     "LiveOrder",
