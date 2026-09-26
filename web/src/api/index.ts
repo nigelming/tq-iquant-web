@@ -659,12 +659,27 @@ export async function deleteBacktestRecord(id: number) {
   return res.data.data
 }
 
+export interface CrisisAlphaBenchmarkResolution {
+  from_snapshot: boolean
+  mismatch: boolean
+  benchmark_code: string
+  benchmark_name: string
+  live_benchmark_code: string
+  live_benchmark_name: string
+  stored_benchmark_code: string | null
+  stored_benchmark_name: string | null
+}
+
+export interface CrisisAlphaRecomputeResult {
+  status: string
+  error: string | null
+  computed_at: string | null
+  benchmark_resolution?: CrisisAlphaBenchmarkResolution
+}
+
 export async function recomputeCrisisAlpha(id: number) {
-  const res = await api.post<ApiResponse<{
-    status: string
-    error: string | null
-    computed_at: string | null
-  }>>(`/backtest/records/${id}/crisis-alpha/recompute`)
+  const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
+    `/backtest/records/${id}/crisis-alpha/recompute`)
   return res.data.data
 }
 

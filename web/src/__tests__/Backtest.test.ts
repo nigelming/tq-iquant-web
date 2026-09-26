@@ -893,6 +893,83 @@ describe('Backtest.vue — 危机Alpha section 骨架', () => {
     expect(w.find('.ca-msg').text()).toContain('重新计算失败')
   })
 
+  it('重算返回基准不一致：消息含告警样式与新旧基准名', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: true, mismatch: true,
+        benchmark_code: '000905.SH', benchmark_name: '中证500',
+        live_benchmark_code: '000300.SH', live_benchmark_name: '沪深300',
+        stored_benchmark_code: '000905.SH', stored_benchmark_name: '中证500',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).toContain('ca-warn')
+    expect(msg.text()).toContain('重新计算完成')
+    expect(msg.text()).toContain('中证500')
+    expect(msg.text()).toContain('沪深300')
+  })
+
+  it('重算返回无基准不一致：不加告警样式', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: true, mismatch: false,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300',
+        live_benchmark_code: '000300.SH', live_benchmark_name: '沪深300',
+        stored_benchmark_code: '000300.SH', stored_benchmark_name: '沪深300',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).not.toContain('ca-warn')
+    expect(msg.text()).toBe('重新计算完成')
+  })
+
+  it('重算无 benchmark_resolution 字段（老后端）：不报错', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).not.toContain('ca-warn')
+    expect(msg.text()).toBe('重新计算完成')
+  })
+
+  it('老记录无快照 + 组合基准已被改：消息提示按记录原基准重算', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: false, mismatch: true,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300',
+        live_benchmark_code: '000905.SH', live_benchmark_name: '中证500',
+        stored_benchmark_code: '000300.SH', stored_benchmark_name: '沪深300',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).toContain('ca-warn')
+    expect(msg.text()).toContain('中证500')
+    expect(msg.text()).toContain('沪深300')
+  })
+
   it('点击危机卡滚动到危机Alpha section', async () => {
     const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
     await w.findAll('.stats-grid .stat-card')[6].trigger('click')

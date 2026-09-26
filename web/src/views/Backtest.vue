@@ -8,7 +8,7 @@ import {
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
-  CrisisAlphaData,
+  CrisisAlphaData, CrisisAlphaBenchmarkResolution,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -46,6 +46,8 @@ let annualBarChart: echarts.ECharts | null = null
 const crisisAlphaSectionEl = ref<HTMLDivElement | null>(null)
 const recomputing = ref(false)
 const recomputeMsg = ref('')
+const recomputeWarn = ref(false)
+const recomputeMsgClass = computed(() => (recomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
 const CRISIS_COLORS: Record<string, string> = {
   逆势上涨: '#d6403a', 跌得少: '#f0a429', 跟着跌: '#9dc88d', 跌更多: '#1f6e4f',
@@ -53,6 +55,7 @@ const CRISIS_COLORS: Record<string, string> = {
 const CRISIS_SCORE_COLORS: Record<string, string> = {
   卓越: '#d6403a', 优秀: '#f0a429', 一般: '#b0a890',
 }
+const CRISIS_CATS = ['逆势上涨', '跌得少', '跟着跌', '跌更多']
 
 const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
@@ -96,20 +99,38 @@ const caKpis = computed(() => {
   ]
 })
 
+function caBenchmarkWarnText(br: CrisisAlphaBenchmarkResolution): string {
+  const used = br.benchmark_name
+  const live = br.live_benchmark_name
+  const stored = br.stored_benchmark_code && br.stored_benchmark_code !== br.benchmark_code
+    ? `（记录原为「${br.stored_benchmark_name || br.stored_benchmark_code}」）`
+    : ''
+  return br.from_snapshot
+    ? `⚠️ 组合策略基准现为「${live}」，本次按回测快照基准「${used}」重算${stored}`
+    : `⚠️ 该记录无参数快照，组合策略基准现为「${live}」，本次按记录原基准「${used}」重算${stored}`
+}
+
 async function recomputeCa() {
   const id = currentRecord.value?.id
   if (!id) return
   recomputing.value = true
   recomputeMsg.value = ''
+  recomputeWarn.value = false
   try {
     const res = await recomputeCrisisAlpha(id)
-    recomputeMsg.value = res.status === 'completed'
+    const base = res.status === 'completed'
       ? '重新计算完成'
       : `重新计算未完成：${res.error || res.status}`
+    const br = res.benchmark_resolution
+    recomputeWarn.value = !!br?.mismatch
+    recomputeMsg.value = recomputeWarn.value && br
+      ? `${base} ｜ ${caBenchmarkWarnText(br)}`
+      : base
     detail.value = await getBacktestDetail(id)
     await nextTick()
     initCharts()
   } catch (e) {
+    recomputeWarn.value = false
     recomputeMsg.value = `重新计算失败：${errMsg(e)}`
   } finally {
     recomputing.value = false
@@ -262,6 +283,11 @@ function pct1(v: number | null | undefined): string {
   return `${(Number(v) * 100).toFixed(1)}%`
 }
 
+function pctSigned(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined) return '—'
+  return `${Number(v) >= 0 ? '+' : ''}${(Number(v) * 100).toFixed(digits)}%`
+}
+
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
 function buildMetrics(m: BacktestEvaluationItem | null | undefined) {
   if (!m) return []
@@ -318,8 +344,7 @@ const summaryCards = computed(() => {
 const overallStats = computed<Array<{ label: string; value: string; anchor?: string }>>(() => {
   const e = detail.value?.evaluations
   if (!e) return []
-  const ca = detail.value?.crisis_alpha
-  const cd = ca?.status === 'completed' ? ca.data : null
+  const cd = ca.value
   return [
     { label: '总收益', value: pct(e.total_return) },
     { label: '年化收益', value: pct(e.annual_return) },
@@ -859,7 +884,7 @@ onUnmounted(() => {
         <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
           {{ recomputing ? '计算中…' : '重新计算' }}
         </button>
-        <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+        <span v-if="recomputeMsg" :class="recomputeMsgClass">{{ recomputeMsg }}</span>
       </div>
 
       <div v-else-if="caStatus === 'failed'" class="card" style="padding:12px">
@@ -867,7 +892,7 @@ onUnmounted(() => {
         <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
           {{ recomputing ? '计算中…' : '重新计算' }}
         </button>
-        <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+        <span v-if="recomputeMsg" :class="recomputeMsgClass">{{ recomputeMsg }}</span>
       </div>
 
       <div v-else-if="caStatus === 'insufficient'" class="card" style="padding:12px">
@@ -903,7 +928,7 @@ onUnmounted(() => {
           <button class="btn btn-sm" :disabled="recomputing" @click="recomputeCa">
             {{ recomputing ? '计算中…' : '重新计算' }}
           </button>
-          <span v-if="recomputeMsg" class="ca-msg">{{ recomputeMsg }}</span>
+          <span v-if="recomputeMsg" :class="recomputeMsgClass">{{ recomputeMsg }}</span>
         </div>
       </template>
     </div>
@@ -1361,6 +1386,7 @@ onUnmounted(() => {
   margin-bottom: 10px;
 }
 .ca-msg { font-size: 12px; color: #1f3a68; }
+.ca-warn { color: #c0392b; font-weight: 700; }
 .ca-sub { font-size: 14px; font-weight: 700; color: #333; margin: 14px 0 8px; }
 .ca-note { font-size: 12px; color: #6b7280; margin: 6px 0 10px; }
 .ca-tags { margin: 10px 0; }
