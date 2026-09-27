@@ -81,7 +81,9 @@ class BacktestEngine:
 
             # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
             #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。
+            #     注入与组合同日的 benchmark_value，使策略层相对指标（FR-1）可算。
             for s_snap in self._strategy_snapshots(portfolio, bar, t.date()):
+                s_snap["benchmark_value"] = snap["benchmark_value"]
                 strategy_snapshots[s_snap["target_id"]].append(s_snap)
 
             # 5. 熔断检测：日终更新峰值/日内盈亏，按 §88 推进熔断次日恢复时序
@@ -97,6 +99,7 @@ class BacktestEngine:
         )
         evaluations = Evaluator().evaluate(snapshots, benchmark_data=bench_series, trades=trades)
         # 策略层评估：复用 Evaluator，喂入该策略快照 + 该策略 trades（按 strategy_id 过滤）。
+        # 传入 bench_series 使策略层也能计算基准相对指标（beta/alpha/IR/捕获率等）。
         strategy_evaluations: Dict[int, dict] = {}
         for ctx in portfolio.strategies:
             s_snaps = strategy_snapshots.get(ctx.strategy_id, [])
@@ -104,7 +107,7 @@ class BacktestEngine:
                 continue
             s_trades = [t for t in trades if t.strategy_id == ctx.strategy_id]
             strategy_evaluations[ctx.strategy_id] = Evaluator().evaluate(
-                s_snaps, benchmark_data=None, trades=s_trades
+                s_snaps, benchmark_data=bench_series, trades=s_trades
             )
         return {
             "trades": trades,

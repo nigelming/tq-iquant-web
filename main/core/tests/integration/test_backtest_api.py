@@ -590,6 +590,36 @@ def test_post_recompute_evaluation_not_found(client):
     assert body["code"] == 404
 
 
+def test_export_html_returns_attachment_with_disposition(client, monkeypatch):
+    """GET /api/backtest/records/{id}/export/html：text/html + Content-Disposition attachment。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    resp = c.get(f"/api/backtest/records/{record_id}/export/html")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "attachment" in resp.headers.get("content-disposition", "")
+    # 单文件：无外链 CSS/JS（除内嵌 ECharts）；含报告标题与净值图表容器
+    assert "<html" in resp.text
+    assert "回测分析报告" in resp.text
+    assert 'class="chart"' in resp.text
+    # 不允许引用外部资源（script src / link href）
+    assert 'src="http' not in resp.text
+    assert 'href="http' not in resp.text
+    assert 'link rel' not in resp.text
+
+
+def test_export_html_not_found(client):
+    c, _ = client
+    resp = c.get("/api/backtest/records/999999/export/html")
+    assert resp.status_code == 200  # 统一 envelope：HTTP 200 + code 404
+    assert resp.json()["code"] == 404
+
+
 def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     c, Session = client
     db = Session()

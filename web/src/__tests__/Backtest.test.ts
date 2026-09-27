@@ -270,6 +270,17 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('买入')
   })
 
+  it('详情页含导出 HTML 报告按钮（指向 /api/backtest/records/{id}/export/html）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const link = w.findAll('a').find(a => a.text().includes('导出 HTML 报告'))
+    expect(link?.exists()).toBe(true)
+    expect(link?.attributes('href')).toBe('/api/backtest/records/1/export/html')
+    expect(link?.attributes('target')).toBe('_blank')
+  })
+
   it('详情有[←返回] → 回列表', async () => {
     const w = mount(Backtest)
     await flushPromises()
@@ -1697,11 +1708,12 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(mrBtns(w).length).toBe(0)
   })
 
-  it('completed：展开渲染 9 KPI/7 图表/九块内容，重算按钮 1 个', async () => {
+  it('completed：展开渲染 6 KPI/7 图表/九块内容，重算按钮 1 个', async () => {
     const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
     await expandMr(w)
     expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
-    expect(w.findAll('.mr-section .ca-kpi').length).toBe(9)
+    // 稳健性 3 张 KPI 卡已紧凑化为一行摘要（节省纵向空间），仅剩顶部 6 卡
+    expect(w.findAll('.mr-section .ca-kpi').length).toBe(6)
     for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
       expect(w.text()).toContain(t)
     }

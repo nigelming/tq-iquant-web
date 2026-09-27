@@ -885,13 +885,16 @@ _EVALUATION_FIELDS = (
 
 
 def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
-    """从 DB 快照 + 成交离线重算组合级评估并 upsert（老记录补新增指标用）。
+    """从 DB 快照 + 成交离线重算评估并 upsert（老记录补新增指标用）。
 
     不重跑回测、不触碰行情；相对指标依赖快照 benchmark_value（老记录已落该列）。
-    策略层评估无基准值，重算不会带来新字段，故只更新组合级行。
+    组合级：直接重算。策略级：策略快照未落 benchmark_value（历史），按日注入组合
+    快照的基准值后重算——相对/磨损/路径指标可补；持仓结构仍依赖 positions_json，
+    老快照无此列时保持 None（前端提示「仅影响老记录」）。
     记录不存在返回 None（路由 404）；快照不足返回 failed 状态。
     """
     from types import SimpleNamespace
+    from collections import defaultdict
 
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
@@ -957,6 +960,50 @@ def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
         db.add(row)
     for f in _EVALUATION_FIELDS:
         setattr(row, f, ev.get(f))
+    db.commit()
+
+    # ---- 策略层离线重算（注入组合基准值后补相对/磨损/路径指标） ----
+    strat_snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="strategy")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    # 按 (date, strategy_id) 索引，合并时注入 portfolio 基准值
+    benchmark_by_date = {s.snap_date: s.benchmark_value for s in snaps}
+    strategy_snap_groups: dict = defaultdict(list)
+    for s in strat_snaps:
+        strategy_snap_groups[s.target_id].append(s)
+    for sid, srows in strategy_snap_groups.items():
+        s_dicts = [
+            {
+                "snap_date": s.snap_date,
+                "total_value": s.total_value,
+                "cash": s.cash,
+                "market_value": s.market_value,
+                "benchmark_value": benchmark_by_date.get(s.snap_date),
+                "positions": json.loads(s.positions_json) if s.positions_json else None,
+            }
+            for s in srows
+        ]
+        s_trades = [t for t in trade_objs if t.strategy_id == sid]
+        sev = Evaluator().evaluate(s_dicts, trades=s_trades)
+        if not sev:
+            continue
+        ser = (
+            db.query(BacktestEvaluation)
+            .filter_by(backtest_record_id=record_id, target_type="strategy", target_id=sid)
+            .one_or_none()
+        )
+        if ser is None:
+            ser = BacktestEvaluation(
+                backtest_record_id=record_id,
+                target_type="strategy",
+                target_id=sid,
+            )
+            db.add(ser)
+        for f in _EVALUATION_FIELDS:
+            setattr(ser, f, sev.get(f))
     db.commit()
 
     return {"status": "ok", "evaluations": _serialize_evaluation(row)}
@@ -1215,6 +1262,8 @@ def _persist_result(
                 total_value=snap["total_value"],
                 cash=snap.get("cash", Decimal("0")),
                 market_value=snap.get("market_value", Decimal("0")),
+                # 引擎已注入与组合同日的基准值（FR-1 策略层相对指标数据源）
+                benchmark_value=snap.get("benchmark_value"),
                 positions_json=(
                     json.dumps(snap["positions"], default=str)
                     if snap.get("positions") is not None else None

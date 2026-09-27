@@ -1,14 +1,17 @@
 from datetime import date
 from threading import Lock
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
 from core.models import PortfolioStrategy
+from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -103,6 +106,25 @@ def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
+
+
+@router.get("/records/{record_id}/export/html")
+def export_record_html(record_id: int, db: Session = Depends(get_db)):
+    """导出单文件离线 HTML 分析报告（FR-21/22，Task 19）。
+
+    例外于统一 envelope：文件下载直接返回 text/html + Content-Disposition，
+    前端以直链/a 标签触发浏览器下载（不经 axios 拦截器）。数字与详情接口同源。
+    """
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    report = build_html_report(detail)
+    rec = detail.get("record") or {}
+    fname = quote(f"回测报告-{rec.get('name') or record_id}.html")
+    return HTMLResponse(
+        content=report,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
 
 
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:

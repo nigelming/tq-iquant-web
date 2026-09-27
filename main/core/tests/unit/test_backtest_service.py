@@ -1250,6 +1250,38 @@ def test_recompute_evaluation_reads_positions_json(db_session):
     assert out["evaluations"]["beta"] is None
 
 
+def test_recompute_evaluation_fills_strategy_level_metrics(db_session):
+    """策略层：老快照无 benchmark_value → 重算时按日注入组合基准值，相对指标补齐。
+
+    覆盖 2026-09 截图问题：策略卡「基准相对/磨损仓位/路径质量」整组「—」，
+    根因是策略层评估无基准数据。修复后重算可补（持仓结构仍依赖 positions_json）。
+    """
+    from datetime import timedelta
+    rec, ps = _seed_record(db_session)
+    _seed_linear_snapshots(db_session, rec, ps)
+    # 策略层快照（sid=7）：无 benchmark_value（模拟老记录），净值同组合线性规律
+    rb_seq = [0.01, -0.01, 0.02, -0.02]
+    vs = 50_000_000.0
+    for i in range(25):
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="strategy", target_id=7,
+            snap_date=date(2024, 1, 1) + timedelta(days=i),
+            total_value=Decimal(str(round(vs, 2))),
+            cash=Decimal("0"), market_value=Decimal(str(round(vs, 2))),
+            benchmark_value=None,
+        ))
+        vs *= 1 + 0.5 * rb_seq[i % 4] + 0.0003
+    db_session.commit()
+
+    out = svc.recompute_evaluation(db_session, rec.id)
+    assert out["status"] == "ok"
+    srow = db_session.query(BacktestEvaluation).filter_by(
+        backtest_record_id=rec.id, target_type="strategy", target_id=7).one()
+    # 注入组合基准后：beta≈0.5（与组合同规律），年化超额≈7.56%
+    assert float(srow.beta) == pytest.approx(0.5, abs=1e-3)
+    assert float(srow.excess_annual_return) == pytest.approx(0.0756, abs=2e-3)
+
+
 def test_get_record_detail_includes_crisis_alpha(db_session, monkeypatch):
     rec, ps = _seed_record(db_session)
     nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)

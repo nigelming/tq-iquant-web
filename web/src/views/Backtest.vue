@@ -1542,11 +1542,34 @@ const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
 // 策略对比卡片
 const strategyCards = computed(() => {
   const evals = detail.value?.strategy_evaluations || []
-  return evals.map((s) => ({
-    strategy_id: s.strategy_id,
-    strategy_name: s.strategy_name,
-    metrics: buildMetrics(s),
-  }))
+  return evals.map((s) => {
+    const metrics = buildMetrics(s)
+    // 检测缺失指标组（增强A：帮助用户理解为何显示「—」）
+    const hasBenchmark = metrics.some(m => m.label === 'Beta' && m.value !== '—')
+    const hasPosition = metrics.some(m => m.label === '最大单票权重' && m.value !== '—')
+    return {
+      strategy_id: s.strategy_id,
+      strategy_name: s.strategy_name,
+      metrics,
+      hasMissing: !hasBenchmark || !hasPosition,
+      missingBenchmark: !hasBenchmark,
+      missingPosition: !hasPosition,
+    }
+  })
+})
+
+// 组合整体缺失指标检测
+const portfolioMissing = computed(() => {
+  const m = detail.value?.evaluations
+  if (!m) return { hasMissing: false, missingBenchmark: false, missingPosition: false }
+  const metrics = buildMetrics(m)
+  const hasBenchmark = metrics.some(r => r.label === 'Beta' && r.value !== '—')
+  const hasPosition = metrics.some(r => r.label === '最大单票权重' && r.value !== '—')
+  return {
+    hasMissing: !hasBenchmark || !hasPosition,
+    missingBenchmark: !hasBenchmark,
+    missingPosition: !hasPosition,
+  }
 })
 
 // 关键指标摘要（4 卡）
@@ -2093,6 +2116,14 @@ onUnmounted(() => {
       <button @click="backToList" class="back-link btn btn-sm">← 返回</button>
       <h1>{{ currentRecord.name }}</h1>
       <p class="subtitle">{{ currentRecord.start_date }} ~ {{ currentRecord.end_date }} · {{ subtitle }}</p>
+      <a v-if="currentRecord.id"
+         :href="`/api/backtest/records/${currentRecord.id}/export/html`"
+         target="_blank"
+         class="btn btn-sm"
+         style="margin-top:8px;display:inline-block"
+         title="下载离线 HTML 单文件报告">
+        📄 导出 HTML 报告
+      </a>
     </div>
 
     <!-- 关键指标摘要 -->
@@ -2682,7 +2713,7 @@ onUnmounted(() => {
 
         <div class="section-title" style="font-size:14px">七、隐含风格暴露（滚动相关热力图）</div>
         <div v-if="!stCorrData" class="table-container">
-          <div class="empty-state"><p>宽基样本不足，无法计算风格暴露。</p></div>
+          <div class="empty-state"><p>宽基样本不足，无法计算风格暴露；老记录（早期计算）可点上方「重新计算」补齐。</p></div>
         </div>
         <template v-else>
           <div class="chart-box">
@@ -2791,67 +2822,62 @@ onUnmounted(() => {
           </div>
         </template>
         <template v-else>
-          <div class="ca-kpi-row">
-            <div class="ca-kpi">
-              <div class="ca-kpi-label">最长亏损窗口</div>
-              <div class="ca-kpi-value">{{ rbBlock?.longest_loss_window?.days ?? 0 }} 天</div>
-              <div class="ca-kpi-sub">{{ rbLossText }}</div>
-            </div>
-            <div class="ca-kpi">
-              <div class="ca-kpi-label">窗口最深回撤</div>
-              <div class="ca-kpi-value text-green">{{ pct1(rbBlock?.longest_loss_window?.drawdown) }}</div>
-              <div class="ca-kpi-sub">峰值日到收复日的谷底幅度</div>
-            </div>
-            <div class="ca-kpi">
-              <div class="ca-kpi-label">分析样本</div>
-              <div class="ca-kpi-value">{{ rbBlock?.n_days }} 个交易日</div>
-              <div class="ca-kpi-sub">{{ rbBlock?.start_date }} ~ {{ rbBlock?.end_date }}</div>
-            </div>
-          </div>
+          <!-- 紧凑摘要行（替代原 3 张 KPI 卡，省纵向空间） -->
+          <p class="ca-note" style="margin:0 0 8px">
+            分析样本 <b>{{ rbBlock?.n_days }}</b> 个交易日（{{ rbBlock?.start_date }} ~ {{ rbBlock?.end_date }}）｜
+            最长亏损窗口 <b>{{ rbBlock?.longest_loss_window?.days ?? 0 }} 天</b>（{{ rbLossText }}）｜
+            窗口最深回撤 <b class="text-green">{{ pct1(rbBlock?.longest_loss_window?.drawdown) }}</b>
+          </p>
 
-          <div class="section-title" style="font-size:13px">逐半年指标矩阵</div>
-          <div class="table-container">
-            <table>
-              <thead><tr><th>区间</th><th>策略收益</th><th>基准收益</th><th>超额</th><th>最大回撤</th><th>夏普</th></tr></thead>
-              <tbody>
-                <tr v-for="r in rbHalfRows" :key="r.period">
-                  <td>{{ r.period }}</td>
-                  <td :class="valueClass(r.strategy_return)">{{ pctSigned(r.strategy_return) }}</td>
-                  <td :class="valueClass(r.benchmark_return)">{{ pctSigned(r.benchmark_return) }}</td>
-                  <td :class="valueClass(r.excess_return)">{{ pctSigned(r.excess_return) }}</td>
-                  <td class="text-green">{{ pct1(r.max_drawdown) }}</td>
-                  <td>{{ num(r.sharpe, 2) }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <div class="rb-grid">
+            <div>
+              <div class="section-title" style="font-size:13px">逐半年指标矩阵</div>
+              <div class="table-container">
+                <table>
+                  <thead><tr><th>区间</th><th>策略收益</th><th>基准收益</th><th>超额</th><th>最大回撤</th><th>夏普</th></tr></thead>
+                  <tbody>
+                    <tr v-for="r in rbHalfRows" :key="r.period">
+                      <td>{{ r.period }}</td>
+                      <td :class="valueClass(r.strategy_return)">{{ pctSigned(r.strategy_return) }}</td>
+                      <td :class="valueClass(r.benchmark_return)">{{ pctSigned(r.benchmark_return) }}</td>
+                      <td :class="valueClass(r.excess_return)">{{ pctSigned(r.excess_return) }}</td>
+                      <td class="text-green">{{ pct1(r.max_drawdown) }}</td>
+                      <td>{{ num(r.sharpe, 2) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
-          <div class="section-title" style="font-size:13px">滚动 26/52 周收益与夏普分布</div>
-          <div class="table-container">
-            <table>
-              <thead><tr><th>窗口</th><th>样本数</th><th>收益中位</th><th>最差</th><th>最好</th><th>负收益占比</th><th>夏普中位</th><th>夏普最差</th><th>夏普为负占比</th></tr></thead>
-              <tbody>
-                <tr v-for="w in rbWindows" :key="w.window">
-                  <td>{{ w.window }} 周</td>
-                  <td>{{ w.n_samples }}</td>
-                  <template v-if="w.n_samples > 0">
-                    <td :class="valueClass(w.returns.median)">{{ rbDistCells(w.returns).median }}</td>
-                    <td class="text-green">{{ rbDistCells(w.returns).min }}</td>
-                    <td class="text-red">{{ rbDistCells(w.returns).max }}</td>
-                    <td>{{ rbDistCells(w.returns).neg }}</td>
-                    <td>{{ num(w.sharpe.median, 2) }}</td>
-                    <td :class="valueClass(w.sharpe.min)">{{ num(w.sharpe.min, 2) }}</td>
-                    <td>{{ pct1(w.sharpe.negative_ratio) }}</td>
-                  </template>
-                  <template v-else>
-                    <td colspan="7" class="empty-state" style="border:none">周频样本不足 {{ w.window }} 周，无法计算</td>
-                  </template>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="chart-box">
-            <div ref="rbHistEl" class="ca-chart"></div>
+            <div>
+              <div class="section-title" style="font-size:13px">滚动 26/52 周收益与夏普分布</div>
+              <div class="table-container">
+                <table>
+                  <thead><tr><th>窗口</th><th>样本数</th><th>收益中位</th><th>最差</th><th>最好</th><th>负收益占比</th><th>夏普中位</th><th>夏普最差</th><th>夏普为负占比</th></tr></thead>
+                  <tbody>
+                    <tr v-for="w in rbWindows" :key="w.window">
+                      <td>{{ w.window }} 周</td>
+                      <td>{{ w.n_samples }}</td>
+                      <template v-if="w.n_samples > 0">
+                        <td :class="valueClass(w.returns.median)">{{ rbDistCells(w.returns).median }}</td>
+                        <td class="text-green">{{ rbDistCells(w.returns).min }}</td>
+                        <td class="text-red">{{ rbDistCells(w.returns).max }}</td>
+                        <td>{{ rbDistCells(w.returns).neg }}</td>
+                        <td>{{ num(w.sharpe.median, 2) }}</td>
+                        <td :class="valueClass(w.sharpe.min)">{{ num(w.sharpe.min, 2) }}</td>
+                        <td>{{ pct1(w.sharpe.negative_ratio) }}</td>
+                      </template>
+                      <template v-else>
+                        <td colspan="7" class="empty-state" style="border:none">周频样本不足 {{ w.window }} 周，无法计算</td>
+                      </template>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="chart-box">
+                <div ref="rbHistEl" class="ca-chart"></div>
+              </div>
+            </div>
           </div>
 
           <div class="section-title" style="font-size:13px">基准替换敏感性（FR-1 相对指标逐基独立计算）</div>
@@ -2901,6 +2927,11 @@ onUnmounted(() => {
               </div>
             </template>
           </div>
+          <!-- 缺失指标提示（增强A）-->
+          <div v-if="sc.hasMissing" class="metric-missing-note">
+            <p v-if="sc.missingBenchmark" class="note-line">💡 策略卡缺少基准相对指标（Beta/Alpha/IR/捕获率等），因策略级评估未传基准数据；已修复（v1.9.2+）。</p>
+            <p v-if="sc.missingPosition" class="note-line">💡 缺少持仓结构指标（最大单票权重/HHI），因回测未保存每日持仓明细（positions_json）；仅影响老记录。</p>
+          </div>
         </div>
         <!-- 组合整体卡 -->
         <div class="strategy-card portfolio-card">
@@ -2913,6 +2944,11 @@ onUnmounted(() => {
                 <span :class="m.cls">{{ m.value }}</span>
               </div>
             </template>
+          </div>
+          <!-- 缺失指标提示（增强A）-->
+          <div v-if="portfolioMissing.hasMissing" class="metric-missing-note">
+            <p v-if="portfolioMissing.missingBenchmark" class="note-line">💡 缺少基准相对指标，因回测未关联基准指数。</p>
+            <p v-if="portfolioMissing.missingPosition" class="note-line">💡 缺少持仓结构指标，因回测未保存每日持仓明细（positions_json）；仅影响老记录。</p>
           </div>
         </div>
       </div>
@@ -3198,6 +3234,31 @@ onUnmounted(() => {
   border-left: 3px solid #667eea;
   background: #eef1fb;
   border-radius: 3px;
+}
+/* 增强A：缺失指标原因提示 */
+.metric-missing-note {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: #fffbeb;
+  border-left: 3px solid #f59e0b;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.note-line {
+  margin: 4px 0;
+  color: #92400e;
+  line-height: 1.5;
+}
+
+/* 稳健性体检紧凑布局：半年矩阵 + 滚动分布 两栏并排 */
+.rb-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 1200px) {
+  .rb-grid { grid-template-columns: 1fr; }
 }
 
 .text-green { color: #10b981; font-weight: 600; }
