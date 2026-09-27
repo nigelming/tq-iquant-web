@@ -14,6 +14,7 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 """
 
 import json
+import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -408,6 +409,22 @@ def _snapshot_value(value):
     return str(value)
 
 
+def _json_safe(obj):
+    """递归清洗分析 payload：NaN/±Inf 浮点 → None。
+
+    分析器在样本不足或零方差场景可能产出非有限浮点（如相关系数 0/0），
+    落库用 allow_nan=False 严格 JSON，故在序列化边界统一转 null（与前端
+    「安全空值」约定一致），不逐个分析点特判。非 float 类型原样返回。
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def build_params_snapshot(ps) -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
@@ -500,7 +517,7 @@ def _upsert_crisis_alpha(
     row.error = error
     row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False)
     row.payload_json = (
-        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
         if payload is not None
         else None
     )
@@ -660,7 +677,7 @@ def _upsert_market_regime(
     row.error = error
     row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False)
     row.payload_json = (
-        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
         if payload is not None
         else None
     )

@@ -1250,6 +1250,18 @@ def test_recompute_evaluation_reads_positions_json(db_session):
     assert out["evaluations"]["beta"] is None
 
 
+def test_json_safe_sanitizes_nonfinite_floats():
+    """_json_safe：NaN/±Inf → None（嵌套 dict/list/tuple），有限值原样。"""
+    from core.services.backtest_service import _json_safe
+    bad = {"a": float("nan"), "b": [1.5, float("inf"), (float("-inf"), 2)],
+           "c": {"d": float("nan")}, "e": "文本", "f": None, "g": 3}
+    out = _json_safe(bad)
+    assert out == {"a": None, "b": [1.5, None, [None, 2]],
+                   "c": {"d": None}, "e": "文本", "f": None, "g": 3}
+    # 清洗后可过 allow_nan=False 严格序列化
+    json.dumps(_json_safe(bad), allow_nan=False)
+
+
 def test_recompute_evaluation_fills_strategy_level_metrics(db_session):
     """策略层：老快照无 benchmark_value → 重算时按日注入组合基准值，相对指标补齐。
 
