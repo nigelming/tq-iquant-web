@@ -9,6 +9,93 @@ RISK_FREE_RATE = 0.02
 # 基准相对指标所需最少对齐日收益样本数（< 20 不出数）
 MIN_REL_SAMPLE_DAYS = 20
 
+# FR-1 八项基准相对指标键序（evaluator/robustness 共用，Minor-5 合并）
+REL_METRIC_KEYS = (
+    "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
+    "information_ratio", "up_capture_ratio", "down_capture_ratio",
+    "excess_max_drawdown",
+)
+
+
+def compute_relative_metrics_core(
+    rs: List[float], rb: List[float],
+    s_first: float, s_last: float, b_first: float, b_last: float,
+    days: int,
+) -> dict:
+    """FR-1 八项基准相对指标唯一实现（Minor-5：evaluator/robustness 共用核心）。
+
+    输入：对齐日收益序列 rs/rb（等长）、策略与基准首末净值、跨度天数。
+    输出：raw float dict（None 安全）；样本 < MIN_REL_SAMPLE_DAYS → 全 None。
+
+    口径（固化，勿随手感改）：
+    - beta：日频总体协方差 / 基准总体方差（分子分母同 ddof=0，比值精确）
+    - Jensen α：对齐窗口 CAGR 口径，α = CAGR_s − rf − β(CAGR_b − rf)
+    - 年化超额/跟踪误差/IR：active 日收益算术口径，IR = 年化超额 / TE
+    - 上/下行捕获率：基准上涨/下跌日中双方日均收益之比；无对应日样本 → None
+    - 超额回撤：cumprod(1+active) 曲线的最大回撤（≥0）
+    """
+    none_result = {k: None for k in REL_METRIC_KEYS}
+    n = len(rs)
+    if n < MIN_REL_SAMPLE_DAYS:
+        return none_result
+
+    mean_s = sum(rs) / n
+    mean_b = sum(rb) / n
+    var_b = sum((r - mean_b) ** 2 for r in rb) / n
+    cov = sum((s - mean_s) * (b - mean_b) for s, b in zip(rs, rb)) / n
+    beta = cov / var_b if var_b > 0 else None
+
+    years = max(days / 365.25, 1 / 365.25)
+    cagr_s = (s_last / s_first) ** (1 / years) - 1
+    cagr_b = (b_last / b_first) ** (1 / years) - 1
+    jensen = (
+        cagr_s - RISK_FREE_RATE - beta * (cagr_b - RISK_FREE_RATE)
+        if beta is not None else None
+    )
+
+    active = [s - b for s, b in zip(rs, rb)]
+    mean_a = sum(active) / n
+    excess_annual = mean_a * 252
+    te = math.sqrt(sum((a - mean_a) ** 2 for a in active) / n * 252)
+    ir = excess_annual / te if te > 0 else None
+
+    up_s = [s for s, b in zip(rs, rb) if b > 0]
+    up_b = [b for b in rb if b > 0]
+    down_s = [s for s, b in zip(rs, rb) if b < 0]
+    down_b = [b for b in rb if b < 0]
+    up_mean_b = sum(up_b) / len(up_b) if up_b else 0
+    down_mean_b = sum(down_b) / len(down_b) if down_b else 0
+    up_capture = (
+        (sum(up_s) / len(up_s)) / up_mean_b
+        if up_b and up_mean_b != 0 else None
+    )
+    down_capture = (
+        (sum(down_s) / len(down_s)) / down_mean_b
+        if down_b and down_mean_b != 0 else None
+    )
+
+    equity = 1.0
+    peak = 1.0
+    excess_dd = 0.0
+    for a in active:
+        equity *= 1 + a
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak
+        if dd > excess_dd:
+            excess_dd = dd
+
+    return {
+        "beta": beta,
+        "jensen_alpha": jensen,
+        "excess_annual_return": excess_annual,
+        "tracking_error": te,
+        "information_ratio": ir,
+        "up_capture_ratio": up_capture,
+        "down_capture_ratio": down_capture,
+        "excess_max_drawdown": excess_dd,
+    }
+
 
 class Evaluator:
     def evaluate(
@@ -303,21 +390,12 @@ class Evaluator:
 
     @staticmethod
     def _compute_relative_metrics(snapshots: List[dict]) -> dict:
-        """从快照序列计算 8 个基准相对指标；对齐日收益 < 20 全部返回 None。
+        """从快照序列计算 8 个基准相对指标（Decimal 量化输出）。
 
-        - beta：日频总体协方/基准方差
-        - Jensen α：对齐窗口 CAGR 口径，α = CAGR_s − rf − β(CAGR_b − rf)
-        - 年化超额/跟踪误差/IR：active 日收益（r_s−r_b）算术口径，IR = 超额/TE
-        - 上下行捕获率：基准上涨/下跌日中双方日均收益之比
-        - 超额回撤：cumprod(1+active) 曲线的最大回撤（正值）
+        计算核心下沉到模块级 ``compute_relative_metrics_core``（与
+        robustness._relative_metrics 共用，Minor-5 消除双实现漂移）；
+        此处只负责快照→日收益对齐与 Decimal 量化。
         """
-        keys = (
-            "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
-            "information_ratio", "up_capture_ratio", "down_capture_ratio",
-            "excess_max_drawdown",
-        )
-        none_result = {k: None for k in keys}
-
         pairs = Evaluator._aligned_daily_pairs(snapshots)
         rs: List[float] = []
         rb: List[float] = []
@@ -327,69 +405,16 @@ class Evaluator:
             if s0 > 0 and b0 > 0:
                 rs.append(s1 / s0 - 1)
                 rb.append(b1 / b0 - 1)
-        n = len(rs)
-        if n < MIN_REL_SAMPLE_DAYS:
-            return none_result
 
         def q(x):
             return Decimal(str(x)).quantize(Decimal("0.0001")) if x is not None else None
 
-        mean_s = sum(rs) / n
-        mean_b = sum(rb) / n
-        var_b = sum((r - mean_b) ** 2 for r in rb) / n
-        cov = sum((s - mean_s) * (b - mean_b) for s, b in zip(rs, rb)) / n
-        beta = cov / var_b if var_b > 0 else None
-
-        # Jensen α：对齐窗口双方 CAGR（与 annual_return 的 CAGR 口径一致）
+        if len(rs) < MIN_REL_SAMPLE_DAYS:
+            return {k: None for k in REL_METRIC_KEYS}
         days = (pairs[-1][0] - pairs[0][0]).days
-        years = max(days / 365.25, 1 / 365.25)
-        cagr_s = (pairs[-1][1] / pairs[0][1]) ** (1 / years) - 1
-        cagr_b = (pairs[-1][2] / pairs[0][2]) ** (1 / years) - 1
-        jensen = (
-            cagr_s - RISK_FREE_RATE - beta * (cagr_b - RISK_FREE_RATE)
-            if beta is not None else None
-        )
-
-        # active 日收益：算术年化超额 + 总体波动年化 TE，IR 与之自洽
-        active = [s - b for s, b in zip(rs, rb)]
-        mean_a = sum(active) / n
-        excess_annual = mean_a * 252
-        te = math.sqrt(sum((a - mean_a) ** 2 for a in active) / n * 252)
-        ir = excess_annual / te if te > 0 else None
-
-        up_s = [s for s, b in zip(rs, rb) if b > 0]
-        up_b = [b for b in rb if b > 0]
-        down_s = [s for s, b in zip(rs, rb) if b < 0]
-        down_b = [b for b in rb if b < 0]
-        up_mean_b = sum(up_b) / len(up_b) if up_b else 0
-        down_mean_b = sum(down_b) / len(down_b) if down_b else 0
-        up_capture = (sum(up_s) / len(up_s)) / up_mean_b if up_mean_b != 0 else None
-        down_capture = (
-            (sum(down_s) / len(down_s)) / down_mean_b if down_mean_b != 0 else None
-        )
-
-        # 超额曲线最大回撤
-        equity = 1.0
-        peak = 1.0
-        excess_dd = 0.0
-        for a in active:
-            equity *= 1 + a
-            if equity > peak:
-                peak = equity
-            dd = (peak - equity) / peak
-            if dd > excess_dd:
-                excess_dd = dd
-
-        return {
-            "beta": q(beta),
-            "jensen_alpha": q(jensen),
-            "excess_annual_return": q(excess_annual),
-            "tracking_error": q(te),
-            "information_ratio": q(ir),
-            "up_capture_ratio": q(up_capture),
-            "down_capture_ratio": q(down_capture),
-            "excess_max_drawdown": q(excess_dd),
-        }
+        core = compute_relative_metrics_core(
+            rs, rb, pairs[0][1], pairs[-1][1], pairs[0][2], pairs[-1][2], days)
+        return {k: q(v) for k, v in core.items()}
 
     # ========================================================================
     # 交易磨损 / 仓位利用 / 持仓结构（FR-2）

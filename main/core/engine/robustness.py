@@ -24,11 +24,16 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from core.engine.evaluator import (
+    MIN_REL_SAMPLE_DAYS,
+    REL_METRIC_KEYS,
+    compute_relative_metrics_core,
+)
+
 TRADING_DAYS = 252
 WEEKS_PER_YEAR = 52
 RISK_FREE_RATE = 0.02
 MIN_ALIGNED_DAYS = 30        # 与市场状态分析一致的共同交易日下限
-MIN_REL_SAMPLE_DAYS = 20     # FR-1 相对指标最小对齐日收益样本
 ROLLING_WINDOWS = (26, 52)   # 滚动窗口（周）
 
 # 滚动窗口收益直方图固定分箱（右闭：首档 ≤-20%，末档 >20%）
@@ -38,11 +43,8 @@ HIST_LABELS = (
     "0%~5%", "5%~10%", "10%~20%", ">20%",
 )
 
-_REL_KEYS = (
-    "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
-    "information_ratio", "up_capture_ratio", "down_capture_ratio",
-    "excess_max_drawdown",
-)
+# FR-1 八项键序唯一来源（Minor-5 合并：evaluator.REL_METRIC_KEYS）
+_REL_KEYS = REL_METRIC_KEYS
 
 
 def _r4(x) -> Optional[float]:
@@ -190,7 +192,8 @@ def _longest_loss_window(s: pd.Series) -> dict:
 
 
 def _relative_metrics(s: pd.Series, b: pd.Series) -> dict:
-    """FR-1 八项指标；口径同 Evaluator._compute_relative_metrics。"""
+    """FR-1 八项指标；计算下沉到 evaluator.compute_relative_metrics_core
+    （Minor-5 唯一实现），此处只做 Series 对齐/适配与 _r4 归一。"""
     none_row = {k: None for k in _REL_KEYS}
     frame = pd.DataFrame({"s": s, "b": b}).dropna()
     rs = frame["s"].pct_change().dropna()
@@ -204,47 +207,18 @@ def _relative_metrics(s: pd.Series, b: pd.Series) -> dict:
             **none_row,
         }
 
-    var_b = rb.var(ddof=0)
-    cov = rs.cov(rb, ddof=0)
-    beta = cov / var_b if var_b > 0 else None
-
-    days = (frame.index[-1] - frame.index[0]).days
-    years = max(days / 365.25, 1 / 365.25)
-    cagr_s = (frame["s"].iloc[-1] / frame["s"].iloc[0]) ** (1 / years) - 1
-    cagr_b = (frame["b"].iloc[-1] / frame["b"].iloc[0]) ** (1 / years) - 1
-    jensen = (
-        cagr_s - RISK_FREE_RATE - beta * (cagr_b - RISK_FREE_RATE)
-        if beta is not None else None
-    )
-
-    active = rs - rb
-    excess_annual = active.mean() * TRADING_DAYS
-    te = active.std(ddof=0) * math.sqrt(TRADING_DAYS)
-    ir = excess_annual / te if te > 0 else None
-
-    up_s = rs[rb > 0]
-    up_mean_b = rb[rb > 0].mean()
-    down_s = rs[rb < 0]
-    down_mean_b = rb[rb < 0].mean()
-    up_capture = up_s.mean() / up_mean_b if up_mean_b else None
-    down_capture = down_s.mean() / down_mean_b if down_mean_b else None
-
-    equity = (1 + active).cumprod()
-    excess_dd = -(equity / equity.cummax() - 1).min()
+    core = compute_relative_metrics_core(
+        rs.tolist(), rb.tolist(),
+        float(frame["s"].iloc[0]), float(frame["s"].iloc[-1]),
+        float(frame["b"].iloc[0]), float(frame["b"].iloc[-1]),
+        (frame.index[-1] - frame.index[0]).days)
 
     return {
         "available": True,
         "n_days": int(n),
         "strategy_total_return": _r4(frame["s"].iloc[-1] / frame["s"].iloc[0] - 1),
         "benchmark_total_return": _r4(frame["b"].iloc[-1] / frame["b"].iloc[0] - 1),
-        "beta": _r4(beta),
-        "jensen_alpha": _r4(jensen),
-        "excess_annual_return": _r4(excess_annual),
-        "tracking_error": _r4(te),
-        "information_ratio": _r4(ir),
-        "up_capture_ratio": _r4(up_capture),
-        "down_capture_ratio": _r4(down_capture),
-        "excess_max_drawdown": _r4(excess_dd),
+        **{k: _r4(v) for k, v in core.items()},
     }
 
 

@@ -910,6 +910,13 @@ const stMatrixRows = computed(() => {
     }))
 })
 
+// FR-13 双窗口一致性说明（Minor-2 修复）：主 60W / 副 20W 标签一致周占比
+const stAgreeText = computed(() => {
+  const d: StyleBlock | undefined = mr.value?.style
+  if (!d || d.fast_window == null || d.label_agree_ratio == null) return ''
+  return `风格标签双窗口（60W 主窗口 / ${d.fast_window}W 快窗口近段确认）：两窗口标签一致周占比 ${pct1(d.label_agree_ratio)}（一致度高 = 主线稳定；矩阵以 60W 主窗口为准）`
+})
+
 const stDispBuckets = computed(() => {
   const d: DispersionBlock | undefined = mr.value?.dispersion
   if (!d) return []
@@ -2689,6 +2696,8 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
+        <!-- FR-13 双窗口说明（Minor-2）：老记录无 fast_window 键 → 不渲染 -->
+        <div v-if="stAgreeText" class="ca-note">{{ stAgreeText }}</div>
 
         <div class="section-title" style="font-size:14px">六、市场分化度（宽基截面标准差）</div>
         <div class="chart-box">

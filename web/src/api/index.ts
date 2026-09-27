@@ -872,6 +872,9 @@ export interface StyleWeekRow {
   label: string
   leader_code: string | null
   leader_return: number
+  // FR-13 双窗口（Minor-2 修复）：20W 快窗口标签，老记录 payload 无此键
+  fast_label?: string
+  fast_leader_code?: string | null
 }
 
 export interface StyleMatrixRow {
@@ -890,6 +893,9 @@ export interface StyleBlock {
   skipped: string[]
   weeks: StyleWeekRow[]
   matrix: Record<string, StyleMatrixRow>
+  // FR-13 双窗口：快窗口周数与 20W/60W 标签一致周占比（老记录无此键）
+  fast_window?: number
+  label_agree_ratio?: number | null
 }
 
 export interface DispersionPoint {

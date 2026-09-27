@@ -493,6 +493,28 @@ def test_tr11_1_tech_growth_leadership_labeled():
     assert style["skipped"] == []
 
 
+def test_tr11_4_dual_window_fast_label_and_agree_ratio():
+    """FR-13 双窗口：每周同时输出 60W 主标签与 20W 快标签 + 一致性占比。
+
+    持续单边领涨场景下两窗口应一致（agree_ratio == 1）。
+    """
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.03,
+        others_weekly=0.0)
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw,
+        benchmark_closes=bc)
+    style = an.analyze()["style"]
+    assert style["fast_window"] == 20
+    weeks = style["weeks"]
+    assert weeks and all("fast_label" in w and "fast_leader_code" in w
+                         for w in weeks)
+    # 单边领涨：60W 与 20W 标签应全部一致
+    assert style["label_agree_ratio"] == pytest.approx(1.0)
+    fast_labels = {w["fast_label"] for w in weeks}
+    assert "科技成长" in fast_labels
+
+
 def test_tr11_2_dispersion_from_input_and_skipped():
     """TR-11.2：分化度序列由输入价格计算（无硬编码）；缺指数进入 skipped。"""
     s_daily, b_daily, bc, fridays, rw = _style_market(

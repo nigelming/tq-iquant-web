@@ -417,14 +417,14 @@ def _neutral(d: dict) -> str:
     n = d.get("neutral") or {}
     cards = "".join([
         _kpi("震荡周数", str(n.get("n_range_weeks", 0))),
-        _kpi("震荡区间基准幅度", pct(n.get("range_ratio"))),
+        _kpi("震荡周占比", pct(n.get("range_ratio"))),
         _kpi("区间累计收益", pct_signed(n.get("cumulative_return")),
              value_cls=cls(n.get("cumulative_return"))),
         _kpi("年化收益", pct_signed(n.get("annualized_return"))),
-        _kpi("日胜率", pct1(n.get("win_rate"))),
+        _kpi("周胜率", pct1(n.get("win_rate"))),
         _kpi("月均交易", num(n.get("monthly_trades"), 1)),
         _kpi("年化换手", num(n.get("annual_turnover"))),
-        _kpi("成本/总收益", pct1(n.get("cost_gross_ratio"))),
+        _kpi("成本/毛利", pct1(n.get("cost_gross_ratio"))),
         _kpi("假突破磨损", f"{n.get('whipsaw_count', 0)} 次",
              f"{n.get('whipsaw_days', 0)} 个交易日"),
     ])
@@ -682,7 +682,21 @@ th:first-child,td:first-child{text-align:left}th{background:#f3f4f6;color:#37415
 .empty{background:#f9fafb;border:1px dashed #d1d5db;border-radius:6px;padding:18px;text-align:center;color:#6b7280;font-size:13px}
 .note{font-size:12px;color:#9ca3af;margin:6px 0}
 .chart{width:100%;margin:8px 0}
+details{margin:8px 0}summary{cursor:pointer;font-size:13px;color:#4b5563}
+pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;font-size:11px;line-height:1.5;max-height:480px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 """
+
+
+def _appendix(detail: dict) -> str:
+    """附录：完整 detail payload 原始 JSON（折叠展示，离线复核/调试用）。
+
+    Minor-4 修复：tasks 证据声称的「附录原始 JSON」补实现。esc 防 XSS。
+    """
+    raw = json.dumps(detail, ensure_ascii=False, default=str, indent=1)
+    return _section(
+        "附录 · 原始数据 JSON",
+        f'<details><summary>展开查看完整回测详情数据（{len(raw)} 字符）</summary>'
+        f'<pre class="json-dump">{esc(raw)}</pre></details>')
 
 
 def build_html_report(detail: dict) -> str:
@@ -698,6 +712,7 @@ def build_html_report(detail: dict) -> str:
         + nav_html
         + _crisis_section(detail)
         + _market_regime_section(detail, charts)
+        + _appendix(detail)
     )
     options = {cid: opt for cid, opt in charts}
     options_json = json.dumps(options, ensure_ascii=False).replace("</", "<\\/")

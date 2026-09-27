@@ -732,41 +732,31 @@ class RegimeAlphaAnalyzer:
             # 样本不足以做滚动，直接返回空矩阵
             return base
 
-        # 每周的 6 指数滚动累计收益（主窗口 60W，不足用可用窗口）
-        weekly_labels: List[Tuple[pd.Timestamp, str, Optional[str], float]] = []
+        # 每周的 6 指数滚动累计收益（FR-13 双窗口：主 60W 稳定，副 20W 近段确认）
+        weekly_labels: List[Tuple[pd.Timestamp, str, Optional[str], float,
+                                  str, Optional[str]]] = []
         for i, ts in enumerate(common):
-            win = min(STYLE_ROLL_WINDOW, i + 1)
-            start = common[max(0, i + 1 - win)]
-            cum: Dict[str, float] = {}
-            for code in self.style_available_codes:
-                seg = self.style_week_rets[code].loc[start:ts]
-                if len(seg) < 2:
-                    continue
-                cum[code] = float((1 + seg).prod() - 1.0)
-            label = self._style_week_label(cum)
-            if label is None:
-                weekly_labels.append((ts, "无主线", None, 0.0))
-                continue
-            # 该周领涨指数 = 滚动累计收益最高者
-            leader_code = max(cum, key=lambda k: cum[k]) if cum else None
-            leader_week_ret = (
-                float(self.style_week_rets[leader_code].loc[ts])
-                if leader_code and ts in self.style_week_rets[leader_code].index
-                else 0.0
-            )
-            weekly_labels.append((ts, label, leader_code, leader_week_ret))
+            label, leader_code, leader_week_ret = self._style_label_at(
+                common, i, ts, STYLE_ROLL_WINDOW)
+            fast_label, fast_leader_code, _ = self._style_label_at(
+                common, i, ts, STYLE_FAST_WINDOW)
+            weekly_labels.append(
+                (ts, label, leader_code, leader_week_ret,
+                 fast_label, fast_leader_code))
 
         base["weeks"] = [
             {"date": _dstr(ts), "label": lbl,
-             "leader_code": lc, "leader_return": lr}
-            for ts, lbl, lc, lr in weekly_labels
+             "leader_code": lc, "leader_return": lr,
+             "fast_label": fl, "fast_leader_code": flc}
+            for ts, lbl, lc, lr, fl, flc in weekly_labels
         ]
 
-        # 风格分组聚合
+        # 风格分组聚合（以主窗口 60W 标签为准）
         s_by_date = {x[0]: x[2] for x in labeled}
         total = len(weekly_labels)
         for lbl in STYLE_LABELS:
-            rows = [(ts, lc, lr) for ts, l, lc, lr in weekly_labels if l == lbl]
+            rows = [(ts, lc, lr) for ts, l, lc, lr, *_ in weekly_labels
+                    if l == lbl]
             blk = base["matrix"][lbl]
             blk["weeks"] = len(rows)
             blk["ratio"] = len(rows) / total if total else 0.0
@@ -781,7 +771,34 @@ class RegimeAlphaAnalyzer:
                 blk["win_rate"] = sum(1 for r in s_rets if r > 0) / len(s_rets)
                 blk["max_drawdown"] = self._style_max_drawdown(
                     [ts for ts, _, _ in rows])
+        # 双窗口一致性统计：20W 与 60W 标签一致的周占比（衡量主线稳定性）
+        agree = sum(1 for t in weekly_labels if t[1] == t[4])
+        base["fast_window"] = STYLE_FAST_WINDOW
+        base["label_agree_ratio"] = agree / total if total else None
         return base
+
+    def _style_label_at(
+        self, common, i: int, ts: pd.Timestamp, window: int
+    ) -> Tuple[str, Optional[str], float]:
+        """单周风格标签（window 周滚动累计收益排名）；样本不足退化为可用窗口。"""
+        win = min(window, i + 1)
+        start = common[max(0, i + 1 - win)]
+        cum: Dict[str, float] = {}
+        for code in self.style_available_codes:
+            seg = self.style_week_rets[code].loc[start:ts]
+            if len(seg) < 2:
+                continue
+            cum[code] = float((1 + seg).prod() - 1.0)
+        label = self._style_week_label(cum)
+        if label is None:
+            return "无主线", None, 0.0
+        leader_code = max(cum, key=lambda k: cum[k]) if cum else None
+        leader_week_ret = (
+            float(self.style_week_rets[leader_code].loc[ts])
+            if leader_code and ts in self.style_week_rets[leader_code].index
+            else 0.0
+        )
+        return label, leader_code, leader_week_ret
 
     def _style_max_drawdown(self, week_ts_list: List[pd.Timestamp]) -> Optional[float]:
         """风格段最大回撤：取该风格涉及的周对应的交易日，净值对段内高点的最大回撤。"""
@@ -923,7 +940,9 @@ class RegimeAlphaAnalyzer:
                 sx = pd.Series(s_arr[start:end + 1])
                 bx = pd.Series(b_arr[start:end + 1])
                 corr_list.append(float(sx.corr(bx)))
-                var_b = float(bx.var(ddof=0))
+                # 分子 cov 默认 ddof=1，分母 var 也须 ddof=1（Minor-1 修复：
+                # 混用 ddof=0 会把 beta 系统性放大 n/(n-1)，n=4 时高估 33%）
+                var_b = float(bx.var())
                 if var_b < 1e-15:
                     beta_list.append(None)
                 else:

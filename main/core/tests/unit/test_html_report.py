@@ -188,3 +188,23 @@ def test_robustness_ok_renders_tables_and_chart():
     assert "基准替换敏感性" in html
     # 图表 JSON 中含稳健性直方图容器 id
     assert "chart-rb" in html
+
+
+def test_appendix_embeds_raw_detail_json():
+    """Minor-4：报告末尾附录折叠展示完整 detail 原始 JSON。"""
+    html = build_html_report(_detail())
+    assert "附录 · 原始数据 JSON" in html
+    assert 'class="json-dump"' in html
+    assert "<details>" in html and "<summary>" in html
+    # 附录内容与 detail 同源（含关键字段原始值），且经 esc 转义
+    assert "热点精选" in html
+    assert "&quot;record&quot;" in html or "record" in html
+
+
+def test_appendix_escapes_html_in_payload():
+    """附录 JSON 中的 HTML 特殊字符必须转义（防 XSS）。"""
+    detail = _detail()
+    detail["record"]["name"] = '<script>alert("x")</script>'
+    html = build_html_report(detail)
+    assert '<script>alert("x")</script>' not in html.split(
+        'class="json-dump"', 1)[1]
