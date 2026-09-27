@@ -792,6 +792,7 @@ export interface MarketRegimeData {
   style: StyleBlock
   dispersion: DispersionBlock
   exposure: ExposureBlock
+  industry_attribution: IndustryAttributionBlock
 }
 
 // ---- 风格轮动 / 分化度 / 隐含风格暴露（FR-13 ~ FR-16）----
@@ -852,6 +853,62 @@ export interface ExposureBlock {
   corr: Record<string, (number | null)[]>
   beta: Record<string, (number | null)[]>
   window: number
+}
+
+// ---- 行业归因（FR-17，通达信二级行业 881）----
+
+export interface IndustryExposureSeries {
+  code: string
+  name: string
+  avg_weight: number
+  weights: number[]
+}
+
+export interface IndustryExposureBlock {
+  dates: string[]
+  series: IndustryExposureSeries[]
+  cash: number[]
+}
+
+export interface IndustryHitRatePeriod {
+  top_n: number
+  periods: number
+  periods_holding: number
+  hits: number
+  hit_rate: number | null
+  details: {
+    period: string
+    held: string[]
+    leaders: string[]
+    hit: boolean
+  }[]
+}
+
+export interface IndustryContributionRow {
+  code: string
+  name: string
+  avg_weight: number
+  index_return: number | null
+  contribution: number
+}
+
+export interface IndustryAttributionBlock {
+  status: 'ok' | 'needs_rerun' | 'failed'
+  taxonomy: string
+  reason?: string
+  error?: string
+  n_days?: number
+  unmapped_codes?: string[]
+  exposure?: IndustryExposureBlock
+  hit_rate?: {
+    weekly: IndustryHitRatePeriod
+    monthly: IndustryHitRatePeriod
+  }
+  contribution?: {
+    available: boolean
+    rows: IndustryContributionRow[]
+    total_contribution: number | null
+  }
 }
 
 export interface BacktestMarketRegimeItem {

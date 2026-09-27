@@ -927,6 +927,54 @@ const marketRegimeCompleted = {
       },
       window: 52,
     },
+    industry_attribution: {
+      status: 'ok',
+      taxonomy: '通达信二级行业(881)',
+      n_days: 60,
+      unmapped_codes: [],
+      exposure: {
+        dates: ['2024-01-05', '2024-01-12'],
+        series: [
+          { code: '881001.SH', name: '半导体', avg_weight: 0.6, weights: [0.6, 0.6] },
+          { code: '881002.SH', name: '煤炭开采', avg_weight: 0.3, weights: [0.3, 0.3] },
+        ],
+        cash: [0.1, 0.1],
+      },
+      hit_rate: {
+        weekly: {
+          top_n: 3, periods: 12, periods_holding: 10, hits: 7, hit_rate: 0.7,
+          details: [{ period: '2024-01-05', held: ['半导体'], leaders: ['半导体', '煤炭开采', '证券'], hit: true }],
+        },
+        monthly: {
+          top_n: 3, periods: 3, periods_holding: 3, hits: 2, hit_rate: 0.667,
+          details: [],
+        },
+      },
+      contribution: {
+        available: true,
+        rows: [
+          { code: '881001.SH', name: '半导体', avg_weight: 0.6, index_return: 0.2, contribution: 0.12 },
+          { code: '881002.SH', name: '煤炭开采', avg_weight: 0.3, index_return: 0.05, contribution: 0.015 },
+        ],
+        total_contribution: 0.135,
+      },
+    },
+  },
+}
+
+const marketRegimeNeedsRerun = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    ...marketRegimeCompleted.data,
+    industry_attribution: {
+      status: 'needs_rerun',
+      taxonomy: '通达信二级行业(881)',
+      reason: '该记录回测时未保存持仓明细，重新回测后可用',
+    },
   },
 }
 
@@ -1554,24 +1602,46 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(mrBtns(w).length).toBe(0)
   })
 
-  it('completed：展开渲染 4 KPI/4 图表/七块内容，重算按钮 1 个', async () => {
+  it('completed：展开渲染 6 KPI/5 图表/八块内容，重算按钮 1 个', async () => {
     const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
     await expandMr(w)
     expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
-    expect(w.findAll('.mr-section .ca-kpi').length).toBe(4)
+    expect(w.findAll('.mr-section .ca-kpi').length).toBe(6)
     for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
       expect(w.text()).toContain(t)
     }
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(4)
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
     for (const t of [
       '一、市场状态×绩效总表', '二、机遇Alpha（上涨捕获）',
       '三、反弹弹性（下跌后反弹段）', '四、中性Alpha（震荡磨损）',
       '五、风格×绩效矩阵（结构性行情）', '六、市场分化度（宽基截面标准差）',
-      '七、隐含风格暴露（滚动相关热力图）',
+      '七、隐含风格暴露（滚动相关热力图）', '八、行业归因',
     ]) {
       expect(w.text()).toContain(t)
     }
     expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('TR-17.1 新记录：行业归因渲染暴露图/命中率卡片/贡献表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('周度领涨命中率')
+    expect(w.text()).toContain('月度领涨命中率')
+    expect(w.text()).toContain('半导体')
+    expect(w.text()).toContain('行业收益贡献分解')
+    // 暴露图容器存在（5 个图表中的第 5 个）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
+  })
+
+  it('TR-17.1 老记录：行业归因仅门禁提示，不 init 图表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeNeedsRerun })
+    await expandMr(w)
+    expect(w.text()).toContain('八、行业归因')
+    expect(w.text()).toContain('该记录回测时未保存持仓明细，重新回测后可用')
+    // 无行业暴露图（仍只有前 4 个图表）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(4)
+    expect(w.text()).not.toContain('周度领涨命中率')
+    expect(w.text()).not.toContain('行业收益贡献分解')
   })
 
   it('风格矩阵渲染 6 行 + 跳过指数提示 + 暴露热力图', async () => {

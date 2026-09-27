@@ -11,6 +11,7 @@ import type {
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
   MarketRegimeData, MarketRegimeStateRow,
   StyleBlock, DispersionBlock, ExposureBlock,
+  IndustryAttributionBlock, IndustryHitRatePeriod,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -945,6 +946,85 @@ const stCorrData = computed(() => {
   }
 })
 
+// 行业归因（FR-17，Task 16/17）
+const iaBlock = computed<IndustryAttributionBlock | undefined>(
+  () => mr.value?.industry_attribution)
+const iaOk = computed(() => iaBlock.value?.status === 'ok')
+const iaExpEl = ref<HTMLDivElement | null>(null)
+let iaExpChart: echarts.ECharts | null = null
+
+const iaHitCards = computed(() => {
+  const hr = iaBlock.value?.hit_rate
+  if (!hr) return []
+  const fmt = (p: IndustryHitRatePeriod) => ({
+    periods: p.periods_holding,
+    hits: p.hits,
+    rate: p.hit_rate === null ? '—' : pct1(p.hit_rate),
+  })
+  return [
+    { label: '周度领涨命中率', ...fmt(hr.weekly) },
+    { label: '月度领涨命中率', ...fmt(hr.monthly) },
+  ]
+})
+
+const iaContribRows = computed(() => {
+  const c = iaBlock.value?.contribution
+  if (!c || !c.available) return []
+  return c.rows.map((r) => ({
+    name: r.name,
+    avg: pct1(r.avg_weight),
+    index: r.index_return === null ? '—' : pctSigned(r.index_return),
+    contribRaw: r.contribution,
+    contrib: pctSigned(r.contribution),
+  }))
+})
+
+function initIaExpChart() {
+  const blk = iaBlock.value
+  const exp = blk?.exposure
+  if (!iaExpEl.value || !exp) return
+  iaExpChart?.dispose()
+  iaExpChart = echarts.init(iaExpEl.value)
+  const palette = ['#4a7ec4', '#1f6e4f', '#d6403a', '#f0a429', '#7c3aed',
+    '#0e7490', '#b45309', '#9d174d', '#6b7280', '#9ca3af']
+  const series = exp.series.map((s, i) => ({
+    name: s.name,
+    type: 'line' as const,
+    stack: 'ia',
+    areaStyle: { opacity: 0.75 },
+    symbol: 'none',
+    smooth: true,
+    lineStyle: { width: 0.5 },
+    color: palette[i % palette.length],
+    data: s.weights.map((w) => Number((w * 100).toFixed(2))),
+  }))
+  series.push({
+    name: '现金',
+    type: 'line' as const,
+    stack: 'ia',
+    areaStyle: { opacity: 0.5 },
+    symbol: 'none',
+    smooth: true,
+    lineStyle: { width: 0.5 },
+    color: '#e5e7eb',
+    data: exp.cash.map((w) => Number((w * 100).toFixed(2))),
+  })
+  iaExpChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { bottom: 0, type: 'scroll' },
+    grid: { left: 48, right: 20, bottom: 44, top: 24, containLabel: true },
+    xAxis: {
+      type: 'category', data: exp.dates, boundaryGap: false,
+      axisLabel: { formatter: (v: string) => v.slice(0, 7) },
+    },
+    yAxis: {
+      type: 'value', name: '仓位(%)', min: 0, max: 100,
+      splitLine: { lineStyle: { type: 'dashed' } },
+    },
+    series,
+  })
+}
+
 const mrKpis = computed(() => {
   const d = mr.value
   if (!d) return []
@@ -1112,6 +1192,7 @@ function initMrCharts() {
   initMrReboundChart()
   initStDispChart()
   initStCorrChart()
+  if (iaOk.value) initIaExpChart()
 }
 
 function initMrStateChart() {
@@ -2540,6 +2621,53 @@ onUnmounted(() => {
           </div>
           <p class="ca-note">
             滚动窗口 {{ stCorrData ? mr?.exposure.window : 52 }} 周；Beta 为普通 OLS（v1 不约束非负权重）。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">八、行业归因（{{ iaBlock?.taxonomy || '通达信二级行业' }}）</div>
+        <template v-if="iaBlock?.status === 'needs_rerun'">
+          <div class="table-container">
+            <div class="empty-state"><p>🏭 {{ iaBlock.reason || '该记录回测时未保存持仓明细，重新回测后可用' }}</p></div>
+          </div>
+        </template>
+        <template v-else-if="iaBlock?.status === 'failed'">
+          <div class="table-container">
+            <div class="empty-state"><p>行业归因不可用：{{ iaBlock.error }}</p></div>
+          </div>
+        </template>
+        <template v-else-if="iaOk">
+          <div class="ca-kpi-row">
+            <div v-for="c in iaHitCards" :key="c.label" class="ca-kpi">
+              <div class="ca-kpi-label">{{ c.label }}</div>
+              <div class="ca-kpi-value">{{ c.rate }}</div>
+              <div class="ca-kpi-sub">{{ c.hits }}/{{ c.periods }} 期命中（Top3）</div>
+            </div>
+          </div>
+          <div class="chart-box">
+            <div ref="iaExpEl" class="ca-chart"></div>
+          </div>
+          <p v-if="iaBlock?.unmapped_codes && iaBlock.unmapped_codes.length" class="ca-note">
+            以下个股未匹配到行业，计入「未分类」：{{ iaBlock.unmapped_codes.join('、') }}
+          </p>
+          <div class="section-title" style="font-size:13px">行业收益贡献分解（期初权重 × 行业日收益）</div>
+          <div v-if="!iaBlock?.contribution?.available" class="table-container">
+            <div class="empty-state"><p>行业指数不可得，仅展示暴露与命中率。</p></div>
+          </div>
+          <div v-else class="table-container">
+            <table>
+              <thead><tr><th>行业</th><th>平均权重</th><th>行业区间涨跌</th><th>配置贡献</th></tr></thead>
+              <tbody>
+                <tr v-for="r in iaContribRows" :key="r.name">
+                  <td>{{ r.name }}</td>
+                  <td>{{ r.avg }}</td>
+                  <td>{{ r.index }}</td>
+                  <td :class="valueClass(r.contribRaw)">{{ r.contrib }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            贡献为行业配置项（Σ 期初行业权重 × 行业日收益），不含行业内个股选择 alpha；合计与策略总收益之差为选股/交易/现金贡献。
           </p>
         </template>
       </template>

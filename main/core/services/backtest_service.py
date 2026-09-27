@@ -34,6 +34,9 @@ from core.engine.crisis_alpha import (
 )
 from core.engine.regime import segment_regime
 from core.engine.regime_alpha import RegimeAlphaAnalyzer
+from core.engine.industry_attribution import (
+    compute_industry_attribution, needs_rerun_block, TAXONOMY as INDUSTRY_TAXONOMY,
+)
 from core.engine.decision import summarize_decisions
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
@@ -309,48 +312,53 @@ def build_open_prices(ps, klines: dict) -> dict:
 
 
 def build_index_close_series(
-    codes: List[str], start: date, end: date
+    codes: List[str], start: date, end: date, batch_size: int = 0
 ) -> Dict[str, Dict[date, Decimal]]:
+    """取指数日线收盘价。batch_size>0 时分批取数（行业指数 128 个用）。"""
     wanted = [c for c in dict.fromkeys(codes) if c]
     if not wanted:
         return {}
     start_str = start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
-    try:
-        raw = TQData().get_history_raw(
-            stocks=wanted,
-            periods=["1d"],
-            start=start_str,
-            end=end_str,
-            dividend_type="front",
-            count=-1,
-        )
-    except Exception:
-        return {}
-    if not isinstance(raw, dict) or not raw:
-        return {}
-    period = raw.get("1d")
-    if not isinstance(period, dict):
-        return {}
-    close_df = period.get("Close")
-    if close_df is None:
-        return {}
-    columns = getattr(close_df, "columns", [])
+    chunks = ([wanted[i:i + batch_size]
+               for i in range(0, len(wanted), batch_size)]
+              if batch_size else [wanted])
     out: Dict[str, Dict[date, Decimal]] = {}
-    for code in wanted:
-        if code not in columns:
+    for chunk in chunks:
+        try:
+            raw = TQData().get_history_raw(
+                stocks=chunk,
+                periods=["1d"],
+                start=start_str,
+                end=end_str,
+                dividend_type="front",
+                count=-1,
+            )
+        except Exception:
             continue
-        series: Dict[date, Decimal] = {}
-        for ts in close_df.index:
-            val = close_df.loc[ts, code]
-            if _is_nan(val):
+        if not isinstance(raw, dict) or not raw:
+            continue
+        period = raw.get("1d")
+        if not isinstance(period, dict):
+            continue
+        close_df = period.get("Close")
+        if close_df is None:
+            continue
+        columns = getattr(close_df, "columns", [])
+        for code in chunk:
+            if code not in columns or code in out:
                 continue
-            d = ts.date() if hasattr(ts, "date") else ts
-            if isinstance(d, datetime):
-                d = d.date()
-            series[d] = _to_decimal(val)
-        if series:
-            out[code] = series
+            series: Dict[date, Decimal] = {}
+            for ts in close_df.index:
+                val = close_df.loc[ts, code]
+                if _is_nan(val):
+                    continue
+                d = ts.date() if hasattr(ts, "date") else ts
+                if isinstance(d, datetime):
+                    d = d.date()
+                series[d] = _to_decimal(val)
+            if series:
+                out[code] = series
     return out
 
 
@@ -659,6 +667,50 @@ def _upsert_market_regime(
 
 # 与危机一致的共同交易日下限（不足标 insufficient，不落 payload）
 _MARKET_REGIME_MIN_DAYS = 30
+_INDUSTRY_FETCH_BATCH = 40
+
+
+def _build_industry_attribution(
+    snapshots: List[dict], start: date, end: date
+) -> dict:
+    """行业归因块（TQ I/O 层）。任何异常不影响市场态主链路。
+
+    老记录（快照无 positions_json）→ needs_rerun；
+    TQ 行业数据整体不可得 → failed 块；部分不可得则按可得集合计算。
+    """
+    if not any(s.get("positions") is not None for s in snapshots):
+        return needs_rerun_block()
+    try:
+        tq_data = TQData()
+        industries = tq_data.get_industry_list()
+        names = {ind["code"]: ind["name"] for ind in industries}
+        held_codes = set()
+        for snap in snapshots:
+            for pos in snap.get("positions") or []:
+                code = pos.get("stock_code")
+                if code:
+                    held_codes.add(code)
+        stock_industry: Dict[str, Optional[dict]] = {}
+        for code in held_codes:
+            try:
+                stock_industry[code] = tq_data.get_stock_industry(code)
+            except Exception:
+                stock_industry[code] = None
+        # 命中率排名需要全量行业指数；分批取数
+        all_codes = [ind["code"] for ind in industries]
+        raw_closes = (build_index_close_series(
+            all_codes, start, end, batch_size=_INDUSTRY_FETCH_BATCH)
+            if all_codes else {})
+        industry_closes = {code: _to_close_series(pts)
+                           for code, pts in raw_closes.items()}
+        return compute_industry_attribution(
+            snapshots, stock_industry, names, industry_closes)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "taxonomy": INDUSTRY_TAXONOMY,
+            "error": f"行业归因取数失败：{exc}",
+        }
 
 
 def compute_and_store_market_regime(
@@ -706,9 +758,12 @@ def compute_and_store_market_regime(
         benchmark_name=benchmark_name,
         benchmark_closes=benchmark_closes,
     )
+    payload = analyzer.analyze()
+    payload["industry_attribution"] = _build_industry_attribution(
+        snapshots, start, end)
     return _upsert_market_regime(
         db, record_id, benchmark_code, benchmark_name,
-        status="completed", payload=analyzer.analyze(),
+        status="completed", payload=payload,
     )
 
 
@@ -771,7 +826,10 @@ def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
     )
     row = safe_compute_market_regime(
         db, record_id, ps,
-        [{"snap_date": s.snap_date, "total_value": s.total_value} for s in snaps],
+        [{"snap_date": s.snap_date, "total_value": s.total_value,
+          "positions": (json.loads(s.positions_json)
+                        if s.positions_json is not None else None)}
+         for s in snaps],
         trades,
         rec.start_date, rec.end_date,
         benchmark_code=resolution["benchmark_code"],

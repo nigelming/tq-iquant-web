@@ -926,8 +926,10 @@ def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypat
     payload = json.loads(row.payload_json)
     assert set(payload) == {"meta", "regime_table", "opportunity",
                             "rebound", "neutral", "style", "dispersion",
-                            "exposure"}
+                            "exposure", "industry_attribution"}
     assert payload["regime_table"]["range"]["weeks"] >= 0
+    # 老记录（无 positions_json）→ needs_rerun，不伪装结果
+    assert payload["industry_attribution"]["status"] == "needs_rerun"
 
     # 重复重算：upsert 不新增行
     monkeypatch.setattr(
@@ -976,6 +978,113 @@ def test_recompute_market_regime_insufficient_common_days(db_session, monkeypatc
     out = svc.recompute_market_regime(db_session, rec.id)
     assert out["status"] == "insufficient"
     assert "不足" in out["error"]
+
+
+class _FakeIndustryTQ(_FakeIndexTQ):
+    """支持行业列表/个股行业反查的 TQ mock。"""
+
+    def __init__(self, frames, industries, stock_industry):
+        super().__init__(frames)
+        self._industries = industries
+        self._stock_industry = stock_industry
+
+    def get_industry_list(self):
+        return list(self._industries)
+
+    def get_stock_industry(self, stock_code):
+        return self._stock_industry.get(stock_code)
+
+
+def test_tr16_industry_attribution_ok_with_positions(db_session, monkeypatch):
+    """TR-16.1 service 链路：positions_json → 行业归因 ok 块并入 payload。"""
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    for d, v in nav_pts.items():
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(round(v, 2))),
+            cash=Decimal("0"), market_value=Decimal(str(round(v, 2))),
+            positions_json=json.dumps([
+                {"stock_code": "000001.SZ", "quantity": 100,
+                 "sellable_quantity": 100,
+                 "market_value": str(round(v, 2)), "cost_value": "1000"},
+            ]),
+        ))
+    db_session.commit()
+
+    industries = [
+        {"code": "881001.SH", "name": "测试行业A"},
+        {"code": "881002.SH", "name": "测试行业B"},
+        {"code": "881003.SH", "name": "测试行业C"},
+        {"code": "881004.SH", "name": "测试行业D"},
+    ]
+    # A（持仓行业）持续上涨；其余行业下跌
+    frames = {"000300.SH": _ca_decimal_frames(bm_pts)}
+    up = {d: Decimal(str(1000 * (1 + 0.004 * i)))
+          for i, d in enumerate(sorted(nav_pts))}
+    down = {d: Decimal("1000") for d in nav_pts}
+    frames["881001.SH"] = up
+    for c in ("881002.SH", "881003.SH", "881004.SH"):
+        frames[c] = down
+    fake = _FakeIndustryTQ(
+        frames, industries,
+        {"000001.SZ": {"code": "881001.SH", "name": "测试行业A"}})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "completed"
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    payload = json.loads(row.payload_json)
+    ia = payload["industry_attribution"]
+    assert ia["status"] == "ok"
+    # 暴露：A 行业满仓
+    ia_series = {s["code"]: s for s in ia["exposure"]["series"]}
+    assert "881001.SH" in ia_series
+    assert abs(ia_series["881001.SH"]["avg_weight"] - 1.0) < 1e-6
+    # 命中率：每周都命中领涨 Top3
+    wk = ia["hit_rate"]["weekly"]
+    assert wk["periods_holding"] >= 10
+    assert wk["hits"] == wk["periods_holding"]
+    # 贡献：A 正贡献
+    assert ia["contribution"]["available"] is True
+    row_a = next(r for r in ia["contribution"]["rows"]
+                 if r["code"] == "881001.SH")
+    assert row_a["contribution"] > 0
+
+
+def test_tr16_industry_attribution_failure_isolated(db_session, monkeypatch):
+    """行业归因 TQ 异常不影响市场态主链路，落 failed 块。"""
+    rec, ps = _seed_record(db_session)
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    for d, v in nav_pts.items():
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(round(v, 2))),
+            cash=Decimal("0"), market_value=Decimal(str(round(v, 2))),
+            positions_json=json.dumps([
+                {"stock_code": "000001.SZ", "quantity": 100,
+                 "market_value": str(round(v, 2))},
+            ]),
+        ))
+    db_session.commit()
+
+    class _BoomIndustryTQ(_FakeIndexTQ):
+        def get_industry_list(self):
+            raise RuntimeError("industry_boom")
+
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _BoomIndustryTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "completed"
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    payload = json.loads(row.payload_json)
+    assert payload["industry_attribution"]["status"] == "failed"
+    assert "industry_boom" in payload["industry_attribution"]["error"]
 
 
 def test_recompute_market_regime_without_snapshots_returns_failed(db_session):
