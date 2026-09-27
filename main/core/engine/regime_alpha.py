@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from core.engine.crisis_alpha import CRISIS_BENCHMARKS
 from core.engine.regime import (
     REGIME_BEAR,
     REGIME_BULL,
@@ -62,6 +63,27 @@ WHIPSAW_DAYS = 5              # 假突破磨损：开仓后 N 个交易日内小
 STATE_ORDER = ("bull", "bear", "range", "rebound")
 TREND_STATES = ("bull", "bear", "rebound")   # 单笔盈亏对比中的「趋势」组
 OPP_CATS = ("同步涨", "涨得少", "踏空", "逆势跌")
+
+# ---------------------------------------------------------------------------
+# 风格轮动（FR-13 ~ FR-16）常量
+# ---------------------------------------------------------------------------
+# 6 宽基 → 风格组映射（复用 crisis_alpha.CRISIS_BENCHMARKS 的 6 只指数）
+STYLE_GROUPS: Dict[str, List[str]] = {
+    "大盘价值": ["000300.SH"],
+    "中小盘": ["000905.SH", "000852.SH"],
+    "科技成长": ["399006.SZ", "000688.SH"],
+}
+# 中证全指仅作普涨/普跌参考，不归属任何主导风格
+STYLE_BROAD_INDEX = "000985.CSI"
+STYLE_LABELS = ("大盘价值", "中小盘", "科技成长", "普涨", "普跌", "无主线")
+
+STYLE_ROLL_WINDOW = 60        # 风格领导主窗口（60 周累计收益排名，稳定）
+STYLE_FAST_WINDOW = 20        # 副窗口（20 周，用于近段确认/短样本回退）
+STYLE_LOW_DISPERSION = 0.05   # 普涨判定：60 周累计收益截面 std < 5%
+STYLE_NOLEADER_EDGE = 0.5     # 无主线判定：榜首与次席差距 < 0.5×截面 std
+
+DISPERSION_WINDOW = 1         # 分化度 = 当期 6 指数周收益截面标准差（无需滚动）
+ROLLING_EXPOSURE_WINDOW = 52  # 滚动相关/OLS beta 窗口（周）
 
 
 def _mean(values: List[float]) -> float:
@@ -99,6 +121,7 @@ class RegimeAlphaAnalyzer:
         regime_weeks: Optional[Any] = None,
         strategy_name: str = "策略",
         benchmark_name: str = "基准",
+        benchmark_closes: Optional[Dict[str, pd.Series]] = None,
     ):
         if not isinstance(strategy_nav, pd.Series) or not isinstance(
                 benchmark_price, pd.Series):
@@ -144,6 +167,12 @@ class RegimeAlphaAnalyzer:
 
         self.trades = self._normalize_trades(trades or [])
         self.events = self._realize()   # FIFO 平仓事件（毛 PnL / 磨损）
+
+        # 风格轮动 / 隐含暴露所需 6 宽基周频收益（FR-13 ~ FR-16）
+        self.style_available_codes: List[str] = []
+        self.style_skipped: List[str] = []
+        self.style_week_rets: Dict[str, pd.Series] = {}
+        self._prepare_style_benchmarks(benchmark_closes)
 
     # ------------------------------------------------------------------
     # 输入归一化
@@ -193,6 +222,37 @@ class RegimeAlphaAnalyzer:
             })
         out.sort(key=lambda x: x["date"])
         return out
+
+    # ------------------------------------------------------------------
+    # 风格轮动：6 宽基周频收益对齐
+    # ------------------------------------------------------------------
+    def _prepare_style_benchmarks(
+        self, benchmark_closes: Optional[Dict[str, pd.Series]]
+    ) -> None:
+        """把 6 宽基日线收盘价转成与策略对齐的周频收益。
+        不可得指数记入 style_skipped；仅保留同时存在于策略周收益索引上的周。
+        """
+        if not benchmark_closes:
+            return
+        all_codes = [spec["code"] for spec in CRISIS_BENCHMARKS]
+        name_by_code = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+        ref_index = self.s_week_ret.index
+        for code in all_codes:
+            series = benchmark_closes.get(code)
+            if series is None or not isinstance(series, pd.Series) or series.empty:
+                self.style_skipped.append(name_by_code.get(code, code))
+                continue
+            wk = series.copy().sort_index().astype(float)
+            wk.index = pd.to_datetime(wk.index).normalize()
+            wk = wk.resample("W-FRI").last().dropna()
+            wk_ret = wk.pct_change().dropna()
+            common = wk_ret.index.intersection(ref_index)
+            wk_ret = wk_ret.loc[common]
+            if len(wk_ret) < 2:
+                self.style_skipped.append(name_by_code.get(code, code))
+                continue
+            self.style_week_rets[code] = wk_ret
+            self.style_available_codes.append(code)
 
     # ------------------------------------------------------------------
     # FIFO 平仓配对（毛 PnL，未扣费用）
@@ -286,6 +346,9 @@ class RegimeAlphaAnalyzer:
             "opportunity": self._opportunity(labeled),
             "rebound": self._rebound(),
             "neutral": self._neutral(labeled),
+            "style": self._style(labeled),
+            "dispersion": self._dispersion(),
+            "exposure": self._exposure(),
         }
 
     def _meta(self, labeled) -> dict:
@@ -558,3 +621,259 @@ class RegimeAlphaAnalyzer:
             "range_count": len(rng_pnl),
         }
         return out
+
+    # ------------------------------------------------------------------
+    # FR-13 ~ FR-15：风格领导分段 + 风格×绩效矩阵 + 分化度
+    # ------------------------------------------------------------------
+    def _style_week_label(
+        self, cum_rets: Dict[str, float]
+    ) -> Optional[str]:
+        """根据某周 6 宽基滚动累计收益截面判定风格标签。
+
+        规则（见 spec FR-13）：
+        - 全部为负 → 普跌
+        - 全部为正 且 截面 std < STYLE_LOW_DISPERSION → 普涨
+        - 否则取榜首指数所属风格组；榜首与次席差距 < 0.5×std → 无主线
+        """
+        if not cum_rets:
+            return None
+        vals = list(cum_rets.values())
+        vmax = max(vals)
+        vmin = min(vals)
+        std = float(pd.Series(vals).std(ddof=0)) if len(vals) >= 2 else 0.0
+        if vmax < 0:
+            return "普跌"
+        if vmin > 0 and std < STYLE_LOW_DISPERSION:
+            return "普涨"
+        # 找榜首
+        leader_code = max(cum_rets, key=lambda k: cum_rets[k])
+        leader_style = None
+        for grp, codes in STYLE_GROUPS.items():
+            if leader_code in codes:
+                leader_style = grp
+                break
+        if leader_style is None:
+            # 榜首是中证全指：若其明显领先则无主线，否则随次席风格
+            return "无主线"
+        # 无主线判定
+        sorted_vals = sorted(vals, reverse=True)
+        edge = sorted_vals[0] - sorted_vals[1] if len(sorted_vals) >= 2 else sorted_vals[0]
+        if std > 1e-9 and edge < STYLE_NOLEADER_EDGE * std:
+            return "无主线"
+        return leader_style
+
+    def _style(self, labeled) -> dict:
+        """风格×绩效矩阵 + 每周风格标签序列。"""
+        n_codes = len(self.style_available_codes)
+        base = {
+            "available_codes": self.style_available_codes,
+            "skipped": self.style_skipped,
+            "weeks": [],           # [{date, label, leader_code, leader_return}]
+            "matrix": {
+                lbl: {
+                    "label": lbl,
+                    "weeks": 0,
+                    "ratio": 0.0,
+                    "strategy_return": None,
+                    "leader_return": None,
+                    "excess_return": None,
+                    "win_rate": None,
+                    "max_drawdown": None,
+                } for lbl in STYLE_LABELS
+            },
+        }
+        if n_codes < 2 or not labeled:
+            return base
+        # 取所有可用指数周收益的共同周索引
+        ref_index = self.s_week_ret.index
+        common = ref_index
+        for code in self.style_available_codes:
+            common = common.intersection(self.style_week_rets[code].index)
+        common = common.intersection(pd.Index(x[0] for x in labeled))
+        if len(common) < STYLE_FAST_WINDOW:
+            # 样本不足以做滚动，直接返回空矩阵
+            return base
+
+        # 每周的 6 指数滚动累计收益（主窗口 60W，不足用可用窗口）
+        weekly_labels: List[Tuple[pd.Timestamp, str, Optional[str], float]] = []
+        for i, ts in enumerate(common):
+            win = min(STYLE_ROLL_WINDOW, i + 1)
+            start = common[max(0, i + 1 - win)]
+            cum: Dict[str, float] = {}
+            for code in self.style_available_codes:
+                seg = self.style_week_rets[code].loc[start:ts]
+                if len(seg) < 2:
+                    continue
+                cum[code] = float((1 + seg).prod() - 1.0)
+            label = self._style_week_label(cum)
+            if label is None:
+                weekly_labels.append((ts, "无主线", None, 0.0))
+                continue
+            # 该周领涨指数 = 滚动累计收益最高者
+            leader_code = max(cum, key=lambda k: cum[k]) if cum else None
+            leader_week_ret = (
+                float(self.style_week_rets[leader_code].loc[ts])
+                if leader_code and ts in self.style_week_rets[leader_code].index
+                else 0.0
+            )
+            weekly_labels.append((ts, label, leader_code, leader_week_ret))
+
+        base["weeks"] = [
+            {"date": _dstr(ts), "label": lbl,
+             "leader_code": lc, "leader_return": lr}
+            for ts, lbl, lc, lr in weekly_labels
+        ]
+
+        # 风格分组聚合
+        s_by_date = {x[0]: x[2] for x in labeled}
+        total = len(weekly_labels)
+        for lbl in STYLE_LABELS:
+            rows = [(ts, lc, lr) for ts, l, lc, lr in weekly_labels if l == lbl]
+            blk = base["matrix"][lbl]
+            blk["weeks"] = len(rows)
+            blk["ratio"] = len(rows) / total if total else 0.0
+            if rows:
+                s_rets = [s_by_date.get(ts, 0.0) for ts, _, _ in rows]
+                l_rets = [lr for _, _, lr in rows]
+                s_cum = _compound(s_rets)
+                l_cum = _compound(l_rets)
+                blk["strategy_return"] = s_cum
+                blk["leader_return"] = l_cum
+                blk["excess_return"] = s_cum - l_cum
+                blk["win_rate"] = sum(1 for r in s_rets if r > 0) / len(s_rets)
+                blk["max_drawdown"] = self._style_max_drawdown(
+                    [ts for ts, _, _ in rows])
+        return base
+
+    def _style_max_drawdown(self, week_ts_list: List[pd.Timestamp]) -> Optional[float]:
+        """风格段最大回撤：取该风格涉及的周对应的交易日，净值对段内高点的最大回撤。"""
+        if not week_ts_list:
+            return None
+        fri_set = {self._friday(ts) for ts in week_ts_list}
+        days = [d for d in self.daily_index if self._friday(d) in fri_set]
+        if not days:
+            return None
+        peak: Optional[float] = None
+        dd = 0.0
+        for d in days:
+            v = float(self.s_nav.loc[d])
+            peak = v if peak is None else max(peak, v)
+            if peak > 0:
+                dd = min(dd, v / peak - 1.0)
+        return dd
+
+    def _dispersion(self) -> dict:
+        """宽基截面分化度时间序列 + 策略超额按分化度分桶对比。"""
+        base = {
+            "available_codes": self.style_available_codes,
+            "skipped": self.style_skipped,
+            "series": [],          # [{date, dispersion}]
+            "buckets": {
+                "low": {"count": 0, "mean_excess": None, "win_rate": None,
+                        "threshold": None},
+                "mid": {"count": 0, "mean_excess": None, "win_rate": None,
+                        "threshold": None},
+                "high": {"count": 0, "mean_excess": None, "win_rate": None,
+                         "threshold": None},
+            },
+        }
+        n_codes = len(self.style_available_codes)
+        if n_codes < 2:
+            return base
+        ref_index = self.s_week_ret.index
+        common = ref_index
+        for code in self.style_available_codes:
+            common = common.intersection(self.style_week_rets[code].index)
+        common = common.intersection(self.b_week_ret.index)
+        if len(common) < 6:
+            return base
+
+        series: List[Tuple[pd.Timestamp, float, float]] = []
+        for ts in common:
+            rets = [float(self.style_week_rets[c].loc[ts])
+                    for c in self.style_available_codes
+                    if ts in self.style_week_rets[c].index]
+            if len(rets) < 2:
+                continue
+            disp = float(pd.Series(rets).std(ddof=0))
+            s_ret = float(self.s_week_ret.loc[ts])
+            b_ret = float(self.b_week_ret.loc[ts])
+            series.append((ts, disp, s_ret - b_ret))
+        if not series:
+            return base
+        disps = sorted(x[1] for x in series)
+        n = len(disps)
+        q1 = disps[n // 3]
+        q2 = disps[(2 * n) // 3]
+        base["series"] = [
+            {"date": _dstr(ts), "dispersion": d} for ts, d, _ in series
+        ]
+        buckets = {"low": [], "mid": [], "high": []}
+        for _, d, exc in series:
+            if d <= q1:
+                buckets["low"].append(exc)
+            elif d <= q2:
+                buckets["mid"].append(exc)
+            else:
+                buckets["high"].append(exc)
+        for name, vals in buckets.items():
+            base["buckets"][name]["count"] = len(vals)
+            base["buckets"][name]["threshold"] = q1 if name == "low" else (
+                q2 if name == "mid" else None)
+            if vals:
+                base["buckets"][name]["mean_excess"] = _mean(vals)
+                base["buckets"][name]["win_rate"] = (
+                    sum(1 for v in vals if v > 0) / len(vals))
+        return base
+
+    # ------------------------------------------------------------------
+    # FR-16：隐含风格暴露（滚动相关热力图 + OLS beta）
+    # ------------------------------------------------------------------
+    def _exposure(self) -> dict:
+        """策略对 6 宽基的滚动相关与 OLS beta（52 周窗口，v1 不约束权重）。"""
+        name_by_code = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+        base = {
+            "available_codes": self.style_available_codes,
+            "available_names": [name_by_code.get(c, c)
+                                for c in self.style_available_codes],
+            "skipped": self.style_skipped,
+            "dates": [],
+            "corr": {},       # code -> [float or None] 对齐 dates
+            "beta": {},       # code -> [float or None]
+            "window": ROLLING_EXPOSURE_WINDOW,
+        }
+        if len(self.style_available_codes) < 1:
+            return base
+        ref_index = self.s_week_ret.index
+        common = ref_index
+        for code in self.style_available_codes:
+            common = common.intersection(self.style_week_rets[code].index)
+        common = common.intersection(self.b_week_ret.index)
+        if len(common) < 4:
+            return base
+        base["dates"] = [_dstr(ts) for ts in common]
+        w = min(ROLLING_EXPOSURE_WINDOW, len(common))
+        s_arr = [float(self.s_week_ret.loc[ts]) for ts in common]
+        for code in self.style_available_codes:
+            b_arr = [float(self.style_week_rets[code].loc[ts]) for ts in common]
+            corr_list: List[Optional[float]] = []
+            beta_list: List[Optional[float]] = []
+            for end in range(len(common)):
+                start = max(0, end + 1 - w)
+                if end - start + 1 < 4:
+                    corr_list.append(None)
+                    beta_list.append(None)
+                    continue
+                sx = pd.Series(s_arr[start:end + 1])
+                bx = pd.Series(b_arr[start:end + 1])
+                corr_list.append(float(sx.corr(bx)))
+                var_b = float(bx.var(ddof=0))
+                if var_b < 1e-15:
+                    beta_list.append(None)
+                else:
+                    cov = float(sx.cov(bx))
+                    beta_list.append(cov / var_b)
+            base["corr"][code] = corr_list
+            base["beta"][code] = beta_list
+        return base
+

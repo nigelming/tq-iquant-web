@@ -673,7 +673,9 @@ def compute_and_store_market_regime(
 ) -> BacktestMarketRegimeAnalysis:
     benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
     benchmark_name = _crisis_benchmark_name(benchmark_code)
-    closes = build_index_close_series([benchmark_code], start, end)
+    # 主基准 + 6 宽基（风格轮动/分化度/隐含暴露复用 crisis 取数）
+    codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
+    closes = build_index_close_series(codes, start, end)
     main_closes = closes.get(benchmark_code) or {}
     if not main_closes:
         return _upsert_market_regime(
@@ -682,6 +684,11 @@ def compute_and_store_market_regime(
             error="主基准指数无数据（TQ 取数失败或代码不被支持）",
         )
     benchmark = _to_close_series(main_closes)
+    benchmark_closes: Dict[str, pd.Series] = {}
+    for spec in CRISIS_BENCHMARKS:
+        got = closes.get(spec["code"])
+        if got:
+            benchmark_closes[spec["code"]] = _to_close_series(got)
     nav = _crisis_nav_from_snapshots(snapshots)
     common = nav.index.intersection(benchmark.index)
     if len(common) < _MARKET_REGIME_MIN_DAYS:
@@ -697,6 +704,7 @@ def compute_and_store_market_regime(
         trades=trades, regime_weeks=regime,
         strategy_name=getattr(ps, "name", "组合"),
         benchmark_name=benchmark_name,
+        benchmark_closes=benchmark_closes,
     )
     return _upsert_market_regime(
         db, record_id, benchmark_code, benchmark_name,

@@ -789,6 +789,69 @@ export interface MarketRegimeData {
       range_count: number
     }
   }
+  style: StyleBlock
+  dispersion: DispersionBlock
+  exposure: ExposureBlock
+}
+
+// ---- 风格轮动 / 分化度 / 隐含风格暴露（FR-13 ~ FR-16）----
+
+export interface StyleWeekRow {
+  date: string
+  label: string
+  leader_code: string | null
+  leader_return: number
+}
+
+export interface StyleMatrixRow {
+  label: string
+  weeks: number
+  ratio: number
+  strategy_return: number | null
+  leader_return: number | null
+  excess_return: number | null
+  win_rate: number | null
+  max_drawdown: number | null
+}
+
+export interface StyleBlock {
+  available_codes: string[]
+  skipped: string[]
+  weeks: StyleWeekRow[]
+  matrix: Record<string, StyleMatrixRow>
+}
+
+export interface DispersionPoint {
+  date: string
+  dispersion: number
+}
+
+export interface DispersionBucket {
+  count: number
+  mean_excess: number | null
+  win_rate: number | null
+  threshold: number | null
+}
+
+export interface DispersionBlock {
+  available_codes: string[]
+  skipped: string[]
+  series: DispersionPoint[]
+  buckets: {
+    low: DispersionBucket
+    mid: DispersionBucket
+    high: DispersionBucket
+  }
+}
+
+export interface ExposureBlock {
+  available_codes: string[]
+  available_names: string[]
+  skipped: string[]
+  dates: string[]
+  corr: Record<string, (number | null)[]>
+  beta: Record<string, (number | null)[]>
+  window: number
 }
 
 export interface BacktestMarketRegimeItem {

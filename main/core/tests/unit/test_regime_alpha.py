@@ -343,7 +343,8 @@ def test_tr73_missing_states_structure():
                                            "segments": [], "counts": {}})
     p = an.analyze()
 
-    assert set(p) == {"meta", "regime_table", "opportunity", "rebound", "neutral"}
+    assert set(p) == {"meta", "regime_table", "opportunity", "rebound",
+                      "neutral", "style", "dispersion", "exposure"}
     table = p["regime_table"]
     assert set(table) == set(STATES)
     for st in ("bull", "bear", "rebound"):
@@ -388,7 +389,8 @@ def test_tr73_missing_states_structure():
 def test_tr73_empty_and_single_day_inputs():
     empty = pd.Series(dtype=float)
     p = RegimeAlphaAnalyzer(empty, empty).analyze()
-    assert set(p) == {"meta", "regime_table", "opportunity", "rebound", "neutral"}
+    assert set(p) == {"meta", "regime_table", "opportunity", "rebound",
+                      "neutral", "style", "dispersion", "exposure"}
     assert all(p["regime_table"][st]["weeks"] == 0 for st in STATES)
     assert p["rebound"]["segments"] == []
     assert p["neutral"]["n_range_weeks"] == 0
@@ -414,3 +416,163 @@ def test_tr73_dict_trades_whipsaw():
     p = an.analyze()
     assert p["neutral"]["whipsaw_count"] == 1    # 当日小亏平仓 → 磨损
     assert p["neutral"]["avg_trade_pnl"]["range_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# TR-11 / TR-12：风格轮动 + 分化度 + 隐含风格暴露（FR-13 ~ FR-16）
+# ---------------------------------------------------------------------------
+
+def _style_market(n_weeks=80, leader_code="399006.SZ", leader_weekly=0.03,
+                  others_weekly=0.0, noise=0.003):
+    """构造风格场景：指定指数持续领涨，其余横盘；策略≈领涨指数。
+
+    返回 (s_daily, b_daily, benchmark_closes, fridays, regime_weeks)。
+    regime_weeks 全部标 bull，让 labeled 周覆盖整个区间（风格计算需要
+    labeled 周索引，见 _style 中 common 与 labeled 的交集）。
+    noise 为周收益微扰（避免恒定收益→方差为零→相关系数 NaN）。
+    """
+    from core.engine.crisis_alpha import CRISIS_BENCHMARKS
+    fridays = [_START + timedelta(weeks=i) for i in range(n_weeks)]
+
+    def _week_closes(base_ret, phase=0):
+        closes = [100.0]
+        for i in range(n_weeks - 1):
+            # 奇偶周微扰，保证序列有方差（相关/beta 可算）；phase 控制反相
+            sign = 1 if (i + phase) % 2 == 0 else -1
+            closes.append(closes[-1] * (1 + base_ret + sign * noise))
+        return closes
+
+    leader_closes = _week_closes(leader_weekly, phase=0)
+    other_closes = _week_closes(others_weekly, phase=1)  # 反相，避免与领涨指数同涨同跌
+    # 主基准用沪深300（横盘），策略≈领涨指数
+    benchmark_closes = {}
+    for spec in CRISIS_BENCHMARKS:
+        code = spec["code"]
+        closes = leader_closes if code == leader_code else other_closes
+        idx, vals = [], []
+        for i, c in enumerate(closes):
+            fri = fridays[i]
+            for k in range(5):
+                idx.append(fri - timedelta(days=4 - k))
+                vals.append(c)
+        benchmark_closes[code] = pd.Series(
+            vals, index=pd.DatetimeIndex(idx), dtype=float)
+    # 策略日频 = 领涨指数（近似）
+    s_daily = benchmark_closes[leader_code].copy()
+    b_daily = benchmark_closes["000300.SH"].copy()
+    regime_weeks = [
+        {"date": fridays[i], "close": other_closes[i], "label": "bull"}
+        for i in range(1, n_weeks)
+    ]
+    return s_daily, b_daily, benchmark_closes, fridays, regime_weeks
+
+
+def test_tr11_1_tech_growth_leadership_labeled():
+    """TR-11.1：创业板持续领涨 → 风格标签含科技成长，矩阵对应行有值。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.03,
+        others_weekly=0.0)
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw,
+        benchmark_closes=bc)
+    p = an.analyze()
+    style = p["style"]
+    assert style["available_codes"]
+    # 至少有一些周被判为科技成长
+    labels = [w["label"] for w in style["weeks"]]
+    assert "科技成长" in labels
+    blk = style["matrix"]["科技成长"]
+    assert blk["weeks"] > 0
+    assert blk["strategy_return"] is not None
+    assert blk["excess_return"] is not None
+    # skipped 应为空（6 指数均构造）
+    assert style["skipped"] == []
+
+
+def test_tr11_2_dispersion_from_input_and_skipped():
+    """TR-11.2：分化度序列由输入价格计算（无硬编码）；缺指数进入 skipped。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.03,
+        others_weekly=-0.01)
+    # 移除科创50（模拟不可得）
+    del bc["000688.SH"]
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw, benchmark_closes=bc)
+    p = an.analyze()
+    disp = p["dispersion"]
+    assert "科创50" in disp["skipped"]
+    # 分化度序列非空且全为非负数
+    assert len(disp["series"]) > 0
+    assert all(s["dispersion"] >= 0 for s in disp["series"])
+    # 分桶三档 count 之和≈序列长度
+    total = sum(disp["buckets"][k]["count"] for k in ("low", "mid", "high"))
+    assert total == len(disp["series"])
+    # 分化度 = 截面 std，可由当周 5 个指数周收益独立复算
+    import math
+    sample = disp["series"][10]
+    ts = pd.Timestamp(sample["date"])
+    s_week_ret = an.s_week_ret
+    if ts in s_week_ret.index:
+        rets = []
+        for code in an.style_available_codes:
+            if ts in an.style_week_rets[code].index:
+                rets.append(float(an.style_week_rets[code].loc[ts]))
+        if len(rets) >= 2:
+            mean = sum(rets) / len(rets)
+            expected = math.sqrt(sum((r - mean) ** 2 for r in rets) / len(rets))
+            assert sample["dispersion"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_tr11_3_no_benchmark_closes_safe_empty():
+    """不传 benchmark_closes → style/dispersion/exposure 安全空结构，不抛错。"""
+    s_daily, b_daily, sc, bc, fridays, rw = _build_market()
+    an = RegimeAlphaAnalyzer(s_daily, b_daily, trades=[], regime_weeks=rw)
+    p = an.analyze()
+    assert p["style"]["available_codes"] == []
+    assert p["dispersion"]["series"] == []
+    assert p["exposure"]["dates"] == []
+
+
+def test_tr12_1_rolling_exposure_single_index_tracking():
+    """TR-12.1：策略≈某单指数 → 该指数滚动相关接近 1、beta 接近 1。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.02,
+        others_weekly=0.01)
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw, benchmark_closes=bc)
+    p = an.analyze()
+    exp = p["exposure"]
+    assert "399006.SZ" in exp["corr"]
+    cyb_corr = [v for v in exp["corr"]["399006.SZ"] if v is not None]
+    cyb_beta = [v for v in exp["beta"]["399006.SZ"] if v is not None]
+    assert cyb_corr, "应有非空滚动相关序列"
+    # 末段 52 周窗口内，策略=创业板 → 相关≈1
+    assert cyb_corr[-1] == pytest.approx(1.0, abs=0.05)
+    assert cyb_beta[-1] == pytest.approx(1.0, abs=0.1)
+    # 沪深300 与策略相关性应较低（横盘 vs 上涨）
+    hs_corr = [v for v in exp["corr"]["000300.SH"] if v is not None]
+    assert hs_corr[-1] < 0.5
+
+
+def test_tr12_2_missing_index_skipped_no_nan_misalignment():
+    """TR-12.2：缺指数 → skipped；exposure 的 corr/beta 仅含可得指数。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="000300.SH", leader_weekly=0.02,
+        others_weekly=0.0)
+    del bc["000688.SH"]   # 科创50 不可得
+    del bc["000852.SH"]   # 中证1000 不可得
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw, benchmark_closes=bc)
+    p = an.analyze()
+    exp = p["exposure"]
+    assert "科创50" in exp["skipped"]
+    assert "中证1000" in exp["skipped"]
+    # 可得指数的 corr/beta 数组长度一致且等于 dates 长度
+    n = len(exp["dates"])
+    for code in exp["available_codes"]:
+        assert len(exp["corr"][code]) == n
+        assert len(exp["beta"][code]) == n
+    # 不可得指数不在 corr/beta 键中
+    assert "000688.SH" not in exp["corr"]
+    assert "000852.SH" not in exp["corr"]
+

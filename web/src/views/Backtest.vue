@@ -10,6 +10,7 @@ import type {
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
   MarketRegimeData, MarketRegimeStateRow,
+  StyleBlock, DispersionBlock, ExposureBlock,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -876,6 +877,74 @@ const mrReboundEl = ref<HTMLDivElement | null>(null)
 let mrStateChart: echarts.ECharts | null = null
 let mrReboundChart: echarts.ECharts | null = null
 
+// 风格轮动 / 分化度 / 隐含暴露（FR-13 ~ FR-16）
+const STYLE_LABEL_CN = ['大盘价值', '中小盘', '科技成长', '普涨', '普跌', '无主线']
+const STYLE_COLORS: Record<string, string> = {
+  大盘价值: '#4a7ec4', 中小盘: '#1f6e4f', 科技成长: '#d6403a',
+  普涨: '#f0a429', 普跌: '#6b7280', 无主线: '#9ca3af',
+}
+const stDispEl = ref<HTMLDivElement | null>(null)
+const stCorrEl = ref<HTMLDivElement | null>(null)
+let stDispChart: echarts.ECharts | null = null
+let stCorrChart: echarts.ECharts | null = null
+
+const stMatrixRows = computed(() => {
+  const d: StyleBlock | undefined = mr.value?.style
+  if (!d) return []
+  return STYLE_LABEL_CN.map((lbl) => d.matrix[lbl]).filter((r) => r && r.weeks > 0)
+    .map((r) => ({
+      label: r.label,
+      weeks: r.weeks,
+      ratio: pct1(r.ratio),
+      strategyRaw: r.strategy_return,
+      strategy: r.strategy_return === null ? '—' : pctSigned(r.strategy_return),
+      leader: r.leader_return === null ? '—' : pctSigned(r.leader_return),
+      excessRaw: r.excess_return,
+      excess: r.excess_return === null ? '—' : pctSigned(r.excess_return),
+      win: r.win_rate === null ? '—' : pct1(r.win_rate),
+      dd: r.max_drawdown === null ? '—' : pct(r.max_drawdown),
+    }))
+})
+
+const stDispBuckets = computed(() => {
+  const d: DispersionBlock | undefined = mr.value?.dispersion
+  if (!d) return []
+  const order = ['low', 'mid', 'high'] as const
+  const labelMap = { low: '低分化（普涨普跌）', mid: '中分化', high: '高分化（结构性）' }
+  return order.map((k) => {
+    const b = d.buckets[k]
+    return {
+      key: k, label: labelMap[k], count: b.count,
+      meanRaw: b.mean_excess,
+      mean: b.mean_excess === null ? '—' : pctSigned(b.mean_excess),
+      win: b.win_rate === null ? '—' : pct1(b.win_rate),
+    }
+  })
+})
+
+const stSkipped = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  const all = new Set<string>()
+  ;['style', 'dispersion', 'exposure'].forEach((k) => {
+    const blk = (d as any)[k]
+    if (blk?.skipped) blk.skipped.forEach((s: string) => all.add(s))
+  })
+  return [...all]
+})
+
+const stCorrData = computed(() => {
+  const d: ExposureBlock | undefined = mr.value?.exposure
+  if (!d || !d.dates.length) return null
+  return {
+    dates: d.dates,
+    codes: d.available_codes,
+    names: d.available_names,
+    corr: d.corr,
+    beta: d.beta,
+  }
+})
+
 const mrKpis = computed(() => {
   const d = mr.value
   if (!d) return []
@@ -1041,6 +1110,8 @@ function initMrCharts() {
   if (!mr.value) return
   initMrStateChart()
   initMrReboundChart()
+  initStDispChart()
+  initStCorrChart()
 }
 
 function initMrStateChart() {
@@ -1107,6 +1178,66 @@ function initMrReboundChart() {
   })
 }
 
+function initStDispChart() {
+  if (!stDispEl.value || !mr.value) return
+  const disp = mr.value.dispersion
+  if (!disp.series.length) return
+  stDispChart?.dispose()
+  stDispChart = echarts.init(stDispEl.value)
+  const dates = disp.series.map((s) => s.date)
+  const vals = disp.series.map((s) => Number((s.dispersion * 100).toFixed(3)))
+  stDispChart.setOption({
+    tooltip: { trigger: 'axis' },
+    grid: { left: 56, right: 24, bottom: 40, top: 30, containLabel: true },
+    xAxis: { type: 'category', data: dates, boundaryGap: false,
+      axisLabel: { formatter: (v: string) => v.slice(0, 7) } },
+    yAxis: {
+      type: 'value', name: '分化度(%)', scale: true,
+      splitLine: { lineStyle: { type: 'dashed' } },
+    },
+    series: [{
+      name: '宽基截面分化度', type: 'line', data: vals, smooth: true, symbol: 'none',
+      lineStyle: { color: '#7c3aed', width: 1.6 },
+      areaStyle: { color: 'rgba(124,58,237,0.08)' },
+    }],
+  })
+}
+
+function initStCorrChart() {
+  if (!stCorrEl.value || !stCorrData.value) return
+  const cd = stCorrData.value
+  stCorrChart?.dispose()
+  stCorrChart = echarts.init(stCorrEl.value)
+  // 热力图 data: [xIdx, yIdx, value]
+  const data: [number, number, number][] = []
+  cd.codes.forEach((code, yi) => {
+    const arr = cd.corr[code] || []
+    arr.forEach((v, xi) => {
+      if (v !== null && !Number.isNaN(v)) {
+        data.push([xi, yi, Number(v.toFixed(2))])
+      }
+    })
+  })
+  stCorrChart.setOption({
+    tooltip: { position: 'top' },
+    grid: { left: 80, right: 24, bottom: 60, top: 20, containLabel: true },
+    xAxis: {
+      type: 'category', data: cd.dates, boundaryGap: false,
+      axisLabel: { formatter: (v: string) => v.slice(0, 7), interval: Math.floor(cd.dates.length / 8) },
+    },
+    yAxis: { type: 'category', data: cd.names },
+    visualMap: {
+      min: -1, max: 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 0,
+      inRange: { color: ['#1f6e4f', '#e5e7eb', '#d6403a'] },
+    },
+    series: [{
+      name: '滚动相关', type: 'heatmap', data,
+      label: { show: false },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.3)' } },
+    }],
+  })
+}
+
 function scrollToSection(anchor: string) {
   if (anchor === 'crisis-alpha') {
     void expandCaSection().then(() => {
@@ -1145,7 +1276,21 @@ function pct(v: number | null | undefined): string {
 }
 function num(v: number | null | undefined, digits = 4): string {
   if (v === null || v === undefined) return '—'
+  if (!Number.isFinite(Number(v))) return '—'
   return Number(v).toFixed(digits)
+}
+
+function lastVal(arr: (number | null)[] | undefined): number | null {
+  if (!arr || !arr.length) return null
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i] !== null && Number.isFinite(arr[i] as number)) return arr[i] as number
+  }
+  return null
+}
+
+function fmtCorr(v: number | null): string {
+  if (v === null) return '—'
+  return Number(v).toFixed(2)
 }
 // 按值正负着色
 // A 股红涨绿跌：正收益→红、负收益→绿
@@ -2322,6 +2467,81 @@ onUnmounted(() => {
         <p class="ca-note">
           磨损指标按交易日归属平仓日；假突破磨损 = 5 个交易日内同票平仓且毛 PnL ≤ 0（FIFO 配对）。
         </p>
+
+        <div class="section-title" style="font-size:14px">五、风格×绩效矩阵（结构性行情）</div>
+        <div v-if="stSkipped.length" class="ca-note">
+          以下宽基指数不可得，已跳过：{{ stSkipped.join('、') }}
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>主导风格</th><th>周数</th><th>占比</th><th>策略累计</th><th>领涨指数累计</th>
+                <th>超额</th><th>胜率</th><th>态内最大回撤</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in stMatrixRows" :key="r.label">
+                <td :style="{ color: STYLE_COLORS[r.label], fontWeight: 700 }">{{ r.label }}</td>
+                <td>{{ r.weeks }}</td>
+                <td>{{ r.ratio }}</td>
+                <td :class="valueClass(r.strategyRaw)">{{ r.strategy }}</td>
+                <td>{{ r.leader }}</td>
+                <td :class="valueClass(r.excessRaw)">{{ r.excess }}</td>
+                <td>{{ r.win }}</td>
+                <td>{{ r.dd }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">六、市场分化度（宽基截面标准差）</div>
+        <div class="chart-box">
+          <div ref="stDispEl" class="ca-chart"></div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>分化度档位</th><th>周数</th><th>策略平均超额</th><th>超额胜率</th></tr></thead>
+            <tbody>
+              <tr v-for="r in stDispBuckets" :key="r.key">
+                <td>{{ r.label }}</td>
+                <td>{{ r.count }}</td>
+                <td :class="valueClass(r.meanRaw)">{{ r.mean }}</td>
+                <td>{{ r.win }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ca-note">
+          高分化（结构性行情）下策略超额是否更显著，可验证策略的结构性捕获能力。
+        </p>
+
+        <div class="section-title" style="font-size:14px">七、隐含风格暴露（滚动相关热力图）</div>
+        <div v-if="!stCorrData" class="table-container">
+          <div class="empty-state"><p>宽基样本不足，无法计算风格暴露。</p></div>
+        </div>
+        <template v-else>
+          <div class="chart-box">
+            <div ref="stCorrEl" class="ca-chart" style="min-height:320px"></div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>宽基</th><th>最新相关</th><th>最新 Beta</th></tr></thead>
+              <tbody>
+                <tr v-for="(name, i) in stCorrData.names" :key="stCorrData.codes[i]">
+                  <td>{{ name }}</td>
+                  <td :class="valueClass(lastVal(stCorrData.corr[stCorrData.codes[i]]))">
+                    {{ fmtCorr(lastVal(stCorrData.corr[stCorrData.codes[i]])) }}
+                  </td>
+                  <td>{{ num(lastVal(stCorrData.beta[stCorrData.codes[i]]), 2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            滚动窗口 {{ stCorrData ? mr?.exposure.window : 52 }} 周；Beta 为普通 OLS（v1 不约束非负权重）。
+          </p>
+        </template>
       </template>
       </template>
     </div>

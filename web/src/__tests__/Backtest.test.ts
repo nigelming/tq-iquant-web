@@ -876,6 +876,57 @@ const marketRegimeCompleted = {
       whipsaw_days: 120,
       avg_trade_pnl: { trend: 1000, trend_count: 10, range: -14.29, range_count: 7 },
     },
+    style: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      skipped: ['科创50'],
+      weeks: [
+        { date: '2024-02-02', label: '科技成长', leader_code: '399006.SZ', leader_return: 0.04 },
+        { date: '2024-02-09', label: '中小盘', leader_code: '000905.SH', leader_return: 0.03 },
+      ],
+      matrix: {
+        大盘价值: { label: '大盘价值', weeks: 5, ratio: 0.1, strategy_return: 0.08, leader_return: 0.06, excess_return: 0.02, win_rate: 0.7, max_drawdown: -0.05 },
+        中小盘: { label: '中小盘', weeks: 10, ratio: 0.2, strategy_return: 0.15, leader_return: 0.12, excess_return: 0.03, win_rate: 0.65, max_drawdown: -0.07 },
+        科技成长: { label: '科技成长', weeks: 20, ratio: 0.4, strategy_return: 0.3, leader_return: 0.25, excess_return: 0.05, win_rate: 0.75, max_drawdown: -0.1 },
+        普涨: { label: '普涨', weeks: 8, ratio: 0.16, strategy_return: 0.05, leader_return: 0.04, excess_return: 0.01, win_rate: 0.6, max_drawdown: -0.03 },
+        普跌: { label: '普跌', weeks: 5, ratio: 0.1, strategy_return: -0.02, leader_return: -0.05, excess_return: 0.03, win_rate: 0.5, max_drawdown: -0.08 },
+        无主线: { label: '无主线', weeks: 2, ratio: 0.04, strategy_return: 0.01, leader_return: 0.005, excess_return: 0.005, win_rate: 0.5, max_drawdown: -0.02 },
+      },
+    },
+    dispersion: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      skipped: ['科创50'],
+      series: [
+        { date: '2024-01-05', dispersion: 0.02 },
+        { date: '2024-01-12', dispersion: 0.015 },
+        { date: '2024-01-19', dispersion: 0.025 },
+      ],
+      buckets: {
+        low: { count: 1, mean_excess: 0.005, win_rate: 0.6, threshold: 0.018 },
+        mid: { count: 1, mean_excess: 0.01, win_rate: 0.7, threshold: 0.022 },
+        high: { count: 1, mean_excess: 0.02, win_rate: 0.8, threshold: null },
+      },
+    },
+    exposure: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      available_names: ['沪深300', '中证500', '中证1000', '创业板指', '中证全指'],
+      skipped: ['科创50'],
+      dates: ['2024-01-05', '2024-01-12', '2024-01-19'],
+      corr: {
+        '000300.SH': [0.3, 0.35, 0.4],
+        '000905.SH': [0.5, 0.55, 0.6],
+        '000852.SH': [0.4, 0.42, 0.45],
+        '399006.SZ': [0.8, 0.82, 0.85],
+        '000985.CSI': [0.6, 0.62, 0.65],
+      },
+      beta: {
+        '000300.SH': [0.3, 0.32, 0.35],
+        '000905.SH': [0.5, 0.52, 0.55],
+        '000852.SH': [0.4, 0.42, 0.45],
+        '399006.SZ': [1.1, 1.12, 1.15],
+        '000985.CSI': [0.6, 0.62, 0.65],
+      },
+      window: 52,
+    },
   },
 }
 
@@ -1503,7 +1554,7 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(mrBtns(w).length).toBe(0)
   })
 
-  it('completed：展开渲染 4 KPI/2 图表/四块内容，重算按钮 1 个', async () => {
+  it('completed：展开渲染 4 KPI/4 图表/七块内容，重算按钮 1 个', async () => {
     const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
     await expandMr(w)
     expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
@@ -1511,12 +1562,40 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
       expect(w.text()).toContain(t)
     }
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(2)
-    expect(w.text()).toContain('一、市场状态×绩效总表')
-    expect(w.text()).toContain('二、机遇Alpha（上涨捕获）')
-    expect(w.text()).toContain('三、反弹弹性（下跌后反弹段）')
-    expect(w.text()).toContain('四、中性Alpha（震荡磨损）')
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(4)
+    for (const t of [
+      '一、市场状态×绩效总表', '二、机遇Alpha（上涨捕获）',
+      '三、反弹弹性（下跌后反弹段）', '四、中性Alpha（震荡磨损）',
+      '五、风格×绩效矩阵（结构性行情）', '六、市场分化度（宽基截面标准差）',
+      '七、隐含风格暴露（滚动相关热力图）',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
     expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('风格矩阵渲染 6 行 + 跳过指数提示 + 暴露热力图', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    // 风格矩阵 6 行
+    const rows = w.findAll('.mr-section table tbody tr')
+    // 前 4 块表行数较多，直接定位含风格标签的文本
+    expect(w.text()).toContain('科技成长')
+    expect(w.text()).toContain('中小盘')
+    expect(w.text()).toContain('大盘价值')
+    expect(w.text()).toContain('普涨')
+    expect(w.text()).toContain('普跌')
+    expect(w.text()).toContain('无主线')
+    // 跳过指数提示
+    expect(w.text()).toContain('科创50')
+    // 分化度档位
+    expect(w.text()).toContain('低分化（普涨普跌）')
+    expect(w.text()).toContain('高分化（结构性）')
+    // 暴露表含宽基名
+    expect(w.text()).toContain('创业板指')
+    expect(w.text()).toContain('最新相关')
+    expect(w.text()).toContain('最新 Beta')
+    void rows
   })
 
   it('点击重算 → 调 recomputeMarketRegime → 成功后显示完成提示', async () => {

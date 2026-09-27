@@ -925,7 +925,8 @@ def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypat
         backtest_record_id=rec.id).one()
     payload = json.loads(row.payload_json)
     assert set(payload) == {"meta", "regime_table", "opportunity",
-                            "rebound", "neutral"}
+                            "rebound", "neutral", "style", "dispersion",
+                            "exposure"}
     assert payload["regime_table"]["range"]["weeks"] >= 0
 
     # 重复重算：upsert 不新增行
