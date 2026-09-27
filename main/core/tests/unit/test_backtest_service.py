@@ -927,7 +927,11 @@ def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypat
     payload = json.loads(row.payload_json)
     assert set(payload) == {"meta", "regime_table", "opportunity",
                             "rebound", "neutral", "style", "dispersion",
-                            "exposure", "industry_attribution", "robustness"}
+                            "exposure", "quadrant_exposure",
+                            "industry_attribution", "robustness"}
+    # fake TQ 未提供四象限指数 → 全部 skipped，安全空结构
+    assert payload["quadrant_exposure"]["available_codes"] == []
+    assert len(payload["quadrant_exposure"]["skipped"]) == 6
     assert payload["regime_table"]["range"]["weeks"] >= 0
     # 老记录（无 positions_json）→ needs_rerun，不伪装结果
     assert payload["industry_attribution"]["status"] == "needs_rerun"

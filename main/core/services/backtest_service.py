@@ -33,7 +33,10 @@ from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
 from core.engine.regime import segment_regime
-from core.engine.regime_alpha import RegimeAlphaAnalyzer
+from core.engine.regime_alpha import (
+    QUADRANT_STYLE_INDICES,
+    RegimeAlphaAnalyzer,
+)
 from core.engine.industry_attribution import (
     compute_industry_attribution, needs_rerun_block, TAXONOMY as INDUSTRY_TAXONOMY,
 )
@@ -726,8 +729,10 @@ def compute_and_store_market_regime(
 ) -> BacktestMarketRegimeAnalysis:
     benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
     benchmark_name = _crisis_benchmark_name(benchmark_code)
-    # 主基准 + 6 宽基（风格轮动/分化度/隐含暴露复用 crisis 取数）
-    codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
+    # 主基准 + 6 宽基 + 巨潮四象限（风格轮动/分化度/隐含暴露复用 crisis 取数）
+    codes = ([benchmark_code]
+             + [spec["code"] for spec in CRISIS_BENCHMARKS]
+             + [spec["code"] for spec in QUADRANT_STYLE_INDICES])
     closes = build_index_close_series(codes, start, end)
     main_closes = closes.get(benchmark_code) or {}
     if not main_closes:
@@ -742,6 +747,11 @@ def compute_and_store_market_regime(
         got = closes.get(spec["code"])
         if got:
             benchmark_closes[spec["code"]] = _to_close_series(got)
+    quadrant_closes: Dict[str, pd.Series] = {}
+    for spec in QUADRANT_STYLE_INDICES:
+        got = closes.get(spec["code"])
+        if got:
+            quadrant_closes[spec["code"]] = _to_close_series(got)
     nav = _crisis_nav_from_snapshots(snapshots)
     common = nav.index.intersection(benchmark.index)
     if len(common) < _MARKET_REGIME_MIN_DAYS:
@@ -758,6 +768,7 @@ def compute_and_store_market_regime(
         strategy_name=getattr(ps, "name", "组合"),
         benchmark_name=benchmark_name,
         benchmark_closes=benchmark_closes,
+        quadrant_closes=quadrant_closes,
     )
     payload = analyzer.analyze()
     payload["industry_attribution"] = _build_industry_attribution(

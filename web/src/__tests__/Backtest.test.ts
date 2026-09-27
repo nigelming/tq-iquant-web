@@ -927,6 +927,28 @@ const marketRegimeCompleted = {
       },
       window: 52,
     },
+    // 增强A：巨潮四象限纯风格暴露
+    quadrant_exposure: {
+      available_codes: ['399372.SZ', '399373.SZ', '399374.SZ', '399375.SZ', '399376.SZ'],
+      available_names: ['大盘成长', '大盘价值', '中盘成长', '中盘价值', '小盘成长'],
+      skipped: ['小盘价值'],
+      dates: ['2024-01-05', '2024-01-12', '2024-01-19'],
+      corr: {
+        '399372.SZ': [0.7, 0.72, 0.75],
+        '399373.SZ': [0.2, 0.22, 0.25],
+        '399374.SZ': [0.6, 0.62, 0.65],
+        '399375.SZ': [0.1, 0.12, 0.15],
+        '399376.SZ': [0.5, 0.52, 0.55],
+      },
+      beta: {
+        '399372.SZ': [0.9, 0.92, 0.95],
+        '399373.SZ': [0.2, 0.22, 0.25],
+        '399374.SZ': [0.7, 0.72, 0.75],
+        '399375.SZ': [0.1, 0.12, 0.15],
+        '399376.SZ': [0.6, 0.62, 0.65],
+      },
+      window: 52,
+    },
     industry_attribution: {
       status: 'ok',
       taxonomy: '通达信二级行业(881)',
@@ -1675,7 +1697,7 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(mrBtns(w).length).toBe(0)
   })
 
-  it('completed：展开渲染 6 KPI/6 图表/九块内容，重算按钮 1 个', async () => {
+  it('completed：展开渲染 9 KPI/7 图表/九块内容，重算按钮 1 个', async () => {
     const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
     await expandMr(w)
     expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
@@ -1683,7 +1705,7 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
       expect(w.text()).toContain(t)
     }
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(7)
     for (const t of [
       '一、市场状态×绩效总表', '二、机遇Alpha（上涨捕获）',
       '三、反弹弹性（下跌后反弹段）', '四、中性Alpha（震荡磨损）',
@@ -1703,8 +1725,8 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(w.text()).toContain('月度领涨命中率')
     expect(w.text()).toContain('半导体')
     expect(w.text()).toContain('行业收益贡献分解')
-    // 暴露图容器存在（6 个图表中的第 5 个）
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
+    // 暴露图容器存在（7 个图表中的第 5 个）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(7)
   })
 
   it('TR-17.1 老记录：行业归因仅门禁提示，不 init 图表', async () => {
@@ -1712,8 +1734,8 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     await expandMr(w)
     expect(w.text()).toContain('八、行业归因')
     expect(w.text()).toContain('该记录回测时未保存持仓明细，重新回测后可用')
-    // 无行业暴露图（基础 4 图 + 稳健性直方图 1 个 = 5）
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
+    // 无行业暴露图（基础 4 图 + 四象限 1 + 稳健性直方图 1 个 = 6）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
     expect(w.text()).not.toContain('周度领涨命中率')
     expect(w.text()).not.toContain('行业收益贡献分解')
   })
@@ -1741,8 +1763,8 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(w.text()).toContain('策略与基准共同交易日不足30天（12），稳健性无法分析')
     expect(w.text()).not.toContain('逐半年指标矩阵')
     expect(w.text()).not.toContain('基准替换敏感性')
-    // 无稳健性直方图（行业暴露图仍在，共 5 图）
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
+    // 无稳健性直方图（四象限+行业暴露图仍在，共 6 图）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
   })
 
   it('风格矩阵渲染 6 行 + 跳过指数提示 + 暴露热力图', async () => {
@@ -1767,6 +1789,29 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(w.text()).toContain('最新相关')
     expect(w.text()).toContain('最新 Beta')
     void rows
+  })
+
+  it('增强A：四象限纯风格暴露渲染第二热力图 + 跳过提示；老记录无该键时空态', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('七-B、巨潮四象限·纯风格暴露')
+    for (const t of ['大盘成长', '中盘价值', '小盘成长']) {
+      expect(w.text()).toContain(t)
+    }
+    // 四象限自身的跳过提示（区别于宽基跳过的「科创50」）
+    expect(w.text()).toContain('以下四象限指数不可得，已跳过：小盘价值')
+    // 老记录：无 quadrant_exposure 键 → 空态且不崩
+    const oldData = { ...marketRegimeCompleted.data }
+    delete (oldData as any).quadrant_exposure
+    const w2 = await mountMr({
+      ...mockDetail,
+      market_regime: { ...marketRegimeCompleted, data: oldData },
+    })
+    await expandMr(w2)
+    expect(w2.text()).toContain('七-B、巨潮四象限·纯风格暴露')
+    expect(w2.text()).toContain('该记录暂无四象限暴露数据')
+    // 少 1 张四象限热力图（7 → 6）
+    expect(w2.findAll('.mr-section .ca-chart').length).toBe(6)
   })
 
   it('点击重算 → 调 recomputeMarketRegime → 成功后显示完成提示', async () => {

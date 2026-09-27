@@ -85,6 +85,18 @@ STYLE_NOLEADER_EDGE = 0.5     # 无主线判定：榜首与次席差距 < 0.5×�
 DISPERSION_WINDOW = 1         # 分化度 = 当期 6 指数周收益截面标准差（无需滚动）
 ROLLING_EXPOSURE_WINDOW = 52  # 滚动相关/OLS beta 窗口（周）
 
+# 巨潮四象限风格指数（规模×成长/价值，纯风格口径；TQ 可取，spike 见计划 0014 同批验证）
+# 与 6 宽基的区别：宽基是规模+板块的混合载体，四象限把规模与成长/价值两维拆开，
+# 用于隐含风格暴露的第二组回归（FR-16 增强），不参与风格领导标签判定。
+QUADRANT_STYLE_INDICES: Tuple[Dict[str, str], ...] = (
+    {"code": "399372.SZ", "name": "大盘成长"},
+    {"code": "399373.SZ", "name": "大盘价值"},
+    {"code": "399374.SZ", "name": "中盘成长"},
+    {"code": "399375.SZ", "name": "中盘价值"},
+    {"code": "399376.SZ", "name": "小盘成长"},
+    {"code": "399377.SZ", "name": "小盘价值"},
+)
+
 
 def _mean(values: List[float]) -> float:
     return sum(values) / len(values) if values else 0.0
@@ -122,6 +134,7 @@ class RegimeAlphaAnalyzer:
         strategy_name: str = "策略",
         benchmark_name: str = "基准",
         benchmark_closes: Optional[Dict[str, pd.Series]] = None,
+        quadrant_closes: Optional[Dict[str, pd.Series]] = None,
     ):
         if not isinstance(strategy_nav, pd.Series) or not isinstance(
                 benchmark_price, pd.Series):
@@ -173,6 +186,14 @@ class RegimeAlphaAnalyzer:
         self.style_skipped: List[str] = []
         self.style_week_rets: Dict[str, pd.Series] = {}
         self._prepare_style_benchmarks(benchmark_closes)
+
+        # 巨潮四象限纯风格周频收益（FR-16 增强：第二组隐含暴露）
+        self.quadrant_available_codes: List[str] = []
+        self.quadrant_skipped: List[str] = []
+        self.quadrant_week_rets: Dict[str, pd.Series] = {}
+        (self.quadrant_available_codes, self.quadrant_skipped,
+         self.quadrant_week_rets) = self._prepare_weekly_rets(
+            quadrant_closes, QUADRANT_STYLE_INDICES)
 
     # ------------------------------------------------------------------
     # 输入归一化
@@ -229,18 +250,33 @@ class RegimeAlphaAnalyzer:
     def _prepare_style_benchmarks(
         self, benchmark_closes: Optional[Dict[str, pd.Series]]
     ) -> None:
-        """把 6 宽基日线收盘价转成与策略对齐的周频收益。
-        不可得指数记入 style_skipped；仅保留同时存在于策略周收益索引上的周。
+        """把 6 宽基日线收盘价转成与策略对齐的周频收益。"""
+        (self.style_available_codes, self.style_skipped,
+         self.style_week_rets) = self._prepare_weekly_rets(
+            benchmark_closes, CRISIS_BENCHMARKS)
+
+    def _prepare_weekly_rets(
+        self,
+        closes: Optional[Dict[str, pd.Series]],
+        specs,
+    ) -> Tuple[List[str], List[str], Dict[str, pd.Series]]:
+        """把 specs 指定的指数日线收盘价转成与策略对齐的周频收益。
+
+        不可得指数记入 skipped（名称）；仅保留同时存在于策略周收益索引上的周。
+        closes 为 None（未接线）时全部安全跳过且 skipped 不诬报；
+        closes 为显式空 dict（已请求但全部缺失）时 specs 全部记入 skipped。
         """
-        if not benchmark_closes:
-            return
-        all_codes = [spec["code"] for spec in CRISIS_BENCHMARKS]
-        name_by_code = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+        available: List[str] = []
+        skipped: List[str] = []
+        week_rets: Dict[str, pd.Series] = {}
+        if closes is None:
+            return available, skipped, week_rets
         ref_index = self.s_week_ret.index
-        for code in all_codes:
-            series = benchmark_closes.get(code)
+        for spec in specs:
+            code, name = spec["code"], spec["name"]
+            series = closes.get(code)
             if series is None or not isinstance(series, pd.Series) or series.empty:
-                self.style_skipped.append(name_by_code.get(code, code))
+                skipped.append(name)
                 continue
             wk = series.copy().sort_index().astype(float)
             wk.index = pd.to_datetime(wk.index).normalize()
@@ -249,10 +285,11 @@ class RegimeAlphaAnalyzer:
             common = wk_ret.index.intersection(ref_index)
             wk_ret = wk_ret.loc[common]
             if len(wk_ret) < 2:
-                self.style_skipped.append(name_by_code.get(code, code))
+                skipped.append(name)
                 continue
-            self.style_week_rets[code] = wk_ret
-            self.style_available_codes.append(code)
+            week_rets[code] = wk_ret
+            available.append(code)
+        return available, skipped, week_rets
 
     # ------------------------------------------------------------------
     # FIFO 平仓配对（毛 PnL，未扣费用）
@@ -349,6 +386,7 @@ class RegimeAlphaAnalyzer:
             "style": self._style(labeled),
             "dispersion": self._dispersion(),
             "exposure": self._exposure(),
+            "quadrant_exposure": self._quadrant_exposure(),
         }
 
     def _meta(self, labeled) -> dict:
@@ -832,30 +870,48 @@ class RegimeAlphaAnalyzer:
     def _exposure(self) -> dict:
         """策略对 6 宽基的滚动相关与 OLS beta（52 周窗口，v1 不约束权重）。"""
         name_by_code = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+        return self._exposure_block(
+            self.style_available_codes, self.style_skipped,
+            self.style_week_rets, name_by_code)
+
+    def _quadrant_exposure(self) -> dict:
+        """策略对巨潮四象限风格指数的滚动相关与 OLS beta（纯风格口径）。"""
+        name_by_code = {s["code"]: s["name"] for s in QUADRANT_STYLE_INDICES}
+        return self._exposure_block(
+            self.quadrant_available_codes, self.quadrant_skipped,
+            self.quadrant_week_rets, name_by_code)
+
+    def _exposure_block(
+        self,
+        available_codes: List[str],
+        skipped: List[str],
+        week_rets: Dict[str, pd.Series],
+        name_by_code: Dict[str, str],
+    ) -> dict:
         base = {
-            "available_codes": self.style_available_codes,
+            "available_codes": available_codes,
             "available_names": [name_by_code.get(c, c)
-                                for c in self.style_available_codes],
-            "skipped": self.style_skipped,
+                                for c in available_codes],
+            "skipped": skipped,
             "dates": [],
             "corr": {},       # code -> [float or None] 对齐 dates
             "beta": {},       # code -> [float or None]
             "window": ROLLING_EXPOSURE_WINDOW,
         }
-        if len(self.style_available_codes) < 1:
+        if len(available_codes) < 1:
             return base
         ref_index = self.s_week_ret.index
         common = ref_index
-        for code in self.style_available_codes:
-            common = common.intersection(self.style_week_rets[code].index)
+        for code in available_codes:
+            common = common.intersection(week_rets[code].index)
         common = common.intersection(self.b_week_ret.index)
         if len(common) < 4:
             return base
         base["dates"] = [_dstr(ts) for ts in common]
         w = min(ROLLING_EXPOSURE_WINDOW, len(common))
         s_arr = [float(self.s_week_ret.loc[ts]) for ts in common]
-        for code in self.style_available_codes:
-            b_arr = [float(self.style_week_rets[code].loc[ts]) for ts in common]
+        for code in available_codes:
+            b_arr = [float(week_rets[code].loc[ts]) for ts in common]
             corr_list: List[Optional[float]] = []
             beta_list: List[Optional[float]] = []
             for end in range(len(common)):

@@ -17,6 +17,8 @@ import pytest
 
 from core.engine.regime_alpha import (
     BIG_UP_TESTS,
+    QUADRANT_STYLE_INDICES,
+    ROLLING_EXPOSURE_WINDOW,
     WHIPSAW_DAYS,
     RegimeAlphaAnalyzer,
 )
@@ -344,7 +346,8 @@ def test_tr73_missing_states_structure():
     p = an.analyze()
 
     assert set(p) == {"meta", "regime_table", "opportunity", "rebound",
-                      "neutral", "style", "dispersion", "exposure"}
+                      "neutral", "style", "dispersion", "exposure",
+                      "quadrant_exposure"}
     table = p["regime_table"]
     assert set(table) == set(STATES)
     for st in ("bull", "bear", "rebound"):
@@ -390,7 +393,8 @@ def test_tr73_empty_and_single_day_inputs():
     empty = pd.Series(dtype=float)
     p = RegimeAlphaAnalyzer(empty, empty).analyze()
     assert set(p) == {"meta", "regime_table", "opportunity", "rebound",
-                      "neutral", "style", "dispersion", "exposure"}
+                      "neutral", "style", "dispersion", "exposure",
+                      "quadrant_exposure"}
     assert all(p["regime_table"][st]["weeks"] == 0 for st in STATES)
     assert p["rebound"]["segments"] == []
     assert p["neutral"]["n_range_weeks"] == 0
@@ -531,6 +535,8 @@ def test_tr11_3_no_benchmark_closes_safe_empty():
     assert p["style"]["available_codes"] == []
     assert p["dispersion"]["series"] == []
     assert p["exposure"]["dates"] == []
+    assert p["quadrant_exposure"]["dates"] == []
+    assert p["quadrant_exposure"]["available_codes"] == []
 
 
 def test_tr12_1_rolling_exposure_single_index_tracking():
@@ -575,4 +581,93 @@ def test_tr12_2_missing_index_skipped_no_nan_misalignment():
     # 不可得指数不在 corr/beta 键中
     assert "000688.SH" not in exp["corr"]
     assert "000852.SH" not in exp["corr"]
+
+
+# ---------------------------------------------------------------------------
+# 巨潮四象限风格暴露（增强A：规模×成长/价值 纯风格口径，数据仅走 TQ）
+# ---------------------------------------------------------------------------
+
+def _quadrant_closes(n_weeks, fridays, leader_code, leader_weekly=0.02,
+                     others_weekly=0.0, noise=0.003):
+    """构造四象限指数日线：leader 持续上涨（phase=0 微扰），其余横盘反相。
+
+    与 _style_market 相同公式/默认参数 → leader 日收盘价与
+    _style_market(leader_weekly=0.02) 的 s_daily 完全一致，相关=1。
+    """
+    def _week_closes(base_ret, phase=0):
+        closes = [100.0]
+        for i in range(n_weeks - 1):
+            sign = 1 if (i + phase) % 2 == 0 else -1
+            closes.append(closes[-1] * (1 + base_ret + sign * noise))
+        return closes
+
+    leader = _week_closes(leader_weekly, phase=0)
+    other = _week_closes(others_weekly, phase=1)
+    out = {}
+    for spec in QUADRANT_STYLE_INDICES:
+        closes = leader if spec["code"] == leader_code else other
+        idx, vals = [], []
+        for i, c in enumerate(closes):
+            fri = fridays[i]
+            for k in range(5):
+                idx.append(fri - timedelta(days=4 - k))
+                vals.append(c)
+        out[spec["code"]] = pd.Series(
+            vals, index=pd.DatetimeIndex(idx), dtype=float)
+    return out
+
+
+def test_tr12_3_quadrant_exposure_pure_style_tracking():
+    """策略≈小盘成长 → 该象限 corr≈1/beta≈1，大盘价值方向不显著。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.02,
+        others_weekly=0.01)
+    qc = _quadrant_closes(80, fridays, "399376.SZ", leader_weekly=0.02)
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw,
+        benchmark_closes=bc, quadrant_closes=qc)
+    p = an.analyze()
+    qe = p["quadrant_exposure"]
+    assert qe["window"] == ROLLING_EXPOSURE_WINDOW
+    assert set(qe["available_codes"]) == {
+        s["code"] for s in QUADRANT_STYLE_INDICES}
+    assert qe["skipped"] == []
+    corr = [v for v in qe["corr"]["399376.SZ"] if v is not None]
+    beta = [v for v in qe["beta"]["399376.SZ"] if v is not None]
+    assert corr, "应有非空滚动相关序列"
+    assert corr[-1] == pytest.approx(1.0, abs=0.05)
+    assert beta[-1] == pytest.approx(1.0, abs=0.1)
+    dv_corr = [v for v in qe["corr"]["399373.SZ"] if v is not None]
+    assert dv_corr[-1] < 0.5
+
+
+def test_tr12_4_quadrant_missing_skipped_and_absent_safe():
+    """缺象限指数 → skipped；不传 quadrant_closes → 安全空结构不抛错。"""
+    s_daily, b_daily, bc, fridays, rw = _style_market(
+        n_weeks=80, leader_code="399006.SZ", leader_weekly=0.02,
+        others_weekly=0.01)
+    qc = _quadrant_closes(80, fridays, "399376.SZ", leader_weekly=0.02)
+    del qc["399376.SZ"]   # 小盘成长 不可得
+    del qc["399377.SZ"]   # 小盘价值 不可得
+    an = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw,
+        benchmark_closes=bc, quadrant_closes=qc)
+    qe = an.analyze()["quadrant_exposure"]
+    assert "小盘成长" in qe["skipped"]
+    assert "小盘价值" in qe["skipped"]
+    assert "399376.SZ" not in qe["corr"]
+    assert "399377.SZ" not in qe["corr"]
+    n = len(qe["dates"])
+    for code in qe["available_codes"]:
+        assert len(qe["corr"][code]) == n
+        assert len(qe["beta"][code]) == n
+
+    # 完全不传 quadrant_closes → 安全空（skipped 不诬报，与 exposure 口径一致）
+    an2 = RegimeAlphaAnalyzer(
+        s_daily, b_daily, trades=[], regime_weeks=rw, benchmark_closes=bc)
+    qe2 = an2.analyze()["quadrant_exposure"]
+    assert qe2["available_codes"] == []
+    assert qe2["dates"] == []
+    assert qe2["skipped"] == []
+    assert qe2["corr"] == {}
 

@@ -792,6 +792,8 @@ export interface MarketRegimeData {
   style: StyleBlock
   dispersion: DispersionBlock
   exposure: ExposureBlock
+  // 增强A：巨潮四象限纯风格暴露（规模×成长/价值，399372~399377）；老记录无此键
+  quadrant_exposure?: ExposureBlock
   industry_attribution: IndustryAttributionBlock
   robustness: RobustnessBlock
 }

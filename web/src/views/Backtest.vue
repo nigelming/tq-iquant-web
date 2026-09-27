@@ -887,8 +887,10 @@ const STYLE_COLORS: Record<string, string> = {
 }
 const stDispEl = ref<HTMLDivElement | null>(null)
 const stCorrEl = ref<HTMLDivElement | null>(null)
+const stQuadEl = ref<HTMLDivElement | null>(null)
 let stDispChart: echarts.ECharts | null = null
 let stCorrChart: echarts.ECharts | null = null
+let stQuadChart: echarts.ECharts | null = null
 
 const stMatrixRows = computed(() => {
   const d: StyleBlock | undefined = mr.value?.style
@@ -944,6 +946,20 @@ const stCorrData = computed(() => {
     names: d.available_names,
     corr: d.corr,
     beta: d.beta,
+  }
+})
+
+// 增强A：巨潮四象限纯风格暴露（老记录无 quadrant_exposure 键 → 不渲染）
+const stQuadData = computed(() => {
+  const d: ExposureBlock | undefined = mr.value?.quadrant_exposure
+  if (!d || !d.dates.length) return null
+  return {
+    dates: d.dates,
+    codes: d.available_codes,
+    names: d.available_names,
+    corr: d.corr,
+    beta: d.beta,
+    skipped: d.skipped,
   }
 })
 
@@ -1243,6 +1259,7 @@ function initMrCharts() {
   initMrReboundChart()
   initStDispChart()
   initStCorrChart()
+  initStQuadChart()
   if (iaOk.value) initIaExpChart()
   if (rbOk.value) initRbHistChart()
 }
@@ -1336,11 +1353,10 @@ function initStDispChart() {
   })
 }
 
-function initStCorrChart() {
-  if (!stCorrEl.value || !stCorrData.value) return
-  const cd = stCorrData.value
-  stCorrChart?.dispose()
-  stCorrChart = echarts.init(stCorrEl.value)
+function buildCorrHeatmap(
+  chart: echarts.ECharts,
+  cd: { dates: string[]; codes: string[]; names: string[]; corr: Record<string, (number | null)[]> },
+) {
   // 热力图 data: [xIdx, yIdx, value]
   const data: [number, number, number][] = []
   cd.codes.forEach((code, yi) => {
@@ -1351,7 +1367,7 @@ function initStCorrChart() {
       }
     })
   })
-  stCorrChart.setOption({
+  chart.setOption({
     tooltip: { position: 'top' },
     grid: { left: 80, right: 24, bottom: 60, top: 20, containLabel: true },
     xAxis: {
@@ -1369,6 +1385,21 @@ function initStCorrChart() {
       emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.3)' } },
     }],
   })
+}
+
+function initStCorrChart() {
+  if (!stCorrEl.value || !stCorrData.value) return
+  stCorrChart?.dispose()
+  stCorrChart = echarts.init(stCorrEl.value)
+  buildCorrHeatmap(stCorrChart, stCorrData.value)
+}
+
+// 增强A：巨潮四象限纯风格暴露热力图
+function initStQuadChart() {
+  if (!stQuadEl.value || !stQuadData.value) return
+  stQuadChart?.dispose()
+  stQuadChart = echarts.init(stQuadEl.value)
+  buildCorrHeatmap(stQuadChart, stQuadData.value)
 }
 
 function scrollToSection(anchor: string) {
@@ -2673,6 +2704,36 @@ onUnmounted(() => {
           </div>
           <p class="ca-note">
             滚动窗口 {{ stCorrData ? mr?.exposure.window : 52 }} 周；Beta 为普通 OLS（v1 不约束非负权重）。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:13px">七-B、巨潮四象限·纯风格暴露（规模×成长/价值）</div>
+        <div v-if="!stQuadData" class="table-container">
+          <div class="empty-state"><p>该记录暂无四象限暴露数据：老记录需重算，或四象限指数样本不足。</p></div>
+        </div>
+        <template v-else>
+          <div class="chart-box">
+            <div ref="stQuadEl" class="ca-chart" style="min-height:280px"></div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>风格指数</th><th>最新相关</th><th>最新 Beta</th></tr></thead>
+              <tbody>
+                <tr v-for="(name, i) in stQuadData.names" :key="stQuadData.codes[i]">
+                  <td>{{ name }}</td>
+                  <td :class="valueClass(lastVal(stQuadData.corr[stQuadData.codes[i]]))">
+                    {{ fmtCorr(lastVal(stQuadData.corr[stQuadData.codes[i]])) }}
+                  </td>
+                  <td>{{ num(lastVal(stQuadData.beta[stQuadData.codes[i]]), 2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="stQuadData.skipped.length" class="ca-note">
+            以下四象限指数不可得，已跳过：{{ stQuadData.skipped.join('、') }}
+          </p>
+          <p class="ca-note">
+            巨潮四象限指数（399372~399377）将规模与成长/价值两维拆开，较宽基更纯粹地刻画策略的风格跟踪。
           </p>
         </template>
 
