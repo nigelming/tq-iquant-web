@@ -12,6 +12,7 @@ import type {
   MarketRegimeData, MarketRegimeStateRow,
   StyleBlock, DispersionBlock, ExposureBlock,
   IndustryAttributionBlock, IndustryHitRatePeriod,
+  RobustnessBlock, RobustWindow, RobustSensitivityRow,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -1025,6 +1026,56 @@ function initIaExpChart() {
   })
 }
 
+// 稳健性体检（FR-20，Task 18）
+const rbBlock = computed<RobustnessBlock | undefined>(() => mr.value?.robustness)
+const rbOk = computed(() => rbBlock.value?.status === 'ok')
+const rbHistEl = ref<HTMLDivElement | null>(null)
+let rbHistChart: echarts.ECharts | null = null
+
+const rbHalfRows = computed(() => rbBlock.value?.half_year_matrix ?? [])
+const rbWindows = computed<RobustWindow[]>(
+  () => rbBlock.value?.rolling?.windows ?? [])
+const rbSensRows = computed<RobustSensitivityRow[]>(
+  () => rbBlock.value?.benchmark_sensitivity ?? [])
+
+function rbDistCells(d: { median: number | null; min: number | null; max: number | null; negative_ratio: number | null }) {
+  return {
+    median: pctSigned(d.median),
+    min: pctSigned(d.min),
+    max: pctSigned(d.max),
+    neg: pct1(d.negative_ratio),
+  }
+}
+
+const rbLossText = computed(() => {
+  const w = rbBlock.value?.longest_loss_window
+  if (!w || w.days === 0 || !w.start_date) return '无（净值持续创新高）'
+  return `${w.start_date} → ${w.end_date}（谷底 ${w.trough_date}）`
+})
+
+function initRbHistChart() {
+  const wins = rbWindows.value
+  if (!rbHistEl.value || wins.length === 0) return
+  rbHistChart?.dispose()
+  rbHistChart = echarts.init(rbHistEl.value)
+  const labels = wins[0].histogram.map((b) => b.label)
+  const colors = ['#4a7ec4', '#f0a429']
+  rbHistChart.setOption({
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { bottom: 0 },
+    grid: { left: 40, right: 20, bottom: 40, top: 24, containLabel: true },
+    xAxis: { type: 'category', data: labels, axisLabel: { interval: 0, fontSize: 10 } },
+    yAxis: { type: 'value', name: '窗口数', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
+    series: wins.map((w, i) => ({
+      name: `${w.window} 周滚动收益`,
+      type: 'bar' as const,
+      barMaxWidth: 26,
+      color: colors[i % colors.length],
+      data: w.histogram.map((b) => b.count),
+    })),
+  })
+}
+
 const mrKpis = computed(() => {
   const d = mr.value
   if (!d) return []
@@ -1193,6 +1244,7 @@ function initMrCharts() {
   initStDispChart()
   initStCorrChart()
   if (iaOk.value) initIaExpChart()
+  if (rbOk.value) initRbHistChart()
 }
 
 function initMrStateChart() {
@@ -2668,6 +2720,105 @@ onUnmounted(() => {
           </div>
           <p class="ca-note">
             贡献为行业配置项（Σ 期初行业权重 × 行业日收益），不含行业内个股选择 alpha；合计与策略总收益之差为选股/交易/现金贡献。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">九、稳健性体检 🔬（只读快照计算，不重跑回测）</div>
+        <template v-if="!rbOk">
+          <div class="table-container">
+            <div class="empty-state"><p>{{ rbBlock?.status === 'insufficient' ? rbBlock.error : (rbBlock?.error || '稳健性分析不可用') }}</p></div>
+          </div>
+        </template>
+        <template v-else>
+          <div class="ca-kpi-row">
+            <div class="ca-kpi">
+              <div class="ca-kpi-label">最长亏损窗口</div>
+              <div class="ca-kpi-value">{{ rbBlock?.longest_loss_window?.days ?? 0 }} 天</div>
+              <div class="ca-kpi-sub">{{ rbLossText }}</div>
+            </div>
+            <div class="ca-kpi">
+              <div class="ca-kpi-label">窗口最深回撤</div>
+              <div class="ca-kpi-value text-green">{{ pct1(rbBlock?.longest_loss_window?.drawdown) }}</div>
+              <div class="ca-kpi-sub">峰值日到收复日的谷底幅度</div>
+            </div>
+            <div class="ca-kpi">
+              <div class="ca-kpi-label">分析样本</div>
+              <div class="ca-kpi-value">{{ rbBlock?.n_days }} 个交易日</div>
+              <div class="ca-kpi-sub">{{ rbBlock?.start_date }} ~ {{ rbBlock?.end_date }}</div>
+            </div>
+          </div>
+
+          <div class="section-title" style="font-size:13px">逐半年指标矩阵</div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>区间</th><th>策略收益</th><th>基准收益</th><th>超额</th><th>最大回撤</th><th>夏普</th></tr></thead>
+              <tbody>
+                <tr v-for="r in rbHalfRows" :key="r.period">
+                  <td>{{ r.period }}</td>
+                  <td :class="valueClass(r.strategy_return)">{{ pctSigned(r.strategy_return) }}</td>
+                  <td :class="valueClass(r.benchmark_return)">{{ pctSigned(r.benchmark_return) }}</td>
+                  <td :class="valueClass(r.excess_return)">{{ pctSigned(r.excess_return) }}</td>
+                  <td class="text-green">{{ pct1(r.max_drawdown) }}</td>
+                  <td>{{ num(r.sharpe, 2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-title" style="font-size:13px">滚动 26/52 周收益与夏普分布</div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>窗口</th><th>样本数</th><th>收益中位</th><th>最差</th><th>最好</th><th>负收益占比</th><th>夏普中位</th><th>夏普最差</th><th>夏普为负占比</th></tr></thead>
+              <tbody>
+                <tr v-for="w in rbWindows" :key="w.window">
+                  <td>{{ w.window }} 周</td>
+                  <td>{{ w.n_samples }}</td>
+                  <template v-if="w.n_samples > 0">
+                    <td :class="valueClass(w.returns.median)">{{ rbDistCells(w.returns).median }}</td>
+                    <td class="text-green">{{ rbDistCells(w.returns).min }}</td>
+                    <td class="text-red">{{ rbDistCells(w.returns).max }}</td>
+                    <td>{{ rbDistCells(w.returns).neg }}</td>
+                    <td>{{ num(w.sharpe.median, 2) }}</td>
+                    <td :class="valueClass(w.sharpe.min)">{{ num(w.sharpe.min, 2) }}</td>
+                    <td>{{ pct1(w.sharpe.negative_ratio) }}</td>
+                  </template>
+                  <template v-else>
+                    <td colspan="7" class="empty-state" style="border:none">周频样本不足 {{ w.window }} 周，无法计算</td>
+                  </template>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="chart-box">
+            <div ref="rbHistEl" class="ca-chart"></div>
+          </div>
+
+          <div class="section-title" style="font-size:13px">基准替换敏感性（FR-1 相对指标逐基独立计算）</div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>基准</th><th>β</th><th>Jensen α(年化)</th><th>年化超额</th><th>跟踪误差</th><th>信息比率</th><th>上行捕获</th><th>下行捕获</th><th>超额回撤</th></tr></thead>
+              <tbody>
+                <tr v-for="r in rbSensRows" :key="r.code">
+                  <td>{{ r.name }}<span v-if="r.is_primary" class="text-orange">（主）</span></td>
+                  <template v-if="r.available">
+                    <td>{{ num(r.beta, 2) }}</td>
+                    <td :class="valueClass(r.jensen_alpha)">{{ pctSigned(r.jensen_alpha) }}</td>
+                    <td :class="valueClass(r.excess_annual_return)">{{ pctSigned(r.excess_annual_return) }}</td>
+                    <td>{{ pct1(r.tracking_error) }}</td>
+                    <td :class="valueClass(r.information_ratio)">{{ num(r.information_ratio, 2) }}</td>
+                    <td>{{ pct1(r.up_capture_ratio) }}</td>
+                    <td>{{ pct1(r.down_capture_ratio) }}</td>
+                    <td class="text-green">{{ pct1(r.excess_max_drawdown) }}</td>
+                  </template>
+                  <template v-else>
+                    <td colspan="8" class="empty-state" style="border:none">对齐交易日不足（{{ r.n_days }} 日），无法计算</td>
+                  </template>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            全部统计仅基于本回测每日净值快照与基准日线：滚动收益按周末净值几何累乘，夏普按周收益年化（×√52）；相对指标口径同评估页 FR-1（日频、对齐日收益 ≥ 20）。
           </p>
         </template>
       </template>

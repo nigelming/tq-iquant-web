@@ -793,6 +793,74 @@ export interface MarketRegimeData {
   dispersion: DispersionBlock
   exposure: ExposureBlock
   industry_attribution: IndustryAttributionBlock
+  robustness: RobustnessBlock
+}
+
+// ---- 轻量稳健性（FR-20）----
+
+export interface RobustHalfYearRow {
+  period: string
+  start_date: string
+  end_date: string
+  strategy_return: number
+  benchmark_return: number
+  excess_return: number
+  max_drawdown: number
+  sharpe: number | null
+}
+
+export interface RobustDist {
+  median: number | null
+  min: number | null
+  max: number | null
+  negative_ratio: number | null
+}
+
+export interface RobustWindow {
+  window: number
+  n_samples: number
+  returns: RobustDist
+  sharpe: RobustDist
+  histogram: { label: string; count: number }[]
+}
+
+export interface RobustSensitivityRow {
+  code: string
+  name: string
+  is_primary: boolean
+  available: boolean
+  n_days: number
+  strategy_total_return: number | null
+  benchmark_total_return: number | null
+  beta: number | null
+  jensen_alpha: number | null
+  excess_annual_return: number | null
+  tracking_error: number | null
+  information_ratio: number | null
+  up_capture_ratio: number | null
+  down_capture_ratio: number | null
+  excess_max_drawdown: number | null
+}
+
+export interface RobustnessBlock {
+  status: 'ok' | 'insufficient' | 'failed'
+  error?: string
+  n_days?: number
+  start_date?: string
+  end_date?: string
+  half_year_matrix?: RobustHalfYearRow[]
+  rolling?: {
+    weekly_points: number
+    windows: RobustWindow[]
+  }
+  longest_loss_window?: {
+    start_date: string | null
+    trough_date: string | null
+    end_date: string | null
+    days: number
+    drawdown: number | null
+  }
+  benchmark_sensitivity?: RobustSensitivityRow[]
 }
 
 // ---- 风格轮动 / 分化度 / 隐含风格暴露（FR-13 ~ FR-16）----

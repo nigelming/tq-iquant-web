@@ -17,6 +17,7 @@ import json
 from datetime import datetime, date
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pandas as pd
 import polars as pl
@@ -926,7 +927,7 @@ def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypat
     payload = json.loads(row.payload_json)
     assert set(payload) == {"meta", "regime_table", "opportunity",
                             "rebound", "neutral", "style", "dispersion",
-                            "exposure", "industry_attribution"}
+                            "exposure", "industry_attribution", "robustness"}
     assert payload["regime_table"]["range"]["weeks"] >= 0
     # 老记录（无 positions_json）→ needs_rerun，不伪装结果
     assert payload["industry_attribution"]["status"] == "needs_rerun"
@@ -1085,6 +1086,30 @@ def test_tr16_industry_attribution_failure_isolated(db_session, monkeypatch):
     payload = json.loads(row.payload_json)
     assert payload["industry_attribution"]["status"] == "failed"
     assert "industry_boom" in payload["industry_attribution"]["error"]
+
+
+def test_tr18_robustness_never_calls_backtest_engine(db_session, monkeypatch):
+    """AC-8/TR-18.1：稳健性只读快照/基准，BacktestEngine.run 零调用。"""
+    from core.engine import backtest_engine
+    rec, ps = _seed_record(db_session)
+    _mr_seed_snapshots(db_session, rec, ps)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    run_mock = MagicMock(side_effect=AssertionError("稳健性分析禁止触发回测重跑"))
+    monkeypatch.setattr(backtest_engine.BacktestEngine, "run", run_mock)
+
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "completed"
+    payload = json.loads(
+        db_session.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=rec.id).one().payload_json)
+    rob = payload["robustness"]
+    assert rob["status"] == "ok"
+    assert "half_year_matrix" in rob and "rolling" in rob
+    assert "longest_loss_window" in rob and "benchmark_sensitivity" in rob
+    assert run_mock.call_count == 0
 
 
 def test_recompute_market_regime_without_snapshots_returns_failed(db_session):

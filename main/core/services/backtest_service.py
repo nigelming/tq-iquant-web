@@ -37,6 +37,7 @@ from core.engine.regime_alpha import RegimeAlphaAnalyzer
 from core.engine.industry_attribution import (
     compute_industry_attribution, needs_rerun_block, TAXONOMY as INDUSTRY_TAXONOMY,
 )
+from core.engine.robustness import compute_robustness
 from core.engine.decision import summarize_decisions
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
@@ -761,6 +762,17 @@ def compute_and_store_market_regime(
     payload = analyzer.analyze()
     payload["industry_attribution"] = _build_industry_attribution(
         snapshots, start, end)
+    # FR-20 稳健性：纯快照+基准计算，不触发回测重跑；失败隔离不影响主链路
+    names = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+    names[benchmark_code] = benchmark_name
+    try:
+        payload["robustness"] = compute_robustness(
+            nav, benchmark,
+            benchmark_closes=benchmark_closes,
+            benchmark_names=names, primary_code=benchmark_code)
+    except Exception as exc:
+        payload["robustness"] = {
+            "status": "failed", "error": f"稳健性分析计算失败：{exc}"}
     return _upsert_market_regime(
         db, record_id, benchmark_code, benchmark_name,
         status="completed", payload=payload,

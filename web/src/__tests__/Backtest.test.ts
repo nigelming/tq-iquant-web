@@ -959,6 +959,79 @@ const marketRegimeCompleted = {
         total_contribution: 0.135,
       },
     },
+    robustness: {
+      status: 'ok',
+      n_days: 600,
+      start_date: '2024-01-02',
+      end_date: '2026-06-30',
+      half_year_matrix: [
+        { period: '2024H1', start_date: '2024-01-02', end_date: '2024-06-28',
+          strategy_return: 0.08, benchmark_return: 0.05, excess_return: 0.03,
+          max_drawdown: 0.04, sharpe: 1.2 },
+        { period: '2024H2', start_date: '2024-07-01', end_date: '2024-12-31',
+          strategy_return: -0.02, benchmark_return: -0.04, excess_return: 0.02,
+          max_drawdown: 0.09, sharpe: -0.3 },
+      ],
+      rolling: {
+        weekly_points: 130,
+        windows: [
+          {
+            window: 26, n_samples: 80,
+            returns: { median: 0.06, min: -0.08, max: 0.15, negative_ratio: 0.2 },
+            sharpe: { median: 0.8, min: -0.5, max: 1.6, negative_ratio: 0.25 },
+            histogram: [
+              { label: '≤-20%', count: 0 }, { label: '-20%~-10%', count: 0 },
+              { label: '-10%~-5%', count: 5 }, { label: '-5%~0%', count: 11 },
+              { label: '0%~5%', count: 30 }, { label: '5%~10%', count: 24 },
+              { label: '10%~20%', count: 10 }, { label: '>20%', count: 0 },
+            ],
+          },
+          {
+            window: 52, n_samples: 54,
+            returns: { median: 0.12, min: 0.02, max: 0.22, negative_ratio: 0 },
+            sharpe: { median: 1.1, min: 0.3, max: 1.8, negative_ratio: 0 },
+            histogram: [
+              { label: '≤-20%', count: 0 }, { label: '-20%~-10%', count: 0 },
+              { label: '-10%~-5%', count: 0 }, { label: '-5%~0%', count: 0 },
+              { label: '0%~5%', count: 10 }, { label: '5%~10%', count: 24 },
+              { label: '10%~20%', count: 20 }, { label: '>20%', count: 0 },
+            ],
+          },
+        ],
+      },
+      longest_loss_window: {
+        start_date: '2024-09-10', trough_date: '2024-10-18',
+        end_date: '2024-12-05', days: 86, drawdown: 0.09,
+      },
+      benchmark_sensitivity: [
+        { code: '000300.SH', name: '沪深300', is_primary: true, available: true, n_days: 600,
+          strategy_total_return: 0.25, benchmark_total_return: 0.12,
+          beta: 0.72, jensen_alpha: 0.06, excess_annual_return: 0.05,
+          tracking_error: 0.08, information_ratio: 0.62,
+          up_capture_ratio: 0.8, down_capture_ratio: 0.5, excess_max_drawdown: 0.07 },
+        { code: '399006.SZ', name: '创业板指', is_primary: false, available: false, n_days: 8,
+          strategy_total_return: null, benchmark_total_return: null,
+          beta: null, jensen_alpha: null, excess_annual_return: null,
+          tracking_error: null, information_ratio: null,
+          up_capture_ratio: null, down_capture_ratio: null, excess_max_drawdown: null },
+      ],
+    },
+  },
+}
+
+const marketRegimeRbInsufficient = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    ...marketRegimeCompleted.data,
+    robustness: {
+      status: 'insufficient',
+      n_days: 12,
+      error: '策略与基准共同交易日不足30天（12），稳健性无法分析',
+    },
   },
 }
 
@@ -1602,20 +1675,21 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(mrBtns(w).length).toBe(0)
   })
 
-  it('completed：展开渲染 6 KPI/5 图表/八块内容，重算按钮 1 个', async () => {
+  it('completed：展开渲染 6 KPI/6 图表/九块内容，重算按钮 1 个', async () => {
     const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
     await expandMr(w)
     expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
-    expect(w.findAll('.mr-section .ca-kpi').length).toBe(6)
+    expect(w.findAll('.mr-section .ca-kpi').length).toBe(9)
     for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
       expect(w.text()).toContain(t)
     }
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
     for (const t of [
       '一、市场状态×绩效总表', '二、机遇Alpha（上涨捕获）',
       '三、反弹弹性（下跌后反弹段）', '四、中性Alpha（震荡磨损）',
       '五、风格×绩效矩阵（结构性行情）', '六、市场分化度（宽基截面标准差）',
       '七、隐含风格暴露（滚动相关热力图）', '八、行业归因',
+      '九、稳健性体检',
     ]) {
       expect(w.text()).toContain(t)
     }
@@ -1629,8 +1703,8 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     expect(w.text()).toContain('月度领涨命中率')
     expect(w.text()).toContain('半导体')
     expect(w.text()).toContain('行业收益贡献分解')
-    // 暴露图容器存在（5 个图表中的第 5 个）
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
+    // 暴露图容器存在（6 个图表中的第 5 个）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
   })
 
   it('TR-17.1 老记录：行业归因仅门禁提示，不 init 图表', async () => {
@@ -1638,10 +1712,37 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     await expandMr(w)
     expect(w.text()).toContain('八、行业归因')
     expect(w.text()).toContain('该记录回测时未保存持仓明细，重新回测后可用')
-    // 无行业暴露图（仍只有前 4 个图表）
-    expect(w.findAll('.mr-section .ca-chart').length).toBe(4)
+    // 无行业暴露图（基础 4 图 + 稳健性直方图 1 个 = 5）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
     expect(w.text()).not.toContain('周度领涨命中率')
     expect(w.text()).not.toContain('行业收益贡献分解')
+  })
+
+  it('TR-18.3 稳健性：渲染半年矩阵/滚动分布/亏损窗口/基准敏感性', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('九、稳健性体检')
+    expect(w.text()).toContain('逐半年指标矩阵')
+    expect(w.text()).toContain('2024H1')
+    expect(w.text()).toContain('滚动 26/52 周收益与夏普分布')
+    expect(w.text()).toContain('最长亏损窗口')
+    expect(w.text()).toContain('86 天')
+    expect(w.text()).toContain('基准替换敏感性')
+    // 主基准标记 + 不可用基准降级文案
+    expect(w.text()).toContain('沪深300')
+    expect(w.text()).toContain('（主）')
+    expect(w.text()).toContain('对齐交易日不足（8 日），无法计算')
+  })
+
+  it('TR-18.3 稳健性不足：显示空态原因且无矩阵/图表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeRbInsufficient })
+    await expandMr(w)
+    expect(w.text()).toContain('九、稳健性体检')
+    expect(w.text()).toContain('策略与基准共同交易日不足30天（12），稳健性无法分析')
+    expect(w.text()).not.toContain('逐半年指标矩阵')
+    expect(w.text()).not.toContain('基准替换敏感性')
+    // 无稳健性直方图（行业暴露图仍在，共 5 图）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(5)
   })
 
   it('风格矩阵渲染 6 行 + 跳过指数提示 + 暴露热力图', async () => {
