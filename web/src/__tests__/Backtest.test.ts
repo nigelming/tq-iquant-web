@@ -8,6 +8,7 @@ vi.mock('../api', () => ({
   getPortfolios: vi.fn(),
   deleteBacktestRecord: vi.fn(),
   recomputeCrisisAlpha: vi.fn(),
+  recomputeMarketRegime: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -27,7 +28,7 @@ vi.mock('echarts', () => {
 import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
-  deleteBacktestRecord, recomputeCrisisAlpha,
+  deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -814,6 +815,70 @@ const crisisAlphaCompleted = {
   },
 }
 
+const marketRegimeCompleted = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T12:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    meta: {
+      strategy_name: '回测A组合',
+      benchmark_name: '沪深300',
+      n_weeks_labeled: 50,
+      n_weeks_total: 56,
+      state_week_counts: { bull: 20, bear: 18, rebound: 4, range: 8 },
+    },
+    regime_table: {
+      bull: { label: 'bull', label_cn: '趋势上涨', weeks: 20, ratio: 0.4, strategy_return: 0.25, benchmark_return: 0.2, excess_return: 0.05, win_rate: 0.7, max_drawdown: 0.08, turnover: 12.5, cost_ratio: 0.02 },
+      bear: { label: 'bear', label_cn: '趋势下跌', weeks: 18, ratio: 0.36, strategy_return: -0.1, benchmark_return: -0.2, excess_return: 0.1, win_rate: 0.6, max_drawdown: 0.12, turnover: 15.0, cost_ratio: 0.03 },
+      range: { label: 'range', label_cn: '震荡', weeks: 8, ratio: 0.16, strategy_return: -0.01, benchmark_return: 0.01, excess_return: -0.02, win_rate: 0.45, max_drawdown: 0.05, turnover: 8.0, cost_ratio: 0.04 },
+      rebound: { label: 'rebound', label_cn: '反弹', weeks: 4, ratio: 0.08, strategy_return: 0.12, benchmark_return: 0.1, excess_return: 0.02, win_rate: 0.75, max_drawdown: 0.02, turnover: 10.0, cost_ratio: 0.02 },
+    },
+    opportunity: {
+      n_bull_weeks: 20,
+      up_capture: 0.85,
+      miss_ratio: 0.1,
+      big_up_tests: [
+        { threshold: 0.03, n: 6, avg_strategy: 0.04, avg_benchmark: 0.045, win_rate: 0.8 },
+        { threshold: 0.05, n: 2, avg_strategy: 0.05, avg_benchmark: 0.06, win_rate: 0.5 },
+      ],
+      cats: {
+        同步涨: { count: 12, avg_strategy: 0.03 },
+        涨得少: { count: 4, avg_strategy: 0.01 },
+        踏空: { count: 2, avg_strategy: 0 },
+        逆势跌: { count: 2, avg_strategy: -0.01 },
+      },
+    },
+    rebound: {
+      n_segments: 1,
+      avg_elasticity: 1.2,
+      segments: [
+        {
+          start_date: '2024-01-12', end_date: '2024-02-02', trough_date: '2024-01-19', weeks: 3,
+          benchmark_rebound_pct: 0.08, strategy_rebound_pct: 0.096, elasticity: 1.2,
+          benchmark_recover_days: null, benchmark_recovered: false,
+          strategy_recover_days: null, strategy_recovered: false,
+        },
+      ],
+    },
+    neutral: {
+      n_range_weeks: 8,
+      range_ratio: 0.16,
+      cumulative_return: -0.01,
+      annualized_return: -0.12,
+      win_rate: 0.45,
+      n_range_days: 40,
+      monthly_trades: 2.5,
+      annual_turnover: 8.0,
+      cost_gross_ratio: 0.35,
+      whipsaw_count: 6,
+      whipsaw_days: 120,
+      avg_trade_pnl: { trend: 1000, trend_count: 10, range: -14.29, range_count: 7 },
+    },
+  },
+}
+
 async function mountDetail(detailPayload: any) {
   ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
   const w = mount(Backtest)
@@ -1377,5 +1442,102 @@ describe('Backtest.vue — 危机Alpha section 折叠', () => {
     await flushPromises()
     expect(w.text()).toContain('本次回测未包含危机Alpha分析')
     expect(w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算')).length).toBe(1)
+  })
+})
+
+describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section', () => {
+  // 挂载详情但不点击任何折叠头（危机与市场状态 section 均保持折叠）
+  async function mountMr(detailPayload: any) {
+    ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  async function expandMr(w: any) {
+    await w.find('.mr-section .ca-header').trigger('click')
+    await flushPromises()
+  }
+
+  const mrBtns = (w: any) =>
+    w.findAll('.mr-section button').filter((b: any) => b.text().includes('重新计算'))
+
+  it('默认折叠：标题可见内容不渲染；market_regime=null 展开后显示未包含提示+重算按钮', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: null })
+    expect(w.find('.mr-section').exists()).toBe(true)
+    expect(w.text()).toContain('🚀 机遇Alpha · ⚖️ 中性Alpha 专题分析')
+    expect(w.text()).not.toContain('市场状态×绩效总表')
+    expect(w.find('.mr-section .ca-caret').classes()).not.toContain('open')
+
+    await expandMr(w)
+    expect(w.text()).toContain('本次回测未包含市场状态分析')
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('failed：展开后显示错误原因+重算按钮', async () => {
+    const w = await mountMr({
+      ...mockDetail,
+      market_regime: {
+        status: 'failed', error: '主基准指数无数据', computed_at: null,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    await expandMr(w)
+    expect(w.text()).toContain('市场状态分析失败：主基准指数无数据')
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('insufficient：显示样本不足，无重算按钮', async () => {
+    const w = await mountMr({
+      ...mockDetail,
+      market_regime: {
+        status: 'insufficient', error: '策略与基准共同交易日不足30天（12），无法分析',
+        computed_at: null, benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    await expandMr(w)
+    expect(w.text()).toContain('样本不足')
+    expect(mrBtns(w).length).toBe(0)
+  })
+
+  it('completed：展开渲染 4 KPI/2 图表/四块内容，重算按钮 1 个', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
+    expect(w.findAll('.mr-section .ca-kpi').length).toBe(4)
+    for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
+      expect(w.text()).toContain(t)
+    }
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(2)
+    expect(w.text()).toContain('一、市场状态×绩效总表')
+    expect(w.text()).toContain('二、机遇Alpha（上涨捕获）')
+    expect(w.text()).toContain('三、反弹弹性（下跌后反弹段）')
+    expect(w.text()).toContain('四、中性Alpha（震荡磨损）')
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('点击重算 → 调 recomputeMarketRegime → 成功后显示完成提示', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    ;(recomputeMarketRegime as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-27T12:00:00',
+    })
+    await mrBtns(w)[0].trigger('click')
+    await flushPromises()
+    expect(recomputeMarketRegime).toHaveBeenCalledWith(1)
+    expect(getBacktestDetail).toHaveBeenCalledTimes(2)  // 详情重载
+    expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算完成')
+  })
+
+  it('重算抛错 → 显示失败提示', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    ;(recomputeMarketRegime as any).mockRejectedValue(new Error('boom'))
+    await mrBtns(w)[0].trigger('click')
+    await flushPromises()
+    expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算失败')
   })
 })

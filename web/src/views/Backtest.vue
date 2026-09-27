@@ -3,12 +3,13 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
-  deleteBacktestRecord, recomputeCrisisAlpha,
+  deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
+  MarketRegimeData, MarketRegimeStateRow,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 
@@ -829,6 +830,7 @@ async function openDetail(id: number) {
   caDownPage.value = 1
   selectedKey.value = null
   caCollapsed.value = true
+  mrCollapsed.value = true
   // 等 DOM 渲染后初始化图表
   await nextTick()
   initCharts()
@@ -849,10 +851,271 @@ async function toggleCaSection() {
   }
 }
 
+// ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
+const mrCollapsed = ref(true)
+const marketRegime = computed(() => detail.value?.market_regime ?? null)
+const mrStatus = computed(() => marketRegime.value?.status ?? null)
+const mr = computed<MarketRegimeData | null>(() => {
+  const item = marketRegime.value
+  if (!item || item.status !== 'completed' || !item.data) return null
+  return item.data
+})
+const marketRegimeSectionEl = ref<HTMLDivElement | null>(null)
+const mrRecomputing = ref(false)
+const mrRecomputeMsg = ref('')
+const mrRecomputeWarn = ref(false)
+const mrRecomputeMsgClass = computed(() => (mrRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
+
+const MR_STATE_ORDER = ['bull', 'bear', 'range', 'rebound']
+const MR_STATE_COLORS: Record<string, string> = {
+  bull: '#d6403a', bear: '#1f6e4f', range: '#6b7280', rebound: '#f0a429',
+}
+
+const mrStateEl = ref<HTMLDivElement | null>(null)
+const mrReboundEl = ref<HTMLDivElement | null>(null)
+let mrStateChart: echarts.ECharts | null = null
+let mrReboundChart: echarts.ECharts | null = null
+
+const mrKpis = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  return [
+    {
+      label: '上涨捕获率',
+      value: d.opportunity.up_capture === null ? '—' : pct1(d.opportunity.up_capture),
+      sub: `${d.opportunity.n_bull_weeks} 个上涨周`,
+      color: '#d6403a',
+    },
+    {
+      label: '踏空周占比',
+      value: pct1(d.opportunity.miss_ratio),
+      sub: '基准上涨而策略未涨',
+      color: '#1f3a68',
+    },
+    {
+      label: '反弹平均弹性',
+      value: d.rebound.avg_elasticity === null ? '—' : `${num(d.rebound.avg_elasticity, 2)}x`,
+      sub: `${d.rebound.n_segments} 个下跌反弹段`,
+      color: '#f0a429',
+    },
+    {
+      label: '假突破磨损',
+      value: `${d.neutral.whipsaw_count} 次`,
+      sub: '5 日内同票平仓且亏损',
+      color: '#c0392b',
+    },
+  ]
+})
+
+const mrStateRows = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  return MR_STATE_ORDER
+    .map((k) => ({ key: k, r: d.regime_table[k] }))
+    .filter((x) => !!x.r)
+    .map(({ key, r }) => ({
+      key,
+      label: r.label_cn,
+      weeks: r.weeks,
+      ratio: r.ratio === null ? '—' : pct1(r.ratio),
+      strategyRaw: r.strategy_return,
+      strategy: r.strategy_return === null ? '—' : pctSigned(r.strategy_return),
+      benchmark: r.benchmark_return === null ? '—' : pctSigned(r.benchmark_return),
+      excessRaw: r.excess_return,
+      excess: r.excess_return === null ? '—' : pctSigned(r.excess_return),
+      win: r.win_rate === null ? '—' : pct1(r.win_rate),
+      dd: r.max_drawdown === null ? '—' : pct(r.max_drawdown),
+      turnover: r.turnover === null ? '—' : `${num(r.turnover, 2)}x`,
+      cost: r.cost_ratio === null ? '—' : pct1(r.cost_ratio),
+    }))
+})
+
+const mrBigUpRows = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  return d.opportunity.big_up_tests.map((t) => ({
+    threshold: `≥ +${(t.threshold * 100).toFixed(0)}%`,
+    n: t.n,
+    strategyRaw: t.avg_strategy,
+    strategy: t.avg_strategy === null ? '—' : pctSigned(t.avg_strategy),
+    benchmark: t.avg_benchmark === null ? '—' : pctSigned(t.avg_benchmark),
+    win: t.win_rate === null ? '—' : pct1(t.win_rate),
+  }))
+})
+
+const mrOppCatRows = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  return Object.entries(d.opportunity.cats).map(([name, c]) => ({
+    name,
+    count: c.count,
+    avgRaw: c.avg_strategy,
+    avg: c.avg_strategy === null ? '—' : pctSigned(c.avg_strategy),
+  }))
+})
+
+const mrReboundRows = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  return d.rebound.segments.map((s) => ({
+    start: s.start_date,
+    trough: s.trough_date,
+    end: s.end_date,
+    weeks: s.weeks,
+    bRebound: s.benchmark_rebound_pct === null ? '—' : pctSigned(s.benchmark_rebound_pct),
+    sReboundRaw: s.strategy_rebound_pct,
+    sRebound: s.strategy_rebound_pct === null ? '—' : pctSigned(s.strategy_rebound_pct),
+    elasticity: s.elasticity === null ? '—' : `${num(s.elasticity, 2)}x`,
+    bRecover: s.benchmark_recovered
+      ? (s.benchmark_recover_days === null ? '—' : `${s.benchmark_recover_days}天`)
+      : '未收复',
+    sRecover: s.strategy_recovered
+      ? (s.strategy_recover_days === null ? '—' : `${s.strategy_recover_days}天`)
+      : '未收复',
+  }))
+})
+
+const mrNeutralRows = computed(() => {
+  const d = mr.value
+  if (!d) return []
+  const n = d.neutral
+  const atp = n.avg_trade_pnl
+  const pnlTxt = (v: number | null, c: number) =>
+    v === null ? '—' : `${num(v, 0)} 元（${c} 笔）`
+  return [
+    { k: '震荡周占比', v: n.range_ratio === null ? '—' : pct1(n.range_ratio), raw: 0 },
+    { k: '震荡周累计收益', v: n.cumulative_return === null ? '—' : pctSigned(n.cumulative_return), raw: n.cumulative_return ?? 0 },
+    { k: '震荡周年化收益', v: n.annualized_return === null ? '—' : pctSigned(n.annualized_return), raw: n.annualized_return ?? 0 },
+    { k: '震荡周胜率', v: n.win_rate === null ? '—' : pct1(n.win_rate), raw: 0 },
+    { k: '震荡交易日数', v: `${n.n_range_days} 天`, raw: 0 },
+    { k: '月均交易次数', v: n.monthly_trades === null ? '—' : num(n.monthly_trades, 1), raw: 0 },
+    { k: '年化换手率', v: n.annual_turnover === null ? '—' : `${num(n.annual_turnover, 2)}x`, raw: 0 },
+    { k: '成本占盈利平仓毛利比', v: n.cost_gross_ratio === null ? '—' : pct1(n.cost_gross_ratio), raw: 0 },
+    { k: '假突破磨损', v: `${n.whipsaw_count} 次（${n.whipsaw_days} 个交易日）`, raw: 0 },
+    {
+      k: '笔均毛PnL 趋势/震荡',
+      v: `${pnlTxt(atp.trend, atp.trend_count)} / ${pnlTxt(atp.range, atp.range_count)}`,
+      raw: 0,
+    },
+  ]
+})
+
+async function recomputeMr() {
+  const id = currentRecord.value?.id
+  if (!id) return
+  mrRecomputing.value = true
+  mrRecomputeMsg.value = ''
+  mrRecomputeWarn.value = false
+  try {
+    const res = await recomputeMarketRegime(id)
+    mrRecomputeMsg.value = res.status === 'completed'
+      ? '重新计算完成'
+      : `重新计算未完成：${res.error || res.status}`
+    detail.value = await getBacktestDetail(id)
+    await nextTick()
+    initCharts()
+    if (!mrCollapsed.value) initMrCharts()
+  } catch (e) {
+    mrRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
+  } finally {
+    mrRecomputing.value = false
+  }
+}
+
+async function expandMrSection() {
+  if (!mrCollapsed.value) return
+  mrCollapsed.value = false
+  await nextTick()
+  initMrCharts()
+}
+
+async function toggleMrSection() {
+  mrCollapsed.value = !mrCollapsed.value
+  if (!mrCollapsed.value) {
+    await nextTick()
+    initMrCharts()
+  }
+}
+
+function initMrCharts() {
+  if (!mr.value) return
+  initMrStateChart()
+  initMrReboundChart()
+}
+
+function initMrStateChart() {
+  if (!mrStateEl.value || !mr.value) return
+  const d = mr.value
+  const rows = MR_STATE_ORDER
+    .map((k) => d.regime_table[k])
+    .filter((r): r is MarketRegimeStateRow => !!r)
+  const mkSeries = (name: string, pick: (r: MarketRegimeStateRow) => number | null, color: string) => ({
+    name,
+    type: 'bar' as const,
+    data: rows.map((r) => {
+      const v = pick(r)
+      return v === null ? null : Number((v * 100).toFixed(2))
+    }),
+    itemStyle: { color },
+  })
+  mrStateChart?.dispose()
+  mrStateChart = echarts.init(mrStateEl.value)
+  mrStateChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { bottom: 0 },
+    grid: { left: 56, right: 24, bottom: 40, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: rows.map((r) => r.label_cn) },
+    yAxis: {
+      type: 'value', name: '区间累计收益(%)', scale: true,
+      splitLine: { lineStyle: { type: 'dashed' } },
+    },
+    series: [
+      mkSeries('策略', (r) => r.strategy_return, '#d6403a'),
+      mkSeries('基准', (r) => r.benchmark_return, '#4a7ec4'),
+      mkSeries('超额', (r) => r.excess_return, '#f0a429'),
+    ],
+  })
+}
+
+function initMrReboundChart() {
+  if (!mrReboundEl.value || !mr.value) return
+  const segs = mr.value.rebound.segments
+  if (segs.length === 0) return
+  mrReboundChart?.dispose()
+  mrReboundChart = echarts.init(mrReboundEl.value)
+  mrReboundChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { bottom: 0 },
+    grid: { left: 56, right: 24, bottom: 40, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: segs.map((s, i) => `段${i + 1} ${s.start_date}~${s.end_date}`) },
+    yAxis: {
+      type: 'value', name: '反弹幅(%)', scale: true,
+      splitLine: { lineStyle: { type: 'dashed' } },
+    },
+    series: [
+      {
+        name: '基准反弹', type: 'bar',
+        data: segs.map((s) => s.benchmark_rebound_pct === null ? null : Number((s.benchmark_rebound_pct * 100).toFixed(2))),
+        itemStyle: { color: '#4a7ec4' },
+      },
+      {
+        name: '策略反弹', type: 'bar',
+        data: segs.map((s) => s.strategy_rebound_pct === null ? null : Number((s.strategy_rebound_pct * 100).toFixed(2))),
+        itemStyle: { color: '#d6403a' },
+      },
+    ],
+  })
+}
+
 function scrollToSection(anchor: string) {
   if (anchor === 'crisis-alpha') {
     void expandCaSection().then(() => {
       crisisAlphaSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
+    })
+  }
+  if (anchor === 'market-regime') {
+    void expandMrSection().then(() => {
+      marketRegimeSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
     })
   }
 }
@@ -1881,6 +2144,184 @@ onUnmounted(() => {
             <button :disabled="caDownPage >= caDownTotalPages" @click="caDownPage++" class="page-btn">下一页</button>
           </div>
         </div>
+      </template>
+      </template>
+    </div>
+
+    <div ref="marketRegimeSectionEl" class="ca-section mr-section">
+      <div class="section-title ca-header" @click="toggleMrSection">
+        <span>🚀 机遇Alpha · ⚖️ 中性Alpha 专题分析</span>
+        <span class="ca-caret" :class="{ open: !mrCollapsed }">▶</span>
+      </div>
+
+      <template v-if="!mrCollapsed">
+      <div v-if="mrStatus === null" class="card" style="padding:12px">
+        <p style="color:#6b7280;margin:0 0 8px">本次回测未包含市场状态分析。</p>
+        <button class="btn btn-sm btn-primary" :disabled="mrRecomputing" @click="recomputeMr">
+          {{ mrRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="mrRecomputeMsg" :class="mrRecomputeMsgClass">{{ mrRecomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="mrStatus === 'failed'" class="card" style="padding:12px">
+        <p style="color:#c0392b;margin:0 0 8px">市场状态分析失败：{{ marketRegime?.error || '未知原因' }}</p>
+        <button class="btn btn-sm btn-primary" :disabled="mrRecomputing" @click="recomputeMr">
+          {{ mrRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="mrRecomputeMsg" :class="mrRecomputeMsgClass">{{ mrRecomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="mrStatus === 'insufficient'" class="card" style="padding:12px">
+        <p style="color:#6b7280;margin:0">样本不足：{{ marketRegime?.error || '共同交易日不足 30 天' }}</p>
+      </div>
+
+      <template v-else>
+        <div class="ca-banner">
+          <div class="t">{{ mr?.meta.strategy_name }} · 市场状态×绩效专项分析</div>
+          <div class="d">
+            机遇Alpha（上涨/反弹捕获）与中性Alpha（震荡磨损）对称评估
+          </div>
+          <div class="d">
+            周频 {{ mr?.meta.n_weeks_labeled }} 个标签收益周 ｜ 主基准：{{ mr?.meta.benchmark_name }}
+          </div>
+        </div>
+
+        <div class="ca-kpi-grid">
+          <div v-for="k in mrKpis" :key="k.label" class="ca-kpi">
+            <div class="v" :style="{ color: k.color }">{{ k.value }}</div>
+            <div class="l">{{ k.label }}</div>
+            <div class="s">{{ k.sub }}</div>
+          </div>
+        </div>
+
+        <div class="ca-status">
+          <span>统计口径：周频状态由均线/突破/反弹规则分段；磨损指标按平仓日归属</span>
+          <span v-if="marketRegime?.computed_at">
+            计算于 {{ marketRegime?.computed_at?.replace('T', ' ').slice(0, 19) }}
+          </span>
+          <button class="btn btn-sm" :disabled="mrRecomputing" @click="recomputeMr">
+            {{ mrRecomputing ? '计算中…' : '重新计算' }}
+          </button>
+          <span v-if="mrRecomputeMsg" :class="mrRecomputeMsgClass">{{ mrRecomputeMsg }}</span>
+        </div>
+
+        <div class="section-title" style="font-size:14px">一、市场状态×绩效总表</div>
+        <div class="chart-box">
+          <div ref="mrStateEl" class="ca-chart mr-chart"></div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>市场状态</th><th>周数</th><th>占比</th><th>策略累计</th><th>基准累计</th>
+                <th>超额</th><th>胜率</th><th>态内最大回撤</th><th>年化换手</th><th>成本占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in mrStateRows" :key="r.key">
+                <td :style="{ color: MR_STATE_COLORS[r.key], fontWeight: 700 }">{{ r.label }}</td>
+                <td>{{ r.weeks }}</td>
+                <td>{{ r.ratio }}</td>
+                <td :class="valueClass(r.strategyRaw)">{{ r.strategy }}</td>
+                <td>{{ r.benchmark }}</td>
+                <td :class="valueClass(r.excessRaw)">{{ r.excess }}</td>
+                <td>{{ r.win }}</td>
+                <td>{{ r.dd }}</td>
+                <td>{{ r.turnover }}</td>
+                <td>{{ r.cost }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">二、机遇Alpha（上涨捕获）</div>
+        <div class="ca-sub">大涨周检验</div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>条件</th><th>周数</th><th>策略平均</th><th>基准平均</th><th>收涨比例</th></tr></thead>
+            <tbody>
+              <tr v-for="r in mrBigUpRows" :key="r.threshold">
+                <td>{{ r.threshold }}</td>
+                <td>{{ r.n }}</td>
+                <td :class="valueClass(r.strategyRaw)">{{ r.strategy }}</td>
+                <td>{{ r.benchmark }}</td>
+                <td>{{ r.win }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="ca-sub">上涨周四档分类</div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>分类</th><th>周数</th><th>平均周收益</th></tr></thead>
+            <tbody>
+              <tr v-for="r in mrOppCatRows" :key="r.name">
+                <td>{{ r.name }}</td>
+                <td>{{ r.count }}</td>
+                <td :class="valueClass(r.avgRaw)">{{ r.avg }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ca-note">
+          上涨周中 <strong>{{ pct1(mr?.opportunity.miss_ratio) }}</strong> 为「踏空」（基准上涨而策略未涨）；
+          上涨捕获率
+          <strong>{{ mr?.opportunity.up_capture == null ? '—' : pct1(mr?.opportunity.up_capture) }}</strong>。
+        </p>
+
+        <div class="section-title" style="font-size:14px">三、反弹弹性（下跌后反弹段）</div>
+        <div v-if="mrReboundRows.length === 0" class="table-container">
+          <div class="empty-state"><p>分析区间内无下跌反弹段。</p></div>
+        </div>
+        <template v-else>
+          <div class="chart-box">
+            <div ref="mrReboundEl" class="ca-chart"></div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>起点</th><th>低点</th><th>终点</th><th>周数</th><th>基准反弹</th><th>策略反弹</th>
+                  <th>弹性</th><th>基准收复前高</th><th>策略收复前高</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in mrReboundRows" :key="r.start">
+                  <td>{{ r.start }}</td>
+                  <td>{{ r.trough }}</td>
+                  <td>{{ r.end }}</td>
+                  <td>{{ r.weeks }}</td>
+                  <td>{{ r.bRebound }}</td>
+                  <td :class="valueClass(r.sReboundRaw)">{{ r.sRebound }}</td>
+                  <td>{{ r.elasticity }}</td>
+                  <td>{{ r.bRecover }}</td>
+                  <td>{{ r.sRecover }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            反弹平均弹性
+            <strong>{{ mr?.rebound.avg_elasticity == null ? '—' : num(mr?.rebound.avg_elasticity, 2) + 'x' }}</strong>
+            （&gt;1 表示反弹段涨幅快于基准）。
+          </p>
+        </template>
+
+        <div class="section-title" style="font-size:14px">四、中性Alpha（震荡磨损）</div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>指标</th><th>数值</th></tr></thead>
+            <tbody>
+              <tr v-for="r in mrNeutralRows" :key="r.k">
+                <td>{{ r.k }}</td>
+                <td :class="valueClass(r.raw)">{{ r.v }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ca-note">
+          磨损指标按交易日归属平仓日；假突破磨损 = 5 个交易日内同票平仓且毛 PnL ≤ 0（FIFO 配对）。
+        </p>
       </template>
       </template>
     </div>

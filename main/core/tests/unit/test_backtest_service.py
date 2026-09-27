@@ -31,6 +31,7 @@ from core.models import (
     BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent,
     BacktestCrisisAlpha,
+    BacktestMarketRegimeAnalysis,
 )
 from core.services import backtest_service as svc
 
@@ -890,6 +891,116 @@ def test_recompute_crisis_alpha_without_snapshots_returns_failed(db_session):
     out = svc.recompute_crisis_alpha(db_session, rec.id)
     assert out["status"] == "failed"
     assert "无组合日快照" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# 市场状态×绩效分析（Task 8，TR-8.1 / TR-8.2）
+# ---------------------------------------------------------------------------
+def _mr_seed_snapshots(db, rec, ps, limit=None):
+    nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
+    items = list(nav_pts.items())[:limit] if limit else nav_pts.items()
+    for d, v in items:
+        db.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(round(v, 2))),
+            cash=Decimal("0"), market_value=Decimal("0"),
+        ))
+    db.commit()
+
+
+def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypatch):
+    """TR-8.1: 重算→落库→详情返回；重复重算 upsert 不新增行。"""
+    rec, ps = _seed_record(db_session)
+    _mr_seed_snapshots(db_session, rec, ps)
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "completed"
+    assert out["error"] is None
+    assert out["computed_at"] is not None
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    payload = json.loads(row.payload_json)
+    assert set(payload) == {"meta", "regime_table", "opportunity",
+                            "rebound", "neutral"}
+    assert payload["regime_table"]["range"]["weeks"] >= 0
+
+    # 重复重算：upsert 不新增行
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    out2 = svc.recompute_market_regime(db_session, rec.id)
+    assert out2["status"] == "completed"
+    rows = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).all()
+    assert len(rows) == 1
+
+    # 详情接口内嵌 market_regime 摘要
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert detail["market_regime"]["status"] == "completed"
+    assert detail["market_regime"]["benchmark_code"] == "000300.SH"
+    assert detail["market_regime"]["data"] == payload
+
+
+def test_recompute_market_regime_without_benchmark_marks_failed(db_session, monkeypatch):
+    """TR-8.2: 基准无数据 status=failed；详情主链路完整、其他模块不受影响。"""
+    rec, ps = _seed_record(db_session)
+    _mr_seed_snapshots(db_session, rec, ps)
+    monkeypatch.setattr(svc, "TQData", lambda: _FakeIndexTQ({}))
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "无数据" in out["error"]
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    assert row.status == "failed"
+    assert row.payload_json is None
+
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert detail["record"]["id"] == rec.id
+    assert detail["snapshots"], "快照模块不受影响"
+    assert detail["market_regime"]["status"] == "failed"
+    assert detail["market_regime"]["data"] is None
+
+
+def test_recompute_market_regime_insufficient_common_days(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+    _mr_seed_snapshots(db_session, rec, ps, limit=10)  # 10 个共同日 < 30
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "insufficient"
+    assert "不足" in out["error"]
+
+
+def test_recompute_market_regime_without_snapshots_returns_failed(db_session):
+    rec, _ = _seed_record(db_session)
+    out = svc.recompute_market_regime(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "无组合日快照" in out["error"]
+
+
+def test_recompute_market_regime_missing_record_returns_none(db_session):
+    assert svc.recompute_market_regime(db_session, 9999) is None
+
+
+def test_safe_compute_market_regime_swallows_and_marks_failed(db_session, monkeypatch):
+    rec, ps = _seed_record(db_session)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("mr_boom")
+
+    monkeypatch.setattr(svc, "compute_and_store_market_regime", _boom)
+    row = svc.safe_compute_market_regime(
+        db_session, rec.id, ps, [], [], date(2024, 1, 1), date(2024, 3, 31)
+    )
+    assert row is not None
+    assert row.status == "failed"
+    assert "mr_boom" in row.error
 
 
 # ---------------------------------------------------------------------------

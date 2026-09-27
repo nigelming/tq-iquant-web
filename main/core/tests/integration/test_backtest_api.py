@@ -544,6 +544,29 @@ def test_post_recompute_crisis_alpha_not_found(client):
     assert body["code"] == 404
 
 
+def test_post_recompute_market_regime_returns_status(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    monkeypatch.setattr(
+        bt_api, "_svc_recompute_market_regime",
+        lambda db, rid: {"status": "completed", "error": None, "computed_at": "2026-09-27T10:00:00"},
+    )
+    body = c.post(f"/api/backtest/records/{record_id}/market-regime/recompute").json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "completed"
+    assert body["data"]["computed_at"] == "2026-09-27T10:00:00"
+
+
+def test_post_recompute_market_regime_not_found(client):
+    c, _ = client
+    body = c.post("/api/backtest/records/999999/market-regime/recompute").json()
+    assert body["code"] == 404
+
+
 def test_post_recompute_evaluation_returns_payload(client, monkeypatch):
     c, Session = client
     db = Session()

@@ -47,6 +47,7 @@ from core.services.backtest_service import (  # noqa: E402
     delete_record as _svc_delete_record,
     run_backtest as _svc_run_backtest,
     recompute_crisis_alpha as _svc_recompute_crisis_alpha,
+    recompute_market_regime as _svc_recompute_market_regime,
     recompute_evaluation as _svc_recompute_evaluation,
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
@@ -81,6 +82,15 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
 @router.post("/records/{record_id}/crisis-alpha/recompute")
 def recompute_record_crisis_alpha(record_id: int, db: Session = Depends(get_db)):
     result = _svc_recompute_crisis_alpha(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/market-regime/recompute")
+def recompute_record_market_regime(record_id: int, db: Session = Depends(get_db)):
+    """离线重算市场状态×绩效分析（机遇/中性Alpha，不重跑回测）。"""
+    result = _svc_recompute_market_regime(db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)

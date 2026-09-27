@@ -428,6 +428,7 @@ export interface BacktestDetailItem {
   decisions: DecisionEventItem[]           // 逐闸门事件（下钻）
   returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
   crisis_alpha: BacktestCrisisAlphaItem | null
+  market_regime: BacktestMarketRegimeItem | null
 }
 
 export async function getStockPools() {
@@ -702,6 +703,106 @@ export interface CrisisAlphaRecomputeResult {
 export async function recomputeCrisisAlpha(id: number) {
   const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
     `/backtest/records/${id}/crisis-alpha/recompute`)
+  return res.data.data
+}
+
+// ---- 市场状态×绩效分析（机遇/中性Alpha，regime-alpha 阶段二）----
+
+export interface MarketRegimeStateRow {
+  label: string
+  label_cn: string
+  weeks: number
+  ratio: number | null
+  strategy_return: number | null
+  benchmark_return: number | null
+  excess_return: number | null
+  win_rate: number | null
+  max_drawdown: number | null
+  turnover: number | null
+  cost_ratio: number | null
+}
+
+export interface MarketRegimeBigUpTest {
+  threshold: number
+  n: number
+  avg_strategy: number | null
+  avg_benchmark: number | null
+  win_rate: number | null
+}
+
+export interface MarketRegimeOppCat {
+  count: number
+  avg_strategy: number | null
+}
+
+export interface MarketRegimeReboundSegment {
+  start_date: string
+  end_date: string
+  trough_date: string
+  weeks: number
+  benchmark_rebound_pct: number | null
+  strategy_rebound_pct: number | null
+  elasticity: number | null
+  benchmark_recover_days: number | null
+  benchmark_recovered: boolean
+  strategy_recover_days: number | null
+  strategy_recovered: boolean
+}
+
+export interface MarketRegimeData {
+  meta: {
+    strategy_name: string
+    benchmark_name: string
+    n_weeks_labeled: number
+    n_weeks_total: number
+    state_week_counts: Record<string, number>
+  }
+  regime_table: Record<string, MarketRegimeStateRow>
+  opportunity: {
+    n_bull_weeks: number
+    up_capture: number | null
+    miss_ratio: number
+    big_up_tests: MarketRegimeBigUpTest[]
+    cats: Record<string, MarketRegimeOppCat>
+  }
+  rebound: {
+    n_segments: number
+    avg_elasticity: number | null
+    segments: MarketRegimeReboundSegment[]
+  }
+  neutral: {
+    n_range_weeks: number
+    range_ratio: number | null
+    cumulative_return: number | null
+    annualized_return: number | null
+    win_rate: number | null
+    n_range_days: number
+    monthly_trades: number | null
+    annual_turnover: number | null
+    cost_gross_ratio: number | null
+    whipsaw_count: number
+    whipsaw_days: number
+    avg_trade_pnl: {
+      trend: number | null
+      trend_count: number
+      range: number | null
+      range_count: number
+    }
+  }
+}
+
+export interface BacktestMarketRegimeItem {
+  status: 'completed' | 'insufficient' | 'failed'
+  error: string | null
+  computed_at: string | null
+  benchmark_code: string
+  benchmark_name: string
+  data: MarketRegimeData | null
+}
+
+export async function recomputeMarketRegime(id: number) {
+  const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
+    `/backtest/records/${id}/market-regime/recompute`)
   return res.data.data
 }
 

@@ -25,13 +25,15 @@ from sqlalchemy.orm import Session
 from core.models import (
     StockPoolStock, Strategy, Formula, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
-    BacktestDecisionEvent, BacktestCrisisAlpha,
+    BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
 )
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
+from core.engine.regime import segment_regime
+from core.engine.regime_alpha import RegimeAlphaAnalyzer
 from core.engine.decision import summarize_decisions
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
@@ -611,6 +613,163 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
     )
     if row is None:
         return {"status": "failed", "error": "危机Alpha 结果落库失败"}
+    return {
+        "status": row.status,
+        "error": row.error,
+        "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "benchmark_resolution": resolution,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 市场状态×绩效分析（FR-11）：regime 分段 + RegimeAlphaAnalyzer，沿用危机模式
+# ---------------------------------------------------------------------------
+def _upsert_market_regime(
+    db: Session,
+    record_id: int,
+    benchmark_code: str,
+    benchmark_name: str,
+    status: str,
+    error: Optional[str] = None,
+    skipped: Optional[List[str]] = None,
+    payload: Optional[dict] = None,
+) -> BacktestMarketRegimeAnalysis:
+    row = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestMarketRegimeAnalysis(backtest_record_id=record_id)
+        db.add(row)
+    row.benchmark_code = benchmark_code
+    row.benchmark_name = benchmark_name
+    row.status = status
+    row.error = error
+    row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False)
+    row.payload_json = (
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        if payload is not None
+        else None
+    )
+    row.computed_at = datetime.now()
+    db.commit()
+    return row
+
+
+# 与危机一致的共同交易日下限（不足标 insufficient，不落 payload）
+_MARKET_REGIME_MIN_DAYS = 30
+
+
+def compute_and_store_market_regime(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    trades: List[BacktestTrade],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> BacktestMarketRegimeAnalysis:
+    benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
+    benchmark_name = _crisis_benchmark_name(benchmark_code)
+    closes = build_index_close_series([benchmark_code], start, end)
+    main_closes = closes.get(benchmark_code) or {}
+    if not main_closes:
+        return _upsert_market_regime(
+            db, record_id, benchmark_code, benchmark_name,
+            status="failed",
+            error="主基准指数无数据（TQ 取数失败或代码不被支持）",
+        )
+    benchmark = _to_close_series(main_closes)
+    nav = _crisis_nav_from_snapshots(snapshots)
+    common = nav.index.intersection(benchmark.index)
+    if len(common) < _MARKET_REGIME_MIN_DAYS:
+        return _upsert_market_regime(
+            db, record_id, benchmark_code, benchmark_name,
+            status="insufficient",
+            error=(f"策略与基准共同交易日不足{_MARKET_REGIME_MIN_DAYS}天"
+                   f"（{len(common)}），无法分析"),
+        )
+    regime = segment_regime(benchmark)
+    analyzer = RegimeAlphaAnalyzer(
+        nav, benchmark,
+        trades=trades, regime_weeks=regime,
+        strategy_name=getattr(ps, "name", "组合"),
+        benchmark_name=benchmark_name,
+    )
+    return _upsert_market_regime(
+        db, record_id, benchmark_code, benchmark_name,
+        status="completed", payload=analyzer.analyze(),
+    )
+
+
+def safe_compute_market_regime(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    trades: List[BacktestTrade],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> Optional[BacktestMarketRegimeAnalysis]:
+    try:
+        return compute_and_store_market_regime(
+            db, record_id, ps, snapshots, trades, start, end,
+            benchmark_code=benchmark_code,
+        )
+    except Exception as exc:
+        db.rollback()
+        code = benchmark_code or _crisis_benchmark_code(ps)
+        try:
+            return _upsert_market_regime(
+                db, record_id, code, _crisis_benchmark_name(code),
+                status="failed", error=str(exc),
+            )
+        except Exception:
+            db.rollback()
+            return None
+
+
+def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
+    """离线重算市场状态分析（不重跑回测）：组合快照净值 + 主基准日线 +
+    成交流水 → regime 分段 + RegimeAlphaAnalyzer → upsert。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+    existing = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    resolution = resolve_crisis_benchmark(rec, existing, ps)
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestTrade.bar_time, BacktestTrade.id)
+        .all()
+    )
+    row = safe_compute_market_regime(
+        db, record_id, ps,
+        [{"snap_date": s.snap_date, "total_value": s.total_value} for s in snaps],
+        trades,
+        rec.start_date, rec.end_date,
+        benchmark_code=resolution["benchmark_code"],
+    )
+    if row is None:
+        return {"status": "failed", "error": "市场状态分析结果落库失败"}
     return {
         "status": row.status,
         "error": row.error,
@@ -1349,6 +1508,22 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
             "data": json.loads(ca.payload_json) if ca.payload_json else None,
         }
 
+    mr = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    market_regime = None
+    if mr is not None:
+        market_regime = {
+            "status": mr.status,
+            "error": mr.error,
+            "computed_at": mr.computed_at.isoformat() if mr.computed_at else None,
+            "benchmark_code": mr.benchmark_code,
+            "benchmark_name": mr.benchmark_name,
+            "data": json.loads(mr.payload_json) if mr.payload_json else None,
+        }
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -1360,6 +1535,7 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         "decisions": [_serialize_decision(d) for d in decision_rows],
         "returns_buckets": returns_buckets,
         "crisis_alpha": crisis_alpha,
+        "market_regime": market_regime,
     }
 
 
