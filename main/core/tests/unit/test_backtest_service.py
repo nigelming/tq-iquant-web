@@ -953,6 +953,72 @@ def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypat
     assert detail["market_regime"]["data"] == payload
 
 
+def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypatch):
+    """回测 positions_json 后，recompute_market_regime 的行业归因不再 needs_rerun。
+
+    这是回测功能的端到端验收：双门禁
+    （backtest_service._build_industry_attribution 与
+    industry_attribution.compute_industry_attribution 都以
+    `any(positions is not None)` 为条件）。
+    """
+    from core.services.positions_backfill import backfill_record
+
+    rec, ps = _seed_record(db_session)
+    strat = db_session.query(Strategy).filter_by(portfolio_id=ps.id).one()
+    bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
+    days = sorted(bm_pts)
+
+    # 两腿持仓（前 5 日 + 第 6 日起），现金序列随之下降，使差分校验真正发挥作用
+    for i, d in enumerate(days):
+        held = i >= 5
+        cash = Decimal("997900.00" if held else "999000.00")
+        market_value = Decimal("2100.00" if held else "1000.00")
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=cash + market_value, cash=cash,
+            market_value=market_value))
+    for i, (price, amount) in enumerate(
+            [("10.00", "1000.00"), ("11.00", "1100.00")]):
+        d = days[0] if i == 0 else days[5]
+        db_session.add(BacktestTrade(
+            backtest_record_id=rec.id, strategy_id=strat.id,
+            signal_name="open_sig", signal_type="OPEN", stock_code="000001.SZ",
+            trade_type="BUY", price=Decimal(price), quantity=100,
+            amount=Decimal(amount), commission=Decimal("0.00"),
+            stamp_duty=Decimal("0.00"),
+            bar_time=datetime(d.year, d.month, d.day, 15, 0)))
+    db_session.commit()
+
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    svc.recompute_market_regime(db_session, rec.id)
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    assert json.loads(row.payload_json)[
+        "industry_attribution"]["status"] == "needs_rerun"
+
+    # 价格与持仓市值逐日一致（加仓后按 10.50 → 市值 2100），缩放系数 k = 1
+    prices = {d: (Decimal("10.00") if i < 5 else Decimal("10.50"))
+              for i, d in enumerate(days)}
+    out = backfill_record(db_session, rec.id,
+                          close_provider=lambda codes, s, e: {
+                              "000001.SZ": prices})
+    assert out["status"] == "ok" and out["written"] is True
+    assert out["cash_check"]["ok"] is True
+    assert out["scale"]["max_dev"] == "0"   # 无缩放偏离
+
+    monkeypatch.setattr(
+        svc, "TQData",
+        lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    svc.recompute_market_regime(db_session, rec.id)
+    row = db_session.query(BacktestMarketRegimeAnalysis).filter_by(
+        backtest_record_id=rec.id).one()
+    # fake TQ 未提供行业指数 → failed（而非 needs_rerun），证明已越过双门禁
+    assert json.loads(row.payload_json)[
+        "industry_attribution"]["status"] == "failed"
+
+
 def test_recompute_market_regime_without_benchmark_marks_failed(db_session, monkeypatch):
     """TR-8.2: 基准无数据 status=failed；详情主链路完整、其他模块不受影响。"""
     rec, ps = _seed_record(db_session)
