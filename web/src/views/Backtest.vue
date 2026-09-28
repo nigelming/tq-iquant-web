@@ -745,7 +745,7 @@ function initCaDimChart() {
           label: {
             show: true,
             position: m.raw[i] >= 10 ? 'insideLeft' : 'right',
-            color: m.raw[i] >= 10 ? 'rgba(255,255,255,0.85)' : cssVar('--ink-soft'),
+            color: m.raw[i] >= 10 ? cssVar('--card-bg') : cssVar('--ink-soft'),
             fontSize: 12,
             formatter: m.types[i],
           },
@@ -1427,7 +1427,7 @@ function buildCorrHeatmap(
     series: [{
       name: '滚动相关', type: 'heatmap', data,
       label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.3)' } },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.5)' } },
     }],
   })
 }
@@ -1956,7 +1956,7 @@ function initMonthlyHeatChart() {
         },
         fontSize: 10,
       },
-      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.3)' } },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.5)' } },
     }],
   })
 }
@@ -2137,7 +2137,7 @@ watch(theme, () => {
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
     </div>
 
-    <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+    <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
       {{ errorMsg }}
     </div>
 
@@ -2147,12 +2147,12 @@ watch(theme, () => {
         <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
-            <td style="color:#888">#{{ r.id }}</td>
+            <td style="color:var(--ink-faint)">#{{ r.id }}</td>
             <td>{{ r.name }}</td>
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
-            <td style="color:#888;font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
+            <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
             <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ STATUS_LABEL[r.status] || r.status }}</span></td>
-            <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:#888">-</span></td>
+            <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:var(--ink-faint)">-</span></td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
               <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
@@ -2241,7 +2241,7 @@ watch(theme, () => {
 
       <template v-if="!caCollapsed">
       <div v-if="caStatus === null" class="card" style="padding:12px">
-        <p style="color:#6b7280;margin:0 0 8px">本次回测未包含危机Alpha分析。</p>
+        <p style="color:var(--ink-soft);margin:0 0 8px">本次回测未包含危机Alpha分析。</p>
         <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
           {{ recomputing ? '计算中…' : '重新计算' }}
         </button>
@@ -2249,7 +2249,7 @@ watch(theme, () => {
       </div>
 
       <div v-else-if="caStatus === 'failed'" class="card" style="padding:12px">
-        <p style="color:#c0392b;margin:0 0 8px">危机Alpha分析失败：{{ crisisAlpha?.error || '未知原因' }}</p>
+        <p style="color:var(--red);margin:0 0 8px">危机Alpha分析失败：{{ crisisAlpha?.error || '未知原因' }}</p>
         <button class="btn btn-sm btn-primary" :disabled="recomputing" @click="recomputeCa">
           {{ recomputing ? '计算中…' : '重新计算' }}
         </button>
@@ -2257,7 +2257,7 @@ watch(theme, () => {
       </div>
 
       <div v-else-if="caStatus === 'insufficient'" class="card" style="padding:12px">
-        <p style="color:#6b7280;margin:0">样本不足：{{ crisisAlpha?.error || '共同交易日不足 30 天' }}</p>
+        <p style="color:var(--ink-soft);margin:0">样本不足：{{ crisisAlpha?.error || '共同交易日不足 30 天' }}</p>
       </div>
 
       <template v-else>
@@ -2306,10 +2306,10 @@ watch(theme, () => {
           且在最深的 {{ caEventStat.n }} 次基准回撤中有 {{ caEventStat.hedged }} 次逆势录得正收益。
         </p>
         <div class="ca-tags">
-          <span class="ca-tag" style="background:#d6403a">
+          <span class="ca-tag" style="background:var(--red)">
             危机Alpha {{ pct1(ca?.quadrant.alpha_ratio) }} · {{ ca?.alpha_rating }}
           </span>
-          <span class="ca-tag" style="background:#f0a429">
+          <span class="ca-tag" style="background:var(--gold)">
             综合评分 {{ num(ca?.score.total_score, 1) }} · {{ ca?.score.rating }}
           </span>
         </div>
@@ -2398,7 +2398,7 @@ watch(theme, () => {
                   <td class="text-green">{{ r.基准 }}</td>
                   <td :class="valueClass(r.strategy_ret)">{{ r.策略 }}</td>
                   <td :class="valueClass(r.excess)">{{ r.超额 }}</td>
-                  <td :style="{ color: r.hedged ? '#d6403a' : '#6b7280', fontWeight: 700 }">{{ r.结果 }}</td>
+                  <td :style="{ color: r.hedged ? 'var(--red)' : 'var(--ink-soft)', fontWeight: 700 }">{{ r.结果 }}</td>
                 </tr>
               </tbody>
             </table>
@@ -2512,7 +2512,7 @@ watch(theme, () => {
               <tr v-for="r in caCostRows" :key="r.指标">
                 <td>{{ r.指标 }}</td>
                 <td>{{ r.数值 }}</td>
-                <td style="color:#6b7280">{{ r.解读 }}</td>
+                <td style="color:var(--ink-soft)">{{ r.解读 }}</td>
               </tr>
             </tbody>
           </table>
@@ -2531,7 +2531,7 @@ watch(theme, () => {
                 <td>{{ r.类型 }}</td>
                 <td>{{ r.权重 }}</td>
                 <td>{{ r.得分 }}</td>
-                <td :style="{ color: CRISIS_SCORE_COLORS[r.评级] || '#d6403a', fontWeight: 700 }">{{ r.评级 }}</td>
+                <td :style="{ color: CRISIS_SCORE_COLORS[r.评级] || 'var(--red)', fontWeight: 700 }">{{ r.评级 }}</td>
                 <td>{{ r.贡献 }}</td>
               </tr>
               <tr>
@@ -2539,7 +2539,7 @@ watch(theme, () => {
                 <td>—</td>
                 <td>100%</td>
                 <td>—</td>
-                <td :style="{ color: CRISIS_SCORE_COLORS[ca?.score.rating || ''] || '#d6403a', fontWeight: 700 }">
+                <td :style="{ color: CRISIS_SCORE_COLORS[ca?.score.rating || ''] || 'var(--red)', fontWeight: 700 }">
                   {{ ca?.score.rating }}
                 </td>
                 <td>{{ num(ca?.score.total_score, 1) }}</td>
@@ -2583,7 +2583,7 @@ watch(theme, () => {
 
       <template v-if="!mrCollapsed">
       <div v-if="mrStatus === null" class="card" style="padding:12px">
-        <p style="color:#6b7280;margin:0 0 8px">本次回测未包含市场状态分析。</p>
+        <p style="color:var(--ink-soft);margin:0 0 8px">本次回测未包含市场状态分析。</p>
         <button class="btn btn-sm btn-primary" :disabled="mrRecomputing" @click="recomputeMr">
           {{ mrRecomputing ? '计算中…' : '重新计算' }}
         </button>
@@ -2591,7 +2591,7 @@ watch(theme, () => {
       </div>
 
       <div v-else-if="mrStatus === 'failed'" class="card" style="padding:12px">
-        <p style="color:#c0392b;margin:0 0 8px">市场状态分析失败：{{ marketRegime?.error || '未知原因' }}</p>
+        <p style="color:var(--red);margin:0 0 8px">市场状态分析失败：{{ marketRegime?.error || '未知原因' }}</p>
         <button class="btn btn-sm btn-primary" :disabled="mrRecomputing" @click="recomputeMr">
           {{ mrRecomputing ? '计算中…' : '重新计算' }}
         </button>
@@ -2599,7 +2599,7 @@ watch(theme, () => {
       </div>
 
       <div v-else-if="mrStatus === 'insufficient'" class="card" style="padding:12px">
-        <p style="color:#6b7280;margin:0">样本不足：{{ marketRegime?.error || '共同交易日不足 30 天' }}</p>
+        <p style="color:var(--ink-soft);margin:0">样本不足：{{ marketRegime?.error || '共同交易日不足 30 天' }}</p>
       </div>
 
       <template v-else>
@@ -3163,7 +3163,7 @@ watch(theme, () => {
         </thead>
         <tbody>
           <tr v-for="t in paginatedTrades" :key="t.id">
-            <td style="font-size:12px;color:#888">{{ t.bar_time?.replace('T', ' ') }}</td>
+            <td style="font-size:12px;color:var(--ink-faint)">{{ t.bar_time?.replace('T', ' ') }}</td>
             <td><span class="strategy-badge">{{ t.strategy_name || `#${t.strategy_id}` }}</span></td>
             <td>
               <span style="font-size:12px">{{ t.signal_name || '—' }}</span>
@@ -3249,7 +3249,7 @@ watch(theme, () => {
   border-radius: 10px;
   padding: 16px;
   border-left: 4px solid var(--accent);
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
 }
 .summary-card .title { font-size: 12px; color: var(--ink-soft); margin-bottom: 6px; }
 .summary-card .value { font-size: 22px; font-weight: 700; color: var(--ink); }
@@ -3273,7 +3273,7 @@ watch(theme, () => {
 }
 .stat-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);
+  box-shadow: 0 8px 20px rgba(90, 143, 192, 0.25);
 }
 .stat-card .value { font-size: 22px; font-weight: 700; }
 .stat-card .label { font-size: 12px; opacity: 0.9; margin-top: 6px; }
@@ -3332,7 +3332,7 @@ watch(theme, () => {
 .metric-missing-note {
   margin-top: 10px;
   padding: 8px 12px;
-  background: rgba(201,162,74,.12);
+  background: rgba(201,162,74,.18);
   border-left: 3px solid var(--gold);
   border-radius: 4px;
   font-size: 12px;
