@@ -152,12 +152,17 @@
 权威副本）。因此校验用**差分**表述，而非绝对值：
 
 ```
-对每个 snap_date i：  stored_cash[i] - stored_cash[0]  ==  cumflow[i]   （容差 0.01）
+对每个 snap_date i：  stored_cash[i] - stored_cash[0]  ==  cumflow[i] - cumflow[0]
 ```
 
 `cumflow[i]` 为第 0 日至第 i 日全部成交的现金流累计（买入 `-(amount+commission+stamp_duty)`，
-卖出 `+(amount-commission-stamp_duty)`）。这与探针的验证方式等价，且规避了
-「首条快照当日是否已含成交」这一未知量。
+卖出 `+(amount-commission-stamp_duty)`）。推导：`stored[i] = 初始现金 + cumflow[i]`，
+两式相减即消掉初始现金。
+
+**必须减 `cumflow[0]` 而非直接比 `cumflow[i]`**：后者隐含「首条快照不含当日成交」。
+实测当前库 10 条记录的首条快照当日成交数均为 0，该前提成立；但换成含首日成交的
+回测就会误判为「现金不自洽」而拒写。`cumflow[0] == 0` 时两式等价，故此修正
+不改变任何现有数据的结论，只是去掉一个未验证的假设。
 
 ## CLI
 

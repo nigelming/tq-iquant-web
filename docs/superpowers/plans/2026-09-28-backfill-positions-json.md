@@ -745,6 +745,19 @@ def test_backfill_record_force_overrides_scale_gate(db_session):
     assert out["written"] is True
 
 
+def test_backfill_record_accepts_trade_on_first_snapshot_day(db_session):
+    """首条快照当日已含成交时仍须通过——差分校验减 cumflow[首日] 而非直接比 cumflow。"""
+    rec, _ps, strat = _seed_record(db_session)
+    _snap(db_session, rec, D1, "9000.00", "1000.00")
+    _snap(db_session, rec, D2, "9000.00", "1000.00")
+    _trade(db_session, rec, strat, datetime(2024, 1, 2, 15, 0), "BUY", "10.00",
+           100, "1000.00")
+    db_session.commit()
+    out = backfill_record(db_session, rec.id, close_provider=_close_two_days)
+    assert out["cash_check"]["ok"] is True
+    assert out["status"] == "ok"
+
+
 def test_backfill_record_fails_on_cash_mismatch(db_session):
     """现金差分校验不通过 → 整条记录失败，一行不写（零漂移硬断言）。"""
     rec, _ps, strat = _seed_record(db_session)
@@ -838,14 +851,18 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
               .order_by(BacktestTrade.bar_time, BacktestTrade.id).all())
     dates = [s.snap_date for s in snaps]
 
-    # 1) 现金差分硬校验：与初始资金无关，零漂移，能抓住任何数量/时序错误
+    # 1) 现金差分硬校验：与初始资金无关，零漂移，能抓住任何数量/时序错误。
+    #    减 cumflow[首日] 而非直接比 cumflow：首条快照若已含当日成交，
+    #    后者会误判。恒等式为 stored[i] - stored[0] == cumflow[i] - cumflow[0]
+    #    （因 stored[i] = 初始现金 + cumflow[i]，两式相减消掉初始现金）。
     cum = replay_cash(trades, dates)
     base_cash = Decimal(str(snaps[0].cash))
+    first_cum = cum[dates[0]]
     mismatches = 0
     first_mismatch = None
     for s in snaps:
         stored = Decimal(str(s.cash)) - base_cash
-        if abs(stored - cum[s.snap_date]) > Decimal("0.01"):
+        if abs(stored - (cum[s.snap_date] - first_cum)) > Decimal("0.01"):
             mismatches += 1
             if first_mismatch is None:
                 first_mismatch = s.snap_date.isoformat()
@@ -907,7 +924,7 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest core/tests/unit/test_positions_backfill.py -q`
-Expected: PASS — `26 passed`
+Expected: PASS — `27 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1137,17 +1154,24 @@ def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypat
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
     days = sorted(bm_pts)
 
-    for d in days:
+    # 两笔成交（首日 + 第 6 日），现金序列随之下移，使差分校验真正考察累积
+    for i, d in enumerate(days):
+        held = i >= 5
+        cash = Decimal("997900.00" if held else "999000.00")
+        market_value = Decimal("2100.00" if held else "1000.00")
         db_session.add(BacktestDailySnapshot(
             backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
-            snap_date=d, total_value=Decimal("1001000"),
-            cash=Decimal("1000000"), market_value=Decimal("1000")))
-    db_session.add(BacktestTrade(
-        backtest_record_id=rec.id, strategy_id=strat.id,
-        signal_name="open_sig", signal_type="OPEN", stock_code="000001.SZ",
-        trade_type="BUY", price=Decimal("10.00"), quantity=100,
-        amount=Decimal("1000.00"), commission=Decimal("0.00"),
-        stamp_duty=Decimal("0.00"), bar_time=datetime(days[0], 15, 0)))
+            snap_date=d, total_value=cash + market_value, cash=cash,
+            market_value=market_value))
+    for i, (price, amount) in enumerate(
+            [("10.00", "1000.00"), ("11.00", "1100.00")]):
+        db_session.add(BacktestTrade(
+            backtest_record_id=rec.id, strategy_id=strat.id,
+            signal_name="open_sig", signal_type="OPEN", stock_code="000001.SZ",
+            trade_type="BUY", price=Decimal(price), quantity=100,
+            amount=Decimal(amount), commission=Decimal("0.00"),
+            stamp_duty=Decimal("0.00"),
+            bar_time=datetime(days[0 if i == 0 else 5], 15, 0)))
     db_session.commit()
 
     monkeypatch.setattr(
@@ -1159,11 +1183,15 @@ def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypat
     assert json.loads(row.payload_json)[
         "industry_attribution"]["status"] == "needs_rerun"
 
-    out = backfill_record(
-        db_session, rec.id,
-        close_provider=lambda codes, s, e: {
-            "000001.SZ": {d: Decimal("10.00") for d in days}})
+    # 价格与存量市值逐日一致（加仓后均价 10.50 → 市值 2100），故 k ≡ 1
+    prices = {d: (Decimal("10.00") if i < 5 else Decimal("10.50"))
+              for i, d in enumerate(days)}
+    out = backfill_record(db_session, rec.id,
+                          close_provider=lambda codes, s, e: {
+                              "000001.SZ": prices})
     assert out["status"] == "ok" and out["written"] is True
+    assert out["cash_check"]["ok"] is True
+    assert out["scale"]["max_dev"] == "0"   # 无漂移，无需缩放
 
     monkeypatch.setattr(
         svc, "TQData",
@@ -1184,7 +1212,7 @@ Expected: PASS — `1 passed`
 - [ ] **Step 3: 运行全量测试确认无回归**
 
 Run: `uv run pytest core/tests/ -q`
-Expected: 全部 PASS（基线 783 passed + 本次新增 27 条）
+Expected: 全部 PASS（基线 783 passed + 本次新增 28 条）
 
 - [ ] **Step 4: 提交**
 
@@ -1268,3 +1296,8 @@ Expected: 每条都不是 `needs_rerun`
 - **现金种子自洽复核**：`test_backfill_record_writes_positions_json` 的 4 天现金序列
   （10000 → 9000 → 7800 → 7800）与两笔成交（1/3 买 1000.00、1/4 买 1200.00）严格自洽，
   且首日 D1 无成交 → 差分校验首日必过。
+- **预检修正（2026-09-28）**：差分校验原写作 `stored[i]-stored[0] == cumflow[i]`，
+  隐含「首条快照不含当日成交」。实测当前库 10 条记录首日成交数均为 0，前提成立，
+  但已改为恒成立的 `cumflow[i] - cumflow[0]`（`cumflow[0]==0` 时两式等价），
+  并补 `test_backfill_record_accepts_trade_on_first_snapshot_day` 覆盖该分支。
+  Task 6 的夹具同步改为两笔成交 + 相应现金序列，使差分真正考察累积而非恒为 0。
