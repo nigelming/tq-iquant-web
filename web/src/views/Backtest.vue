@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
@@ -15,6 +15,22 @@ import type {
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import { useTheme } from '../composables/useTheme'
+
+function cssVar(name: string): string {
+  if (typeof document === 'undefined') return '#000000'
+  const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return val || '#000000'
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16)
+  const g = parseInt(hex.slice(3, 5), 16)
+  const b = parseInt(hex.slice(5, 7), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
+const { theme } = useTheme()
 
 // ===== 列表 =====
 const records = ref<BacktestRecordItem[]>([])
@@ -54,10 +70,10 @@ const recomputeWarn = ref(false)
 const recomputeMsgClass = computed(() => (recomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
 const CRISIS_COLORS: Record<string, string> = {
-  逆势上涨: '#d6403a', 跌得少: '#f0a429', 跟着跌: '#9dc88d', 跌更多: '#1f6e4f',
+  逆势上涨: cssVar('--red'), 跌得少: cssVar('--gold'), 跟着跌: hexToRgba(cssVar('--green'), 0.6), 跌更多: cssVar('--green'),
 }
 const CRISIS_SCORE_COLORS: Record<string, string> = {
-  卓越: '#d6403a', 优秀: '#f0a429', 一般: '#b0a890',
+  卓越: cssVar('--red'), 优秀: cssVar('--gold'), 一般: cssVar('--ink-faint'),
 }
 const CRISIS_CATS = ['逆势上涨', '跌得少', '跟着跌', '跌更多']
 const MONTH_STATES = ['大涨', '小涨', '小跌', '大跌']
@@ -88,7 +104,7 @@ const caKpis = computed(() => {
       label: '综合危机保护评分',
       value: num(d.score.total_score, 1),
       sub: d.score.rating,
-      color: CRISIS_SCORE_COLORS[d.score.rating] || '#6b7280',
+      color: CRISIS_SCORE_COLORS[d.score.rating] || cssVar('--ink-soft'),
     },
     {
       label: '下跌周逆势上涨比例',
@@ -100,7 +116,7 @@ const caKpis = computed(() => {
       label: '策略累计收益',
       value: pct1(s.cum),
       sub: `年化 ${pct1(s.ann)} ｜ MDD ${pct1(s.mdd)}`,
-      color: '#1f3a68',
+      color: cssVar('--ink'),
     },
   ]
 })
@@ -152,7 +168,7 @@ const caCatRows = computed(() => {
     占比: pct1(q.alpha_ratio),
     平均周收益: '—',
     avg: null,
-    color: '#111827',
+    color: cssVar('--ink'),
   })
   return rows
 })
@@ -265,7 +281,7 @@ const caMultiSeries = computed(() => {
   return {
     labels: rows.map((m) => `${m.name}${m.is_main ? '（主基准）' : ''}`),
     values: rows.map((m) => +(m.alpha_ratio * 100).toFixed(4)),
-    colors: rows.map((m) => (m.is_main ? '#d6403a' : '#f0a429')),
+    colors: rows.map((m) => (m.is_main ? cssVar('--red') : cssVar('--gold'))),
     main: +(((ca.value?.quadrant.alpha_ratio ?? 0)) * 100).toFixed(4),
   }
 })
@@ -333,7 +349,7 @@ const caAnnualSeries = computed(() => {
   return {
     labels: rows.map((r) => `${r.年份}${r.完整 ? '' : '*'}`),
     values: rows.map((r) => +(r.危机Alpha * 100).toFixed(4)),
-    colors: rows.map((r) => (r.危机Alpha * 100 >= 85 ? '#d6403a' : '#f0a429')),
+    colors: rows.map((r) => (r.危机Alpha * 100 >= 85 ? cssVar('--red') : cssVar('--gold'))),
     main: +(((ca.value?.quadrant.alpha_ratio ?? 0)) * 100).toFixed(4),
   }
 })
@@ -371,7 +387,7 @@ const caDimSeries = computed(() => {
     types: sorted.map((x) => x.类型),
     values: sorted.map((x) => Math.max(x.得分, 3)),
     raw: sorted.map((x) => x.得分),
-    colors: sorted.map((x) => CRISIS_SCORE_COLORS[x.评级] || '#b0a890'),
+    colors: sorted.map((x) => CRISIS_SCORE_COLORS[x.评级] || cssVar('--ink-faint')),
   }
 })
 
@@ -381,7 +397,7 @@ const caDownRows = computed(() => (ca.value?.down_weeks ?? []).map((r) => ({
   策略: pctSigned(r.策略收益 ?? 0),
   超额: pctSigned(r.超额 ?? 0),
   分类: r.分类,
-  color: CRISIS_COLORS[r.分类] || '#111827',
+  color: CRISIS_COLORS[r.分类] || cssVar('--ink'),
 })))
 
 // ===== 模块十二：下跌周明细分页（与交易明细同款）=====
@@ -454,7 +470,7 @@ function initCaNavChart() {
   const mark = nav.shade_spans.length
     ? [{
         silent: true,
-        itemStyle: { color: 'rgba(214,64,58,0.08)' },
+        itemStyle: { color: hexToRgba(cssVar('--red'), 0.08) },
         data: nav.shade_spans.map(([s, e]) => [{ xAxis: s }, { xAxis: e }]),
       }]
     : undefined
@@ -471,17 +487,17 @@ function initCaNavChart() {
     series: [
       {
         name: d.strategy_name, type: 'line', data: nav.strategy, smooth: true, symbol: 'none',
-        lineStyle: { color: '#d6403a', width: 2.2 }, itemStyle: { color: '#d6403a' },
+        lineStyle: { color: cssVar('--red'), width: 2.2 }, itemStyle: { color: cssVar('--red') },
         markArea: mark,
         markLine: {
           silent: true, symbol: 'none', label: { show: false },
-          lineStyle: { color: '#9ca3af', type: 'dashed' },
+          lineStyle: { color: cssVar('--ink-faint'), type: 'dashed' },
           data: [{ yAxis: 1 }],
         },
       },
       {
         name: d.benchmark_name, type: 'line', data: nav.benchmark, smooth: true, symbol: 'none',
-        lineStyle: { color: '#4a7ec4', width: 1.8 }, itemStyle: { color: '#4a7ec4' },
+        lineStyle: { color: cssVar('--blue'), width: 1.8 }, itemStyle: { color: cssVar('--blue') },
       },
     ],
   })
@@ -503,7 +519,7 @@ function initCaPieChart() {
     legend: {
       orient: 'vertical', right: 12, top: 'center',
       icon: 'roundRect', itemWidth: 15, itemHeight: 15, itemGap: 16,
-      textStyle: { fontSize: 13, color: '#374151' },
+      textStyle: { fontSize: 13, color: cssVar('--ink-soft') },
       formatter: (name: string) => `${name}   ${pctByName[name] ?? ''}`,
     },
     series: [{
@@ -511,7 +527,7 @@ function initCaPieChart() {
       radius: ['48%', '80%'],
       center: ['30%', '50%'],
       sort: false,
-      itemStyle: { borderColor: '#fff', borderWidth: 2 },
+      itemStyle: { borderColor: cssVar('--card-bg'), borderWidth: 2 },
       label: { show: false },
       labelLine: { show: false },
       data: names.map((nm, i) => ({
@@ -520,9 +536,9 @@ function initCaPieChart() {
     }],
     graphic: [
       { type: 'text', left: '30%', top: '38%',
-        style: { text: `${p.alpha}%`, fontSize: 30, fontWeight: 800, fill: '#d6403a', textAlign: 'center' } },
+        style: { text: `${p.alpha}%`, fontSize: 30, fontWeight: 800, fill: cssVar('--red'), textAlign: 'center' } },
       { type: 'text', left: '30%', top: '56%',
-        style: { text: '危机Alpha', fontSize: 13, fill: '#1f3a68', textAlign: 'center' } },
+        style: { text: '危机Alpha', fontSize: 13, fill: cssVar('--ink'), textAlign: 'center' } },
     ],
   })
 }
@@ -539,14 +555,14 @@ function initCaTopChart() {
     xAxis: { type: 'category', data: t.labels },
     yAxis: { type: 'value', name: '周收益(%)' },
     series: [
-      { name: '基准周收益', type: 'bar', data: t.b, barMaxWidth: 20, itemStyle: { color: '#2e8b57' },
+      { name: '基准周收益', type: 'bar', data: t.b, barMaxWidth: 20, itemStyle: { color: cssVar('--green') },
         label: { show: true, position: 'bottom', fontSize: 10, formatter: (x: any) => Number(x.value).toFixed(1) },
         markLine: {
           silent: true, symbol: 'none', label: { show: false },
-          lineStyle: { color: '#6b7280', width: 1 },
+          lineStyle: { color: cssVar('--ink-soft'), width: 1 },
           data: [{ yAxis: 0 }],
         } },
-      { name: '策略周收益', type: 'bar', data: t.s, barMaxWidth: 20, itemStyle: { color: '#d6403a' },
+      { name: '策略周收益', type: 'bar', data: t.s, barMaxWidth: 20, itemStyle: { color: cssVar('--red') },
         label: { show: true, position: 'top', fontSize: 10, formatter: (x: any) => Number(x.value).toFixed(2) } },
     ],
   })
@@ -575,15 +591,15 @@ function initCaScatterChart() {
       itemStyle: { color: s.color, opacity: 0.78 },
       markLine: i === 0 ? {
         silent: true, symbol: 'none', label: { show: false },
-        lineStyle: { color: '#4b5563', width: 1.2 },
+        lineStyle: { color: cssVar('--ink-soft'), width: 1.2 },
         data: [{ xAxis: 0 }, { yAxis: 0 }],
       } : undefined,
     })),
     graphic: [
-      { type: 'text', left: 60, top: 46, style: { text: `危机Alpha\n（股跌+${shortName}涨）`, fill: '#d6403a', fontSize: 12 } },
-      { type: 'text', right: 150, top: 46, style: { text: '同涨', fill: '#b8860b', fontSize: 12 } },
-      { type: 'text', left: 60, bottom: 50, style: { text: '同跌', fill: '#2b6cb0', fontSize: 12 } },
-      { type: 'text', right: 130, bottom: 50, style: { text: `股涨+${shortName}跌`, fill: '#1f6e4f', fontSize: 12 } },
+      { type: 'text', left: 60, top: 46, style: { text: `危机Alpha\n（股跌+${shortName}涨）`, fill: cssVar('--red'), fontSize: 12 } },
+      { type: 'text', right: 150, top: 46, style: { text: '同涨', fill: cssVar('--gold'), fontSize: 12 } },
+      { type: 'text', left: 60, bottom: 50, style: { text: '同跌', fill: cssVar('--blue'), fontSize: 12 } },
+      { type: 'text', right: 130, bottom: 50, style: { text: `股涨+${shortName}跌`, fill: cssVar('--green'), fontSize: 12 } },
     ],
   })
 }
@@ -623,7 +639,7 @@ function initCaMultiChart() {
       label: { show: true, position: 'top', formatter: (x: any) => `${Number(x.value).toFixed(1)}%` },
       markLine: {
         silent: true, symbol: 'none', label: { show: false },
-        lineStyle: { color: '#1f3a68', type: 'dashed', width: 1.4 },
+        lineStyle: { color: cssVar('--ink'), type: 'dashed', width: 1.4 },
         data: [{ yAxis: m.main }],
       },
     }],
@@ -642,14 +658,14 @@ function initCaMonthChart() {
     xAxis: { type: 'category', data: m.labels },
     yAxis: { type: 'value', name: '月均收益(%)' },
     series: [
-      { name: '基准月均', type: 'bar', data: m.b, barMaxWidth: 26, itemStyle: { color: '#9db3d2' },
+      { name: '基准月均', type: 'bar', data: m.b, barMaxWidth: 26, itemStyle: { color: hexToRgba(cssVar('--blue'), 0.5) },
         label: { show: true, position: 'top', fontSize: 11, formatter: (x: any) => Number(x.value).toFixed(1) },
         markLine: {
           silent: true, symbol: 'none', label: { show: false },
-          lineStyle: { color: '#6b7280', width: 1 },
+          lineStyle: { color: cssVar('--ink-soft'), width: 1 },
           data: [{ yAxis: 0 }],
         } },
-      { name: '策略月均', type: 'bar', data: m.s, barMaxWidth: 26, itemStyle: { color: '#d6403a' },
+      { name: '策略月均', type: 'bar', data: m.s, barMaxWidth: 26, itemStyle: { color: cssVar('--red') },
         label: { show: true, position: 'top', fontSize: 11, formatter: (x: any) => Number(x.value).toFixed(2) } },
     ],
   })
@@ -668,12 +684,12 @@ function initCaCorrChart() {
     yAxis: { type: 'value', name: '相关系数', min: -1.05, max: 1.05 },
     series: [
       { name: '扩展窗口相关（不足52周）', type: 'line', data: c.earlyData, symbol: 'none', connectNulls: true,
-        lineStyle: { color: '#9ca3af', width: 1.4, type: 'dashed' } },
+        lineStyle: { color: cssVar('--ink-faint'), width: 1.4, type: 'dashed' } },
       { name: '滚动52周相关', type: 'line', data: c.rcData, symbol: 'none', connectNulls: true,
-        lineStyle: { color: '#1f3a68', width: 2 }, areaStyle: { color: 'rgba(31,58,104,0.10)' },
+        lineStyle: { color: cssVar('--ink'), width: 2 }, areaStyle: { color: hexToRgba(cssVar('--ink'), 0.10) },
         markLine: {
           silent: true, symbol: 'none', label: { show: false },
-          lineStyle: { color: '#6b7280', type: 'dashed' },
+          lineStyle: { color: cssVar('--ink-soft'), type: 'dashed' },
           data: [{ yAxis: 0 }],
         } },
     ],
@@ -696,7 +712,7 @@ function initCaAnnualChart() {
       label: { show: true, position: 'top', formatter: (x: any) => Number(x.value).toFixed(0) },
       markLine: {
         silent: true, symbol: 'none', label: { show: false },
-        lineStyle: { color: '#1f3a68', type: 'dashed' },
+        lineStyle: { color: cssVar('--ink'), type: 'dashed' },
         data: [{ yAxis: a.main }],
       },
     }],
@@ -729,7 +745,7 @@ function initCaDimChart() {
           label: {
             show: true,
             position: m.raw[i] >= 10 ? 'insideLeft' : 'right',
-            color: m.raw[i] >= 10 ? 'rgba(255,255,255,0.85)' : '#6b7280',
+            color: m.raw[i] >= 10 ? 'rgba(255,255,255,0.85)' : cssVar('--ink-soft'),
             fontSize: 12,
             formatter: m.types[i],
           },
@@ -871,7 +887,7 @@ const mrRecomputeMsgClass = computed(() => (mrRecomputeWarn.value ? 'ca-msg ca-w
 
 const MR_STATE_ORDER = ['bull', 'bear', 'range', 'rebound']
 const MR_STATE_COLORS: Record<string, string> = {
-  bull: '#d6403a', bear: '#1f6e4f', range: '#6b7280', rebound: '#f0a429',
+  bull: cssVar('--red'), bear: cssVar('--green'), range: cssVar('--ink-soft'), rebound: cssVar('--gold'),
 }
 
 const mrStateEl = ref<HTMLDivElement | null>(null)
@@ -882,8 +898,8 @@ let mrReboundChart: echarts.ECharts | null = null
 // 风格轮动 / 分化度 / 隐含暴露（FR-13 ~ FR-16）
 const STYLE_LABEL_CN = ['大盘价值', '中小盘', '科技成长', '普涨', '普跌', '无主线']
 const STYLE_COLORS: Record<string, string> = {
-  大盘价值: '#4a7ec4', 中小盘: '#1f6e4f', 科技成长: '#d6403a',
-  普涨: '#f0a429', 普跌: '#6b7280', 无主线: '#9ca3af',
+  大盘价值: cssVar('--blue'), 中小盘: cssVar('--green'), 科技成长: cssVar('--red'),
+  普涨: cssVar('--gold'), 普跌: cssVar('--ink-soft'), 无主线: cssVar('--ink-faint'),
 }
 const stDispEl = ref<HTMLDivElement | null>(null)
 const stCorrEl = ref<HTMLDivElement | null>(null)
@@ -937,12 +953,29 @@ const stSkipped = computed(() => {
   const d = mr.value
   if (!d) return []
   const all = new Set<string>()
-  ;['style', 'dispersion', 'exposure'].forEach((k) => {
+  ;['style', 'dispersion', 'exposure', 'quadrant_exposure'].forEach((k) => {
     const blk = (d as any)[k]
     if (blk?.skipped) blk.skipped.forEach((s: string) => all.add(s))
   })
   return [...all]
 })
+
+// 实际统计窗口披露：五/六/七/七-B 均对「全体指数求交集」取周，科创50 等历史
+// 较短的指数会把窗口截到其起始日之后，短于回测区间且用户无从判断，必须写明。
+function weekWindowText(dates: string[] | undefined | null): string {
+  if (!dates || dates.length === 0) return ''
+  const n = dates.length
+  const total = mr.value?.meta?.n_weeks_labeled ?? null
+  const base = `实际统计窗口 ${dates[0]} ~ ${dates[n - 1]}（${n} 周）`
+  if (total != null && n < total) {
+    return `${base}；短于回测区间 ${total} 周（受宽基指数历史长度限制，仅在该窗口内计算）`
+  }
+  return base
+}
+const stStyleWindowText = computed(() =>
+  weekWindowText(mr.value?.style?.weeks.map((w) => w.date)))
+const stDispWindowText = computed(() =>
+  weekWindowText(mr.value?.dispersion?.series.map((s) => s.date)))
 
 const stCorrData = computed(() => {
   const d: ExposureBlock | undefined = mr.value?.exposure
@@ -955,6 +988,7 @@ const stCorrData = computed(() => {
     beta: d.beta,
   }
 })
+const stCorrWindowText = computed(() => weekWindowText(stCorrData.value?.dates))
 
 // 增强A：巨潮四象限纯风格暴露（老记录无 quadrant_exposure 键 → 不渲染）
 const stQuadData = computed(() => {
@@ -969,6 +1003,7 @@ const stQuadData = computed(() => {
     skipped: d.skipped,
   }
 })
+const stQuadWindowText = computed(() => weekWindowText(stQuadData.value?.dates))
 
 // 行业归因（FR-17，Task 16/17）
 const iaBlock = computed<IndustryAttributionBlock | undefined>(
@@ -1009,8 +1044,8 @@ function initIaExpChart() {
   if (!iaExpEl.value || !exp) return
   iaExpChart?.dispose()
   iaExpChart = echarts.init(iaExpEl.value)
-  const palette = ['#4a7ec4', '#1f6e4f', '#d6403a', '#f0a429', '#7c3aed',
-    '#0e7490', '#b45309', '#9d174d', '#6b7280', '#9ca3af']
+  const palette = [cssVar('--blue'), cssVar('--green'), cssVar('--red'), cssVar('--gold'), cssVar('--accent'),
+    cssVar('--blue'), cssVar('--gold'), cssVar('--red'), cssVar('--ink-soft'), cssVar('--ink-faint')]
   const series = exp.series.map((s, i) => ({
     name: s.name,
     type: 'line' as const,
@@ -1030,7 +1065,7 @@ function initIaExpChart() {
     symbol: 'none',
     smooth: true,
     lineStyle: { width: 0.5 },
-    color: '#e5e7eb',
+    color: cssVar('--line'),
     data: exp.cash.map((w) => Number((w * 100).toFixed(2))),
   })
   iaExpChart.setOption({
@@ -1082,7 +1117,7 @@ function initRbHistChart() {
   rbHistChart?.dispose()
   rbHistChart = echarts.init(rbHistEl.value)
   const labels = wins[0].histogram.map((b) => b.label)
-  const colors = ['#4a7ec4', '#f0a429']
+  const colors = [cssVar('--blue'), cssVar('--gold')]
   rbHistChart.setOption({
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { bottom: 0 },
@@ -1107,25 +1142,25 @@ const mrKpis = computed(() => {
       label: '上涨捕获率',
       value: d.opportunity.up_capture === null ? '—' : pct1(d.opportunity.up_capture),
       sub: `${d.opportunity.n_bull_weeks} 个上涨周`,
-      color: '#d6403a',
+      color: cssVar('--red'),
     },
     {
       label: '踏空周占比',
       value: pct1(d.opportunity.miss_ratio),
       sub: '基准上涨而策略未涨',
-      color: '#1f3a68',
+      color: cssVar('--ink'),
     },
     {
       label: '反弹平均弹性',
       value: d.rebound.avg_elasticity === null ? '—' : `${num(d.rebound.avg_elasticity, 2)}x`,
       sub: `${d.rebound.n_segments} 个下跌反弹段`,
-      color: '#f0a429',
+      color: cssVar('--gold'),
     },
     {
       label: '假突破磨损',
       value: `${d.neutral.whipsaw_count} 次`,
       sub: '5 日内同票平仓且亏损',
-      color: '#c0392b',
+      color: cssVar('--red'),
     },
   ]
 })
@@ -1298,9 +1333,9 @@ function initMrStateChart() {
       splitLine: { lineStyle: { type: 'dashed' } },
     },
     series: [
-      mkSeries('策略', (r) => r.strategy_return, '#d6403a'),
-      mkSeries('基准', (r) => r.benchmark_return, '#4a7ec4'),
-      mkSeries('超额', (r) => r.excess_return, '#f0a429'),
+      mkSeries('策略', (r) => r.strategy_return, cssVar('--red')),
+      mkSeries('基准', (r) => r.benchmark_return, cssVar('--blue')),
+      mkSeries('超额', (r) => r.excess_return, cssVar('--gold')),
     ],
   })
 }
@@ -1324,12 +1359,12 @@ function initMrReboundChart() {
       {
         name: '基准反弹', type: 'bar',
         data: segs.map((s) => s.benchmark_rebound_pct === null ? null : Number((s.benchmark_rebound_pct * 100).toFixed(2))),
-        itemStyle: { color: '#4a7ec4' },
+        itemStyle: { color: cssVar('--blue') },
       },
       {
         name: '策略反弹', type: 'bar',
         data: segs.map((s) => s.strategy_rebound_pct === null ? null : Number((s.strategy_rebound_pct * 100).toFixed(2))),
-        itemStyle: { color: '#d6403a' },
+        itemStyle: { color: cssVar('--red') },
       },
     ],
   })
@@ -1354,8 +1389,8 @@ function initStDispChart() {
     },
     series: [{
       name: '宽基截面分化度', type: 'line', data: vals, smooth: true, symbol: 'none',
-      lineStyle: { color: '#7c3aed', width: 1.6 },
-      areaStyle: { color: 'rgba(124,58,237,0.08)' },
+      lineStyle: { color: cssVar('--accent'), width: 1.6 },
+      areaStyle: { color: hexToRgba(cssVar('--accent'), 0.08) },
     }],
   })
 }
@@ -1378,13 +1413,16 @@ function buildCorrHeatmap(
     tooltip: { position: 'top' },
     grid: { left: 80, right: 24, bottom: 60, top: 20, containLabel: true },
     xAxis: {
-      type: 'category', data: cd.dates, boundaryGap: false,
+      // 热力图两轴必须是 band 轴（boundaryGap 默认 true）。曾误设 boundaryGap:false
+      // （折线图的习惯），ECharts 抛 "Heatmap on cartesian must have two axes with
+      // boundaryGap true" 并中断 initMrCharts 后续图表 → 七/七-B 空白且八/九 从未初始化。
+      type: 'category', data: cd.dates,
       axisLabel: { formatter: (v: string) => v.slice(0, 7), interval: Math.floor(cd.dates.length / 8) },
     },
     yAxis: { type: 'category', data: cd.names },
     visualMap: {
       min: -1, max: 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 0,
-      inRange: { color: ['#1f6e4f', '#e5e7eb', '#d6403a'] },
+      inRange: { color: [cssVar('--green'), cssVar('--line'), cssVar('--red')] },
     },
     series: [{
       name: '滚动相关', type: 'heatmap', data,
@@ -1780,14 +1818,14 @@ function initEquityChart() {
     smooth: true,
     areaStyle: {
       color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-        { offset: 0, color: 'rgba(102, 126, 234, 0.3)' },
-        { offset: 1, color: 'rgba(102, 126, 234, 0.05)' },
+        { offset: 0, color: hexToRgba(cssVar('--accent'), 0.3) },
+        { offset: 1, color: hexToRgba(cssVar('--accent'), 0.05) },
       ]),
     },
-    itemStyle: { color: '#667eea' },
+    itemStyle: { color: cssVar('--accent') },
     markLine: {
       silent: true,
-      data: [{ yAxis: 0, lineStyle: { color: '#999', type: 'dashed' } }],
+      data: [{ yAxis: 0, lineStyle: { color: cssVar('--ink-faint'), type: 'dashed' } }],
       label: { show: false },
     },
   }]
@@ -1803,8 +1841,8 @@ function initEquityChart() {
     series.push({
       name: '基准', type: 'line', data: benchmarkCurve.value, smooth: true,
       symbol: 'none',
-      lineStyle: { width: 1.5, type: 'dashed', color: '#9ca3af' },
-      itemStyle: { color: '#9ca3af' },
+      lineStyle: { width: 1.5, type: 'dashed', color: cssVar('--ink-faint') },
+      itemStyle: { color: cssVar('--ink-faint') },
     })
   }
   // 超额收益曲线（金色，区别组合紫/策略自动色/基准灰虚线）；无基准数据则不画
@@ -1812,8 +1850,8 @@ function initEquityChart() {
     series.push({
       name: '超额收益（相对基准）', type: 'line', data: excessCurve.value, smooth: true,
       symbol: 'none',
-      lineStyle: { width: 1.5, color: '#f59e0b' },
-      itemStyle: { color: '#f59e0b' },
+      lineStyle: { width: 1.5, color: cssVar('--gold') },
+      itemStyle: { color: cssVar('--gold') },
     })
   }
 
@@ -1859,11 +1897,11 @@ function initDrawdownChart() {
       name: '回撤', type: 'line', data: drawdownCurve.value, smooth: true,
       areaStyle: {
         color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(16, 185, 129, 0.3)' },
-          { offset: 1, color: 'rgba(16, 185, 129, 0.05)' },
+          { offset: 0, color: hexToRgba(cssVar('--green'), 0.3) },
+          { offset: 1, color: hexToRgba(cssVar('--green'), 0.05) },
         ]),
       },
-      itemStyle: { color: '#10b981' }, // A股红涨绿跌：回撤=跌幅→绿
+      itemStyle: { color: cssVar('--green') }, // A股红涨绿跌：回撤=跌幅→绿
     }],
   })
 }
@@ -1904,7 +1942,7 @@ function initMonthlyHeatChart() {
       calculable: true,
       orient: 'vertical', right: 0, top: 'center',
       // A 股红涨绿跌：负收益（min）绿 → 零（中）黄 → 正收益（max）红
-      inRange: { color: ['#10b981', '#fef3c7', '#ef4444'] },
+      inRange: { color: [cssVar('--green'), hexToRgba(cssVar('--gold'), 0.3), cssVar('--red')] },
       text: ['+', '-'],
       textStyle: { fontSize: 11 },
     },
@@ -1947,7 +1985,7 @@ function initDailyBoxChart() {
     yAxis: { type: 'value', name: '日收益率(%)' },
     series: [{
       type: 'boxplot', data: boxData,
-      itemStyle: { color: '#dbeafe', borderColor: '#3b82f6' },
+      itemStyle: { color: cssVar('--accent-light'), borderColor: cssVar('--blue') },
     }],
   })
 }
@@ -1976,7 +2014,7 @@ function initMonthlyBoxChart() {
     yAxis: { type: 'value', name: '月收益率(%)' },
     series: [{
       type: 'boxplot', data: boxData,
-      itemStyle: { color: '#d1fae5', borderColor: '#10b981' },
+      itemStyle: { color: hexToRgba(cssVar('--green'), 0.15), borderColor: cssVar('--green') },
     }],
   })
 }
@@ -1992,7 +2030,7 @@ function initAnnualBarChart() {
       value: +(ar * 100).toFixed(2),
       name: String(y.year),
       // A 股红涨绿跌：正收益红、负收益绿
-      itemStyle: { color: ar >= 0 ? '#ef4444' : '#10b981' },
+      itemStyle: { color: ar >= 0 ? cssVar('--red') : cssVar('--green') },
     }
   })
   annualBarChart.setOption({
@@ -2024,6 +2062,13 @@ function handleResize() {
   caCorrChart?.resize()
   caAnnualChart?.resize()
   caDimChart?.resize()
+  mrStateChart?.resize()
+  mrReboundChart?.resize()
+  stDispChart?.resize()
+  stCorrChart?.resize()
+  stQuadChart?.resize()
+  iaExpChart?.resize()
+  rbHistChart?.resize()
 }
 
 onMounted(() => {
@@ -2047,6 +2092,41 @@ onUnmounted(() => {
   caCorrChart?.dispose()
   caAnnualChart?.dispose()
   caDimChart?.dispose()
+})
+
+function disposeAllCharts() {
+  equityChart?.dispose(); equityChart = null
+  drawdownChart?.dispose(); drawdownChart = null
+  monthlyHeatChart?.dispose(); monthlyHeatChart = null
+  dailyBoxChart?.dispose(); dailyBoxChart = null
+  monthlyBoxChart?.dispose(); monthlyBoxChart = null
+  annualBarChart?.dispose(); annualBarChart = null
+  caNavChart?.dispose(); caNavChart = null
+  caPieChart?.dispose(); caPieChart = null
+  caTopChart?.dispose(); caTopChart = null
+  caScatterChart?.dispose(); caScatterChart = null
+  caMultiChart?.dispose(); caMultiChart = null
+  caMonthChart?.dispose(); caMonthChart = null
+  caCorrChart?.dispose(); caCorrChart = null
+  caAnnualChart?.dispose(); caAnnualChart = null
+  caDimChart?.dispose(); caDimChart = null
+  mrStateChart?.dispose(); mrStateChart = null
+  mrReboundChart?.dispose(); mrReboundChart = null
+  stDispChart?.dispose(); stDispChart = null
+  stCorrChart?.dispose(); stCorrChart = null
+  stQuadChart?.dispose(); stQuadChart = null
+  iaExpChart?.dispose(); iaExpChart = null
+  rbHistChart?.dispose(); rbHistChart = null
+}
+
+watch(theme, () => {
+  setTimeout(() => {
+    disposeAllCharts()
+    nextTick(() => {
+      initCharts()
+      if (!mrCollapsed.value) initMrCharts()
+    })
+  }, 60)
 })
 </script>
 
@@ -2671,6 +2751,7 @@ onUnmounted(() => {
         </p>
 
         <div class="section-title" style="font-size:14px">五、风格×绩效矩阵（结构性行情）</div>
+        <div v-if="stStyleWindowText" class="ca-note">{{ stStyleWindowText }}</div>
         <div v-if="stSkipped.length" class="ca-note">
           以下宽基指数不可得，已跳过：{{ stSkipped.join('、') }}
         </div>
@@ -2700,6 +2781,7 @@ onUnmounted(() => {
         <div v-if="stAgreeText" class="ca-note">{{ stAgreeText }}</div>
 
         <div class="section-title" style="font-size:14px">六、市场分化度（宽基截面标准差）</div>
+        <div v-if="stDispWindowText" class="ca-note">{{ stDispWindowText }}</div>
         <div class="chart-box">
           <div ref="stDispEl" class="ca-chart"></div>
         </div>
@@ -2725,6 +2807,7 @@ onUnmounted(() => {
           <div class="empty-state"><p>宽基样本不足，无法计算风格暴露；老记录（早期计算）可点上方「重新计算」补齐。</p></div>
         </div>
         <template v-else>
+          <div v-if="stCorrWindowText" class="ca-note">{{ stCorrWindowText }}</div>
           <div class="chart-box">
             <div ref="stCorrEl" class="ca-chart" style="min-height:320px"></div>
           </div>
@@ -2752,6 +2835,7 @@ onUnmounted(() => {
           <div class="empty-state"><p>该记录暂无四象限暴露数据：老记录需重算，或四象限指数样本不足。</p></div>
         </div>
         <template v-else>
+          <div v-if="stQuadWindowText" class="ca-note">{{ stQuadWindowText }}</div>
           <div class="chart-box">
             <div ref="stQuadEl" class="ca-chart" style="min-height:280px"></div>
           </div>

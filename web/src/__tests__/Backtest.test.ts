@@ -1,6 +1,36 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
+const { CSS_VARS, stubGetComputedStyle } = vi.hoisted(() => {
+  const CSS_VARS: Record<string, string> = {
+    '--red': '#d6403a',
+    '--green': '#1f6e4f',
+    '--gold': '#f0a429',
+    '--blue': '#4a7ec4',
+    '--ink': '#1f3a68',
+    '--ink-soft': '#6b7280',
+    '--ink-faint': '#9ca3af',
+    '--line': '#e5e7eb',
+    '--card-bg': '#ffffff',
+    '--accent': '#667eea',
+    '--accent-light': '#dbeafe',
+  }
+
+  function stubGetComputedStyle() {
+    Object.defineProperty(globalThis, 'getComputedStyle', {
+      value: () => ({
+        getPropertyValue: (name: string) => CSS_VARS[name] ?? '',
+      }),
+      writable: true,
+      configurable: true,
+    })
+  }
+
+  stubGetComputedStyle()
+
+  return { CSS_VARS, stubGetComputedStyle }
+})
+
 vi.mock('../api', () => ({
   getBacktestRecords: vi.fn(),
   getBacktestDetail: vi.fn(),
@@ -67,6 +97,7 @@ const mockDetail = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  stubGetComputedStyle()
   scrollTargets.length = 0
   ;(Element.prototype as any).scrollIntoView = vi.fn(function (this: any) {
     scrollTargets.push(this)
@@ -450,8 +481,8 @@ describe('Backtest.vue — 收益分布 A 股红涨绿跌配色', () => {
     const colors = heat.visualMap?.inRange?.color
     expect(colors).toHaveLength(3)
     // A 股惯例：涨（正值）红、跌（负值）绿 → 渐变序列负端绿、正端红
-    expect(colors[0]).toBe('#10b981')  // 负收益端（min）→ 绿
-    expect(colors[2]).toBe('#ef4444')  // 正收益端（max）→ 红
+    expect(colors[0]).toBe(CSS_VARS['--green'])  // 负收益端（min）→ 绿
+    expect(colors[2]).toBe(CSS_VARS['--red'])  // 正收益端（max）→ 红
   })
 
   it('年收益柱状图正收益红、负收益绿', async () => {
@@ -468,8 +499,8 @@ describe('Backtest.vue — 收益分布 A 股红涨绿跌配色', () => {
     const data = barOpt.series[0].data
     expect(data).toHaveLength(2)
     const byName = Object.fromEntries(data.map((d: any) => [d.name, d.itemStyle.color]))
-    expect(byName['2025']).toBe('#10b981')  // 年收益 -5% → 绿
-    expect(byName['2026']).toBe('#ef4444')  // 年收益 +2% → 红
+    expect(byName['2025']).toBe(CSS_VARS['--green'])  // 年收益 -5% → 绿
+    expect(byName['2026']).toBe(CSS_VARS['--red'])  // 年收益 +2% → 红
   })
 })
 
@@ -682,7 +713,7 @@ describe('Backtest.vue — 回撤曲线红涨绿跌', () => {
     expect(dd).toBeTruthy()
     const series = dd.series.find((s: any) => s.name === '回撤')
     expect(series).toBeTruthy()
-    expect(series.itemStyle.color).toBe('#10b981')
+    expect(series.itemStyle.color).toBe(CSS_VARS['--green'])
   })
 })
 
@@ -703,8 +734,8 @@ describe('Backtest.vue — 净值曲线超额收益（相对基准）', () => {
     expect(excess.type).toBe('line')
     expect(excess.smooth).toBe(true)
     expect(excess.symbol).toBe('none')
-    expect(excess.lineStyle).toEqual({ width: 1.5, color: '#f59e0b' })
-    expect(excess.itemStyle.color).toBe('#f59e0b')
+    expect(excess.lineStyle).toEqual({ width: 1.5, color: CSS_VARS['--gold'] })
+    expect(excess.itemStyle.color).toBe(CSS_VARS['--gold'])
     // 手算：组合收益% [0,1,-1] − 基准% [0,2,1] = [0,-1,-2]
     expect(excess.data).toEqual([0, -1, -2])
   })
@@ -1569,7 +1600,7 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
     const html = w.html()
     expect(html).toContain('#d6403a')
     expect(html).toContain('#f0a429')
-    expect(html).toContain('#9dc88d')
+    expect(html).toContain('rgba(31, 110, 79, 0.6)')
     expect(html).toContain('#1f6e4f')
   })
 
@@ -1728,6 +1759,32 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
       expect(w.text()).toContain(t)
     }
     expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('披露实际统计窗口：五/六/七/七-B 窗口短于回测区间时给出截断说明', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    // 夹具：meta.n_weeks_labeled=50，实际窗口 3 周 / 2 周 → 四处都应提示被截断
+    expect(w.text()).toContain('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）')
+    expect(w.text()).toContain('实际统计窗口 2024-02-02 ~ 2024-02-09（2 周）')
+    expect(w.text()).toContain('短于回测区间 50 周')
+    // 六/七/七-B 同为 3 周窗口 → 三处都披露
+    const notes = w.findAll('.mr-section .ca-note').map((n) => n.text())
+      .filter((t) => t.includes('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）'))
+    expect(notes.length).toBe(3)
+  })
+
+  it('窗口覆盖整个回测区间时只报窗口、不误报截断', async () => {
+    const full = JSON.parse(JSON.stringify(marketRegimeCompleted))
+    full.data.meta.n_weeks_labeled = 3
+    const w = await mountMr({ ...mockDetail, market_regime: full })
+    await expandMr(w)
+    const notes = w.findAll('.mr-section .ca-note').map((n) => n.text())
+      .filter((t) => t.includes('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）'))
+    expect(notes.length).toBe(3)
+    for (const t of notes) expect(t).not.toContain('短于回测区间')
+    // 五 只有 2 周 < 3 周 → 仍应报截断
+    expect(w.text()).toContain('实际统计窗口 2024-02-02 ~ 2024-02-09（2 周）；短于回测区间 3 周')
   })
 
   it('TR-17.1 新记录：行业归因渲染暴露图/命中率卡片/贡献表', async () => {
