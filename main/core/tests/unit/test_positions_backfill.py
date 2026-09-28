@@ -446,6 +446,28 @@ def test_backfill_record_fails_on_cash_mismatch(db_session):
     assert all(s.positions_json is None for s in rows)
 
 
+def test_backfill_record_tolerates_rounding_drift(db_session):
+    """容差 1.00 容忍 DB 四舍五入累积误差（引擎全精度 vs 重放用 2 位小数）。
+
+    实测 10 条记录 15,022 快照最大累积偏差 0.18；真实错误（漏交易/公式错）
+    偏差达数百上千。0.50 的偏差应通过。
+    """
+    rec, _ps, strat = _seed_record(db_session)
+    _snap(db_session, rec, D1, "10000.00", "0.00")
+    _snap(db_session, rec, D2, "8999.50", "1000.00")   # 预期 9000.00，偏差 0.50
+    _trade(db_session, rec, strat, datetime(2024, 1, 3, 15, 0), "BUY", "10.00",
+           100, "1000.00")
+    db_session.commit()
+
+    def _flat(codes, start, end):
+        return {"000001.SZ": {D2: Decimal("10")}}   # 收盘价=成本 → 无缩放偏离
+
+    out = backfill_record(db_session, rec.id, close_provider=_flat)
+    assert out["cash_check"]["ok"] is True
+    assert out["cash_check"]["mismatches"] == 0
+    assert out["status"] == "ok"
+
+
 def test_backfill_record_missing_record_returns_failed(db_session):
     out = backfill_record(db_session, 9999, close_provider=_close_two_days)
     assert out["status"] == "failed"

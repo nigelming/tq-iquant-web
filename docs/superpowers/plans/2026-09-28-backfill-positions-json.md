@@ -879,7 +879,7 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
     first_mismatch = None
     for s in snaps:
         stored = Decimal(str(s.cash)) - base_cash
-        if abs(stored - (cum[s.snap_date] - first_cum)) > Decimal("0.01"):
+        if abs(stored - (cum[s.snap_date] - first_cum)) > Decimal("1.00"):
             mismatches += 1
             if first_mismatch is None:
                 first_mismatch = s.snap_date.isoformat()
@@ -1378,3 +1378,12 @@ Expected: 每条都不是 `needs_rerun`
   记录（当前库仅 3/4/8/11 有），只会处理 6 条；用户选定「全部 10 条」。
   **修复**：`--all` 与 `--all-including-done` 等价，处理全部记录；`--all-including-done`
   保留为兼容别名。示例统一改用 `--all`。
+
+## 现金容差修正（2026-09-28，Task 5 实施后发现）
+
+- **根因**：DB 中 `commission`/`stamp_duty` 为 `Numeric(10,2)`（2 位小数），引擎用全精度
+  计算现金流流向，重放用四舍五入后的值，每笔累积 ~0.005 误差。实测 10 条记录 15,022 快照
+  最大累积偏差 **0.18**（record 8），远超原设 0.01 容差，导致全部 10 条记录现金校验失败。
+- **修复**：容差从 `0.01` 改为 `1.00`（5.5x 余量）。真实错误（漏交易/公式错）偏差达数百上千，
+  1.00 仍能抓住。已加 `test_backfill_record_tolerates_rounding_drift` 锚定该行为。
+- 设计文档容差说明已同步。

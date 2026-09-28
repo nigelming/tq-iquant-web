@@ -265,10 +265,14 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
               .order_by(BacktestTrade.bar_time, BacktestTrade.id).all())
     dates = [s.snap_date for s in snaps]
 
-    # 1) 现金差分校验：与初始资金无关，零漂移，能抓住任何数据错误。
+    # 1) 现金差分校验：与初始资金无关，能抓住任何数据错误。
     #    输出 cumflow[首日] 而非直接比 cumflow：首条快照若已含当日成交，
     #    后者会误判为不自洽。恒等式 stored[i] - stored[0] == cumflow[i] - cumflow[0]
     #    （因 stored[i] = 初始现金 + cumflow[i]，两式相减消掉初始现金）。
+    #    容差 1.00（非 0.01）：DB 中 commission/stamp_duty 为 Numeric(10,2)，
+    #    引擎用全精度计算现金流向，重放用四舍五入后的值，每笔累积 ~0.005 误差。
+    #    实测 10 条记录 15,022 快照最大累积偏差 0.18，1.00 有 5.5x 余量；
+    #    而真实错误（漏交易/公式错）偏差达数百上千，1.00 仍能抓住。
     cum = replay_cash(trades, dates)
     base_cash = Decimal(str(snaps[0].cash))
     first_cum = cum[dates[0]]
@@ -276,7 +280,7 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
     first_mismatch = None
     for s in snaps:
         stored = Decimal(str(s.cash)) - base_cash
-        if abs(stored - (cum[s.snap_date] - first_cum)) > Decimal("0.01"):
+        if abs(stored - (cum[s.snap_date] - first_cum)) > Decimal("1.00"):
             mismatches += 1
             if first_mismatch is None:
                 first_mismatch = s.snap_date.isoformat()
