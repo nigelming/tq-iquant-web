@@ -545,9 +545,9 @@ def value_positions(detail: List[dict], close: Dict[str, Dict[date, Decimal]],
         qty = slot["quantity"]
         series = close.get(slot["stock_code"]) or {}
         price = series.get(snap_date)
-        if price is None:
+        if price is None or price <= 0:
             carried = _last_price(series, snap_date)
-            if carried is not None:
+            if carried is not None and carried > 0:
                 price = carried
                 notes["carried"] += 1
             else:
@@ -574,7 +574,7 @@ def value_positions(detail: List[dict], close: Dict[str, Dict[date, Decimal]],
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest core/tests/unit/test_positions_backfill.py -q`
-Expected: PASS — `17 passed`
+Expected: PASS — `19 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1329,6 +1329,17 @@ Expected: 每条都不是 `needs_rerun`
 - Task 1 评审发现 `.upper()` 归一化零覆盖：删掉该行 5 个测试全绿。
   已补 `test_replay_cash_accepts_lowercase_trade_type`；实施者用变异测试确认
   「删 `.upper()` → 仅此测试失败」，确认真正锚定了该行为。
+- Task 3 实施修正（2026-09-28）：计划的 `value_positions` **docstring 声明镜像
+  `positions_detail` 的 `price is None or price <= 0 → avg_cost` 兜底，但计划自己的代码只判
+  `is None`**。实施者按 docstring（而非计划代码）实现，复审独立确认正确：
+  - 权威实现 `portfolio.py:450` 与 `:475` 两处都带 `<= 0`；设计文档 `:105-106` 同。
+  - `build_index_close_series`（`backtest_service.py:359`）只用 `_is_nan` 过滤、**不过滤 0**，
+    0 收盘价确实可达。
+  - 危害不止兜底：0 价槽位压低 `raw_sum` → `k` 暴涨。实测 900→2900 用例 `k` 从 `3.33`
+    变 `1.0345`，不加守卫输出 `['3000.00', '0.00']`（一只股票独占 100% 权重）。
+  - 同理把「结转价」也收紧为 `carried > 0`——非正的「最近已知收盘价」不算已知价。
+   - 计划代码块与期望数（`17` → 实际 `19`）已同步。
+
 - Task 2 实施修正（2026-09-28）：`test_replay_positions_sell_is_fifo_and_flattens` 断言
   1/4 剩余 50 股 `sellable_quantity == 0`，与实现的 `available_shares_on` 矛盾。
   计划注释「当日不可卖」是推理失误——该夹具 1/4 **没有买入**，50 股来自 1/3 桶，
@@ -1336,3 +1347,20 @@ Expected: 每条都不是 `needs_rerun`
   （当初写入 `positions_json` 的函数）用的正是同一调用，重建值必须与之一致。
   断言已改为 `== 50` 并订正注释；T+1 反向覆盖仍在其他用例（买入日 0、次日全量）。
   另：Step 4 期望数 `10 passed` 系 Task 1 fix wave 多加 1 个测试所致，实际 `11 passed`。
+
+## Task 4 门禁陷阱（Task 3 评审发现，务必照此实现）
+
+`unscaled` 只在**一条**路径上被置 True，但它并不是「已缩放」的可靠判据。`value_positions` 有三条提前返回：
+
+| 出口 | `k` | `unscaled` |
+|---|---|---|
+| `detail` 为空 | `None` | `False` |
+| `raw_sum <= 0` | `None` | `False` |
+| 无 stored MV | `None` | `True` |
+
+即 `unscaled is False` **不能**推出「已缩放」。Task 4 编排时：
+
+1. 先判 `detail` 是否为空（空仓记录属正常，不拒）。
+2. 再判「有持仓却 `k is None` 且 `unscaled is False`」——这才是 `raw_sum <= 0` 的异常出口，应拒。
+3. `unscaled is True` 单独标识「有持仓但无存量市值」，按设计跳过缩放并告警，不阻断。
+4. 笼统地 `k is None` 就拒，会把正常的空仓记录一起误杀。
