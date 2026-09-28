@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
+import { useTheme } from './composables/useTheme'
 
 const route = useRoute()
+const { theme, toggle: toggleTheme } = useTheme()
 const titles: Record<string, string> = {
   'dashboard': '首页', 'stock-pools': '股票池', 'formulas': '公式管理', 'portfolios': '组合策略',
   'backtest': '回测管理', 'live': '实盘交易', 'system': '系统配置',
@@ -21,6 +23,11 @@ const titles: Record<string, string> = {
         <router-link to="/live" class="nav-item" active-class="active">⚡ 实盘交易</router-link>
         <router-link to="/system" class="nav-item" active-class="active">⚙️ 系统配置</router-link>
       </nav>
+      <div class="sidebar-footer">
+        <button class="nav-item theme-toggle" @click="toggleTheme">
+          <span>{{ theme === 'dark' ? '☀ 浅色' : '☾ 暗色' }}</span>
+        </button>
+      </div>
     </aside>
     <div class="main-container">
       <header class="topbar"><span class="topbar-title">{{ titles[route.name as string] || '创懿量化' }}</span></header>
@@ -28,3 +35,8 @@ const titles: Record<string, string> = {
     </div>
   </div>
 </template>
+
+<style scoped>
+.sidebar-footer{padding:8px;border-top:1px solid var(--line)}
+.theme-toggle{width:100%;justify-content:center}
+</style>
