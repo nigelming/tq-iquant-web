@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { useTheme } from '../composables/useTheme'
+import { useTheme, resetTheme } from '../composables/useTheme'
 
 describe('useTheme', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); resetTheme() })
 
   it('defaults to light when no localStorage', () => {
     const { theme } = useTheme()

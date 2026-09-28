@@ -1,4 +1,4 @@
-import { ref, watch } from 'vue'
+import { ref, watch, type Ref } from 'vue'
 
 type Theme = 'light' | 'dark'
 
@@ -8,16 +8,29 @@ function getInitialTheme(): Theme {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
-export function useTheme() {
-  const theme = ref<Theme>(getInitialTheme())
+let _theme: Ref<Theme> | null = null
 
-  watch(theme, (val) => {
+function createTheme(): Ref<Theme> {
+  const t = ref<Theme>(getInitialTheme())
+  watch(t, (val) => {
     document.documentElement.dataset.theme = val
     localStorage.setItem('theme', val)
   }, { immediate: true, flush: 'sync' })
+  return t
+}
+
+export function useTheme() {
+  if (!_theme) {
+    _theme = createTheme()
+  }
+  const theme = _theme
 
   function toggle() {
     theme.value = theme.value === 'light' ? 'dark' : 'light'
   }
   return { theme, toggle }
+}
+
+export function resetTheme() {
+  _theme = null
 }
