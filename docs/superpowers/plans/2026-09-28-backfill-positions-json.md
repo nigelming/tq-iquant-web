@@ -595,10 +595,14 @@ git commit -m "feat(backfill): value_positions 估值(结转/avg_cost兜底)+按
 - Consumes: `replay_cash`、`replay_positions`、`value_positions`（Task 1-3）、`core.services.backtest_service.build_index_close_series`
 - Produces:
   ```python
-  backfill_record(db, record_id, force=False, close_provider=None) -> dict
+  backfill_record(db, record_id, force=False, close_provider=None, apply=True) -> dict
   ```
   `close_provider(codes: List[str], start: date, end: date) -> Dict[code, Dict[date, Decimal]]`，
   缺省用 `build_index_close_series(codes, start, end, batch_size=32)`。
+
+  **Task 5 修订（2026-09-28）**：新增 `apply: bool = True` 参数。`apply=False` 时完成全部
+  重放/校验/估值计算并返回完整报告，但**跳过 `db.commit()`** 且 `written=False`——这是 CLI
+  dry-run 的实现基础。Task 4 已合并的测试不传 `apply`，取默认 `True`，行为不变。
 
   返回 `{"status": "ok"|"skipped"|"failed", "record_id", "snapshots", "held_codes",
   "missing_price_codes": [...], "cash_check": {"ok", "mismatches", "first_mismatch"},
@@ -986,11 +990,11 @@ git commit -m "feat(backfill): backfill_record 编排层（现金硬校验+缩�
 用法
 ----
     cd main
-    uv run python scripts/backfill_positions_json.py --all-including-done
+    uv run python scripts/backfill_positions_json.py --all
     uv run python scripts/backfill_positions_json.py --record 11
-    uv run python scripts/backfill_positions_json.py --all-including-done --apply
-    uv run python scripts/backfill_positions_json.py --all-including-done --apply --recompute
-    uv run python scripts/backfill_positions_json.py --all-including-done --apply --force
+    uv run python scripts/backfill_positions_json.py --all --apply
+    uv run python scripts/backfill_positions_json.py --all --apply --recompute
+    uv run python scripts/backfill_positions_json.py --all --apply --force
 
 注意：脚本需 import core.*，故自行把 main/ 插入 sys.path（main/scripts/ 下
 其余脚本不 import core.*，无此先例）。取价需通达信客户端在运行。
@@ -1044,12 +1048,9 @@ def _target_ids(db, args):
     q = db.query(BacktestRecord).order_by(BacktestRecord.id)
     if args.record:
         return [r.id for r in q.filter(BacktestRecord.id == args.record).all()]
-    ids = [r.id for r in q.all()]
-    if not args.all_including_done:
-        done = {row.backtest_record_id
-                for row in db.query(BacktestMarketRegimeAnalysis).all()}
-        ids = [i for i in ids if i not in done]
-    return ids
+    # --all 与 --all-including-done 等价：处理全部记录。
+    # 用户选定「全部 10 条」，不再按 market_regime 结果过滤。
+    return [r.id for r in q.all()]
 
 
 def main():
@@ -1057,9 +1058,9 @@ def main():
         description="回填老回测记录的 positions_json（默认 dry-run）")
     p.add_argument("--record", type=int, help="只处理指定记录 id")
     p.add_argument("--all", action="store_true",
-                   help="处理所有尚无市场态分析结果的记录")
+                   help="处理全部记录（含已有市场态结果的）")
     p.add_argument("--all-including-done", action="store_true",
-                   help="处理所有记录（含已有市场态结果的）")
+                   help="（兼容别名，等价于 --all）")
     p.add_argument("--apply", action="store_true",
                    help="真正写库（缺省只打印对账表）")
     p.add_argument("--force", action="store_true",
@@ -1082,7 +1083,7 @@ def main():
         for rid in ids:
             rec = db.get(BacktestRecord, rid)
             _section("record %s  %s ~ %s" % (rid, rec.start_date, rec.end_date))
-            r = backfill_record(db, rid, force=args.force)
+            r = backfill_record(db, rid, force=args.force, apply=args.apply)
             _print_report(r)
             reports.append((rid, r))
 
@@ -1248,7 +1249,7 @@ git commit -m "test(backfill): 回填后行业归因越过 needs_rerun 双门禁
 
 - [ ] **Step 1: 全量 dry-run，人工审阅对账表**
 
-Run: `uv run python scripts/backfill_positions_json.py --all-including-done`
+Run: `uv run python scripts/backfill_positions_json.py --all`
 Expected: 10 条记录全部 `[OK]`，且每条「现金校验 ok=True 不符 0 日」。
 **若任一条现金校验不符，立即停止排查——那说明持仓重放的数量或时序有误，
 绝不能 `--apply`。**
@@ -1259,7 +1260,7 @@ Run: `Copy-Item data/dev.db data/dev.db.bak-before-backfill`
 
 - [ ] **Step 3: 写入并重算**
 
-Run: `uv run python scripts/backfill_positions_json.py --all-including-done --apply --recompute`
+Run: `uv run python scripts/backfill_positions_json.py --all --apply --recompute`
 Expected: 10 条全部写入；重算阶段每条打印 `[OK] record N 市场态重算：completed`
 （需通达信客户端在运行；128 个行业指数取数较慢，可能几十分钟）
 
@@ -1364,3 +1365,16 @@ Expected: 每条都不是 `needs_rerun`
 2. 再判「有持仓却 `k is None` 且 `unscaled is False`」——这才是 `raw_sum <= 0` 的异常出口，应拒。
 3. `unscaled is True` 单独标识「有持仓但无存量市值」，按设计跳过缩放并告警，不阻断。
 4. 笼统地 `k is None` 就拒，会把正常的空仓记录一起误杀。
+
+## Task 5 计划缺陷修正（2026-09-28，实施前修复）
+
+- **缺陷 1（dry-run 写库）**：原计划 CLI 伪代码在 `if not args.apply:` 判断**之前**就调用
+  `backfill_record(db, rid, force=args.force)`，而 `backfill_record` 内部无条件 `db.commit()`。
+  即 dry-run 模式实际会写库，与「默认 dry-run：只打印对账表，不写库」的核心需求直接矛盾。
+  **修复**：给 `backfill_record` 增加 `apply: bool = True` 参数；`apply=False` 时完成全部
+  计算但跳过 `db.commit()` 且 `written=False`。CLI 传 `apply=args.apply`。
+  Task 4 已合并测试不传 `apply`（取默认 `True`），行为不变。
+- **缺陷 2（`--all` 范围）**：原计划 `--all` 过滤掉已有 `BacktestMarketRegimeAnalysis` 结果的
+  记录（当前库仅 3/4/8/11 有），只会处理 6 条；用户选定「全部 10 条」。
+  **修复**：`--all` 与 `--all-including-done` 等价，处理全部记录；`--all-including-done`
+  保留为兼容别名。示例统一改用 `--all`。
