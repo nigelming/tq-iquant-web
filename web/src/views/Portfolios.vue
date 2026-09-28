@@ -400,7 +400,7 @@ onMounted(loadPortfolios)
         <tbody>
           <template v-for="p in portfolios" :key="p.id">
             <tr>
-              <td style="color:#888">#{{ p.id }}</td>
+              <td style="color:var(--ink-soft)">#{{ p.id }}</td>
               <td>
                 <button class="btn btn-sm toggle-expand" @click="toggleExpand(p)">
                   {{ expanded.has(p.id) ? '▼' : '▶' }}

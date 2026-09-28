@@ -58,7 +58,7 @@ onMounted(load)
     <button @click="load" class="btn">刷新</button>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
   </div>
 
@@ -104,7 +104,7 @@ onMounted(load)
           <tbody>
             <tr v-for="r in recentBacktests" :key="r.id">
               <td>{{ r.name }}</td>
-              <td style="color:#888">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
+              <td style="color:var(--ink-soft)">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
               <td>
                 <span v-if="r.status === 'completed'" class="badge badge-green">完成</span>
                 <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>

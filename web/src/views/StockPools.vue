@@ -86,7 +86,7 @@ onMounted(load)
     <button @click="load" class="btn">刷新</button>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
   </div>
 
@@ -97,9 +97,9 @@ onMounted(load)
       <tbody>
         <tr v-for="p in pools" :key="p.code">
           <td>{{ p.name }}</td>
-          <td style="color:#888">{{ p.code }}</td>
+          <td style="color:var(--ink-soft)">{{ p.code }}</td>
           <td>
-            <span v-if="!p.exists_in_tdx" class="badge" style="background:#f0f0f0;color:#888">通达信已删除</span>
+            <span v-if="!p.exists_in_tdx" class="badge" style="background:var(--line);color:var(--ink-soft)">通达信已删除</span>
             <span v-else-if="p.synced" class="badge badge-green">已同步</span>
             <span v-else class="badge badge-gray">未同步</span>
           </td>
@@ -127,7 +127,7 @@ onMounted(load)
           <tbody>
             <tr v-for="s in stocksList" :key="s.stock_code">
               <td>{{ s.stock_code }}</td>
-              <td style="color:#888">{{ s.stock_name || '-' }}</td>
+              <td style="color:var(--ink-soft)">{{ s.stock_name || '-' }}</td>
             </tr>
           </tbody>
         </table>
