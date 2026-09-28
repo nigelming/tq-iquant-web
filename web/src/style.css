@@ -67,7 +67,7 @@ tbody tr:last-child td{border-bottom:none}
 .badge-purple{background:var(--accent-light);color:var(--accent)}
 .btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card-bg);color:var(--ink-soft);cursor:pointer;font-size:13px;transition:all .15s}
 .btn:hover{background:var(--hover-bg);color:var(--ink)}
-.btn-primary{background:var(--accent);color:var(--ink);border-color:var(--accent)}
+.btn-primary{background:var(--accent);color:var(--card-bg);border-color:var(--accent)}
 .btn-primary:hover{background:var(--accent)}
 .btn-sm{padding:4px 10px;font-size:12px}
 .btn-danger{color:var(--red)}.btn-danger:hover{background:rgba(224,101,80,.12);border-color:var(--red)}
