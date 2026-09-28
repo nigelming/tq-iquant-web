@@ -269,10 +269,11 @@ def test_replay_positions_sell_is_fifo_and_flattens():
     out = replay_positions(trades, [date(2024, 1, 3), date(2024, 1, 4),
                                     date(2024, 1, 5)])
     assert out[date(2024, 1, 3)][0]["quantity"] == 200
-    # 150 股卖光 1/2 两桶（各 100），剩 50 股仍来自 1/3 桶 → 当日不可卖
+    # 150 股卖光 1/2 两桶（各 100），剩 50 股仍来自 1/3 桶
+    # → 1/3 相对 1/4 已过 T+1，故可卖 50（与 portfolio.py:488 同一调用）
     held = out[date(2024, 1, 4)][0]
     assert held["quantity"] == 50
-    assert held["sellable_quantity"] == 0
+    assert held["sellable_quantity"] == 50
     assert out[date(2024, 1, 5)] == []
 
 
@@ -385,7 +386,7 @@ def replay_positions(trades, snap_dates: Sequence[date]) -> Dict[date, List[dict
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest core/tests/unit/test_positions_backfill.py -q`
-Expected: PASS — `10 passed`
+Expected: PASS — `11 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1328,3 +1329,10 @@ Expected: 每条都不是 `needs_rerun`
 - Task 1 评审发现 `.upper()` 归一化零覆盖：删掉该行 5 个测试全绿。
   已补 `test_replay_cash_accepts_lowercase_trade_type`；实施者用变异测试确认
   「删 `.upper()` → 仅此测试失败」，确认真正锚定了该行为。
+- Task 2 实施修正（2026-09-28）：`test_replay_positions_sell_is_fifo_and_flattens` 断言
+  1/4 剩余 50 股 `sellable_quantity == 0`，与实现的 `available_shares_on` 矛盾。
+  计划注释「当日不可卖」是推理失误——该夹具 1/4 **没有买入**，50 股来自 1/3 桶，
+  `d < query_date` 判定 1/3 < 1/4 已过 T+1，故为 50。决定性证据：`portfolio.py:488`
+  （当初写入 `positions_json` 的函数）用的正是同一调用，重建值必须与之一致。
+  断言已改为 `== 50` 并订正注释；T+1 反向覆盖仍在其他用例（买入日 0、次日全量）。
+  另：Step 4 期望数 `10 passed` 系 Task 1 fix wave 多加 1 个测试所致，实际 `11 passed`。
