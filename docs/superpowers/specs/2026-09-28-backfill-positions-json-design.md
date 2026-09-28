@@ -121,6 +121,12 @@
 5. **若 `stored_market_value` 为 0 或 NULL**（理论上不该发生——有持仓就有市值）→
    跳过缩放，保留重算值，并把该日计入 `notes` 告警，不阻断。
 6. 返回 `k` 供门限判定与报告。
+7. **落库前把 `market_value` 量化到 2 位小数**（`quantize(Decimal("0.01"))`）。`k` 是
+   无限循环小数（3000/2700），不量化会写出 `999.9999999999999999999999999` 这种值，
+   也与库中 `Numeric(15,2)` 列的精度约定不符。量化后 Σ 与存量市值的残差
+   ≤ 0.005 × 持仓数，对行业权重（÷`total_value`）的影响在 1e-6 量级，可忽略。
+   `cost_value` **不量化**，严格用 `str(avg_cost × quantity)`，与
+   `Portfolio.positions_detail()` 逐字节一致。
 
 **为何缩放是正确而非取巧**：`_daily_industry_weights`
 （`industry_attribution.py:84-103`）用 `market_value / total_value` 算日权重，绝对
