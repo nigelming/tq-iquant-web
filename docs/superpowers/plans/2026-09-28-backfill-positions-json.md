@@ -177,8 +177,11 @@ def _cash_flow(trade) -> Decimal:
 def replay_cash(trades, snap_dates: Sequence[date]) -> Dict[date, Decimal]:
     """重放截至各快照日的累计净现金流。
 
-    与初始资金无关：校验时用 `stored_cash[i] - stored_cash[0] == cumflow[i]`，
-    这样无需知道回测的初始现金，也规避了「首条快照当日是否已含成交」这一未知量。
+    与初始资金无关：校验恒等式为
+    `stored_cash[i] - stored_cash[0] == cumflow[i] - cumflow[0]`
+    （由 cash[i] = 初始现金 + cumflow[i] 两式相减消掉初始现金得到）。
+    必须减 cumflow[0]——直接比 cumflow[i] 隐含「首条快照不含当日成交」，
+    首日有成交时会误判为不自洽。
     快照含当日成交，故对 snap_date D 累加所有 bar_time.date() <= D 的成交。
     """
     flows = sorted(((_trade_day(t), _cash_flow(t)) for t in trades),
@@ -1316,3 +1319,12 @@ Expected: 每条都不是 `needs_rerun`
   `"HOLD"`，并补 `test_replay_cash_accepts_lowercase_trade_type` 固化归一化行为。
 - 数量修正（2026-09-28）：组合快照实为 **15,022** 条（10 条记录），此前文档误写
   13,022。Task 7 Step 4 的期望值已同步。
+- Task 1 评审修正（2026-09-28，commit `a947877`）：`replay_cash` 的**函数体正确但契约说明错**。
+  Task 1 代码块里的 docstring 仍写着旧的 `stored_cash[i]-stored_cash[0] == cumflow[i]`
+  （我最初只改了 Task 4 的编排代码，漏改了 Task 1 代码块内的 docstring），实施者忠实转录。
+  该式仅在 `cumflow[0]==0` 时成立；首条快照当日有成交时恒等式偏一个 `F(0)`，会误判记录不自洽。
+  Task 1 实施报告里给出的反例（BUY 1000.00+5.00 于 01-03、SELL 2000.00-5.00-2.00 于 01-05）
+  实证了这一点。docstring 已同步为 `cash[i]-cash[0] == cumflow[i]-cumflow[0]`。
+- Task 1 评审发现 `.upper()` 归一化零覆盖：删掉该行 5 个测试全绿。
+  已补 `test_replay_cash_accepts_lowercase_trade_type`；实施者用变异测试确认
+  「删 `.upper()` → 仅此测试失败」，确认真正锚定了该行为。
