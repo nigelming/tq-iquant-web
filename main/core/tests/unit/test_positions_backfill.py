@@ -52,6 +52,13 @@ def test_replay_cash_rejects_unknown_trade_type():
         replay_cash(trades, [date(2024, 1, 3)])
 
 
+def test_replay_cash_accepts_lowercase_trade_type():
+    """小写 trade_type 经 .upper() 归一化后正常处理，不抛错。"""
+    trades = [_t(datetime(2024, 1, 3, 10, 0), "buy", "1000.00", "5.00")]
+    out = replay_cash(trades, [date(2024, 1, 3)])
+    assert out[date(2024, 1, 3)] == Decimal("-1005.00")
+
+
 def test_replay_cash_without_trades_is_all_zero():
     out = replay_cash([], [date(2024, 1, 2), date(2024, 1, 3)])
     assert set(out.values()) == {Decimal("0")}

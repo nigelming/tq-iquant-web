@@ -41,8 +41,11 @@ def _cash_flow(trade) -> Decimal:
 def replay_cash(trades, snap_dates: Sequence[date]) -> Dict[date, Decimal]:
     """重放截至各快照日的累计净现金流。
 
-    与初始资金无关：校验时用 `stored_cash[i] - stored_cash[0] == cumflow[i]`，
-    这样无需知道回测的初始现金，也规避了「首条快照当日是否已含成交」这一未知量。
+    与初始资金无关：校验恒等式为
+    `stored_cash[i] - stored_cash[0] == cumflow[i] - cumflow[0]`
+    （由 cash[i] = 初始现金 + cumflow[i] 两式相减消掉初始现金得到）。
+    必须减 cumflow[0]——直接比 cumflow[i] 隐含「首条快照不含当日成交」，
+    首日有成交时会误判为不自洽。
     快照含当日成交，故对 snap_date D 累加所有 bar_time.date() <= D 的成交。
     """
     flows = sorted(((_trade_day(t), _cash_flow(t)) for t in trades),
