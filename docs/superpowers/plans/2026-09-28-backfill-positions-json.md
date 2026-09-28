@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 用成交流水 + 存量市值为 10 条老回测记录的 13,022 条组合快照回填 `positions_json`，让「机遇Alpha · 中性Alpha」栏目第八节（行业归因）从「需重新回测」变为可用。
+**Goal:** 用成交流水 + 存量市值为 10 条老回测记录的 15,022 条组合快照回填 `positions_json`，让「机遇Alpha · 中性Alpha」栏目第八节（行业归因）从「需重新回测」变为可用。
 
 **Architecture:** 新建 `main/core/services/positions_backfill.py`，含 3 个纯函数（`replay_cash` / `replay_positions` / `value_positions`，零 I/O，可离线单测）+ 1 个编排函数 `backfill_record`（唯一做 DB/TQ I/O 的层）。新建 `main/scripts/backfill_positions_json.py` 作为薄 CLI，默认 dry-run。
 
@@ -105,9 +105,18 @@ def test_replay_cash_accumulates_across_days():
 
 
 def test_replay_cash_rejects_unknown_trade_type():
-    trades = [_t(datetime(2024, 1, 3, 10, 0), "buy", "1000.00")]
+    # 用真正未知的类型，而非小写 "buy"——_cash_flow 走 .upper() 归一化，
+    # 小写是合法输入（与 live_engine.py:1139 / live_service.py:461 同策略）。
+    trades = [_t(datetime(2024, 1, 3, 10, 0), "HOLD", "1000.00")]
     with pytest.raises(ValueError):
         replay_cash(trades, [date(2024, 1, 3)])
+
+
+def test_replay_cash_accepts_lowercase_trade_type():
+    """小写 trade_type 经 .upper() 归一化后正常处理，不抛错。"""
+    trades = [_t(datetime(2024, 1, 3, 10, 0), "buy", "1000.00", "5.00")]
+    out = replay_cash(trades, [date(2024, 1, 3)])
+    assert out[date(2024, 1, 3)] == Decimal("-1005.00")
 
 
 def test_replay_cash_without_trades_is_all_zero():
@@ -188,7 +197,7 @@ def replay_cash(trades, snap_dates: Sequence[date]) -> Dict[date, Decimal]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest core/tests/unit/test_positions_backfill.py -q`
-Expected: PASS — `5 passed`
+Expected: PASS — `6 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1231,7 +1240,7 @@ git commit -m "test(backfill): 回填后行业归因越过 needs_rerun 双门禁
 
 **Interfaces:**
 - Consumes: Task 5 的 CLI
-- Produces: 库中 13,022 条组合快照的 `positions_json` + 10 条刷新后的市场态 payload
+- Produces: 库中 15,022 条组合快照的 `positions_json` + 10 条刷新后的市场态 payload
 
 - [ ] **Step 1: 全量 dry-run，人工审阅对账表**
 
@@ -1256,7 +1265,7 @@ Run:
 ```bash
 uv run python -c "import sqlite3;c=sqlite3.connect('data/dev.db');print(c.execute('SELECT COUNT(*), SUM(positions_json IS NOT NULL) FROM backtest_daily_snapshots WHERE target_type=?',('portfolio',)).fetchone())"
 ```
-Expected: 两个数字相等（13,022 / 13,022）
+Expected: 两个数字相等（15,022 / 15,022）
 
 - [ ] **Step 5: 验证行业归因已脱离 needs_rerun**
 
@@ -1296,8 +1305,14 @@ Expected: 每条都不是 `needs_rerun`
 - **现金种子自洽复核**：`test_backfill_record_writes_positions_json` 的 4 天现金序列
   （10000 → 9000 → 7800 → 7800）与两笔成交（1/3 买 1000.00、1/4 买 1200.00）严格自洽，
   且首日 D1 无成交 → 差分校验首日必过。
-- **预检修正（2026-09-28）**：差分校验原写作 `stored[i]-stored[0] == cumflow[i]`，
+- 预检修正（2026-09-28）：差分校验原写作 `stored[i]-stored[0] == cumflow[i]`，
   隐含「首条快照不含当日成交」。实测当前库 10 条记录首日成交数均为 0，前提成立，
   但已改为恒成立的 `cumflow[i] - cumflow[0]`（`cumflow[0]==0` 时两式等价），
   并补 `test_backfill_record_accepts_trade_on_first_snapshot_day` 覆盖该分支。
   Task 6 的夹具同步改为两笔成交 + 相应现金序列，使差分真正考察累积而非恒为 0。
+- Task 1 实施修正（2026-09-28）：`test_replay_cash_rejects_unknown_trade_type` 原本
+  用小写 `"buy"` 期望 `ValueError`，与实现里的 `.upper()` 归一化自相矛盾
+  （小写归一化后是合法输入，与 `live_engine.py:1139` 同策略）。已改为用真正未知的
+  `"HOLD"`，并补 `test_replay_cash_accepts_lowercase_trade_type` 固化归一化行为。
+- 数量修正（2026-09-28）：组合快照实为 **15,022** 条（10 条记录），此前文档误写
+  13,022。Task 7 Step 4 的期望值已同步。
