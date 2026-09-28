@@ -694,7 +694,7 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     expect(danger.exists()).toBe(true)
     expect(danger.text()).toContain('最大回撤')
     // 注意：SFC scoped 样式在 vitest(happy-dom) 不注入，边框色无法经 getComputedStyle 断言；
-    // 颜色改动（positive→#ef4444、danger 保持 #ef4444）由实现步骤的显式 CSS 修改 + 最终构建验证保证。
+    // 颜色改动（positive→var(--red)、danger 保持 var(--red)）由实现步骤的显式 CSS 修改 + 最终构建验证保证。
   })
 })
 
@@ -1598,10 +1598,10 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
   it('四档配色为红/橙/浅绿/深绿（与红涨绿跌一致）', async () => {
     const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
     const html = w.html()
-    expect(html).toContain('#d6403a')
-    expect(html).toContain('#f0a429')
+    expect(html).toContain(CSS_VARS['--red'])
+    expect(html).toContain(CSS_VARS['--gold'])
     expect(html).toContain('rgba(31, 110, 79, 0.6)')
-    expect(html).toContain('#1f6e4f')
+    expect(html).toContain(CSS_VARS['--green'])
   })
 
   it('重算后重新初始化 9 个危机Alpha 图表', async () => {
