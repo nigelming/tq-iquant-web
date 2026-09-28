@@ -59,3 +59,70 @@ def replay_cash(trades, snap_dates: Sequence[date]) -> Dict[date, Decimal]:
             i += 1
         out[d] = total
     return out
+
+
+def _to_trade_event(trade) -> TradeEvent:
+    """ORM 行 / SimpleNamespace → 引擎 TradeEvent（Position.apply_trade 的入参）。"""
+    return TradeEvent(
+        strategy_id=trade.strategy_id, portfolio_id=0,
+        stock_code=trade.stock_code,
+        trade_type=TradeType(str(trade.trade_type).upper()),
+        price=Decimal(str(trade.price)), quantity=trade.quantity,
+        amount=Decimal(str(trade.amount)),
+        commission=Decimal(str(trade.commission)),
+        stamp_duty=Decimal(str(trade.stamp_duty)),
+        trade_time=trade.bar_time, signal_type=None,
+    )
+
+
+def _aggregate(positions: Dict[Tuple[int, str], Position],
+               snap_date: date) -> List[dict]:
+    """策略层持仓 → 组合层按 stock_code 聚合，输出 positions_detail 同构结构。
+
+    刻意复用引擎 Position.available_shares_on，使 T+1 分桶与 FIFO 扣减语义
+    与原始回测 100% 一致，不重写一套（重写必然随引擎演进而漂移）。
+    """
+    agg: Dict[str, dict] = {}
+    for pos in positions.values():
+        if pos.quantity == 0:
+            continue
+        slot = agg.setdefault(pos.stock_code, {
+            "stock_code": pos.stock_code, "quantity": 0,
+            "sellable_quantity": 0, "cost_value": Decimal("0"),
+        })
+        slot["quantity"] += pos.quantity
+        slot["sellable_quantity"] += pos.available_shares_on(snap_date)
+        slot["cost_value"] += pos.avg_cost * pos.quantity
+    return [
+        {"stock_code": agg[code]["stock_code"],
+         "quantity": agg[code]["quantity"],
+         "sellable_quantity": agg[code]["sellable_quantity"],
+         "market_value": "0",
+         "cost_value": str(agg[code]["cost_value"])}
+        for code in sorted(agg)
+    ]
+
+
+def replay_positions(trades, snap_dates: Sequence[date]) -> Dict[date, List[dict]]:
+    """按 (strategy_id, stock_code) 重放持仓，返回 {snap_date: 持仓明细列表}。
+
+    持仓按策略分桶（与引擎一致：策略层持仓独立于组合层），组合层再聚合。
+    快照含当日成交，故对 snap_date D 先应用 bar_time.date() <= D 的全部成交。
+    market_value 恒为 "0"——本函数无价格输入，由 value_positions 填充。
+    """
+    positions: Dict[Tuple[int, str], Position] = {}
+    for t in trades:
+        positions.setdefault((t.strategy_id, t.stock_code),
+                             Position(t.stock_code))
+    ordered = sorted(trades,
+                     key=lambda t: (t.bar_time, getattr(t, "id", 0) or 0))
+    out: Dict[date, List[dict]] = {}
+    i = 0
+    for d in sorted(snap_dates):
+        while i < len(ordered) and _trade_day(ordered[i]) <= d:
+            t = ordered[i]
+            positions[(t.strategy_id, t.stock_code)].apply_trade(
+                _to_trade_event(t))
+            i += 1
+        out[d] = _aggregate(positions, d)
+    return out
