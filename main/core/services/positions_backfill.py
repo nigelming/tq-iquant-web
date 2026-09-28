@@ -226,12 +226,15 @@ def _default_close_provider(codes: List[str], start: date, end: date):
 
 
 def backfill_record(db: Session, record_id: int, force: bool = False,
-                    close_provider=None) -> dict:
+                    close_provider=None, apply: bool = True) -> dict:
     """回填一条记录的组合快照 positions_json。返回结果 dict（绝不抛异常）。
 
     流程：读组合快照 + 成交 → 现金差分校验 → 重放持仓（无 I/O）→ 按实际
     持仓过的代码取日线收盘价 → 逐日估值+缩放 → 门限判定 → 单次 commit 写入。
     任一步失败则一行不写（原子性），返回 status=failed/skipped 及原因。
+
+    apply=False 时完成全部计算但跳过 db.commit()，返回 written=False。
+    用于 CLI dry-run 模式——只打印对账表，不写库。
 
     门限：
     - 现金硬门限：重放累计现金流与存量 cash 列对不上（容差 0.01）→ 整条失败。
@@ -340,8 +343,11 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
         return report
 
     # 4) 单次 commit：不允许部分写入
+    # apply=False 时跳过写库（dry-run 模式），但仍设置 ORM 属性以便调用方
+    # 检查结果；这些未提交的修改会在 session 关闭时自动回滚。
     for s, payload in zip(snaps, payloads):
         s.positions_json = payload
-    db.commit()
-    report["written"] = True
+    if apply:
+        db.commit()
+        report["written"] = True
     return report
