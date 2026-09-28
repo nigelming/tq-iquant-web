@@ -126,3 +126,69 @@ def replay_positions(trades, snap_dates: Sequence[date]) -> Dict[date, List[dict
             i += 1
         out[d] = _aggregate(positions, d)
     return out
+
+
+_CENT = Decimal("0.01")
+
+
+def _last_price(series: Dict[date, Decimal], snap_date: date):
+    """该股在 snap_date（含）之前的最近一个已知收盘价；无则 None。"""
+    best = None
+    for d in series:
+        if d <= snap_date and (best is None or d > best):
+            best = d
+    return None if best is None else series[best]
+
+
+def value_positions(detail: List[dict], close: Dict[str, Dict[date, Decimal]],
+                    snap_date: date,
+                    stored_market_value) -> Tuple[List[dict], dict]:
+    """给持仓明细填 market_value，返回 (新明细, notes)。不改入参。
+
+    缺价策略：当天无 bar → 结转该股最近一个已知价；该股全程无价 → 回退
+    avg_cost(=cost_value/quantity)，与 Portfolio.positions_detail 处
+    `price is None or price <= 0 → price = pos.avg_cost` 口径一致。
+    非正收盘价同样算缺价：行情源对停牌股会给出 0 占位，若当成真价，该槽市值为 0
+    会压小 raw_sum、连带把其余持仓的 k 放大。
+    缩放：事后取到的是今日前复权价，与回测当时存在除权漂移。若直接写入，
+    行业权重（market_value/total_value）之和会偏离 1。按 stored_market_value
+    缩放，Σ 市值精确回到回测自身存量市值，权重之和为 100%。
+    k 是无限循环小数，故落库前量化到分——与库中 Numeric(15,2) 列一致。
+    cost_value 不缩放：它没有对应的存量真值，且不参与行业归因。
+    """
+    notes = {"carried": 0, "cost_fallback": 0, "no_price": [],
+             "k": None, "unscaled": False}
+    if not detail:
+        return [], notes
+    out: List[dict] = []
+    raw_sum = Decimal("0")
+    for slot in detail:
+        qty = slot["quantity"]
+        series = close.get(slot["stock_code"]) or {}
+        price = series.get(snap_date)
+        if price is None or price <= 0:
+            carried = _last_price(series, snap_date)
+            if carried is not None and carried <= 0:
+                carried = None
+            if carried is not None:
+                price = carried
+                notes["carried"] += 1
+            else:
+                price = ((Decimal(slot["cost_value"]) / qty) if qty
+                         else Decimal("0"))
+                notes["cost_fallback"] += 1
+                if not series:
+                    notes["no_price"].append(slot["stock_code"])
+        market_value = price * qty
+        raw_sum += market_value
+        out.append(dict(slot, market_value=str(market_value.quantize(_CENT))))
+    if raw_sum <= 0:
+        return out, notes
+    if not stored_market_value:
+        # 有持仓却无存量市值：跳过缩放并告警，不阻断
+        notes["unscaled"] = True
+        return out, notes
+    k = Decimal(str(stored_market_value)) / raw_sum
+    notes["k"] = k
+    return [dict(s, market_value=str((Decimal(s["market_value"]) * k)
+                                    .quantize(_CENT))) for s in out], notes

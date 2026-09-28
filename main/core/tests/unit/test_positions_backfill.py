@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.services.positions_backfill import replay_cash, replay_positions
+from core.services.positions_backfill import (replay_cash, replay_positions,
+                                             value_positions)
 
 
 def _t(bar_time, trade_type, amount, commission="0.00", stamp_duty="0.00",
@@ -137,3 +138,94 @@ def test_replay_positions_sorted_by_code_and_empty_before_first_trade():
     assert out[date(2024, 1, 2)] == []
     assert [s["stock_code"] for s in out[date(2024, 1, 3)]] == [
         "000001.SZ", "600000.SH"]
+
+
+def _slot(code="000001.SZ", qty=100, sellable=100, cost="1000.00"):
+    return {"stock_code": code, "quantity": qty, "sellable_quantity": sellable,
+            "market_value": "0", "cost_value": cost}
+
+
+def test_value_positions_uses_exact_date_price():
+    d = date(2024, 1, 3)
+    out, notes = value_positions(
+        [_slot()], {"000001.SZ": {d: Decimal("10")}}, d, Decimal("1000"))
+    assert out[0]["market_value"] == "1000.00"   # 量化到 2 位
+    assert notes["carried"] == 0
+    assert notes["cost_fallback"] == 0
+    assert notes["k"] == Decimal("1")
+    assert notes["unscaled"] is False
+
+
+def test_value_positions_carries_forward_last_price():
+    """停牌/缺 bar → 结转该股最近一个已知收盘价。"""
+    d = date(2024, 1, 4)
+    out, notes = value_positions(
+        [_slot()],
+        {"000001.SZ": {date(2024, 1, 2): Decimal("10"),
+                       date(2024, 1, 3): Decimal("11")}},
+        d, Decimal("1100"))
+    assert out[0]["market_value"] == "1100.00"   # 结转 1/3 的 11 × 100
+    assert notes["carried"] == 1
+    assert notes["k"] == Decimal("1")
+
+
+def test_value_positions_falls_back_to_avg_cost_when_no_price_at_all():
+    """该股全程无价 → 用 avg_cost(=cost_value/quantity) 兜底，与 positions_detail 一致。"""
+    d = date(2024, 1, 3)
+    out, notes = value_positions([_slot()], {}, d, Decimal("1000"))
+    assert out[0]["market_value"] == "1000.00"
+    assert notes["cost_fallback"] == 1
+    assert notes["no_price"] == ["000001.SZ"]
+
+
+def test_value_positions_scales_to_stored_market_value():
+    """事后前复权价有除权漂移 → 缩放到快照存量市值，使行业权重之和为 100%。"""
+    d = date(2024, 1, 3)
+    detail = [_slot("000001.SZ", 100, cost="1000.00"),
+              _slot("600000.SH", 100, cost="2000.00")]
+    close = {"000001.SZ": {d: Decimal("9")}, "600000.SH": {d: Decimal("18")}}
+    out, notes = value_positions(detail, close, d, Decimal("3000"))
+    # 重算 raw = 900 + 1800 = 2700 → k = 3000/2700（无限循环小数）
+    assert notes["k"] == Decimal("3000") / Decimal("2700")
+    # 量化到 2 位后恰好回到存量市值
+    assert [s["market_value"] for s in out] == ["1000.00", "2000.00"]
+    assert sum(Decimal(s["market_value"]) for s in out) == Decimal("3000.00")
+
+
+def test_value_positions_does_not_scale_when_stored_missing():
+    d = date(2024, 1, 3)
+    out, notes = value_positions(
+        [_slot()], {"000001.SZ": {d: Decimal("10")}}, d, None)
+    assert out[0]["market_value"] == "1000.00"
+    assert notes["k"] is None
+    assert notes["unscaled"] is True
+
+
+def test_value_positions_does_not_mutate_input():
+    d = date(2024, 1, 3)
+    detail = [_slot()]
+    value_positions(detail, {"000001.SZ": {d: Decimal("10")}}, d,
+                    Decimal("1000"))
+    assert detail[0]["market_value"] == "0"
+
+
+def test_value_positions_empty_detail_is_noop():
+    d = date(2024, 1, 3)
+    out, notes = value_positions([], {}, d, Decimal("0"))
+    assert out == []
+    assert notes["k"] is None
+    assert notes["carried"] == 0
+
+
+def test_value_positions_treats_nonpositive_close_as_missing():
+    """行情源给出 0 收盘价（停牌占位）时按无价处理，回退 avg_cost。
+
+    与 `positions_detail()` 的 `price is None or price <= 0 → pos.avg_cost` 口径一致
+    （`portfolio.py:475`）；否则该槽市值为 0，会把 raw_sum 压小、连带放大其余持仓的 k。
+    """
+    d = date(2024, 1, 3)
+    out, notes = value_positions(
+        [_slot()], {"000001.SZ": {d: Decimal("0")}}, d, Decimal("1000"))
+    assert out[0]["market_value"] == "1000.00"
+    assert notes["cost_fallback"] == 1
+    assert notes["no_price"] == []      # 序列存在，只是当日价不可用
