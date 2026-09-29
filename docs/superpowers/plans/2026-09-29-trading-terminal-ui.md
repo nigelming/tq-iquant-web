@@ -818,7 +818,7 @@ describe('Backtest.vue — 饼图描边色走 --chart-bg token', () => {
   })
 
   it('浅色 :root 中 --chart-bg 与 --card-bg 同值（描边在浅底上可见）', () => {
-    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf-8')
+    const css = readFileSync('src/style.css', 'utf-8')
     const root = css.match(/:root\s*\{([\s\S]*?)\n\}/)![1]
     const pick = (n: string) => root.match(new RegExp(`${n}:\\s*([^;]+);`))![1].trim()
     expect(pick('--chart-bg')).toBe(pick('--card-bg'))
