@@ -2014,7 +2014,7 @@ function initMonthlyHeatChart() {
       // A 股红涨绿跌：负收益（min）绿 → 零（中）黄 → 正收益（max）红
       inRange: { color: [cssVar('--green'), hexToRgba(cssVar('--gold'), 0.3), cssVar('--red')] },
       text: ['+', '-'],
-      textStyle: { fontSize: 11 },
+      textStyle: { fontSize: 11, color: cssVar('--ink-soft') },
     },
     series: [{
       type: 'heatmap', data,
@@ -2025,6 +2025,7 @@ function initMonthlyHeatChart() {
           return text[ri]?.[ci] || ''
         },
         fontSize: 10,
+        color: cssVar('--ink-soft'),
       },
       emphasis: { itemStyle: { shadowBlur: 6, shadowColor: cssVar('--overlay') } },
     }],
