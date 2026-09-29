@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { useTheme } from '../composables/useTheme'
 
-const { CSS_VARS, stubGetComputedStyle } = vi.hoisted(() => {
+const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
   const CSS_VARS: Record<string, string> = {
     '--red': '#d6403a',
     '--green': '#1f6e4f',
@@ -14,6 +15,16 @@ const { CSS_VARS, stubGetComputedStyle } = vi.hoisted(() => {
     '--card-bg': '#ffffff',
     '--accent': '#667eea',
     '--accent-light': '#dbeafe',
+    '--score-1': '#c0392b',
+    '--score-2': '#c85a10',
+    '--score-3': '#8a7408',
+    '--score-4': '#2c7a4b',
+    '--score-5': '#14532d',
+    '--overlay': 'rgba(11,11,11,.4)',
+  }
+
+  const SCORE_TIER_OF: Record<string, string> = {
+    '#c0392b': '卓越', '#c85a10': '优秀', '#8a7408': '良好', '#2c7a4b': '尚可', '#14532d': '偏弱',
   }
 
   function stubGetComputedStyle() {
@@ -28,7 +39,7 @@ const { CSS_VARS, stubGetComputedStyle } = vi.hoisted(() => {
 
   stubGetComputedStyle()
 
-  return { CSS_VARS, stubGetComputedStyle }
+  return { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle }
 })
 
 vi.mock('../api', () => ({
@@ -478,6 +489,7 @@ describe('Backtest.vue — 收益分布 A 股红涨绿跌配色', () => {
     const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
     const heat = options.find((o: any) => o.series?.[0]?.type === 'heatmap')
     expect(heat).toBeTruthy()
+    expect(heat.series[0].emphasis.itemStyle.shadowColor).toBe(CSS_VARS['--overlay'])
     const colors = heat.visualMap?.inRange?.color
     expect(colors).toHaveLength(3)
     // A 股惯例：涨（正值）红、跌（负值）绿 → 渐变序列负端绿、正端红
@@ -825,9 +837,9 @@ const crisisAlphaCompleted = {
       total_score: 72.3,
       rating: '优秀',
       dimensions: [
-        { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 78.7, 评级: '优秀', 贡献: 15.7 },
-        { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 65.0, 评级: '一般', 贡献: 9.8 },
-        { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 85.0, 评级: '卓越', 贡献: 10.2 },
+        { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 92.0, 评级: '卓越', 贡献: 15.7 },
+        { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 65.0, 评级: '尚可', 贡献: 9.8 },
+        { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 85.0, 评级: '优秀', 贡献: 10.2 },
       ],
     },
     weekly_detail: [
@@ -1602,6 +1614,121 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
     expect(html).toContain(CSS_VARS['--gold'])
     expect(html).toContain('rgba(31, 110, 79, 0.6)')
     expect(html).toContain(CSS_VARS['--green'])
+  })
+
+  it('三：四档饼图中心数字与标签按饼心居中（title 锚点=series.center，非 graphic left）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const pie = options.find((o: any) => o.series?.[0]?.type === 'pie')
+    expect(pie).toBeTruthy()
+    const pieCenter = pie.series[0].center
+    const titles = pie.title as any[]
+    expect(titles).toHaveLength(2)
+    expect(titles[0].text).toMatch(/%$/)
+    expect(titles[1].text).toBe('危机Alpha')
+    for (const t of titles) {
+      expect(t.left).toBe(pieCenter[0])
+      expect(t.textAlign).toBe('center')
+      expect(t.textVerticalAlign).toBe('middle')
+      expect(t.padding).toBe(0)
+    }
+    expect(pie.graphic).toBeUndefined()
+  })
+
+  const fiveTierCrisis = {
+    ...crisisAlphaCompleted,
+    data: {
+      ...crisisAlphaCompleted.data,
+      score: {
+        ...crisisAlphaCompleted.data.score,
+        dimensions: [
+          { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 92.0, 评级: '卓越', 贡献: 18.4 },
+          { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 85.0, 评级: '优秀', 贡献: 12.8 },
+          { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 75.0, 评级: '良好', 贡献: 9.0 },
+          { 维度: '回撤独立性', 类型: '对冲', 权重: 0.12, 得分: 65.0, 评级: '尚可', 贡献: 7.8 },
+          { 维度: '极端事件保护', 类型: '核心', 权重: 0.1, 得分: 55.0, 评级: '偏弱', 贡献: 5.5 },
+        ],
+      },
+    },
+  }
+
+  it('十一：评分图条块按五档评级取鲜艳色（--score-1..5，非灰）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: fiveTierCrisis })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dim = options.find((o: any) => o.yAxis?.type === 'category' && Array.isArray(o.yAxis.data)
+      && o.yAxis.data.includes('回撤独立性'))
+    expect(dim).toBeTruthy()
+    const colors = dim.series[0].data.map((d: any) => d.itemStyle.color)
+    const tiers = ['卓越', '优秀', '良好', '尚可', '偏弱']
+    const scoreValues = tiers.map((_, i) => CSS_VARS[`--score-${i + 1}`])
+    expect(colors.length).toBe(5)
+    expect(colors.every((c: string) => scoreValues.includes(c))).toBe(true)
+    expect(colors).not.toContain(CSS_VARS['--ink-faint'])
+    expect(colors).not.toContain(CSS_VARS['--gold'])
+    expect(new Set(colors).size).toBe(5)
+  })
+
+  it('五档评级全覆盖：卓越/优秀/良好/尚可/偏弱 各自映射唯一 --score-N', async () => {
+    const expected = ['卓越', '优秀', '良好', '尚可', '偏弱']
+    expected.forEach((rating, i) => {
+      expect(SCORE_TIER_OF[CSS_VARS[`--score-${i + 1}`]]).toBe(rating)
+    })
+  })
+
+  it('全部图表实例在卸载时 dispose（22 个，无泄漏）', async () => {
+    const { init } = await import('echarts')
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const before = (init as any).mock.results.length
+    expect(before).toBeGreaterThan(0)
+    const instances = (init as any).mock.results.map((r: any) => r.value)
+    w.unmount()
+    const alive = instances.filter((c: any) => c.dispose.mock.calls.length === 0)
+    expect(alive).toHaveLength(0)
+  })
+
+  it('切换主题后图表颜色跟着变（reactive 常量不再冻结在首次主题）', async () => {
+    const { init } = await import('echarts')
+    const { theme: themeRef } = useTheme()
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: fiveTierCrisis })
+    const dimOf = () => {
+      const options = (init as any).mock.results
+        .map((r: any) => r.value.setOption.mock.calls[0]?.[0])
+        .filter(Boolean)
+      return [...options].reverse().find((o: any) => o.yAxis?.type === 'category'
+        && Array.isArray(o.yAxis.data) && o.yAxis.data.includes('回撤独立性'))
+    }
+    const lightColors = dimOf().series[0].data.map((d: any) => d.itemStyle.color)
+    CSS_VARS['--score-1'] = '#ff0000'
+    CSS_VARS['--ink-soft'] = '#00ff00'
+    ;(w.vm as any).$forceUpdate?.()
+    themeRef.value = themeRef.value === 'light' ? 'dark' : 'light'
+    await new Promise((r) => setTimeout(r, 200))
+    await flushPromises()
+    const darkColors = dimOf().series[0].data.map((d: any) => d.itemStyle.color)
+    expect(darkColors).toContain('#ff0000')
+    expect(darkColors).not.toEqual(lightColors)
+    CSS_VARS['--score-1'] = '#c0392b'
+    CSS_VARS['--ink-soft'] = '#6b7280'
+  })
+
+  it('图表根级文字色/坐标轴/图例随主题注入（不落回 ECharts 浅色默认）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    expect(options.length).toBeGreaterThan(0)
+    for (const o of options) {
+      expect(o.textStyle.color).toBe(CSS_VARS['--ink-soft'])
+      for (const ax of ['xAxis', 'yAxis']) {
+        if (!o[ax]) continue
+        for (const inst of ([] as any[]).concat(o[ax])) {
+          if (inst.axisLabel) expect(inst.axisLabel.color).toBe(CSS_VARS['--ink-soft'])
+          if (inst.splitLine) expect(inst.splitLine.lineStyle.color).toBe(CSS_VARS['--line'])
+        }
+      }
+      if (o.legend && o.legend.textStyle) expect(o.legend.textStyle.color).toBe(CSS_VARS['--ink-soft'])
+    }
   })
 
   it('重算后重新初始化 9 个危机Alpha 图表', async () => {

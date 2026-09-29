@@ -64,12 +64,19 @@ def _classify_crisis(b_values, s_values) -> List[str]:
     return labels
 
 
+SCORE_RATINGS = ("卓越", "优秀", "良好", "尚可", "偏弱")
+
+
 def _rating(score: float) -> str:
-    if score >= 85:
+    if score >= 90:
         return "卓越"
-    if score >= 70:
+    if score >= 80:
         return "优秀"
-    return "一般"
+    if score >= 70:
+        return "良好"
+    if score >= 60:
+        return "尚可"
+    return "偏弱"
 
 
 def alpha_rating(ratio: float) -> str:

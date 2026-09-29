@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
@@ -31,6 +31,60 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 const { theme } = useTheme()
+
+function deepMerge<T>(base: T, over: unknown): T {
+  if (over === undefined) return base
+  if (Array.isArray(over) || over === null || typeof over !== 'object') return over as T
+  const out: Record<string, unknown> = Array.isArray(base)
+    ? ([...(base as unknown[])] as unknown as Record<string, unknown>)
+    : { ...(base as Record<string, unknown>) }
+  for (const [k, v] of Object.entries(over as Record<string, unknown>)) {
+    const b = out[k]
+    out[k] = (b !== null && typeof b === 'object' && !Array.isArray(b)) ? deepMerge(b, v) : v
+  }
+  return out as T
+}
+
+function chartBase(): Record<string, unknown> {
+  return {
+    textStyle: { color: cssVar('--ink-soft') },
+    legend: { textStyle: { color: cssVar('--ink-soft') } },
+    xAxis: { axisLabel: { color: cssVar('--ink-soft') }, axisLine: { lineStyle: { color: cssVar('--line') } }, splitLine: { lineStyle: { color: cssVar('--line') } }, nameTextStyle: { color: cssVar('--ink-soft') } },
+    yAxis: { axisLabel: { color: cssVar('--ink-soft') }, axisLine: { lineStyle: { color: cssVar('--line') } }, splitLine: { lineStyle: { color: cssVar('--line') } }, nameTextStyle: { color: cssVar('--ink-soft') } },
+  }
+}
+
+function applyBase(option: Record<string, unknown>): Record<string, unknown> {
+  const base: Record<string, unknown> = chartBase()
+  const out: Record<string, unknown> = {
+    ...option,
+    textStyle: deepMerge(base.textStyle, option.textStyle),
+  }
+  for (const key of ['legend', 'xAxis', 'yAxis']) {
+    if (out[key] === undefined) continue
+    out[key] = deepMerge(base[key], out[key])
+  }
+  return out
+}
+
+function setThemed(chart: echarts.ECharts | null, option: Record<string, unknown>) {
+  chart?.setOption(applyBase(option))
+}
+
+function refreshThemeColors() {
+  Object.assign(CRISIS_COLORS, crisisColors())
+  SCORE_RATINGS.forEach((r) => { CRISIS_SCORE_COLORS[r] = scoreColor(r) })
+  MR_STATE_COLORS.bull = cssVar('--red')
+  MR_STATE_COLORS.bear = cssVar('--green')
+  MR_STATE_COLORS.range = cssVar('--ink-soft')
+  MR_STATE_COLORS.rebound = cssVar('--gold')
+  STYLE_COLORS['大盘价值'] = cssVar('--blue')
+  STYLE_COLORS['中小盘'] = cssVar('--green')
+  STYLE_COLORS['科技成长'] = cssVar('--red')
+  STYLE_COLORS['普涨'] = cssVar('--gold')
+  STYLE_COLORS['普跌'] = cssVar('--ink-soft')
+  STYLE_COLORS['无主线'] = cssVar('--ink-faint')
+}
 
 // ===== 列表 =====
 const records = ref<BacktestRecordItem[]>([])
@@ -69,12 +123,20 @@ const recomputeMsg = ref('')
 const recomputeWarn = ref(false)
 const recomputeMsgClass = computed(() => (recomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
-const CRISIS_COLORS: Record<string, string> = {
-  逆势上涨: cssVar('--red'), 跌得少: cssVar('--gold'), 跟着跌: hexToRgba(cssVar('--green'), 0.6), 跌更多: cssVar('--green'),
+function crisisColors(): Record<string, string> {
+  return {
+    逆势上涨: cssVar('--red'), 跌得少: cssVar('--gold'), 跟着跌: hexToRgba(cssVar('--green'), 0.6), 跌更多: cssVar('--green'),
+  }
 }
-const CRISIS_SCORE_COLORS: Record<string, string> = {
-  卓越: cssVar('--red'), 优秀: cssVar('--gold'), 一般: cssVar('--ink-faint'),
+const CRISIS_COLORS: Record<string, string> = reactive(crisisColors())
+const SCORE_RATINGS = ['卓越', '优秀', '良好', '尚可', '偏弱']
+const scoreColor = (rating: string): string => {
+  const i = SCORE_RATINGS.indexOf(rating)
+  return cssVar(`--score-${i >= 0 ? i + 1 : 5}`)
 }
+const CRISIS_SCORE_COLORS: Record<string, string> = reactive(
+  Object.fromEntries(SCORE_RATINGS.map((r) => [r, scoreColor(r)]))
+)
 const CRISIS_CATS = ['逆势上涨', '跌得少', '跟着跌', '跌更多']
 const MONTH_STATES = ['大涨', '小涨', '小跌', '大跌']
 
@@ -387,7 +449,7 @@ const caDimSeries = computed(() => {
     types: sorted.map((x) => x.类型),
     values: sorted.map((x) => Math.max(x.得分, 3)),
     raw: sorted.map((x) => x.得分),
-    colors: sorted.map((x) => CRISIS_SCORE_COLORS[x.评级] || cssVar('--ink-faint')),
+    colors: sorted.map((x) => CRISIS_SCORE_COLORS[x.评级] || scoreColor(x.评级)),
   }
 })
 
@@ -474,7 +536,7 @@ function initCaNavChart() {
         data: nav.shade_spans.map(([s, e]) => [{ xAxis: s }, { xAxis: e }]),
       }]
     : undefined
-  caNavChart.setOption({
+  setThemed(caNavChart, {
     tooltip: { trigger: 'axis' },
     legend: { data: [d.strategy_name, d.benchmark_name], bottom: 0 },
     grid: { left: 56, right: 24, bottom: 34, top: 40, containLabel: true },
@@ -514,7 +576,8 @@ function initCaPieChart() {
   names.forEach((nm, i) => {
     pctByName[nm] = `${((p.values[i] / total) * 100).toFixed(1)}%`
   })
-  caPieChart.setOption({
+  const center: [string, string] = ['30%', '50%']
+  setThemed(caPieChart, {
     tooltip: { trigger: 'item', formatter: '{b}: {c}周' },
     legend: {
       orient: 'vertical', right: 12, top: 'center',
@@ -525,7 +588,7 @@ function initCaPieChart() {
     series: [{
       type: 'pie',
       radius: ['48%', '80%'],
-      center: ['30%', '50%'],
+      center,
       sort: false,
       itemStyle: { borderColor: cssVar('--card-bg'), borderWidth: 2 },
       label: { show: false },
@@ -534,11 +597,17 @@ function initCaPieChart() {
         name: nm, value: p.values[i], itemStyle: { color: p.colors[i] },
       })),
     }],
-    graphic: [
-      { type: 'text', left: '30%', top: '38%',
-        style: { text: `${p.alpha}%`, fontSize: 30, fontWeight: 800, fill: cssVar('--red'), textAlign: 'center' } },
-      { type: 'text', left: '30%', top: '56%',
-        style: { text: '危机Alpha', fontSize: 13, fill: cssVar('--ink'), textAlign: 'center' } },
+    title: [
+      {
+        text: `${p.alpha}%`, left: center[0], top: '38%',
+        textAlign: 'center', textVerticalAlign: 'middle', padding: 0,
+        textStyle: { fontSize: 30, fontWeight: 800, color: cssVar('--red') },
+      },
+      {
+        text: '危机Alpha', left: center[0], top: '56%',
+        textAlign: 'center', textVerticalAlign: 'middle', padding: 0,
+        textStyle: { fontSize: 13, color: cssVar('--ink') },
+      },
     ],
   })
 }
@@ -548,7 +617,7 @@ function initCaTopChart() {
   const t = caTop.value
   caTopChart?.dispose()
   caTopChart = echarts.init(caTopEl.value)
-  caTopChart.setOption({
+  setThemed(caTopChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { data: ['基准周收益', '策略周收益'], top: 0 },
     grid: { left: 52, right: 24, bottom: 40, top: 40, containLabel: true },
@@ -577,7 +646,7 @@ function initCaScatterChart() {
   const shortName = ca.value && ca.value.strategy_name.length > 7
     ? `${ca.value.strategy_name.slice(0, 7)}…`
     : (ca.value?.strategy_name || '')
-  caScatterChart.setOption({
+  setThemed(caScatterChart, {
     tooltip: {
       trigger: 'item',
       formatter: (x: any) => `${x.seriesName}<br/>基准周收益 ${x.value[0]}%<br/>策略周收益 ${x.value[1]}%`,
@@ -628,7 +697,7 @@ function initCaMultiChart() {
   const m = caMultiSeries.value
   caMultiChart?.dispose()
   caMultiChart = echarts.init(caMultiEl.value)
-  caMultiChart.setOption({
+  setThemed(caMultiChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 52, right: 24, bottom: 60, top: 30, containLabel: true },
     xAxis: { type: 'category', data: m.labels, axisLabel: { rotate: 20, fontSize: 11 } },
@@ -651,7 +720,7 @@ function initCaMonthChart() {
   const m = caMonthSeries.value
   caMonthChart?.dispose()
   caMonthChart = echarts.init(caMonthEl.value)
-  caMonthChart.setOption({
+  setThemed(caMonthChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { data: ['基准月均', '策略月均'], top: 0 },
     grid: { left: 52, right: 24, bottom: 40, top: 40, containLabel: true },
@@ -676,7 +745,7 @@ function initCaCorrChart() {
   const c = caCorrRows.value
   caCorrChart?.dispose()
   caCorrChart = echarts.init(caCorrEl.value)
-  caCorrChart.setOption({
+  setThemed(caCorrChart, {
     tooltip: { trigger: 'axis' },
     legend: { data: ['扩展窗口相关（不足52周）', '滚动52周相关'], top: 0 },
     grid: { left: 52, right: 24, bottom: 36, top: 40, containLabel: true },
@@ -701,7 +770,7 @@ function initCaAnnualChart() {
   const a = caAnnualSeries.value
   caAnnualChart?.dispose()
   caAnnualChart = echarts.init(caAnnualEl.value)
-  caAnnualChart.setOption({
+  setThemed(caAnnualChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 52, right: 24, bottom: 30, top: 30, containLabel: true },
     xAxis: { type: 'category', data: a.labels },
@@ -724,7 +793,7 @@ function initCaDimChart() {
   const m = caDimSeries.value
   caDimChart?.dispose()
   caDimChart = echarts.init(caDimEl.value)
-  caDimChart.setOption({
+  setThemed(caDimChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
       formatter: (ps: any) => `${ps[0].name}<br/>得分 ${m.raw[ps[0].dataIndex].toFixed(1)}` },
     grid: { left: 104, right: 40, bottom: 30, top: 20, containLabel: true },
@@ -886,9 +955,9 @@ const mrRecomputeWarn = ref(false)
 const mrRecomputeMsgClass = computed(() => (mrRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
 const MR_STATE_ORDER = ['bull', 'bear', 'range', 'rebound']
-const MR_STATE_COLORS: Record<string, string> = {
+const MR_STATE_COLORS: Record<string, string> = reactive({
   bull: cssVar('--red'), bear: cssVar('--green'), range: cssVar('--ink-soft'), rebound: cssVar('--gold'),
-}
+})
 
 const mrStateEl = ref<HTMLDivElement | null>(null)
 const mrReboundEl = ref<HTMLDivElement | null>(null)
@@ -897,10 +966,10 @@ let mrReboundChart: echarts.ECharts | null = null
 
 // 风格轮动 / 分化度 / 隐含暴露（FR-13 ~ FR-16）
 const STYLE_LABEL_CN = ['大盘价值', '中小盘', '科技成长', '普涨', '普跌', '无主线']
-const STYLE_COLORS: Record<string, string> = {
+const STYLE_COLORS: Record<string, string> = reactive({
   大盘价值: cssVar('--blue'), 中小盘: cssVar('--green'), 科技成长: cssVar('--red'),
   普涨: cssVar('--gold'), 普跌: cssVar('--ink-soft'), 无主线: cssVar('--ink-faint'),
-}
+})
 const stDispEl = ref<HTMLDivElement | null>(null)
 const stCorrEl = ref<HTMLDivElement | null>(null)
 const stQuadEl = ref<HTMLDivElement | null>(null)
@@ -1068,7 +1137,7 @@ function initIaExpChart() {
     color: cssVar('--line'),
     data: exp.cash.map((w) => Number((w * 100).toFixed(2))),
   })
-  iaExpChart.setOption({
+  setThemed(iaExpChart, {
     tooltip: { trigger: 'axis' },
     legend: { bottom: 0, type: 'scroll' },
     grid: { left: 48, right: 20, bottom: 44, top: 24, containLabel: true },
@@ -1118,7 +1187,7 @@ function initRbHistChart() {
   rbHistChart = echarts.init(rbHistEl.value)
   const labels = wins[0].histogram.map((b) => b.label)
   const colors = [cssVar('--blue'), cssVar('--gold')]
-  rbHistChart.setOption({
+  setThemed(rbHistChart, {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { bottom: 0 },
     grid: { left: 40, right: 20, bottom: 40, top: 24, containLabel: true },
@@ -1323,7 +1392,7 @@ function initMrStateChart() {
   })
   mrStateChart?.dispose()
   mrStateChart = echarts.init(mrStateEl.value)
-  mrStateChart.setOption({
+  setThemed(mrStateChart, {
     tooltip: { trigger: 'axis' },
     legend: { bottom: 0 },
     grid: { left: 56, right: 24, bottom: 40, top: 40, containLabel: true },
@@ -1346,7 +1415,7 @@ function initMrReboundChart() {
   if (segs.length === 0) return
   mrReboundChart?.dispose()
   mrReboundChart = echarts.init(mrReboundEl.value)
-  mrReboundChart.setOption({
+  setThemed(mrReboundChart, {
     tooltip: { trigger: 'axis' },
     legend: { bottom: 0 },
     grid: { left: 56, right: 24, bottom: 40, top: 40, containLabel: true },
@@ -1378,7 +1447,7 @@ function initStDispChart() {
   stDispChart = echarts.init(stDispEl.value)
   const dates = disp.series.map((s) => s.date)
   const vals = disp.series.map((s) => Number((s.dispersion * 100).toFixed(3)))
-  stDispChart.setOption({
+  setThemed(stDispChart, {
     tooltip: { trigger: 'axis' },
     grid: { left: 56, right: 24, bottom: 40, top: 30, containLabel: true },
     xAxis: { type: 'category', data: dates, boundaryGap: false,
@@ -1409,7 +1478,7 @@ function buildCorrHeatmap(
       }
     })
   })
-  chart.setOption({
+  setThemed(chart, {
     tooltip: { position: 'top' },
     grid: { left: 80, right: 24, bottom: 60, top: 20, containLabel: true },
     xAxis: {
@@ -1427,7 +1496,7 @@ function buildCorrHeatmap(
     series: [{
       name: '滚动相关', type: 'heatmap', data,
       label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.5)' } },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: cssVar('--overlay') } },
     }],
   })
 }
@@ -1861,7 +1930,7 @@ function initEquityChart() {
     legendData.push('超额收益（相对基准）')
   }
 
-  equityChart.setOption({
+  setThemed(equityChart, {
     tooltip: {
       trigger: 'axis',
       formatter: (params: any) => {
@@ -1888,7 +1957,7 @@ function initDrawdownChart() {
   if (!drawdownChartEl.value || drawdownCurve.value.length < 2) return
   drawdownChart?.dispose()
   drawdownChart = echarts.init(drawdownChartEl.value)
-  drawdownChart.setOption({
+  setThemed(drawdownChart, {
     tooltip: { trigger: 'axis', formatter: (p: any) => `${p[0].axisValue}<br />回撤: ${Number(p[0].value).toFixed(4)}%` },
     grid: { left: '3%', right: '4%', bottom: '3%', top: '10%', containLabel: true },
     xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
@@ -1919,7 +1988,7 @@ function initMonthlyHeatChart() {
     })
   })
   const absMax = Math.max(...data.map((d) => Math.abs(d[2])), 5)
-  monthlyHeatChart.setOption({
+  setThemed(monthlyHeatChart, {
     tooltip: {
       formatter: (params: any) => {
         const [ci, ri] = params.data
@@ -1956,7 +2025,7 @@ function initMonthlyHeatChart() {
         },
         fontSize: 10,
       },
-      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.5)' } },
+      emphasis: { itemStyle: { shadowBlur: 6, shadowColor: cssVar('--overlay') } },
     }],
   })
 }
@@ -1972,7 +2041,7 @@ function initDailyBoxChart() {
     .map(boxplotData)
     .filter(Boolean)
   if (boxData.length === 0) return
-  dailyBoxChart.setOption({
+  setThemed(dailyBoxChart, {
     tooltip: {
       trigger: 'item',
       formatter: (p: any) => {
@@ -2001,7 +2070,7 @@ function initMonthlyBoxChart() {
     .map(boxplotData)
     .filter(Boolean)
   if (boxData.length === 0) return
-  monthlyBoxChart.setOption({
+  setThemed(monthlyBoxChart, {
     tooltip: {
       trigger: 'item',
       formatter: (p: any) => {
@@ -2033,7 +2102,7 @@ function initAnnualBarChart() {
       itemStyle: { color: ar >= 0 ? cssVar('--red') : cssVar('--green') },
     }
   })
-  annualBarChart.setOption({
+  setThemed(annualBarChart, {
     tooltip: { trigger: 'axis' },
     grid: { left: 60, right: 20, top: 40, bottom: 30 },
     xAxis: { type: 'category', data: yearly.map((y) => String(y.year)) },
@@ -2077,21 +2146,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
-  equityChart?.dispose()
-  drawdownChart?.dispose()
-  monthlyHeatChart?.dispose()
-  dailyBoxChart?.dispose()
-  monthlyBoxChart?.dispose()
-  annualBarChart?.dispose()
-  caNavChart?.dispose()
-  caPieChart?.dispose()
-  caTopChart?.dispose()
-  caScatterChart?.dispose()
-  caMultiChart?.dispose()
-  caMonthChart?.dispose()
-  caCorrChart?.dispose()
-  caAnnualChart?.dispose()
-  caDimChart?.dispose()
+  disposeAllCharts()
 })
 
 function disposeAllCharts() {
@@ -2121,6 +2176,7 @@ function disposeAllCharts() {
 
 watch(theme, () => {
   setTimeout(() => {
+    refreshThemeColors()
     disposeAllCharts()
     nextTick(() => {
       initCharts()
@@ -3209,7 +3265,7 @@ watch(theme, () => {
   margin: 0;
   font-size: 22px;
   font-weight: 600;
-  color: var(--text-heading, var(--ink));
+  color: var(--ink);
 }
 .subtitle {
   margin: 6px 0 0;
@@ -3221,7 +3277,7 @@ watch(theme, () => {
 .section-title {
   font-size: 16px;
   font-weight: 600;
-  color: var(--text-heading, var(--ink));
+  color: var(--ink);
   margin: 24px 0 14px;
   padding-bottom: 8px;
   border-bottom: 2px solid var(--accent);
@@ -3249,7 +3305,7 @@ watch(theme, () => {
   border-radius: 10px;
   padding: 16px;
   border-left: 4px solid var(--accent);
-  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  box-shadow: var(--shadow-sm);
 }
 .summary-card .title { font-size: 12px; color: var(--ink-soft); margin-bottom: 6px; }
 .summary-card .value { font-size: 22px; font-weight: 700; color: var(--ink); }
@@ -3273,7 +3329,7 @@ watch(theme, () => {
 }
 .stat-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(90, 143, 192, 0.25);
+  box-shadow: 0 8px 20px var(--accent-glow);
 }
 .stat-card .value { font-size: 22px; font-weight: 700; }
 .stat-card .label { font-size: 12px; opacity: 0.9; margin-top: 6px; }
@@ -3332,7 +3388,7 @@ watch(theme, () => {
 .metric-missing-note {
   margin-top: 10px;
   padding: 8px 12px;
-  background: rgba(201,162,74,.18);
+  background: var(--gold-wash);
   border-left: 3px solid var(--gold);
   border-radius: 4px;
   font-size: 12px;

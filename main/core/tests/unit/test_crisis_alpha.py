@@ -9,7 +9,7 @@ import pytest
 from core.engine import crisis_alpha as ca_mod
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, CRISIS_CATS, CRISIS_COLORS, CrisisAlphaAnalyzer,
-    _classify_crisis, _frame_records, _rating, alpha_rating,
+    SCORE_RATINGS, _classify_crisis, _frame_records, _rating, alpha_rating,
     build_crisis_alpha_payload, sanitize_for_json,
 )
 
@@ -55,8 +55,11 @@ def test_classify_crisis_zero_benchmark_with_negative_strategy_is_worst():
 
 
 def test_rating_and_alpha_rating_thresholds():
-    assert _rating(85) == "卓越" and _rating(84.9) == "优秀"
-    assert _rating(70) == "优秀" and _rating(69.9) == "一般"
+    assert _rating(90) == "卓越" and _rating(89.9) == "优秀"
+    assert _rating(80) == "优秀" and _rating(79.9) == "良好"
+    assert _rating(70) == "良好" and _rating(69.9) == "尚可"
+    assert _rating(60) == "尚可" and _rating(59.9) == "偏弱"
+    assert _rating(0) == "偏弱" and _rating(100) == "卓越"
     assert alpha_rating(0.80) == "卓越" and alpha_rating(0.60) == "优秀"
     assert alpha_rating(0.40) == "一般" and alpha_rating(0.39) == "较弱"
 
@@ -380,7 +383,7 @@ def test_composite_score_shape_weights_and_contributions():
     assert sum(d["权重"] for d in sc["dimensions"]) == pytest.approx(1.0)
     for d in sc["dimensions"]:
         assert 0.0 <= d["得分"] <= 100.0
-        assert d["评级"] in {"卓越", "优秀", "一般"}
+        assert d["评级"] in SCORE_RATINGS
     assert [d["得分"] for d in sc["dimensions"]] == pytest.approx(
         [30.3, 49.2, 38.6, 0.0, 15.0, 0.0, 50.0, 95.6, 14.2]
     )
@@ -388,7 +391,10 @@ def test_composite_score_shape_weights_and_contributions():
         [6.1, 7.4, 4.6, 0.0, 1.5, 0.0, 5.0, 5.7, 0.7]
     )
     assert sc["total_score"] == pytest.approx(31.0)
-    assert sc["rating"] in {"卓越", "优秀", "一般"}
+    assert sc["rating"] in SCORE_RATINGS
+    assert [d["评级"] for d in sc["dimensions"]] == [
+        "偏弱", "偏弱", "偏弱", "偏弱", "偏弱", "偏弱", "偏弱", "卓越", "偏弱",
+    ]
     b_w = [-0.08, -0.06, -0.05, -0.04, 0.02, 0.04, 0.06, 0.10, 0.12, -0.07, 0.08, 0.03]
     s_w = [0.02, -0.01, -0.03, -0.02, 0.04, 0.03, 0.02, 0.015, -0.004, 0.01, -0.008, -0.012]
     cost_dims = {
