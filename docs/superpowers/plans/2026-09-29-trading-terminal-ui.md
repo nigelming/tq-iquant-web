@@ -14,7 +14,7 @@
 
 - **禁止新增 npm 依赖。** `web/package.json` 的 `dependencies` 必须保持 `axios` / `echarts` / `vue` / `vue-router` 四项不变。
 - **禁止硬编码颜色。** 所有新写/改的颜色必须用 `var(--token)` 或经 `cssVar('--token')` 读取。唯一允许的字面色值是 `style.css` 内 `:root` / `[data-theme="dark"]` 两个 token 块中的 token 定义本身。
-- **禁止改动这 7 个文件**（超出本次范围）：`Dashboard.vue`、`StockPools.vue`、`Formulas.vue`、`Portfolios.vue`、`Backtest.vue`、`LiveSessions.vue`、`SystemConfig.vue` 的**模板与脚本**。唯一例外见 Task 5。
+- **禁止改动这 7 个文件**（超出本次范围）：`Dashboard.vue`、`StockPools.vue`、`Formulas.vue`、`Portfolios.vue`、`Backtest.vue`、`LiveSessions.vue`、`SystemConfig.vue` 的**模板与脚本**。样式块的**唯一例外**见 Task 2 Step 7（`Backtest.vue` 的 `.chart-box` scoped 规则，2 个声明）与 Task 5（`itemStyle.borderColor` 一个字符串）。
 - **禁止改动 `style.css` 中 `--score-1` 至 `--score-5`、`--green-wash`、`--red-wash`、`--warn-wash`、`--gold-wash`、`--overlay`、`--shadow-sm`、`--shadow-md`、`--accent-light` 之外的既有语义 token 名**。可以改其值（如 `--red`），不可改名——改名会波及 `Backtest.vue` 的 `cssVar('--xxx')` 调用点。
 - **禁止删除既有 token。** 只允许新增与改值。
 - 测试基线：`npx vitest run` = **199 passed**，`npx vue-tsc -b` = **exit 0**。每个 Task 结束前两者都必须复现该基线（Task 3–4 后为 205 passed，Task 5 后为 207 passed）。
@@ -214,11 +214,12 @@ git commit -m "feat(theme): 冷调专业色板 — 浅色转冷灰、暗色转�
 
 **Files:**
 - Modify: `web/src/style.css`（第 64 行起的选择器区；用 `edit` 做定点替换，**不改 token 块**）
+- Modify: `web/src/views/Backtest.vue:3419-3424`（**仅** scoped `.chart-box` 的 `background` 与 `border-radius` 两个声明，见 Step 7）
 - Test: 无新增测试，靠既有 199 个测试回归
 
 **Interfaces:**
 - Consumes: Task 1 的全部 token（含新增的 `--font-mono`、`--shadow-card`、`--chart-bg`、`--focus-ring`）
-- Produces: Task 4 依赖的类名 `.icon`、`.nav-group-label`、`.status-dot`、`.status-chip`、`.topbar-path`
+- Produces: Task 4 依赖的类名 `.icon`、`.nav-group-label`、`.status-dot`、`.status-chip`、`.topbar-path`；Task 5 依赖 `.chart-box` 实际底色已改为 `--chart-bg`（否则 Task 5 的饼图描边会与画布底色不一致）
 
 - [ ] **Step 1: 替换 layout 基元（sidebar / topbar / content / card）**
 
@@ -335,30 +336,57 @@ tbody td{padding:8px 14px;border-bottom:1px solid var(--line)}
 .status-dot.offline{background:var(--ticker-up)}
 @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 var(--focus-ring)}50%{opacity:.75;box-shadow:0 0 0 3px transparent}}
 
-/* 图表画布真实底色：与 .card-bg 对齐，扇区间分隔线描边色（Backtest.vue 读 --card-bg）才正确 */
-.chart-box{background:var(--chart-bg)}
+/* 图表画布真实底色：.chart-box 的 scoped 规则见 Task 2 Step 7（scoped 优先级高于全局，
+   故 .chart-box 必须在 scoped 块内改，全局规则只对 .ca-chart / .chart-container 生效） */
 .ca-chart{background:var(--chart-bg)}
 .chart-container{background:var(--chart-bg)}
 
 :where(button,a,input,select,textarea):focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}
 ```
 
-- [ ] **Step 7: 验证**
+- [ ] **Step 7: 同步 `Backtest.vue` 的 scoped `.chart-box` 规则**
+
+`Backtest.vue` 的 `<style scoped>` 块里第 3419 行有：
+
+```
+.chart-box {
+  background: var(--hover-bg);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 8px;
+}
+```
+
+**必须同步改这里**，否则 Task 2 Step 6 的全局 `.chart-box` 规则是死代码：Vue scoped 样式编译后带 `[data-v-xxx]` 属性选择器，`.chart-box[data-v-x]`（特异性 0,2,0）会压过全局 `.chart-box`（0,1,0）。且不改的话，Task 5 把饼图描边改成 `--chart-bg` 会与实际画布底色 `--hover-bg` 不一致，描边反而变得不可见。
+
+用 `edit` 工具把上面那 2 行替换为：
+
+```
+  background: var(--chart-bg);
+  border-radius: var(--radius);
+```
+
+`padding: 16px` 与 `margin-bottom: 8px` **保持不动**。
+
+> 这是本次计划中对业务视图 scoped 样式的**唯一**改动（2 个声明）。改完跑 `npx vue-tsc -b` 与全量 vitest 应仍为 199 passed——因为没有测试断言 `.chart-box` 的具体 background 或 border-radius 值。
+
+- [ ] **Step 8: 验证**
 
 ```bash
 cd D:\project\tq-iquant-web\web
 npx vitest run
 npx vue-tsc -b
 Select-String -Path "src\style.css" -Pattern "chart-box|ca-chart|chart-container" | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+Select-String -Path "src\views\Backtest.vue" -Pattern "^\.chart-box \{" -Context 0,3 | ForEach-Object { $_.Line.Trim(); $_.Context.PostContext | ForEach-Object { "  $($_.Trim())" } }
 ```
 
-Expected: `199 passed`、vue-tsc exit 0；最后一条命令应显示 3 处新增（若显示 0 处说明 Step 6 未生效，检查是否误写进 token 块内）。
+Expected: `199 passed`、vue-tsc exit 0；第 3 条命令应显示 2 处（`.ca-chart` / `.chart-container`，**没有** `.chart-box` 是正确的——它走 scoped）；第 4 条命令应显示 `background: var(--chart-bg);` 与 `border-radius: var(--radius);`。
 
-- [ ] **Step 8: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 cd D:\project\tq-iquant-web
-git add web/src/style.css
+git add web/src/style.css web/src/views/Backtest.vue
 git commit -m "feat(ui): 终端密度与基元样式 — 直角 4px、紧凑表格、等宽数字、SVG 图标与状态点样式"
 ```
 
@@ -761,7 +789,7 @@ git commit -m "feat(ui): 应用外壳改造 — SVG 图标导航分三组、顶�
 - Test: `web/src/__tests__/Backtest.test.ts`（追加 2 个用例）
 
 **Interfaces:**
-- Consumes: Task 1 的 `--chart-bg`、Task 2 的 `.chart-box` / `.ca-chart` / `.chart-container` 背景声明
+- Consumes: Task 1 的 `--chart-bg`；Task 2 Step 7 已把 `Backtest.vue` scoped `.chart-box` 的底色改为 `var(--chart-bg)`——**Task 5 的描边色必须与该画布底色同源**，两者不一致会导致扇区分隔线不可见
 - Produces: 无（终态）
 
 - [ ] **Step 1: 追加失败测试**
@@ -920,7 +948,7 @@ Tab 键遍历侧边栏与顶栏按钮，确认 `:focus-visible` 焦点环可见�
 | §4.3 品牌区 | Task 2 Step 1、Task 4 Step 3 |
 | §5.1–5.3 图标 | Task 3 |
 | §5.4 path 坐标约束 | Task 3 Step 3（path 均在 2–22 内） |
-| §6 图表底色 | Task 2 Step 6（`.chart-box` 等）+ Task 5（`borderColor`） |
+| §6 图表底色 | Task 2 Step 6（全局 `.ca-chart`/`.chart-container`）+ Task 2 Step 7（scoped `.chart-box`）+ Task 5（`borderColor`） |
 | §7.2 验证方式 | 每个 Task Step 末 + Task 6 |
 | §8 实施顺序 6 步 | Task 1–6 一一对应 |
 | §9 不做的事 | 全部 Task 均未越界（无新依赖、无布局重排、无动画库、无移动端适配） |
@@ -945,3 +973,5 @@ Tab 键遍历侧边栏与顶栏按钮，确认 `:focus-visible` 焦点环可见�
 - `Backtest.test.ts` 共 2034 行；`CSS_VARS` 在第 6 行（`vi.hoisted` 内，已有 `'--card-bg': '#ffffff'`）、`crisisAlphaCompleted` 在第 772 行、`mountDetail` 在第 1130 行——均为模块级，Task 5 的新 describe 内可直接访问。
 - `api/index.ts:1134-1141` 确有 `SystemStatus` 与 `getSystemStatus`，Task 4 的 import 路径 `./api` 正确。
 - 现有 12 个测试文件均**不 mock `vue-router`**，故 Task 3 Step 1 必须新增该 mock，否则 `useRoute()` 返回 `undefined` 导致 mount 崩溃。
+- **Pre-flight 裁定（controller，2026-09-29）**：`.chart-box` / `.chart-container` / `.ca-chart` 定义在 `Backtest.vue` 的 `<style scoped>`（第 3419/3425/3592 行），scoped 编译后带 `[data-v-xxx]`，特异性 0,2,0 压过全局 0,1,0。原计划 Task 2 Step 6 的全局 `.chart-box` 规则是死代码，且 Task 5 改描边为 `--chart-bg` 后会与实际画布底色 `--hover-bg` 不一致使描边不可见。经用户裁定：改 `Backtest.vue` scoped `.chart-box` 的 `background` 与 `border-radius`（Task 2 Step 7）。这也是计划中唯一对业务视图 scoped 样式的改动。
+- `.num` 已被 `Backtest.vue` 使用 4 次（第 3172/3175/3176/3202 行），但全项目**无任何 `.num` 的字体/等宽定义**（第 3517 行只有 `text-align: right`）。故 Task 2 Step 3 在 `style.css` 新增的全局 `.num` 会立即生效，无 scoped 冲突。
