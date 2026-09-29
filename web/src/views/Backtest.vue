@@ -3648,10 +3648,10 @@ watch(theme, () => {
 .score-info { flex: 1; }
 .score-title { font-size: 14px; font-weight: 600; color: var(--ink); }
 .score-total { font-size: 20px; font-weight: 800; color: var(--accent); }
-.score-dims { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
-.score-dim { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.dim-label { width: 70px; color: var(--ink-soft); flex-shrink: 0; }
-.dim-bar { flex: 1; height: 6px; background: var(--hover-bg); border-radius: 3px; overflow: hidden; }
+.score-dims { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; margin-top: 8px; }
+.score-dim { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-shrink: 0; }
+.dim-label { width: 70px; color: var(--ink-soft); flex-shrink: 0; white-space: nowrap; }
+.dim-bar { flex: 1; min-width: 60px; height: 6px; background: var(--hover-bg); border-radius: 3px; overflow: hidden; }
 .dim-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 .dim-score { width: 48px; text-align: right; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .score-summary { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
