@@ -82,25 +82,30 @@ body{font-family:var(--sans);font-size:14px;color:var(--ink);background:var(--bg
 a{text-decoration:none}
 input,select,button{font-family:inherit;font-size:inherit}
 .app-layout{display:flex;min-height:100vh;background:var(--bg)}
-.sidebar{width:200px;background:var(--card-bg);display:flex;flex-direction:column;flex-shrink:0;border-right:1px solid var(--border)}
-.sidebar-header{padding:20px 18px;border-bottom:1px solid var(--line)}
-.sidebar-header h1{font-size:18px;font-weight:600;color:var(--ink)}
-.sidebar-nav{flex:1;padding:8px;display:flex;flex-direction:column}
-.nav-item{display:flex;align-items:center;padding:10px 14px;margin-bottom:2px;border-radius:var(--radius);color:var(--ink-soft);font-size:14px;transition:all .15s}
-.nav-item:hover{background:var(--accent-light);color:var(--accent)}
-.nav-item.active{background:var(--accent-light);color:var(--accent);font-weight:500}
+.sidebar{width:208px;background:var(--shell-bg);display:flex;flex-direction:column;flex-shrink:0;border-right:1px solid var(--border)}
+.sidebar-header{padding:18px 16px 14px;border-bottom:1px solid var(--line)}
+.sidebar-header h1{font-size:17px;font-weight:650;color:var(--ink);letter-spacing:.2px}
+.sidebar-subtitle{font-size:11px;color:var(--ink-faint);margin-top:3px;letter-spacing:.3px}
+.sidebar-nav{flex:1;padding:8px 8px;display:flex;flex-direction:column;overflow-y:auto}
+.nav-item{display:flex;align-items:center;gap:9px;padding:9px 14px;margin-bottom:1px;border-radius:var(--radius);color:var(--ink-soft);font-size:13.5px;font-weight:500;transition:background .15s,color .15s}
+.nav-item:hover{background:var(--hover-bg);color:var(--ink)}
+.nav-item.active{background:var(--accent-light);color:var(--accent);box-shadow:inset 3px 0 0 var(--nav-active-bar)}
 .main-container{flex:1;display:flex;flex-direction:column}
-.topbar{height:52px;background:var(--card-bg);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;flex-shrink:0}
-.topbar-title{font-size:16px;font-weight:500;color:var(--ink)}
+.topbar{height:48px;background:var(--shell-bg);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;flex-shrink:0}
+.topbar-left{display:flex;flex-direction:column;gap:1px}
+.topbar-title{font-size:15px;font-weight:600;color:var(--ink)}
+.topbar-path{font-family:var(--font-mono);font-size:11px;color:var(--ink-faint)}
+.topbar-right{display:flex;align-items:center;gap:10px}
 .content{flex:1;padding:20px;overflow-y:auto}
-.card{background:var(--card-bg);border-radius:var(--radius);border:1px solid var(--border)}
+.card{background:var(--card-bg);border-radius:var(--radius);border:1px solid var(--border);box-shadow:var(--shadow-card)}
 .table-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:13.5px}
-thead th{text-align:left;padding:10px 14px;font-weight:500;color:var(--ink-soft);border-bottom:1px solid var(--border);font-size:12px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
-tbody td{padding:10px 14px;border-bottom:1px solid var(--line)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{text-align:left;padding:8px 14px;font-weight:600;color:var(--ink-soft);border-bottom:1px solid var(--border);font-size:11.5px;letter-spacing:.5px;white-space:nowrap}
+tbody td{padding:8px 14px;border-bottom:1px solid var(--line)}
+.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
 tbody tr:hover td{background:var(--hover-bg)}
 tbody tr:last-child td{border-bottom:none}
-.badge{display:inline-flex;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:500}
+.badge{display:inline-flex;padding:2px 8px;border-radius:3px;font-size:11.5px;font-weight:500;font-variant-numeric:tabular-nums}
 .badge-green{background:var(--green-wash);color:var(--green)}
 .badge-gray{background:var(--hover-bg);color:var(--ink-soft)}
 .badge-blue{background:var(--accent-light);color:var(--accent)}
@@ -115,7 +120,7 @@ tbody tr:last-child td{border-bottom:none}
 .btn-sm{padding:4px 10px;font-size:12px}
 .btn-danger{color:var(--red)}.btn-danger:hover{background:var(--red-wash);border-color:var(--red)}
 .modal-overlay{position:fixed;inset:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;z-index:100}
-.modal-content{background:var(--card-bg);border-radius:8px;padding:24px;min-width:360px;box-shadow:var(--shadow-md)}
+.modal-content{background:var(--card-bg);border-radius:var(--radius);padding:24px;min-width:360px;box-shadow:var(--shadow-pop)}
 .modal-lg .modal-content{width:560px;max-width:90vw}
 .modal-content h3{font-size:16px;font-weight:600;margin-bottom:16px;color:var(--ink)}
 .modal-content label{display:block;font-size:13px;font-weight:500;color:var(--ink-soft);margin-bottom:4px}
@@ -164,3 +169,20 @@ tbody tr:last-child td{border-bottom:none}
 .chart-tooltip{display:inline-flex;flex-direction:column;gap:2px;background:var(--ink);color:var(--bg);padding:6px 10px;border-radius:var(--radius);font-size:12px;margin-top:4px}
 .chart-tooltip .tt-date{color:var(--ink-faint);font-size:11px}
 .chart-tooltip .tt-value{font-weight:600;font-variant-numeric:tabular-nums}
+
+/* ===== 专业交易终端：图标 / 状态 / 图表底色 ===== */
+.icon{width:17px;height:17px;flex-shrink:0;vertical-align:-3px}
+.nav-item.active .icon{color:var(--accent)}
+
+.status-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card-bg);font-size:11.5px;color:var(--ink-soft);font-variant-numeric:tabular-nums}
+.status-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--ink-faint)}
+.status-dot.online{background:var(--ticker-down);animation:pulse 2s ease-in-out infinite}
+.status-dot.offline{background:var(--ticker-up)}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 var(--focus-ring)}50%{opacity:.75;box-shadow:0 0 0 3px transparent}}
+
+/* 图表画布真实底色：.chart-box 的 scoped 规则见 Task 2 Step 7（scoped 优先级高于全局，
+   故 .chart-box 必须在 scoped 块内改，全局规则只对 .ca-chart / .chart-container 生效） */
+.ca-chart{background:var(--chart-bg)}
+.chart-container{background:var(--chart-bg)}
+
+:where(button,a,input,select,textarea):focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}

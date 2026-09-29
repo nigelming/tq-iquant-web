@@ -3417,8 +3417,8 @@ watch(theme, () => {
 
 /* 图表 */
 .chart-box {
-  background: var(--hover-bg);
-  border-radius: 10px;
+  background: var(--chart-bg);
+  border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 8px;
 }
