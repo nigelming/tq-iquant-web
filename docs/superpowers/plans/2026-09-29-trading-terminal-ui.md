@@ -19,8 +19,9 @@
 - **禁止删除既有 token。** 只允许新增与改值。
 - 测试基线：`npx vitest run` = **199 passed**，`npx vue-tsc -b` = **exit 0**。每个 Task 结束前两者都必须复现该基线（Task 3–4 后为 205 passed，Task 5 后为 207 passed）。
 - 提交粒度：每个 Task 独立 commit，message 用中文，遵循仓库现有前缀风格（`feat:` / `fix:` / `test:` / `docs:`）。
-- 文件编码 UTF-8 **无 BOM**，行尾 CRLF。修改 `web/src/` 下文件时若使用 PowerShell，必须用 `[System.IO.File]::WriteAllText($p, $c, (New-Object System.Text.UTF8Encoding($false)))`，**不可用** `Set-Content -Encoding UTF8`（PowerShell 5.1 会写 BOM）。
-- 修改 `Backtest.vue` 这类 3600+ 行的大文件时**不可用** `Set-Content` 全文重写（会破坏 CRLF 与 BOM 状态），必须用 `edit` 工具做定点替换。
+- **必须保持每个文件现有的编码与行尾，不要"顺手规范化"。** 本仓库两种约定并存（已实测）：`style.css` = UTF-8 **带 BOM** + **LF**；`App.vue` / `Backtest.vue` / `Backtest.test.ts` = UTF-8 **无 BOM** + **CRLF**。改动后各自的 BOM 状态与行尾必须与上表一致。**禁止**用 `Set-Content` / `Out-File` 写 `web/src/` 下任何文件（PowerShell 5.1 会改变 BOM 与行尾）。用 `edit` 工具做定点替换，或用 `[System.IO.File]::WriteAllText($p, $c, $encoding)` 并显式指定原编码。
+- **`.NET` 的 `File`/`Directory` API 不跟随 PowerShell 的 `cd`。** `[System.IO.File]::ReadAllText("src\style.css")` 会从进程工作目录解析而**不是** PowerShell 当前目录。本计划所有校验脚本中的路径**必须写绝对路径** `D:\project\tq-iquant-web\web\src\style.css`。
+- 修改 `Backtest.vue` 这类 3600+ 行的大文件时**不可用**全文重写（会破坏行尾与 BOM 状态），必须用 `edit` 工具做定点替换。
 
 ---
 
@@ -158,9 +159,8 @@ Expected: `Test Files 13 passed (13)` / `Tests 199 passed (199)`。若不是 199
 
 - [ ] **Step 4: 验证无重复 token 定义**
 
-```bash
-cd D:\project\tq-iquant-web\web
-$c = [System.IO.File]::ReadAllText("src\style.css")
+```powershell
+$c = [System.IO.File]::ReadAllText("D:\project\tq-iquant-web\web\src\style.css")
 $rootBlock = [regex]::Match($c, '(?s):root\s*\{(.*?)\n\}').Groups[1].Value
 $darkBlock = [regex]::Match($c, '(?s)\[data-theme="dark"\]\s*\{(.*?)\n\}').Groups[1].Value
 $rootVars = [regex]::Matches($rootBlock, '(--[a-z0-9-]+)\s*:') | ForEach-Object { $_.Groups[1].Value }
@@ -176,17 +176,18 @@ Expected: `root count=39 unique=39`、`dark count=36 unique=36`、`dup in root:`
 
 （39 − 3 = 36 的差额正是两模式共享、不在暗色块重复定义的 `--font-mono` / `--radius` / `--sans`。）
 
-- [ ] **Step 5: 验证文件无 BOM、行尾未变**
+- [ ] **Step 5: 验证 BOM 与行尾未被改动**
 
-```bash
-cd D:\project\tq-iquant-web\web
-$b = [System.IO.File]::ReadAllBytes("src\style.css")
+`style.css` 改动前是 **UTF-8 带 BOM + LF**（实测 `first3=239,187,191`、`lfOnly=149`）。改动后必须仍是这个状态：
+
+```powershell
+$b = [System.IO.File]::ReadAllBytes("D:\project\tq-iquant-web\web\src\style.css")
 "first3=$($b[0]),$($b[1]),$($b[2])"
-$c = [System.IO.File]::ReadAllText("src\style.css")
+$c = [System.IO.File]::ReadAllText("D:\project\tq-iquant-web\web\src\style.css")
 "crlf=" + ([regex]::Matches($c,"`r`n")).Count + " lfOnly=" + ([regex]::Matches($c,"(?<!`r)`n")).Count
 ```
 
-Expected: `first3=58,58,10`（即 `:r`——`58` 是 `:` 的 ASCII，不是 `239,187,191` 的 BOM）；`lfOnly=0`。
+Expected: `first3=239,187,191`（BOM 保持不变）、`crlf=0 lfOnly=<新行数>`。若 `first3` 变成 `58,58,10`（`:ro`），说明 BOM 被意外剥掉——**必须恢复**，否则 `git diff` 会显示整个文件被重写。
 
 - [ ] **Step 6: 跑全量测试 + 类型检查**
 
