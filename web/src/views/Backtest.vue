@@ -590,7 +590,7 @@ function initCaPieChart() {
       radius: ['48%', '80%'],
       center,
       sort: false,
-      itemStyle: { borderColor: cssVar('--card-bg'), borderWidth: 2 },
+      itemStyle: { borderColor: cssVar('--chart-bg'), borderWidth: 2 },
       label: { show: false },
       labelLine: { show: false },
       data: names.map((nm, i) => ({
@@ -1643,6 +1643,7 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
 
     _group('路径质量'),
     { label: '最长连亏天数', value: num(m.max_consecutive_loss_days, 0), cls: 'text-orange' },
+    { label: '最长连盈天数', value: num(m.max_consecutive_profit_days, 0), cls: 'text-orange' },
     { label: '最差日收益', value: pctSigned(m.worst_daily_return), cls: valueClass(m.worst_daily_return) },
     { label: '最差周收益', value: pctSigned(m.worst_weekly_return), cls: valueClass(m.worst_weekly_return) },
     { label: '收益偏度', value: num(m.return_skewness, 2), cls: 'text-blue' },

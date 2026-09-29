@@ -170,8 +170,9 @@ export interface BacktestEvaluationItem {
   empty_days_ratio: number | null
   max_single_weight: number | null
   hhi: number | null
-  // 路径 5 指标
+  // 路径 6 指标
   max_consecutive_loss_days: number | null
+  max_consecutive_profit_days: number | null
   worst_daily_return: number | null
   worst_weekly_return: number | null
   return_skewness: number | null

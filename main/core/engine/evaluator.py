@@ -523,6 +523,7 @@ class Evaluator:
     @staticmethod
     def _compute_path_metrics(daily_rows: List[dict], daily_returns: List[float]) -> dict:
         streak = best_streak = 0
+        win_streak = best_win_streak = 0
         for r in daily_returns:
             if r < 0:
                 streak += 1
@@ -530,6 +531,9 @@ class Evaluator:
                     best_streak = streak
             else:
                 streak = 0
+                win_streak += 1
+                if win_streak > best_win_streak:
+                    best_win_streak = win_streak
 
         worst_daily = min(daily_returns) if daily_returns else None
 
@@ -562,6 +566,7 @@ class Evaluator:
 
         return {
             "max_consecutive_loss_days": best_streak,
+            "max_consecutive_profit_days": best_win_streak,
             "worst_daily_return": (
                 Decimal(str(worst_daily)).quantize(Decimal("0.0001"))
                 if worst_daily is not None else None

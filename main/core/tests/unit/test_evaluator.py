@@ -407,6 +407,7 @@ def test_loss_streak_and_worst_returns():
     ]
     result = Evaluator().evaluate(snaps)
     assert result["max_consecutive_loss_days"] == 2
+    assert result["max_consecutive_profit_days"] == 3
     assert result["worst_daily_return"] == Decimal("-0.0800")
     assert result["worst_weekly_return"] == Decimal("-0.0800")
     # 收益样本 < 20 → 偏度峰度为 None
