@@ -1654,6 +1654,61 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
 // 组合整体 18 项指标
 const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
 
+// ===== 综合评分卡 =====
+interface ScoreDimension { label: string; score: number; max: number; comment: string }
+interface StrategyScore {
+  total: number; grade: 'A' | 'B' | 'C' | 'D'; gradeLabel: string
+  dimensions: ScoreDimension[]; summary: string[]
+}
+
+function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategyScore | null {
+  if (!m) return null
+  const sharpe = m.sharpe_ratio ?? 0
+  const calmar = m.calmar_ratio ?? 0
+  const sortino = m.sortino_ratio ?? 0
+  const maxDd = Math.abs(m.max_drawdown ?? 0)
+  const ulcer = m.ulcer_index ?? 0
+  const stability = m.return_stability ?? 0
+  const costRatio = m.total_cost_ratio ?? 0
+  const winRate = m.win_rate ?? 0
+  const util = m.avg_position_utilization ?? 0
+  const emptyDays = m.empty_days_ratio ?? 0
+
+  const riskAdj = Math.min(sharpe / 3, 1) * 15 + Math.min(calmar / 3, 1) * 10 + Math.min(sortino / 3, 1) * 5
+  const ddCtrl = Math.max(0, 15 - maxDd * 50) + Math.max(0, 5 - ulcer * 100)
+  const stabScore = stability * 15
+  const costScore = Math.max(0, 10 - costRatio * 20) + winRate * 5
+  const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10)
+
+  const total = Math.round(riskAdj + ddCtrl + stabScore + costScore + utilScore)
+  const grade = total >= 80 ? 'A' : total >= 60 ? 'B' : total >= 40 ? 'C' : 'D'
+  const gradeLabel = { A: '优秀', B: '良好', C: '一般', D: '较差' }[grade]
+
+  const summary: string[] = []
+  if (sharpe >= 1.5) summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益优秀`)
+  else if (sharpe >= 1) summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益良好`)
+  else summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益一般`)
+  if (maxDd <= 0.1) summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制优秀`)
+  else if (maxDd <= 0.2) summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制良好`)
+  else summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制需改善`)
+  if (costRatio > 0.1) summary.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，侵蚀明显`)
+  if (util < 0.3) summary.push(`仓位利用率 ${(util * 100).toFixed(1)}%，资金闲置较多`)
+
+  return {
+    total, grade, gradeLabel,
+    dimensions: [
+      { label: '风险调整收益', score: Math.round(riskAdj), max: 30, comment: `夏普${sharpe.toFixed(2)} / 卡玛${calmar.toFixed(2)}` },
+      { label: '回撤控制', score: Math.round(ddCtrl), max: 20, comment: `最大回撤${(maxDd * 100).toFixed(2)}%` },
+      { label: '收益稳定性', score: Math.round(stabScore), max: 15, comment: `R²=${stability.toFixed(2)}` },
+      { label: '交易效率', score: Math.round(costScore), max: 15, comment: `成本${(costRatio * 100).toFixed(1)}%` },
+      { label: '仓位利用', score: Math.round(utilScore), max: 20, comment: `利用率${(util * 100).toFixed(1)}%` },
+    ],
+    summary,
+  }
+}
+
+const portfolioScore = computed(() => scoreStrategy(detail.value?.evaluations))
+
 // 策略对比卡片
 const strategyCards = computed(() => {
   const evals = detail.value?.strategy_evaluations || []
@@ -3063,9 +3118,30 @@ watch(theme, () => {
       </template>
     </div>
 
-    <!-- 策略对比分析 -->
+    <!-- 策略绩效评估 -->
     <template v-if="strategyCards.length > 0">
-      <div class="section-title">策略对比分析</div>
+      <div class="section-title">策略绩效评估</div>
+
+      <!-- 综合评分卡 -->
+      <div v-if="portfolioScore" class="score-card">
+        <div class="score-header">
+          <div class="score-grade" :class="'grade-' + portfolioScore.grade.toLowerCase()">{{ portfolioScore.grade }}</div>
+          <div class="score-info">
+            <div class="score-title">综合评分 <span class="score-total">{{ portfolioScore.total }}</span> / 100 — {{ portfolioScore.gradeLabel }}</div>
+            <div class="score-dims">
+              <div v-for="d in portfolioScore.dimensions" :key="d.label" class="score-dim">
+                <span class="dim-label">{{ d.label }}</span>
+                <div class="dim-bar"><div class="dim-fill" :style="{ width: (d.score / d.max * 100) + '%' }"></div></div>
+                <span class="dim-score">{{ d.score }}/{{ d.max }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="score-summary">
+          <p v-for="(s, i) in portfolioScore.summary" :key="i">· {{ s }}</p>
+        </div>
+      </div>
+
       <div class="strategy-comparison">
         <div v-for="sc in strategyCards" :key="sc.strategy_id" class="strategy-card">
           <h3>{{ sc.strategy_name }}</h3>
@@ -3552,6 +3628,35 @@ watch(theme, () => {
 }
 .ca-banner .t { font-size: 20px; font-weight: 800; }
 .ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
+.score-card {
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-bottom: 12px;
+}
+.score-header { display: flex; gap: 16px; align-items: flex-start; }
+.score-grade {
+  width: 56px; height: 56px; border-radius: var(--radius);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 28px; font-weight: 800; flex-shrink: 0;
+}
+.score-grade.grade-a { background: var(--green-wash); color: var(--green); }
+.score-grade.grade-b { background: var(--accent-light); color: var(--accent); }
+.score-grade.grade-c { background: var(--gold-wash); color: var(--gold); }
+.score-grade.grade-d { background: var(--red-wash); color: var(--red); }
+.score-info { flex: 1; }
+.score-title { font-size: 14px; font-weight: 600; color: var(--ink); }
+.score-total { font-size: 20px; font-weight: 800; color: var(--accent); }
+.score-dims { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.score-dim { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.dim-label { width: 70px; color: var(--ink-soft); flex-shrink: 0; }
+.dim-bar { flex: 1; height: 6px; background: var(--hover-bg); border-radius: 3px; overflow: hidden; }
+.dim-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+.dim-score { width: 48px; text-align: right; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.score-summary { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.score-summary p { margin: 2px 0; font-size: 12.5px; color: var(--ink-soft); }
+
 .ca-hit-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

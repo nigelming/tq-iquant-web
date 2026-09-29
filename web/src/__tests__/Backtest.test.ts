@@ -617,7 +617,7 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
     await flushPromises()
 
-    expect(w.text()).toContain('策略对比分析')
+    expect(w.text()).toContain('策略绩效评估')
     expect(w.text()).toContain('正收益策略')
     expect(w.text()).toContain('负收益策略')
 
