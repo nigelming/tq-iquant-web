@@ -84,7 +84,7 @@ input,select,button{font-family:inherit;font-size:inherit}
 .app-layout{display:flex;min-height:100vh;background:var(--bg)}
 .sidebar{width:208px;background:var(--shell-bg);display:flex;flex-direction:column;flex-shrink:0;border-right:1px solid var(--border)}
 .sidebar-header{padding:18px 16px 14px;border-bottom:1px solid var(--line)}
-.sidebar-header h1{font-size:17px;font-weight:650;color:var(--ink);letter-spacing:.2px}
+.sidebar-header h1{font-size:19px;font-weight:700;color:var(--accent);letter-spacing:.2px}
 .sidebar-subtitle{font-size:11px;color:var(--ink-faint);margin-top:3px;letter-spacing:.3px}
 .sidebar-nav{flex:1;padding:8px 8px;display:flex;flex-direction:column;overflow-y:auto}
 .nav-group-label{font-size:11px;font-weight:600;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.6px;padding:14px 14px 5px}
