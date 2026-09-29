@@ -1685,14 +1685,35 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   const gradeLabel = { A: '优秀', B: '良好', C: '一般', D: '较差' }[grade]
 
   const summary: string[] = []
-  if (sharpe >= 1.5) summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益优秀`)
-  else if (sharpe >= 1) summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益良好`)
-  else summary.push(`夏普比率 ${sharpe.toFixed(2)}，风险调整收益一般`)
-  if (maxDd <= 0.1) summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制优秀`)
-  else if (maxDd <= 0.2) summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制良好`)
-  else summary.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制需改善`)
-  if (costRatio > 0.1) summary.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，侵蚀明显`)
-  if (util < 0.3) summary.push(`仓位利用率 ${(util * 100).toFixed(1)}%，资金闲置较多`)
+  const highlights: string[] = []
+  const issues: string[] = []
+
+  // 亮点
+  if (sharpe >= 1.5) highlights.push(`夏普 ${sharpe.toFixed(2)} / 卡玛 ${calmar.toFixed(2)} / 索提诺 ${sortino.toFixed(2)}，风险调整收益优秀`)
+  if (maxDd <= 0.1) highlights.push(`最大回撤 ${(maxDd * 100).toFixed(2)}%，回撤控制优秀`)
+  if (stability >= 0.9) highlights.push(`收益稳定性 R²=${stability.toFixed(2)}，净值曲线平滑`)
+  if ((m.profit_factor ?? 0) >= 2) highlights.push(`盈亏比 ${(m.profit_factor ?? 0).toFixed(2)}，胜率 ${((m.win_rate ?? 0) * 100).toFixed(1)}%，截断亏损让利润奔跑`)
+  if (ulcer <= 0.05) highlights.push(`Ulcer 指数 ${ulcer.toFixed(2)}，回撤深度极浅`)
+
+  // 问题
+  if (costRatio > 0.08) issues.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，年化换手 ${(m.annual_turnover ?? 0).toFixed(1)} 次，成本侵蚀明显`)
+  if (util < 0.3) issues.push(`仓位利用率 ${(util * 100).toFixed(1)}%，空仓日 ${(emptyDays * 100).toFixed(1)}%，资金闲置较多`)
+  if ((m.return_kurtosis ?? 0) > 10) issues.push(`收益峰度 ${(m.return_kurtosis ?? 0).toFixed(1)}，尾部风险大（最差日 ${((m.worst_daily_return ?? 0) * 100).toFixed(2)}%）`)
+  if ((m.max_consecutive_profit_days ?? 0) > 500) issues.push(`最长连盈 ${m.max_consecutive_profit_days} 天，交易信号触发频率低`)
+
+  // 超额回撤说明
+  const beta = m.beta ?? 0
+  if (beta < 0.3) issues.push(`超额回撤 ${((m.excess_max_drawdown ?? 0) * 100).toFixed(1)}% 可忽略（β=${beta.toFixed(2)}，非指数增强策略）`)
+
+  // 优化方向
+  const suggestions: string[] = []
+  if (costRatio > 0.08) suggestions.push('降低换手率')
+  if (util < 0.3) suggestions.push('提高仓位利用率')
+  if ((m.return_kurtosis ?? 0) > 10) suggestions.push('控制尾部风险')
+
+  if (highlights.length) summary.push(`亮点：${highlights.join('；')}`)
+  if (issues.length) summary.push(`关注：${issues.join('；')}`)
+  if (suggestions.length) summary.push(`优化方向：${suggestions.join(' + ')}`)
 
   return {
     total, grade, gradeLabel,
@@ -3138,7 +3159,7 @@ watch(theme, () => {
           </div>
         </div>
         <div class="score-summary">
-          <p v-for="(s, i) in portfolioScore.summary" :key="i">· {{ s }}</p>
+          <p v-for="(s, i) in portfolioScore.summary" :key="i" :class="{ 'summary-highlight': s.startsWith('亮点'), 'summary-issue': s.startsWith('关注'), 'summary-suggestion': s.startsWith('优化') }">{{ s }}</p>
         </div>
       </div>
 
@@ -3655,7 +3676,10 @@ watch(theme, () => {
 .dim-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 .dim-score { width: 48px; text-align: right; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .score-summary { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
-.score-summary p { margin: 2px 0; font-size: 12.5px; color: var(--ink-soft); }
+.score-summary p { margin: 3px 0; font-size: 12.5px; line-height: 1.5; }
+.summary-highlight { color: var(--green); }
+.summary-issue { color: var(--gold); }
+.summary-suggestion { color: var(--accent); }
 
 .ca-hit-row {
   display: grid;
