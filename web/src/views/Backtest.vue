@@ -3345,14 +3345,14 @@ watch(theme, () => {
   margin-bottom: 8px;
 }
 .strategy-card {
-  background: var(--hover-bg);
-  border-radius: 10px;
+  background: var(--chart-bg);
+  border-radius: var(--radius);
   padding: 16px;
   border: 1px solid var(--line);
 }
 .strategy-card.portfolio-card {
   border: 2px solid var(--accent);
-  background: linear-gradient(135deg, var(--hover-bg) 0%, var(--accent-light) 100%);
+  background: linear-gradient(135deg, var(--chart-bg) 0%, var(--accent-light) 100%);
 }
 .strategy-card h3 {
   margin: 0 0 12px;
@@ -3369,7 +3369,7 @@ watch(theme, () => {
   justify-content: space-between;
   padding: 5px 10px;
   background: var(--card-bg);
-  border-radius: 5px;
+  border-radius: var(--radius);
   font-size: 12px;
 }
 .metric-label { color: var(--ink-soft); }
@@ -3431,8 +3431,8 @@ watch(theme, () => {
 
 /* 交易明细表 */
 .table-container {
-  background: var(--hover-bg);
-  border-radius: 10px;
+  background: var(--chart-bg);
+  border-radius: var(--radius);
   padding: 16px;
   overflow-x: auto;
 }
