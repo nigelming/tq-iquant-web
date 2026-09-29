@@ -110,7 +110,7 @@ onMounted(load)
                 <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
                 <span v-else class="badge badge-gray">{{ r.status }}</span>
               </td>
-              <td>{{ r.progress != null ? Math.round(r.progress * 100) + '%' : '-' }}</td>
+              <td>{{ r.progress != null ? r.progress + '%' : '-' }}</td>
             </tr>
           </tbody>
         </table>
