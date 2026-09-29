@@ -47,6 +47,7 @@ class BacktestEvaluation(Base):
     hhi = Column(Numeric(10, 4), nullable=True)
     # ---- 路径 / 分布（FR-3）----
     max_consecutive_loss_days = Column(Integer, nullable=True)
+    max_consecutive_profit_days = Column(Integer, nullable=True)
     worst_daily_return = Column(Numeric(10, 4), nullable=True)
     worst_weekly_return = Column(Numeric(10, 4), nullable=True)
     return_skewness = Column(Numeric(10, 4), nullable=True)

@@ -896,7 +896,8 @@ _EVALUATION_FIELDS = (
     "excess_max_drawdown",
     "annual_turnover", "total_cost_ratio", "avg_position_utilization",
     "empty_days_ratio", "max_single_weight", "hhi",
-    "max_consecutive_loss_days", "worst_daily_return", "worst_weekly_return",
+    "max_consecutive_loss_days", "max_consecutive_profit_days",
+    "worst_daily_return", "worst_weekly_return",
     "return_skewness", "return_kurtosis",
 )
 
@@ -1445,6 +1446,7 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "max_single_weight": _f(e.max_single_weight),
         "hhi": _f(e.hhi),
         "max_consecutive_loss_days": e.max_consecutive_loss_days,
+        "max_consecutive_profit_days": e.max_consecutive_profit_days,
         "worst_daily_return": _f(e.worst_daily_return),
         "worst_weekly_return": _f(e.worst_weekly_return),
         "return_skewness": _f(e.return_skewness),
