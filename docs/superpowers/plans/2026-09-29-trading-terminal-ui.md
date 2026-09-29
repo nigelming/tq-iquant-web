@@ -15,8 +15,15 @@
 - **禁止新增 npm 依赖。** `web/package.json` 的 `dependencies` 必须保持 `axios` / `echarts` / `vue` / `vue-router` 四项不变。
 - **禁止硬编码颜色。** 所有新写/改的颜色必须用 `var(--token)` 或经 `cssVar('--token')` 读取。唯一允许的字面色值是 `style.css` 内 `:root` / `[data-theme="dark"]` 两个 token 块中的 token 定义本身。
 - **禁止改动这 7 个文件**（超出本次范围）：`Dashboard.vue`、`StockPools.vue`、`Formulas.vue`、`Portfolios.vue`、`Backtest.vue`、`LiveSessions.vue`、`SystemConfig.vue` 的**模板与脚本**。样式块的**唯一例外**见 Task 2 Step 7（`Backtest.vue` 的 `.chart-box` scoped 规则，2 个声明）与 Task 5（`itemStyle.borderColor` 一个字符串）。
-- **禁止改动 `style.css` 中 `--score-1` 至 `--score-5`、`--green-wash`、`--red-wash`、`--warn-wash`、`--gold-wash`、`--overlay`、`--shadow-sm`、`--shadow-md`、`--accent-light` 之外的既有语义 token 名**。可以改其值（如 `--red`），不可改名——改名会波及 `Backtest.vue` 的 `cssVar('--xxx')` 调用点。
-- **禁止删除既有 token。** 只允许新增与改值。
+- **禁止改名或删除既有 token**（改名会波及 `Backtest.vue` 的 `cssVar('--xxx')` 调用点）。**改值是允许且必要的**——旧 token 内嵌旧 ink/accent 的 RGB，换冷调色板后必须跟随更新，否则会残留暖黑投影与旧强调色。
+- **`--score-1` 至 `--score-5` 的值必须完全不变**：它们是独立的五档色阶（红→金→绿），本就不等于 `--red`/`--green`，不随基色板联动。
+- **4 个 wash token（`--red-wash` / `--green-wash` / `--gold-wash` / `--warn-wash`）必须从各自新基色重新派生**，保持原 alpha 值不变：
+  - `--red-wash` = `rgba(198,40,40,.12)`（新 `--red` `#c62828`）
+  - `--green-wash` = `rgba(27,127,75,.12)`（新 `--green` `#1b7f4b`）
+  - `--gold-wash` = `rgba(161,98,7,.18)`（新 `--gold` `#a16207`）
+  - `--warn-wash` = `rgba(180,83,9,.12)`（新 `--warn` `#b45309`）
+  - 暗色块同样重新派生：`--red-wash` = `rgba(242,86,77,.16)`、`--green-wash` = `rgba(63,178,127,.16)`、`--gold-wash` = `rgba(212,169,74,.20)`、`--warn-wash` = `rgba(226,155,79,.16)`
+  - 浅色 `--gold-wash` 的 alpha 保持 `.18`、暗色保持 `.20`，其余保持 `.12` / `.16`——**只换 RGB，不换 alpha**。
 - 测试基线：`npx vitest run` = **199 passed**，`npx vue-tsc -b` = **exit 0**。每个 Task 结束前两者都必须复现该基线（Task 3–4 后为 205 passed，Task 5 后为 207 passed）。
 - 提交粒度：每个 Task 独立 commit，message 用中文，遵循仓库现有前缀风格（`feat:` / `fix:` / `test:` / `docs:`）。
 - **必须保持每个文件现有的编码与行尾，不要"顺手规范化"。** 本仓库两种约定并存（已实测）：`style.css` = UTF-8 **带 BOM** + **LF**；`App.vue` / `Backtest.vue` / `Backtest.test.ts` = UTF-8 **无 BOM** + **CRLF**。改动后各自的 BOM 状态与行尾必须与上表一致。**禁止**用 `Set-Content` / `Out-File` 写 `web/src/` 下任何文件（PowerShell 5.1 会改变 BOM 与行尾）。用 `edit` 工具做定点替换，或用 `[System.IO.File]::WriteAllText($p, $c, $encoding)` 并显式指定原编码。
@@ -84,10 +91,10 @@ Expected: `Test Files 13 passed (13)` / `Tests 199 passed (199)`。若不是 199
   --score-3: #8a7408;
   --score-4: #2c7a4b;
   --score-5: #14532d;
-  --green-wash: rgba(30,107,58,.12);
-  --red-wash: rgba(179,64,42,.12);
-  --warn-wash: rgba(192,86,33,.12);
-  --gold-wash: rgba(138,109,28,.18);
+  --green-wash: rgba(27,127,75,.12);
+  --red-wash: rgba(198,40,40,.12);
+  --warn-wash: rgba(180,83,9,.12);
+  --gold-wash: rgba(161,98,7,.18);
   --accent-glow: rgba(47,74,122,.25);
   --shadow-sm: 0 2px 8px rgba(15,23,42,.15);
   --shadow-md: 0 4px 12px rgba(15,23,42,.10);
@@ -108,7 +115,7 @@ Expected: `Test Files 13 passed (13)` / `Tests 199 passed (199)`。若不是 199
 }
 ```
 
-注意 `--score-1..5` 与五个 wash token 的**值必须与改动前完全一致**（Global Constraints 要求），上面照抄了现值。`--accent-glow` 的值从 `rgba(43,92,138,.25)` 改为 `rgba(47,74,122,.25)`（跟随新 accent 的 RGB 47,74,122）。
+注意 `--score-1..5` 的**值必须与改动前完全一致**（Global Constraints 要求），上面照抄了现值。4 个 wash token 的 RGB 已按新基色重新派生（alpha 不变），`--accent-glow` 的值从 `rgba(43,92,138,.25)` 改为 `rgba(47,74,122,.25)`（跟随新 accent 的 RGB 47,74,122）。
 
 - [ ] **Step 3: 替换 `[data-theme="dark"]` 块的 token 定义**
 
@@ -134,10 +141,10 @@ Expected: `Test Files 13 passed (13)` / `Tests 199 passed (199)`。若不是 199
   --score-3: #d8b93a;
   --score-4: #4aa96f;
   --score-5: #2f8a58;
-  --green-wash: rgba(63,160,107,.16);
-  --red-wash: rgba(224,101,80,.16);
+  --green-wash: rgba(63,178,127,.16);
+  --red-wash: rgba(242,86,77,.16);
   --warn-wash: rgba(226,155,79,.16);
-  --gold-wash: rgba(201,162,74,.20);
+  --gold-wash: rgba(212,169,74,.20);
   --accent-glow: rgba(107,163,208,.30);
   --shadow-sm: 0 2px 10px rgba(0,0,0,.45);
   --shadow-md: 0 4px 14px rgba(0,0,0,.50);
@@ -976,3 +983,6 @@ Tab 键遍历侧边栏与顶栏按钮，确认 `:focus-visible` 焦点环可见�
 - 现有 12 个测试文件均**不 mock `vue-router`**，故 Task 3 Step 1 必须新增该 mock，否则 `useRoute()` 返回 `undefined` 导致 mount 崩溃。
 - **Pre-flight 裁定（controller，2026-09-29）**：`.chart-box` / `.chart-container` / `.ca-chart` 定义在 `Backtest.vue` 的 `<style scoped>`（第 3419/3425/3592 行），scoped 编译后带 `[data-v-xxx]`，特异性 0,2,0 压过全局 0,1,0。原计划 Task 2 Step 6 的全局 `.chart-box` 规则是死代码，且 Task 5 改描边为 `--chart-bg` 后会与实际画布底色 `--hover-bg` 不一致使描边不可见。经用户裁定：改 `Backtest.vue` scoped `.chart-box` 的 `background` 与 `border-radius`（Task 2 Step 7）。这也是计划中唯一对业务视图 scoped 样式的改动。
 - `.num` 已被 `Backtest.vue` 使用 4 次（第 3172/3175/3176/3202 行），但全项目**无任何 `.num` 的字体/等宽定义**（第 3517 行只有 `text-align: right`）。故 Task 2 Step 3 在 `style.css` 新增的全局 `.num` 会立即生效，无 scoped 冲突。
+- **Wash token 裁定（controller，Task 1 实施后，2026-09-29）**：Task 1 首次提交（`efcb094`）按 plan 旧文本冻结了 4 个 wash token 的值，实测其内嵌**旧**基色 RGB（`--red-wash` = `rgba(179,64,42)` 而新 `--red` = `rgb(198,40,40)`），冷调色板上会出现基色与背景 wash 不同源。plan 旧文本给的理由「有测试锁定」经核实**不成立**——`Backtest.test.ts` 的 `CSS_VARS` 是自洽 mock，不读真实 `style.css`。经用户裁定：4 个 wash 重新派生，alpha 不变。已更新 plan 的 Global Constraints 与两个 token 块。
+- **Task 1 实施者发现（已确认属实）**：controller 的 dispatch 简报把 Global Constraints 第 18 条误述为「9 个 token 的值必须不变」，而 plan 原文约束的是**不得改名**。实施者选择遵循 plan 并主动上报，未自行猜测。controller 已在本次裁定中重写该条约束，消除歧义。
+- plan Task 1 的 Interfaces 段与提交 message 称「新增 10 个 token」，实际为 **9 个**（`--font-mono` 只在 `:root` 定义，暗色块共享）。属文案笔误，不影响实现。
