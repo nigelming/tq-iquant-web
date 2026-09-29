@@ -221,9 +221,11 @@ git commit -m "feat(theme): 冷调专业色板 — 浅色转冷灰、暗色转�
 ## Task 2: 排版密度与基元样式
 
 **Files:**
-- Modify: `web/src/style.css`（第 64 行起的选择器区；用 `edit` 做定点替换，**不改 token 块**）
+- Modify: `web/src/style.css` 第 80 行起的选择器区（用 `edit` 做定点替换，**绝对不改第 1–79 行的两个 token 块**）
 - Modify: `web/src/views/Backtest.vue:3419-3424`（**仅** scoped `.chart-box` 的 `background` 与 `border-radius` 两个声明，见 Step 7）
 - Test: 无新增测试，靠既有 199 个测试回归
+
+> **行号基准（Task 1 完成后实测）**：`style.css` 共 166 行，`:root` = 1–39 行，`[data-theme="dark"]` = 40–79 行，选择器区 = 80–166 行。待替换的旧选择器实测位于：layout 组 85–96 行、nav-item 组 89–91 行、table 组 98–100 行、`.badge` 103 行、`.modal-content` 118 行。**用 `edit` 的字符串匹配定位，不要依赖行号。**
 
 **Interfaces:**
 - Consumes: Task 1 的全部 token（含新增的 `--font-mono`、`--shadow-card`、`--chart-bg`、`--focus-ring`）
@@ -331,7 +333,7 @@ tbody td{padding:8px 14px;border-bottom:1px solid var(--line)}
 
 - [ ] **Step 6: 追加图标 / 状态点 / 状态胶囊 / 图表底色选择器**
 
-在 `style.css` 文件**末尾**（第 149 行之后）追加：
+在 `style.css` 文件**末尾**（当前第 166 行之后）追加：
 
 ```css
 /* ===== 专业交易终端：图标 / 状态 / 图表底色 ===== */
