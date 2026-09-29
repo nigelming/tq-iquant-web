@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { readFileSync } from 'node:fs'
 import { useTheme } from '../composables/useTheme'
 
 const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
@@ -21,6 +22,7 @@ const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
     '--score-4': '#2c7a4b',
     '--score-5': '#14532d',
     '--overlay': 'rgba(11,11,11,.4)',
+    '--chart-bg': '#123456',
   }
 
   const SCORE_TIER_OF: Record<string, string> = {
@@ -2030,5 +2032,23 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     await mrBtns(w)[0].trigger('click')
     await flushPromises()
     expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算失败')
+  })
+})
+
+describe('Backtest.vue — 饼图描边色走 --chart-bg token', () => {
+  it('扇区描边色取自 --chart-bg 而非 --card-bg', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const pie = options.find((o: any) => o.series?.[0]?.type === 'pie')
+    expect(pie).toBeTruthy()
+    expect(pie.series[0].itemStyle.borderColor).toBe(CSS_VARS['--chart-bg'])
+  })
+
+  it('浅色 :root 中 --chart-bg 与 --card-bg 同值（描边在浅底上可见）', () => {
+    const css = readFileSync('src/style.css', 'utf-8')
+    const root = css.match(/:root\s*\{([\s\S]*?)\n\}/)![1]
+    const pick = (n: string) => root.match(new RegExp(`${n}:\\s*([^;]+);`))![1].trim()
+    expect(pick('--chart-bg')).toBe(pick('--card-bg'))
   })
 })
