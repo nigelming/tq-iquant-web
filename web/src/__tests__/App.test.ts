@@ -62,3 +62,42 @@ describe('App.vue — 图标渲染', () => {
     expect(w.text()).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u)
   })
 })
+
+describe('App.vue — 外壳结构', () => {
+  beforeEach(() => {
+    resetTheme()
+    localStorage.clear()
+  })
+
+  it('侧边栏导航分三组（研究/交易/系统）并有组标签', async () => {
+    const w = mount(App)
+    await flushPromises()
+    const labels = w.findAll('.nav-group-label').map((e) => e.text())
+    expect(labels).toEqual(['研究', '交易', '系统'])
+    expect(w.findAll('.nav-group-label')).toHaveLength(3)
+  })
+
+  it('主题切换按钮在顶栏（不在侧边栏底部）', async () => {
+    const w = mount(App)
+    await flushPromises()
+    expect(w.find('.topbar-right').find('.theme-toggle').exists()).toBe(true)
+    expect(w.find('.sidebar-footer').exists()).toBe(false)
+  })
+
+  it('Core 在线时状态点为 online 且显示版本与运行时长', async () => {
+    const w = mount(App)
+    await flushPromises()
+    const dot = w.find('.status-dot')
+    expect(dot.exists()).toBe(true)
+    expect(dot.classes()).toContain('online')
+    expect(w.find('.status-chip').text()).toContain('Core 在线')
+    expect(w.find('.status-chip').text()).toContain('v1.0')
+    expect(w.find('.status-chip').text()).toContain('0h53m')
+  })
+
+  it('顶栏显示当前路由路径（等宽字体）', async () => {
+    const w = mount(App)
+    await flushPromises()
+    expect(w.find('.topbar-path').text()).toBe('/dashboard')
+  })
+})
