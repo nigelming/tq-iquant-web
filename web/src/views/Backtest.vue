@@ -2931,7 +2931,7 @@ watch(theme, () => {
           </div>
         </template>
         <template v-else-if="iaOk">
-          <div class="ca-kpi-row">
+          <div class="ca-hit-row">
             <div v-for="c in iaHitCards" :key="c.label" class="ca-kpi">
               <div class="ca-kpi-label">{{ c.label }}</div>
               <div class="ca-kpi-value">{{ c.rate }}</div>
@@ -3552,6 +3552,12 @@ watch(theme, () => {
 }
 .ca-banner .t { font-size: 20px; font-weight: 800; }
 .ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
+.ca-hit-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 14px 0 10px;
+}
 .ca-kpi-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -3561,7 +3567,7 @@ watch(theme, () => {
 .ca-kpi {
   background: var(--card-bg);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius);
   padding: 16px 10px;
   text-align: center;
 }
