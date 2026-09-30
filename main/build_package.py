@@ -39,7 +39,6 @@ def main():
         "--include-package=yaml",
         "--include-package=alembic",
         "--windows-disable-console",
-        "--prefer-source-code",
         "--output-filename=tq-iquant",
         "--output-dir=" + str(ROOT / "dist" / "tq-iquant"),
     ]

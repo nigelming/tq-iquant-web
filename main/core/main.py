@@ -55,15 +55,36 @@ async def health():
     return {"ok": True}
 
 
+@app.get("/debug-path")
+async def debug_path():
+    import sys
+    from pathlib import Path
+    base = Path(sys.argv[0]).resolve().parent
+    dist = base / "_internal" / "web" / "dist"
+    if not dist.exists():
+        dist = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+    return {
+        "frozen": hasattr(sys, 'frozen'),
+        "argv0": sys.argv[0],
+        "base": str(base),
+        "dist": str(dist),
+        "exists": dist.exists(),
+    }
+
+
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
 import sys as _sys
 
-if hasattr(_sys, 'frozen'):
+def _is_frozen() -> bool:
+    return hasattr(_sys, 'frozen') or (_sys.argv[0] and _sys.argv[0].endswith('.exe'))
+
+if _is_frozen():
     _base = _Path(_sys.argv[0]).resolve().parent
     _dist = _base / "_internal" / "web" / "dist"
 else:
     _dist = _Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+logger.info("Static dist path: %s (exists=%s)", _dist, _dist.exists())
 if _dist.exists():
     app.mount("/", StaticFiles(directory=str(_dist), html=True), name="static")
 
