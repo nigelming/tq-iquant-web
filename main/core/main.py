@@ -53,3 +53,16 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path as _Path
+
+_dist = _Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+if _dist.exists():
+    app.mount("/", StaticFiles(directory=str(_dist), html=True), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
