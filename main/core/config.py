@@ -17,7 +17,7 @@ def get_config_path() -> Path:
 
 def _defaults() -> dict:
     return {
-        "tdx_path": r"D:\zd_zyb",
+        "tdx_path": "",
         "iquant_path": "",
         "max_concurrent_backtest": 1,
         "database": {
