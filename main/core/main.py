@@ -57,8 +57,13 @@ async def health():
 
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
+import sys as _sys
 
-_dist = _Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+if hasattr(_sys, 'frozen'):
+    _base = _Path(_sys.argv[0]).resolve().parent
+    _dist = _base / "_internal" / "web" / "dist"
+else:
+    _dist = _Path(__file__).resolve().parent.parent.parent / "web" / "dist"
 if _dist.exists():
     app.mount("/", StaticFiles(directory=str(_dist), html=True), name="static")
 

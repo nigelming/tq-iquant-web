@@ -20,11 +20,13 @@ def run_cmd(cmd, cwd=None):
 
 def main():
     print("=== Step 1: Nuitka 编译 ===")
-    run_cmd([
-        sys.executable, "-m", "nuitka",
+    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
+    python_exe = str(venv_python) if venv_python.exists() else sys.executable
+    nuitka_cmd = [
+        python_exe, "-m", "nuitka",
         "--standalone",
         "--include-package=core",
-        "--include-package=shared",
+        "--include-package=tq_iquant_shared",
         "--include-package=sqlalchemy",
         "--include-package=fastapi",
         "--include-package=uvicorn",
@@ -34,18 +36,31 @@ def main():
         "--include-package=httpx",
         "--include-package=pytdx",
         "--include-package=openpyxl",
-        "--include-package=pyyaml",
+        "--include-package=yaml",
         "--include-package=alembic",
-        "--include-package=tqdm",
         "--windows-disable-console",
-        "--windows-icon-from-ico=" + str(ROOT.parent / "web" / "public" / "favicon.ico"),
+        "--prefer-source-code",
         "--output-filename=tq-iquant",
         "--output-dir=" + str(ROOT / "dist" / "tq-iquant"),
-        "core/main.py",
-    ], cwd=str(ROOT))
+    ]
+    icon_path = ROOT.parent / "web" / "public" / "favicon.ico"
+    if icon_path.exists():
+        nuitka_cmd.append("--windows-icon-from-ico=" + str(icon_path))
+    else:
+        print(f"  WARNING: {icon_path} not found, skipping icon")
+    nuitka_cmd.append("core/main.py")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT.parent / "shared") + os.pathsep + env.get("PYTHONPATH", "")
+    print(f"  PYTHONPATH={env['PYTHONPATH']}")
+    result = subprocess.run(nuitka_cmd, cwd=str(ROOT), env=env)
+    if result.returncode != 0:
+        print(f"FAILED: {nuitka_cmd}")
+        sys.exit(1)
+
+    dist_dir = OUTPUT_DIR / "main.dist"
 
     print("\n=== Step 2: 复制前端静态文件 ===")
-    dest_web = OUTPUT_DIR / "_internal" / "web" / "dist"
+    dest_web = dist_dir / "_internal" / "web" / "dist"
     dest_web.parent.mkdir(parents=True, exist_ok=True)
     if WEB_DIST.exists():
         shutil.copytree(WEB_DIST, dest_web, dirs_exist_ok=True)
@@ -55,19 +70,19 @@ def main():
 
     print("\n=== Step 3: 复制 config.yaml ===")
     if CONFIG_YAML.exists():
-        shutil.copy2(CONFIG_YAML, OUTPUT_DIR / "config.yaml")
+        shutil.copy2(CONFIG_YAML, dist_dir / "config.yaml")
         print(f"  copied config.yaml")
 
     print("\n=== Step 4: 创建 data/ 和 logs/ 目录 ===")
-    (OUTPUT_DIR / "data").mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    (dist_dir / "data").mkdir(parents=True, exist_ok=True)
+    (dist_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     print("\n=== Step 5: 创建启动.bat ===")
-    bat = OUTPUT_DIR / "启动.bat"
+    bat = dist_dir / "启动.bat"
     bat.write_text('@echo off\r\nchcp 65001 >nul\r\ncd /d "%~dp0"\r\nstart "" "tq-iquant.exe"\r\n', encoding='utf-8')
 
     print("\n=== Step 6: 创建 README-分发说明.txt ===")
-    readme = OUTPUT_DIR / "README-分发说明.txt"
+    readme = dist_dir / "README-分发说明.txt"
     readme.write_text(
         "创懿量化交易平台 — 分发说明\r\n"
         "========================\r\n"
