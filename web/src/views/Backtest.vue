@@ -1657,11 +1657,15 @@ const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
 // ===== 综合评分卡 =====
 interface ScoreDimension { label: string; score: number; max: number; comment: string }
 interface StrategyScore {
-  total: number; grade: 'A' | 'B' | 'C' | 'D'; gradeLabel: string
+  total: number; rawTotal: number; timeFactor: number; confidencePct: number; sampleYears: number
+  grade: 'A' | 'B' | 'C' | 'D'; gradeLabel: string
   dimensions: ScoreDimension[]; summary: string[]
 }
 
-function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategyScore | null {
+// 综合评分时间因子：样本时长置信度，短周期按比例折扣（满该年数记 100%）
+const SCORE_REFERENCE_YEARS = 3
+
+function scoreStrategy(m: BacktestEvaluationItem | null | undefined, sampleYears = 0): StrategyScore | null {
   if (!m) return null
   const sharpe = m.sharpe_ratio ?? 0
   const calmar = m.calmar_ratio ?? 0
@@ -1680,7 +1684,10 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   const costScore = Math.max(0, 10 - costRatio * 20) + winRate * 5
   const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10)
 
-  const total = Math.round(riskAdj + ddCtrl + stabScore + costScore + utilScore)
+  // 时间因子：样本时长置信度，短于参考年数按比例折扣；总分 = 原始分 × 时间因子
+  const timeFactor = Math.min(sampleYears / SCORE_REFERENCE_YEARS, 1)
+  const rawTotal = riskAdj + ddCtrl + stabScore + costScore + utilScore
+  const total = Math.round(rawTotal * timeFactor)
   const grade = total >= 80 ? 'A' : total >= 60 ? 'B' : total >= 40 ? 'C' : 'D'
   const gradeLabel = { A: '优秀', B: '良好', C: '一般', D: '较差' }[grade]
 
@@ -1716,7 +1723,9 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   if (suggestions.length) summary.push(`优化方向：${suggestions.join(' + ')}`)
 
   return {
-    total, grade, gradeLabel,
+    total, rawTotal: Math.round(rawTotal), timeFactor,
+    confidencePct: Math.round(timeFactor * 100), sampleYears,
+    grade, gradeLabel,
     dimensions: [
       { label: '风险调整收益', score: Math.round(riskAdj), max: 30, comment: `夏普${sharpe.toFixed(2)} / 卡玛${calmar.toFixed(2)}` },
       { label: '回撤控制', score: Math.round(ddCtrl), max: 20, comment: `最大回撤${(maxDd * 100).toFixed(2)}%` },
@@ -1728,7 +1737,14 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   }
 }
 
-const portfolioScore = computed(() => scoreStrategy(detail.value?.evaluations))
+// 回测样本年数（按交易日估算，252 日/年），用于综合评分的时间因子
+const backtestYears = computed(() => {
+  const snaps = detail.value?.snapshots || []
+  if (snaps.length < 2) return 0
+  return (snaps.length - 1) / 252
+})
+
+const portfolioScore = computed(() => scoreStrategy(detail.value?.evaluations, backtestYears.value))
 
 // 策略对比卡片
 const strategyCards = computed(() => {
@@ -2278,7 +2294,7 @@ watch(theme, () => {
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
@@ -2286,7 +2302,6 @@ watch(theme, () => {
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
             <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
             <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ STATUS_LABEL[r.status] || r.status }}</span></td>
-            <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:var(--ink-faint)">-</span></td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
               <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
@@ -2345,6 +2360,18 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+    </div>
+
+    <!-- 信号预检警告：回测 completed 但公式报错/输出线缺失/区间零信号 -->
+    <div v-if="currentRecord.warnings && currentRecord.warnings.length"
+         class="card signal-preflight-banner">
+      <div class="spb-title">
+        ⚠️ 信号预检发现 {{ currentRecord.warnings.length }} 项问题
+        <span>（回测已完成，但可能未产生预期交易）</span>
+      </div>
+      <ul class="spb-list">
+        <li v-for="(w, i) in currentRecord.warnings" :key="i">{{ w }}</li>
+      </ul>
     </div>
 
     <!-- 关键指标摘要 -->
@@ -3149,6 +3176,10 @@ watch(theme, () => {
           <div class="score-grade" :class="'grade-' + portfolioScore.grade.toLowerCase()">{{ portfolioScore.grade }}</div>
           <div class="score-info">
             <div class="score-title">综合评分 <span class="score-total">{{ portfolioScore.total }}</span> / 100 — {{ portfolioScore.gradeLabel }}</div>
+            <div class="score-confidence">
+              样本时长 {{ portfolioScore.sampleYears.toFixed(2) }} 年 · 置信度 {{ portfolioScore.confidencePct }}%
+              <span v-if="portfolioScore.timeFactor < 1" class="score-confidence-note">（不足 {{ SCORE_REFERENCE_YEARS }} 年，评分按置信度折扣；原始分 {{ portfolioScore.rawTotal }}）</span>
+            </div>
             <div class="score-dims">
               <div v-for="d in portfolioScore.dimensions" :key="d.label" class="score-dim">
                 <span class="dim-label">{{ d.label }}</span>
@@ -3359,6 +3390,30 @@ watch(theme, () => {
   left: 0;
   top: 0;
   text-decoration: none;
+}
+.signal-preflight-banner {
+  margin: 0 0 20px;
+  padding: 12px 16px;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-wash);
+}
+.signal-preflight-banner .spb-title {
+  color: var(--warn);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.signal-preflight-banner .spb-title span {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-left: 6px;
+}
+.signal-preflight-banner .spb-list {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.7;
 }
 .report-header h1 {
   margin: 0;
@@ -3669,6 +3724,8 @@ watch(theme, () => {
 .score-info { flex: 1; }
 .score-title { font-size: 14px; font-weight: 600; color: var(--ink); }
 .score-total { font-size: 20px; font-weight: 800; color: var(--accent); }
+.score-confidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
+.score-confidence-note { color: var(--gold); }
 .score-dims { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; margin-top: 8px; }
 .score-dim { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-shrink: 0; }
 .dim-label { width: 70px; color: var(--ink-soft); flex-shrink: 0; white-space: nowrap; }

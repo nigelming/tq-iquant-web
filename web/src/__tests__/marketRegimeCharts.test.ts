@@ -41,7 +41,7 @@ import Backtest from '../views/Backtest.vue'
 import { getBacktestRecords, getBacktestDetail, getPortfolios } from '../api'
 
 const mockRecords = [
-  { id: 1, name: '回测A', portfolio_strategy_id: 1, status: 'completed', progress: 100,
+  { id: 1, name: '回测A', portfolio_strategy_id: 1, status: 'completed',
     start_date: '2026-07-01', end_date: '2026-07-31', created_at: '2026-08-01T10:00:00' },
 ]
 

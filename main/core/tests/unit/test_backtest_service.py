@@ -124,8 +124,7 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
 
     # patch 数据获取层（避开真实 TQ/TDX）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -163,7 +162,6 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
     # record 状态
     rec = db_session.get(BacktestRecord, result["record_id"])
     assert rec.status == "completed"
-    assert rec.progress == 100
     assert rec.completed_at is not None
 
     # 持久化：1 trade + 2 snapshot(portfolio) + 1 evaluation(portfolio)
@@ -179,8 +177,7 @@ def test_run_backtest_persists_positions_json(db_session, monkeypatch):
     """新回测：快照 positions 明细落 positions_json；空仓日落 "[]" 而非 NULL。"""
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, k: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -218,8 +215,7 @@ def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkey
     ps, _ = _seed(db_session)
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -244,8 +240,7 @@ def test_run_backtest_exception_marks_failed_and_reraises(db_session, monkeypatc
         raise RuntimeError("polars panic: str cannot be int")
 
     monkeypatch.setattr(svc, "build_klines", _boom)
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -271,8 +266,7 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
     """完整详情：record + snapshots + trades + evaluations + 策略层四件套齐全。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
@@ -310,15 +304,16 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
 # 查询：delete_record
 # ---------------------------------------------------------------------------
 def test_delete_record_returns_false_when_missing(db_session):
-    assert svc.delete_record(db_session, 99999) is False
+    ok_flag, msg = svc.delete_record(db_session, 99999)
+    assert ok_flag is False
+    assert msg is not None and "不存在" in msg
 
 
 def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     """存在返回 True；record + trades/snapshots/evaluations 全清。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
@@ -342,7 +337,9 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
 
     # 删除前子表有数据
     assert db_session.query(BacktestTrade).filter_by(backtest_record_id=rid).count() == 1
-    assert svc.delete_record(db_session, rid) is True
+    ok_flag, msg = svc.delete_record(db_session, rid)
+    assert ok_flag is True
+    assert msg is None
 
     # 删除后 record + 子表全空
     assert db_session.get(BacktestRecord, rid) is None
@@ -377,8 +374,7 @@ def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch)
     """result["decisions"] 逐行落 backtest_decision_events；详情带聚合统计 + 明细。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
@@ -419,8 +415,7 @@ def test_delete_record_cascades_decisions(db_session, monkeypatch):
     """删除回测记录时 decision 事件一并清空。"""
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
@@ -433,9 +428,87 @@ def test_delete_record_cascades_decisions(db_session, monkeypatch):
     assert db_session.query(BacktestDecisionEvent).filter_by(
         backtest_record_id=rid).count() == 3
 
-    assert svc.delete_record(db_session, rid) is True
+    ok_flag, msg = svc.delete_record(db_session, rid)
+    assert ok_flag is True
+    assert msg is None
     assert db_session.query(BacktestDecisionEvent).filter_by(
         backtest_record_id=rid).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# #4: delete_record 运行中守卫 — 防止并发删除运行中的回测引发 FK 500 / 数据竞争。
+# 对照 live_service.delete_session 返回 (ok, msg) 风格，运行中拒绝并返回说明。
+# ---------------------------------------------------------------------------
+def test_delete_record_rejects_running(db_session):
+    """status=running 的回测记录拒绝删除，返回 (False, '...运行中...')；
+    记录与子表保持不变。回测同步内联执行，进程内运行中即代表并发删除。"""
+    ps, _ = _seed(db_session)
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps.id, name="running_one",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="running",
+    )
+    db_session.add(rec)
+    db_session.commit()
+    rid = rec.id
+
+    ok_flag, msg = svc.delete_record(db_session, rid)
+    assert ok_flag is False
+    assert msg is not None and "运行中" in msg
+
+    # 记录仍在，状态不变
+    still = db_session.get(BacktestRecord, rid)
+    assert still is not None
+    assert still.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# #5: recover_stale_running_backtests — 应用启动时清理僵尸 running 记录。
+# 进程崩溃/重启后 DB 残留 status=running 的记录，前端会永久显示"运行中"。
+# 启动时统一标记 failed 并附说明，让用户能识别并重新发起。
+# ---------------------------------------------------------------------------
+def test_recover_stale_running_backtests_marks_failed(db_session):
+    """残留 running 全部标记 failed + error_message 附说明；已完成的记录不动；
+    返回受影响记录数。"""
+    ps, _ = _seed(db_session)
+    r1 = BacktestRecord(
+        portfolio_strategy_id=ps.id, name="crashed1",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="running",
+    )
+    r2 = BacktestRecord(
+        portfolio_strategy_id=ps.id, name="completed_ok",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="completed",
+    )
+    r3 = BacktestRecord(
+        portfolio_strategy_id=ps.id, name="crashed2",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="running",
+    )
+    db_session.add_all([r1, r2, r3])
+    db_session.commit()
+
+    count = svc.recover_stale_running_backtests(db_session)
+    assert count == 2
+
+    assert db_session.get(BacktestRecord, r1.id).status == "failed"
+    assert db_session.get(BacktestRecord, r1.id).error_message  # 含说明
+    assert db_session.get(BacktestRecord, r3.id).status == "failed"
+    # 已完成的不动
+    assert db_session.get(BacktestRecord, r2.id).status == "completed"
+
+
+def test_recover_stale_running_backtests_noop_when_clean(db_session):
+    """无残留 running 时返回 0，不写库。"""
+    ps, _ = _seed(db_session)
+    db_session.add(BacktestRecord(
+        portfolio_strategy_id=ps.id, name="ok",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="completed",
+    ))
+    db_session.commit()
+    assert svc.recover_stale_running_backtests(db_session) == 0
 
 
 def test_list_records_returns_newest_first(db_session, monkeypatch):
@@ -443,8 +516,7 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     created_at 相等，故断言非递增而非严格递减——避免对亚秒分辨率过约束）。"""
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     svc.run_backtest(db_session, ps, _req(name="r1"))
@@ -455,7 +527,7 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     # 序列化字段齐全
     for r in recs:
         assert {"id", "portfolio_strategy_id", "name", "status",
-                "progress", "start_date", "end_date", "created_at"} <= set(r.keys())
+                "start_date", "end_date", "created_at"} <= set(r.keys())
     # 按 created_at 倒序（非递增）；两条 name 都在
     assert recs[0]["created_at"] >= recs[1]["created_at"]
     names = {r["name"] for r in recs}
@@ -474,7 +546,7 @@ class TestReturnBucketsInDetail:
         rec = BacktestRecord(
             portfolio_strategy_id=ps.id, name="rb_test",
             start_date=D(2024, 1, 15), end_date=D(2024, 1, 16),
-            status="completed", progress=100,
+            status="completed",
         )
         db_session.add(rec)
         db_session.flush()
@@ -570,7 +642,7 @@ def _seed_record(db):
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id, name="ca_test",
         start_date=date(2024, 1, 1), end_date=date(2024, 3, 31),
-        status="completed", progress=100,
+        status="completed",
     )
     db.add(rec)
     db.commit()
@@ -789,8 +861,7 @@ def test_safe_compute_crisis_alpha_swallows_and_marks_failed(db_session, monkeyp
 def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkeypatch):
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
 
     def _boom(*a, **kw):
@@ -813,7 +884,6 @@ def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkey
     result = svc.run_backtest(db_session, ps, _req())
     rec = db_session.get(BacktestRecord, result["record_id"])
     assert rec.status == "completed"
-    assert rec.progress == 100
     rows = db_session.query(BacktestCrisisAlpha).filter_by(
         backtest_record_id=rec.id).all()
     assert len(rows) == 1
@@ -826,8 +896,7 @@ def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkey
 def test_run_backtest_calls_crisis_alpha_after_main_commit(db_session, monkeypatch):
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     snapshots = [
         {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
@@ -1400,8 +1469,7 @@ _NO_TRADES_RESULT = {
 
 def _patch_data_layer(monkeypatch, result=None):
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     if result is not None:
@@ -1593,3 +1661,194 @@ def test_resolve_crisis_benchmark_cases_without_db():
         SimpleNamespace(params_snapshot=None), None,
         SimpleNamespace(benchmark_index=None))
     assert defaulted["benchmark_code"] == "000300.SH"
+
+
+# ---------------------------------------------------------------------------
+# 信号预检：build_signal_warnings（零信号 / 输出线缺失 / 公式报错）
+# 场景根因：30 分钟主图公式挂在 1d 策略上时公式不报错但全程零信号，
+# 回测静默 completed，用户无法判断"为什么没有交易"。
+# ---------------------------------------------------------------------------
+def _seed_strat(db, period="1d", trigger=1, sig_name="open_sig"):
+    """基于 _seed 改周期/触发值/信号名，返回 (ps, strat)。"""
+    ps, strat_id = _seed(db)
+    strat = db.get(Strategy, strat_id)
+    strat.period = period
+    sig = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).one()
+    sig.signal_name = sig_name
+    sig.trigger_value = trigger
+    db.commit()
+    return ps, strat
+
+
+def test_build_signal_warnings_zero_signal(db_session):
+    """信号在回测区间内从未触发 → 警告含策略名/信号名/触发值/周期。"""
+    ps, strat = _seed_strat(db_session, period="30m", trigger=2, sig_name="最终强交易买")
+    t = datetime(2026, 7, 29)
+    # 输出线存在，但全程为 0（无信号常态值），永不等于 trigger=2
+    cache = {(strat.id, "000001.SZ", t): [{"name": "最终强交易买", "value": 0}]}
+    diagnostics = {"errors": {}, "output_lines": {strat.id: {"最终强交易买"}}}
+
+    warnings = svc.build_signal_warnings(db_session, [strat], cache, diagnostics)
+
+    assert len(warnings) == 1
+    assert "s1" in warnings[0]
+    assert "最终强交易买" in warnings[0]
+    assert "2" in warnings[0]
+    assert "30m" in warnings[0]
+    assert "从未触发" in warnings[0]
+
+
+def test_build_signal_warnings_triggered_no_warning(db_session):
+    """区间内存在一次匹配触发 → 无警告。"""
+    ps, strat = _seed_strat(db_session, trigger=2)
+    t = datetime(2026, 7, 29)
+    cache = {(strat.id, "000001.SZ", t): [{"name": "open_sig", "value": 2}]}
+    diagnostics = {"errors": {}, "output_lines": {strat.id: {"open_sig"}}}
+
+    assert svc.build_signal_warnings(db_session, [strat], cache, diagnostics) == []
+
+
+def test_build_signal_warnings_missing_output_line(db_session):
+    """配置的信号名不在公式实际输出线中 → 输出线缺失警告（线名写错/公式版本不同）。"""
+    ps, strat = _seed_strat(db_session, sig_name="最终强交易买")
+    diagnostics = {"errors": {}, "output_lines": {strat.id: {"MACD柱", "趋势"}}}
+
+    warnings = svc.build_signal_warnings(db_session, [strat], {}, diagnostics)
+
+    assert len(warnings) == 1
+    assert "最终强交易买" in warnings[0]
+    assert "输出线" in warnings[0]
+
+
+def test_build_signal_warnings_formula_error_short_circuits(db_session):
+    """公式执行报错 → 一条错误警告，不再逐信号报零触发（错误才是根因）。"""
+    ps, strat = _seed_strat(db_session)
+    diagnostics = {"errors": {strat.id: "ErrorId=3 Error=公式语法错误"}, "output_lines": {}}
+
+    warnings = svc.build_signal_warnings(db_session, [strat], {}, diagnostics)
+
+    assert len(warnings) == 1
+    assert "公式执行失败" in warnings[0]
+    assert "公式语法错误" in warnings[0]
+
+
+def test_build_signal_warnings_empty_diagnostics_no_crash(db_session):
+    """诊断信息缺失（如 build_signal_cache 被旁路）→ 不误报、不异常。"""
+    ps, strat = _seed_strat(db_session)
+    assert svc.build_signal_warnings(db_session, [strat], {}, {}) == []
+
+
+def test_build_signal_cache_collects_error_diagnostics(db_session, monkeypatch):
+    """ErrorId 异常 → diagnostics['errors'] 记录策略与错误，cache 为空。"""
+    ps, strat = _seed_strat(db_session)
+    klines = _mock_klines()
+
+    class _FakeTQ:
+        def compute(self, **kw):
+            return {"ErrorId": 7, "Error": "公式语法错误"}
+
+    monkeypatch.setattr(svc, "TQFormula", _FakeTQ)
+
+    diagnostics = {}
+    cache = svc.build_signal_cache(ps, klines, db_session, diagnostics=diagnostics)
+
+    assert cache == {}
+    assert strat.id in diagnostics["errors"]
+    assert "ErrorId=7" in diagnostics["errors"][strat.id]
+
+
+def test_build_signal_cache_collects_output_lines(db_session, monkeypatch):
+    """正常返回 → diagnostics['output_lines'] 收集该公式全部真实输出线名。"""
+    ps, strat = _seed_strat(db_session)
+    klines = _mock_klines()
+
+    class _FakeTQ:
+        def compute(self, **kw):
+            return {
+                "ErrorId": 0,
+                "000001.SZ": {
+                    "open_sig": [{"Date": "20260729", "Value": "2.00"}],
+                    "MACD柱": [{"Date": "20260729", "Value": "0.10"}],
+                },
+            }
+
+    monkeypatch.setattr(svc, "TQFormula", _FakeTQ)
+
+    diagnostics = {}
+    cache = svc.build_signal_cache(ps, klines, db_session, diagnostics=diagnostics)
+
+    assert diagnostics["errors"] == {}
+    assert diagnostics["output_lines"][strat.id] == {"open_sig", "MACD柱"}
+    # cache 正常转换不受影响
+    key = (strat.id, "000001.SZ", datetime(2026, 7, 29))
+    assert {"name": "open_sig", "value": 2} in cache[key]
+
+
+def _patch_common_backtest_deps(monkeypatch):
+    """run_backtest 周边依赖（信号/基准/危机Alpha走桩，引擎由各用例自行替换）。"""
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+
+
+def _fake_engine_result():
+    return {
+        "trades": [],
+        "snapshots": [
+            {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
+             "cash": Decimal("100000"), "market_value": Decimal("0")},
+        ],
+        "evaluations": {"total_return": Decimal("0")},
+        "strategy_snapshots": {},
+        "strategy_evaluations": {},
+    }
+
+
+def test_run_backtest_zero_signal_persists_warning(db_session, monkeypatch):
+    """端到端：零信号回测 completed 但 warnings_json 落库，详情接口可读。"""
+    ps, strat = _seed_strat(db_session, trigger=2, sig_name="最终强交易买")
+    _patch_common_backtest_deps(monkeypatch)
+
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+        if diagnostics is not None:
+            diagnostics["errors"] = {}
+            diagnostics["output_lines"] = {strat.id: {"最终强交易买"}}
+        return {}  # 全程零信号
+
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc.BacktestEngine, "run",
+                        lambda self, portfolio, **kw: _fake_engine_result())
+
+    result = svc.run_backtest(db_session, ps, _req())
+
+    rec = db_session.get(BacktestRecord, result["record_id"])
+    assert rec.status == "completed"
+    warnings = json.loads(rec.warnings_json)
+    assert any("最终强交易买" in w and "从未触发" in w for w in warnings)
+
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert any("最终强交易买" in w for w in detail["record"]["warnings"])
+
+
+def test_run_backtest_triggered_signal_has_no_warning(db_session, monkeypatch):
+    """信号正常触发时 warnings_json 为 NULL，详情 warnings 为空列表。"""
+    ps, strat = _seed_strat(db_session, trigger=2)
+    _patch_common_backtest_deps(monkeypatch)
+
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+        if diagnostics is not None:
+            diagnostics["errors"] = {}
+            diagnostics["output_lines"] = {strat.id: {"open_sig"}}
+        t = datetime(2026, 7, 29)
+        return {(strat.id, "000001.SZ", t): [{"name": "open_sig", "value": 2}]}
+
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc.BacktestEngine, "run",
+                        lambda self, portfolio, **kw: _fake_engine_result())
+
+    result = svc.run_backtest(db_session, ps, _req())
+
+    rec = db_session.get(BacktestRecord, result["record_id"])
+    assert rec.warnings_json is None
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert detail["record"]["warnings"] == []

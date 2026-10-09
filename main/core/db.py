@@ -3,7 +3,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from core.config import load_config
+from core.config import is_frozen_app, load_config
 
 # 锚定到 main/ 目录（本文件位于 main/core/db.py），让 sqlite_path 无论
 # 从哪个 cwd 启动都解析到同一绝对路径，消除对进程工作目录的依赖。
@@ -16,7 +16,8 @@ def _db_path() -> Path:
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     p = Path(sqlite_path)
     if not p.is_absolute():
-        if hasattr(sys, 'frozen'):
+        # Nuitka 不设置 sys.frozen，统一走 is_frozen_app（exe 目录锚定）。
+        if is_frozen_app():
             exe_dir = Path(sys.argv[0]).resolve().parent
         else:
             exe_dir = Path(__file__).resolve().parent.parent
@@ -35,9 +36,18 @@ SessionLocal = sessionmaker(bind=engine)
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_fk(dbapi_conn, connection_record):
-    """SQLite 外键约束默认关闭，逐连接开启以让 ondelete CASCADE/RESTRICT 生效。"""
+    """SQLite 逐连接 PRAGMA：外键约束 + WAL 日志 + 写锁等待（#9）。
+
+    foreign_keys=ON 让 ondelete CASCADE/RESTRICT 生效（默认关闭）；
+    journal_mode=WAL 读写不互斥，SSE 推送/轮询读与回测写并发时不再互相阻塞
+    （WAL 是库级持久设置，逐连接执行为幂等 no-op）；
+    busy_timeout=5000ms 写锁冲突时等待 5s 再报 database is locked，
+    消除回测落库与行情轮询并发写时的偶发锁冲突。
+    """
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

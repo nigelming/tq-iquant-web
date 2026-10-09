@@ -217,6 +217,37 @@ def test_intraday_bars_daily_returns_not_per_bar():
 
 
 # ===========================================================================
+# #6: 分钟回测一天多 bar 的口径一致性 — 路径指标按日聚合序列算。
+# max_drawdown/ulcer/return_stability/recovery_days 旧实现直接用原始快照序列
+# （含日内多条），与 sharpe/sortino（已按日聚合）口径不一致：日内假回撤会被
+# 当真实回撤计入，恢复天数会被同日"假恢复"算成 0 天。
+# ===========================================================================
+def test_intraday_bars_max_drawdown_uses_daily_close():
+    """#6: max_drawdown/ulcer/return_stability 按日聚合序列（每日最后一根 bar）
+    算，不被日内中间 bar 的假回撤拉高。
+
+    场景：day1 日内跌到 80000 又收回 100000（日内假回撤 20%），日收盘 100000；
+          day2/day3 收盘 110000/120000。日聚合序列 [100000, 110000, 120000]
+          线性上涨 → 无回撤、r2=1。
+    原始快照序列含 80000 → max_drawdown=20%、r2<1（错）。
+    """
+    snaps = [
+        _snap(100000, date(2024, 1, 2)),
+        _snap(80000, date(2024, 1, 2)),   # 日内假回撤
+        _snap(100000, date(2024, 1, 2)),  # day1 收盘
+        _snap(110000, date(2024, 1, 3)),  # day2 收盘
+        _snap(120000, date(2024, 1, 4)),  # day3 收盘
+    ]
+    ev = Evaluator().evaluate(snaps)
+    # 日聚合序列 [100000, 110000, 120000] → 线性上涨无回撤
+    assert ev["max_drawdown"] == Decimal("0")
+    # ulcer = sqrt(Σ dd² / n)，日聚合无回撤 → 0
+    assert ev["ulcer_index"] == Decimal("0.0000")
+    # r2：日聚合 3 点完全线性 → 1
+    assert ev["return_stability"] == Decimal("1.0000")
+
+
+# ===========================================================================
 # 基准相对指标（beta / Jensen α / 年化超额 / 跟踪误差 / IR / 捕获率 / 超额回撤）
 #
 # 数据源是快照自身的 snap_date + benchmark_value（每日收盘对齐），不是

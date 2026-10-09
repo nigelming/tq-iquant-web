@@ -23,6 +23,7 @@ class StrategyContext:
         role: str = "independent",
         master_strategy_id: Optional[int] = None,
         stock_pool: Optional[Set[str]] = None,
+        slave_exit_mode: str = "independent",
     ):
         self.strategy_id = strategy_id
         self.period = period
@@ -37,6 +38,8 @@ class StrategyContext:
         # 主从角色（independent/master/slave）
         self.role = role
         self.master_strategy_id = master_strategy_id
+        # 从策略卖出模式（仅 role=slave 时有意义）
+        self.slave_exit_mode = slave_exit_mode
         # 本策略可交易股票池（组合的 stock_pool_id 对应成分；None=不限，回测单池/旧调用）
         self.stock_pool: Optional[Set[str]] = stock_pool
         self.positions: Dict[str, Position] = {}

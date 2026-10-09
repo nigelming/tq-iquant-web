@@ -68,16 +68,9 @@ def test_run_minimal_buy_then_stop_loss():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    # open 价表供 SimulatedDispatcher 成交
-    open_prices = {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),  # bar2 open 成交 BUY
-            datetime(2026, 7, 31): Decimal("9.0"),   # bar3 open 成交 SELL
-        }
-    }
-
+    # open 价表供 SimulatedDispatcher 成交（成交价取 price_index 的 Open 列）
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     trades = result["trades"]
     snapshots = result["snapshots"]
@@ -120,14 +113,7 @@ def test_run_collects_decision_events():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
-    }
-
-    result = BacktestEngine().run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
 
     decisions = result["decisions"]
     stop = [d for d in decisions if d["gate"] == "stop_loss"]
@@ -153,10 +139,8 @@ def test_run_no_signal_no_trade():
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {datetime(2026, 7, 30): Decimal("10.2")}}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     assert result["trades"] == []
     assert len(result["snapshots"]) == 2
@@ -217,14 +201,9 @@ def test_run_breaker_triggers_on_drawdown_and_halts_next_bar_buy():
         (1, stock, datetime(2026, 7, 31)): [{"name": "add_sig", "signal_type": SignalType.ADD, "value": 1}],
         (1, stock, datetime(2026, 8, 1)): [{"name": "add_sig", "signal_type": SignalType.ADD, "value": 1}],
     }
-    open_prices = {stock: {
-        datetime(2026, 7, 30): Decimal("30"),
-        datetime(2026, 7, 31): Decimal("30"),
-        datetime(2026, 8, 1): Decimal("30"),
-    }}
 
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     # bar1(7/29) 收盘价 40 → 峰值 100000，无回撤；ADD 生成 bar1 订单（bar2 open 成交 #1）。
     # bar2(7/30) 收盘价 30 → 总值 80000，回撤 20% → update 触发熔断；
@@ -275,8 +254,7 @@ def test_strategy_snapshots_additivity():
     }
 
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache,
-                        open_prices={stock: {}})
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     strategy_snaps = result["strategy_snapshots"]
     # 两个策略各 2 个快照
@@ -309,10 +287,8 @@ def test_strategy_evaluations_present():
         (2, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (2, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {datetime(2026, 7, 30): Decimal("10.2")}}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     # s1 有交易（BUY@10.2），其评估应存在
     sev = result["strategy_evaluations"]
@@ -347,7 +323,7 @@ def test_benchmark_filled_into_snapshots_and_evaluated():
     engine = BacktestEngine()
     result = engine.run(
         port, klines=klines, signal_cache=cache,
-        open_prices={stock: {}}, benchmark_data=benchmark_data,
+        benchmark_data=benchmark_data,
     )
 
     # 每个组合快照都带 benchmark_value
@@ -376,7 +352,7 @@ def test_no_benchmark_data_no_curve():
 
     engine = BacktestEngine()
     result = engine.run(
-        port, klines=klines, signal_cache=cache, open_prices={stock: {}}
+        port, klines=klines, signal_cache=cache
     )
 
     snaps = result["snapshots"]
@@ -463,3 +439,267 @@ def test_run_first_day_signal_burst_respects_max_positions():
     buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
     assert len(buys) == 5  # max_positions=5，不超开
     assert len({t.stock_code for t in buys}) == 5
+
+
+# ===== 未来函数修复测试 =====
+# 日线信号 bar_time=00:00 在混合周期时间轴中排在当日分钟 bar 之前。
+# 修复：OrderEvent 携带 signal_bar_date，日线信号须在 t.date() > signal_bar_date 的下一交易日成交。
+
+def test_daily_signal_not_filled_same_day_in_mixed_timeline():
+    """混合 1d+5m 时间轴：1d 信号 D 日 00:00 生成，D 日 09:30 不可成交，
+    D+1 日 09:30 才成交。防止日线信号当日开盘成交（未来函数）。"""
+    stock = "000001.SZ"
+    # 1d bars：7/29 和 7/30（00:00）
+    df_1d = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+        "Open": [Decimal("10"), Decimal("11")],
+        "High": [Decimal("10.3"), Decimal("11.2")],
+        "Low": [Decimal("9.9"), Decimal("10.8")],
+        "Close": [Decimal("10.2"), Decimal("11.0")],
+        "Volume": [1000, 1000],
+    })
+    # 5m bars：7/29 09:30 和 7/30 09:30
+    df_5m = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29, 9, 30), datetime(2026, 7, 30, 9, 30)],
+        "Open": [Decimal("10.1"), Decimal("11.0")],
+        "High": [Decimal("10.5"), Decimal("11.3")],
+        "Low": [Decimal("10.0"), Decimal("10.8")],
+        "Close": [Decimal("10.3"), Decimal("11.1")],
+        "Volume": [500, 500],
+    })
+    klines = {stock: {"1d": df_1d, "5m": df_5m}}
+
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+
+    # 1d 信号在 7/29 00:00 触发
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    # 有 1 笔 BUY，成交日 = 7/30（而非 7/29 当日开盘）
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.BUY
+    assert trades[0].trade_time.date() == date(2026, 7, 30)
+    assert trades[0].price == Decimal("11.0")  # 7/30 次日 open 价
+
+
+def test_minute_signal_filled_next_bar_no_delay():
+    """分钟级信号 signal_bar_date=None，下一 bar open 立即成交（现有行为不变）。
+
+    3 根 5m bar：7/29 09:30（信号）→ 09:35（成交）→ 7/30 09:30（无信号，
+    仅为 Evaluator 提供 2 个日终行避免 ZeroDivisionError）。
+    """
+    stock = "000001.SZ"
+    df = pl.DataFrame({
+        "datetime": [
+            datetime(2026, 7, 29, 9, 30),
+            datetime(2026, 7, 29, 9, 35),
+            datetime(2026, 7, 30, 9, 30),
+        ],
+        "Open": [Decimal("10"), Decimal("10.2"), Decimal("10.4")],
+        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("10.6")],
+        "Low": [Decimal("9.9"), Decimal("10.1"), Decimal("10.2")],
+        "Close": [Decimal("10.2"), Decimal("10.3"), Decimal("10.5")],
+        "Volume": [1000, 1000, 1000],
+    })
+    klines = {stock: {"5m": df}}
+
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="5m",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+
+    cache = {
+        (1, stock, datetime(2026, 7, 29, 9, 30)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 29, 9, 35)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 30, 9, 30)): [{"name": "open_sig", "value": -1}],
+    }
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.BUY
+    # 09:30 信号 → 09:35 成交（同日，分钟信号无延迟）
+    assert trades[0].trade_time == datetime(2026, 7, 29, 9, 35)
+
+
+def test_daily_signal_order_carries_signal_bar_date():
+    """日线策略的 _signal_to_order 生成的 OrderEvent 有 signal_bar_date。"""
+    from core.engine.event import OrderEvent
+    from core.engine.portfolio import _DAILY_PERIODS
+    stock = "000001.SZ"
+    bar = BarEvent(
+        stocks={stock: {"open": Decimal("10"), "high": Decimal("10.3"),
+                         "low": Decimal("9.9"), "close": Decimal("10.2"), "volume": 1000}},
+        bar_time=datetime(2026, 7, 29),
+    )
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    # 预置持仓使 signal 能走到 order（OPEN 需无持仓才能触发）
+    from core.engine.event import SignalEvent
+    sig = SignalEvent(
+        strategy_id=1, stock_code=stock, signal_name="open_sig",
+        signal_type=SignalType.OPEN, bar_time=bar.bar_time,
+    )
+    order = port._signal_to_order(ctx, sig, bar)
+    assert order is not None
+    assert order.signal_bar_date == date(2026, 7, 29)
+
+
+def test_minute_signal_order_has_none_signal_bar_date():
+    """分钟级策略的 OrderEvent.signal_bar_date 为 None。"""
+    from core.engine.event import SignalEvent
+    stock = "000001.SZ"
+    bar = BarEvent(
+        stocks={stock: {"open": Decimal("10"), "high": Decimal("10.3"),
+                         "low": Decimal("9.9"), "close": Decimal("10.2"), "volume": 1000}},
+        bar_time=datetime(2026, 7, 29, 9, 30),
+    )
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="5m",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    sig = SignalEvent(
+        strategy_id=1, stock_code=stock, signal_name="open_sig",
+        signal_type=SignalType.OPEN, bar_time=bar.bar_time,
+    )
+    order = port._signal_to_order(ctx, sig, bar)
+    assert order is not None
+    assert order.signal_bar_date is None
+
+
+# ===========================================================================
+# #2 静默丢弃修复：待成交订单遇停牌/无行情不丢弃，延后至下一有价 bar 重试
+# ===========================================================================
+def _two_stock_klines(rows_a, rows_b):
+    """双股票 1d klines：A 全程有行情，B 可缺行（模拟停牌）。"""
+    def _df(rows):
+        return pl.DataFrame({
+            "datetime": [r[0] for r in rows],
+            "Open": [r[1] for r in rows],
+            "High": [r[2] for r in rows],
+            "Low": [r[3] for r in rows],
+            "Close": [r[4] for r in rows],
+            "Volume": [r[5] for r in rows],
+        })
+    return {
+        "000001.SZ": {"1d": _df(rows_a)},
+        "600001.SH": {"1d": _df(rows_b)},
+    }
+
+
+_ROWS_A = [  # A 全程有行情（撑起 7/30、7/31 的 bar）
+    (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+    (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("10.0"), Decimal("10.4"), 1000),
+    (datetime(2026, 7, 31), Decimal("10.4"), Decimal("10.6"), Decimal("10.1"), Decimal("10.5"), 1000),
+    (datetime(2026, 8, 1), Decimal("10.5"), Decimal("10.8"), Decimal("10.2"), Decimal("10.6"), 1000),
+]
+# B：7/30、7/31 停牌缺行，8/1 复牌。7/29 close=18.5（成本 20，亏 7.5% 触发止损）
+_ROWS_B_SUSPENDED = [
+    (datetime(2026, 7, 29), Decimal("20"), Decimal("20.5"), Decimal("18.3"), Decimal("18.5"), 1000),
+    (datetime(2026, 8, 1), Decimal("21"), Decimal("21.5"), Decimal("20.8"), Decimal("21.0"), 1000),
+]
+
+
+def test_run_suspended_buy_carried_until_quoted():
+    """#2 BUY 遇停牌不静默丢弃：延后至复牌 bar open 成交，no_market_data 仅首 bar 记 1 条。
+
+    7/29 B 触发 OPEN → BUY 排队；7/30、7/31 bar 存在（A 有行情）但 B 无 open 价
+    → 延后重试（首 bar 记 1 条 defer 决策事件）；8/1 复牌 @21 成交。
+    """
+    klines = _two_stock_klines(_ROWS_A, _ROWS_B_SUSPENDED)
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, "600001.SH", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+    }
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    # 修复前：订单在 7/30 无价被静默丢弃，trades 为空
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.BUY
+    assert trades[0].stock_code == "600001.SH"
+    assert trades[0].price == Decimal("21")  # 8/1 复牌 open 成交
+    assert trades[0].trade_time == datetime(2026, 8, 1)
+    # 决策事件：仅首次延后记 1 条（两个停牌 bar 不刷屏）
+    no_md = [d for d in result["decisions"] if d["gate"] == "no_market_data"]
+    assert len(no_md) == 1
+    assert no_md[0]["action"] == "defer"
+    assert no_md[0]["stock_code"] == "600001.SH"
+
+
+def test_run_suspended_sell_stop_loss_carried_until_quoted():
+    """#2 止损 SELL 遇停牌不静默丢弃：延后至复牌 open 成交（止损不被遗忘）。
+
+    预置 B 1000 股 @20；7/29 close=18.5 亏 7.5% > 5% 触发 STOP_LOSS → SELL 排队；
+    7/30、7/31 B 停牌延后；8/1 复牌 @21 成交。
+    """
+    klines = _two_stock_klines(_ROWS_A, _ROWS_B_SUSPENDED)
+    port, ctx = _portfolio_with_strategy()
+    from core.engine.event import TradeEvent
+    pos = Position("600001.SH")
+    pos.apply_trade(TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600001.SH",
+        trade_type=TradeType.BUY, price=Decimal("20"), quantity=1000,
+        amount=Decimal("20000"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 7, 28, 9, 30),
+    ))
+    ctx.positions["600001.SH"] = pos
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache={})
+
+    trades = result["trades"]
+    # 修复前：SELL 在 7/30 无价被静默丢弃，止损永远不执行
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.SELL
+    assert trades[0].stock_code == "600001.SH"
+    assert trades[0].price == Decimal("21")  # 8/1 复牌 open 成交
+    no_md = [d for d in result["decisions"] if d["gate"] == "no_market_data"]
+    assert len(no_md) == 1

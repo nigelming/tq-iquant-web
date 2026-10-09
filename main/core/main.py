@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
 
-from core.db import init_db
+from core.db import init_db, SessionLocal
 from core.api.stock_pools import router as stock_pools_router
 from core.api.formulas import router as formulas_router
 from core.api.strategies import router as strategies_router
@@ -12,6 +12,7 @@ from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
 from core.logging_config import setup_logging
+from core.services.backtest_service import recover_stale_running_backtests
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     setup_logging()
     init_db()
+    # #5: 清理上次进程崩溃/重启残留的僵尸 running 回测记录（同步内联执行，
+    # 正常退出不残留 running；残留即崩溃）。统一标 failed + 附说明，避免前端
+    # 永久显示"运行中"且无法重新发起（_BACKTEST_LOCK 是进程内锁，重启已释放）。
+    with SessionLocal() as db:
+        n = recover_stale_running_backtests(db)
+        if n:
+            logger.warning("启动恢复：%d 条僵尸 running 回测已标记 failed", n)
     yield
 
 
@@ -91,4 +99,4 @@ if _dist.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8888)

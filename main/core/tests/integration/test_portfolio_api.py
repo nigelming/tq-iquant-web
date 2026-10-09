@@ -820,7 +820,7 @@ def test_delete_strategy_referenced_by_backtest_trade(client):
     rec = BacktestRecord(
         portfolio_strategy_id=pid, name="bt1",
         start_date=datetime(2026, 7, 1).date(), end_date=datetime(2026, 7, 31).date(),
-        status="completed", progress=100,
+        status="completed",
     )
     db.add(rec); db.flush()
     db.add(BacktestTrade(

@@ -117,14 +117,18 @@ class Evaluator:
         # 日频聚合行（每日最后一根 bar）：日收益/仓位/持仓结构/路径指标统一从这里出
         daily_rows = self._daily_rows(snapshots)
         daily_returns = self._returns_from_rows(daily_rows)
+        # #6: 路径指标（max_drawdown/ulcer/r2/recovery_days）也走日聚合序列，
+        # 避免分钟回测日内多 bar 的中间值污染（与 sharpe/sortino 口径一致）。
+        daily_values = [r["total_value"] for r in daily_rows]
+        daily_n = len(daily_values)
 
         days = (snapshots[-1]["snap_date"] - snapshots[0]["snap_date"]).days
         years = max(days / 365.25, 1 / 365.25)
         annual_return = (1 + float(total_return)) ** (1 / years) - 1 if total_return > -1 else -1
 
-        peak = values[0]
+        peak = daily_values[0]
         max_dd = Decimal("0")
-        for v in values:
+        for v in daily_values:
             if v > peak:
                 peak = v
             dd = (peak - v) / peak
@@ -156,20 +160,20 @@ class Evaluator:
         else:
             cvar = None
 
-        peak_u = values[0]
+        peak_u = daily_values[0]
         dd_sq_sum = Decimal("0")
-        for v in values:
+        for v in daily_values:
             if v > peak_u:
                 peak_u = v
             drawdown = (peak_u - v) / peak_u
             dd_sq_sum += drawdown ** 2
-        ulcer = math.sqrt(float(dd_sq_sum) / n)
+        ulcer = math.sqrt(float(dd_sq_sum) / daily_n) if daily_n > 0 else 0
 
-        if n > 2:
-            xs = list(range(n))
-            ys = [float(v) for v in values]
-            mean_x = sum(xs) / n
-            mean_y = sum(ys) / n
+        if daily_n > 2:
+            xs = list(range(daily_n))
+            ys = [float(v) for v in daily_values]
+            mean_x = sum(xs) / daily_n
+            mean_y = sum(ys) / daily_n
             num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
             den = math.sqrt(sum((x - mean_x) ** 2 for x in xs) * sum((y - mean_y) ** 2 for y in ys))
             r2 = (num / den) ** 2 if den > 0 else 0
@@ -182,8 +186,12 @@ class Evaluator:
         # ---- 基准收益 ----
         benchmark_return = self._compute_benchmark_return(benchmark_data)
 
-        # ---- 回撤恢复天数 ----
-        recovery = self._compute_recovery_days(snapshots, values)
+        # ---- 回撤恢复天数（#6: 按日聚合序列算，不被日内多 bar 污染）----
+        daily_snaps = [
+            {"snap_date": r["date"], "total_value": r["total_value"]}
+            for r in daily_rows
+        ]
+        recovery = self._compute_recovery_days(daily_snaps, daily_values)
 
         # ---- 基准相对指标（基于快照内 benchmark_value 按日对齐）----
         relative = self._compute_relative_metrics(snapshots)

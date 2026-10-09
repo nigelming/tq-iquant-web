@@ -1,4 +1,4 @@
-"""build_klines / build_signal_cache / build_open_prices 数据对接层测试。
+"""build_klines / build_signal_cache 数据对接层测试。
 
 这些函数桥接 TQ 原始格式与回测引擎内部格式。TQ 调用本身依赖通达信进程，
 不可单测；故将逻辑拆为纯转换函数（_convert_market_data / _convert_formula_output）
@@ -166,37 +166,6 @@ def test_convert_market_data_multi_period():
     assert "5m" in klines["000001.SZ"]
     assert klines["000001.SZ"]["1d"].height == 3
     assert klines["000001.SZ"]["5m"].height == 2
-
-
-# ---------------------------------------------------------------------------
-# build_open_prices：klines → {stock: {bar_time: Decimal open}}
-# ---------------------------------------------------------------------------
-def test_build_open_prices_from_klines():
-    """open 价表直接从 klines 的 Open 列提取，key 为 datetime。"""
-    df = pl.DataFrame({
-        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)],
-        "Open": [Decimal("10"), Decimal("10.2"), Decimal("9.0")],
-        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("9.2")],
-        "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("8.8")],
-        "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("9.1")],
-        "Volume": [1000, 1000, 1000],
-    })
-    klines = {"000001.SZ": {"1d": df}}
-    prices = bt_api.build_open_prices(None, klines)
-
-    assert "000001.SZ" in prices
-    stock_prices = prices["000001.SZ"]
-    assert stock_prices[datetime(2026, 7, 29)] == Decimal("10")
-    assert stock_prices[datetime(2026, 7, 30)] == Decimal("10.2")
-    assert stock_prices[datetime(2026, 7, 31)] == Decimal("9.0")
-    # 值为 Decimal
-    for v in stock_prices.values():
-        assert isinstance(v, Decimal)
-
-
-def test_build_open_prices_empty_klines():
-    """空 klines → 空 open_prices。"""
-    assert bt_api.build_open_prices(None, {}) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -842,4 +811,118 @@ def test_build_signal_cache_minute_warmup_align_then_filter(db_session, monkeypa
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
     assert (strat.id, "000001.SZ", datetime(2026, 7, 28, 14, 55)) not in cache
+
+
+# ---------------------------------------------------------------------------
+# 多周期信号对齐：klines 含 1d + 5m 时，5m 策略的 bar_times 必须只取 5m 时间轴，
+# 不能混入 1d 午夜时间戳（否则索引串位，cache key 落在错误时间点）。
+# ---------------------------------------------------------------------------
+def test_build_signal_cache_multi_period_filters_by_strategy_period(db_session, monkeypatch):
+    """多周期 klines（1d + 5m）：5m 策略 signal_cache key 全部在 5m 时间点，
+    不含 1d 午夜时间——_bar_times_by_period 按策略周期过滤，避免并集串位。"""
+    from core.models import Strategy
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Strategy).filter_by(id=strat.id).update({"period": "5m"})
+    db.commit()
+
+    # klines：1d 2 根（午夜）+ 5m 4 根（带时分）
+    klines = {"000001.SZ": {
+        "1d": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
+        }),
+        "5m": pl.DataFrame({
+            "datetime": [
+                datetime(2026, 7, 29, 9, 35),
+                datetime(2026, 7, 29, 9, 40),
+                datetime(2026, 7, 30, 9, 35),
+                datetime(2026, 7, 30, 9, 40),
+            ],
+            "Open": [Decimal("10"), Decimal("10.2"), Decimal("10.1"), Decimal("10.3")],
+            "High": [Decimal("10.3"), Decimal("10.5"), Decimal("10.4"), Decimal("10.6")],
+            "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("10.0"), Decimal("10.1")],
+            "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("10.3"), Decimal("10.4")],
+            "Volume": [1000, 1000, 1000, 1000],
+        }),
+    }}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        # 4 条 5m 输出（Date 日粒度，Value 逐条变）
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},    # → 5m bar 09:35
+                    {"Date": "20260729", "Value": -1},   # → 5m bar 09:40
+                    {"Date": "20260730", "Value": 1},    # → 5m bar 09:35
+                    {"Date": "20260730", "Value": -1},   # → 5m bar 09:40
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 4 个 cache key 全部在 5m 时间点
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 9, 35)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 9, 40)) in cache
+    # 1d 午夜时间不应出现在 5m 策略的 cache 中
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 0, 0)) not in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 0, 0)) not in cache
+    # 信号值不串位
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
+
+
+def test_build_signal_cache_multi_period_daily_strategy_uses_date_match(db_session, monkeypatch):
+    """同上 klines（1d + 5m），1d 策略走 Date 匹配（不传 bar_times）→
+    cache key 在 1d 午夜时间点。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)  # 默认 1d 策略
+
+    klines = {"000001.SZ": {
+        "1d": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
+        }),
+        "5m": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29, 9, 35), datetime(2026, 7, 29, 9, 40)],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
+        }),
+    }}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},
+                    {"Date": "20260730", "Value": -1},
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 1d 走 Date 匹配 → cache key 在午夜
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30)) in cache
+    # 5m 时间点不应出现在 1d 策略的 cache 中
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) not in cache
 

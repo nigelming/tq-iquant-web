@@ -31,6 +31,9 @@ _FULL_CLOSE_TYPES = {
     SignalType.CLOSE, SignalType.STOP_LOSS,
     SignalType.TAKE_PROFIT, SignalType.TRAILING_STOP,
 }
+# 日线及以上周期：bar_time 为当日 00:00，close 在收盘后才确认。
+# 此类信号订单须延迟到 t.date() > signal_bar_date 的下一交易日成交，避免未来函数。
+_DAILY_PERIODS: set = {"1d", "1w", "1mon"}
 
 
 def _signal_priority(signal_type: SignalType) -> int:
@@ -105,10 +108,24 @@ class Portfolio:
             sid: set(codes) for sid, codes in (inflight_opens or {}).items()
         }
         orders: List[OrderEvent] = []
+        # 收集 master/slave 本 bar 卖出的股票集合，供 _follow_master_sells 去重
+        master_sells_this_bar: Dict[int, set] = {}
+        slave_sells_this_bar: Dict[int, set] = {}
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
                 continue
-            orders.extend(self._process_strategy(ctx, bar, signal_cache, inflight))
+            strat_orders = self._process_strategy(ctx, bar, signal_cache, inflight)
+            for o in strat_orders:
+                if o.trade_type == TradeType.SELL:
+                    if ctx.role == "master":
+                        master_sells_this_bar.setdefault(ctx.strategy_id, set()).add(o.stock_code)
+                    elif ctx.role == "slave":
+                        slave_sells_this_bar.setdefault(ctx.strategy_id, set()).add(o.stock_code)
+            orders.extend(strat_orders)
+        # 第二遍：follow_master 联动——master 卖的股票，slave 跟随全平（若持有且本 bar 未卖）
+        orders.extend(self._follow_master_sells(
+            bar, master_sells_this_bar, slave_sells_this_bar, period
+        ))
         # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
         # §88：熔断期间不清仓，仅暂停新开仓。DEBUG——熔断期每 bar 每 BUY 都会触发，
         # INFO 会刷屏；DEBUG 供排查"为何 BUY 信号没下单"（被剥的 BUY 不进返回列表，
@@ -408,7 +425,66 @@ class Portfolio:
             quantity=quantity,
             price=close,
             bar_time=bar.bar_time,
+            signal_bar_date=bar.bar_time.date() if ctx.period in _DAILY_PERIODS else None,
         )
+
+    def _follow_master_sells(
+        self,
+        bar: BarEvent,
+        master_sells: Dict[int, set],
+        slave_sells: Dict[int, set],
+        period: Optional[str],
+    ) -> List[OrderEvent]:
+        """follow_master 模式：master 本 bar 卖出某股 → slave 同步全平（若持有且本 bar 未卖）。
+
+        语义：master 触发 CLOSE/REDUCE/STOP_LOSS 等卖出时，slave 跟随全平同股票存量。
+        不影响 slave 自身已触发的卖出（去重保护）；slave 未持仓则跳过。
+        signal_bar_date 按 slave 自身 period 标注（日线 slave 仍走延迟闸门）。
+        """
+        if not master_sells:
+            return []
+        follow_orders: List[OrderEvent] = []
+        for ctx in self.strategies:
+            if ctx.role != "slave" or ctx.slave_exit_mode != "follow_master":
+                continue
+            if ctx.master_strategy_id is None:
+                continue
+            if period is not None and ctx.period != period:
+                continue
+            master_sold = master_sells.get(ctx.master_strategy_id, set())
+            if not master_sold:
+                continue
+            already_sold = slave_sells.get(ctx.strategy_id, set())
+            sig_bar_date = bar.bar_time.date() if ctx.period in _DAILY_PERIODS else None
+            for stock_code in master_sold - already_sold:
+                pos = ctx.positions.get(stock_code)
+                if pos is None or pos.quantity == 0:
+                    continue
+                close = bar.stocks.get(stock_code, {}).get("close")
+                if close is None or close <= Decimal("0"):
+                    continue
+                follow_orders.append(OrderEvent(
+                    strategy_id=ctx.strategy_id,
+                    portfolio_id=self.portfolio_id,
+                    stock_code=stock_code,
+                    trade_type=TradeType.SELL,
+                    signal_type=SignalType.CLOSE,
+                    signal_name="follow_master",
+                    quantity=pos.quantity,
+                    price=close,
+                    bar_time=bar.bar_time,
+                    signal_bar_date=sig_bar_date,
+                ))
+                self.recorder.record(
+                    gate="follow_master_sell", layer="signal_gate", action="trigger",
+                    portfolio_id=self.portfolio_id, strategy_id=ctx.strategy_id,
+                    stock_code=stock_code, bar_time=bar.bar_time,
+                    param_name="master_strategy_id",
+                    param_value=ctx.master_strategy_id,
+                    message="follow_master：master 卖出 %s，slave 同步全平 %d 股"
+                            % (stock_code, pos.quantity),
+                )
+        return follow_orders
 
     def check_circuit_breaker(self) -> bool:
         return self.risk_manager.circuit_breaker_active

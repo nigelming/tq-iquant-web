@@ -213,3 +213,65 @@ def test_signal_name_defaults_empty_when_unset():
         _order_open("000001.SZ", TradeType.BUY, 100, "10")  # 不传 signal_name
     )
     assert trade.signal_name == ""
+
+
+# ---------------------------------------------------------------------------
+# 跳空高开保护：cap_quantity 按信号 bar 收盘价审批，place_order 按下一 bar
+# 开盘价成交。跳空高开时实际成本 > 审批金额 → 二次校验缩量或拒单，防止现金为负。
+# ---------------------------------------------------------------------------
+def test_gap_up_buy_rejected_when_cash_insufficient():
+    """跳空高开 + 现金不足 1 手 → 拒单，trade=None，cash 不变。
+
+    收盘 10 审批 100 股（需 1000=现金），次日开盘 11（实际需 1105>1000）→ 拒单。
+    """
+    acc = Account(Decimal("1000"))
+    pos = Position("000001.SZ")
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("11")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+
+    order = _order(TradeType.BUY, "000001.SZ", 100, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(order, acc, pos)
+
+    assert trade is None
+    assert acc.cash == Decimal("1000")  # 现金不变
+    assert pos.quantity == 0
+
+
+def test_gap_up_buy_shrunk_when_partial_cash():
+    """跳空高开 + 现金够部分 → 缩量到可用现金能覆盖的 100 股整数倍。
+
+    收盘 10 审批 1000 股（需 10000=现金），次日开盘 11（实际需 11005>10000）→
+    缩量到 900 股（900×11=9900+佣金<10000）。
+    """
+    acc = Account(Decimal("10000"))
+    pos = Position("000001.SZ")
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("11")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(order, acc, pos)
+
+    assert trade is not None
+    assert trade.quantity == 900
+    # 现金 = 10000 - (900*11 + commission) > 0（不为负）
+    assert acc.cash > Decimal("0")
+    assert pos.quantity == 900
+
+
+def test_normal_buy_no_gap_no_recheck():
+    """无跳空（收盘=开盘）→ 正常成交，二次校验不触发（回归测试）。"""
+    acc = Account(Decimal("100000"))
+    pos = Position("000001.SZ")
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(order, acc, pos)
+
+    assert trade is not None
+    assert trade.quantity == 1000
+    assert trade.price == Decimal("10")
+    assert acc.cash == Decimal("100000") - (trade.amount + trade.commission + trade.stamp_duty)

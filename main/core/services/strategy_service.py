@@ -28,6 +28,8 @@ def serialize_strategy(s: Strategy) -> dict:
         "period": s.period,
         "role": s.role,
         "master_strategy_id": s.master_strategy_id,
+        "stock_pool_id": s.stock_pool_id,
+        "slave_exit_mode": s.slave_exit_mode,
         "capital_ratio": float(s.capital_ratio) if s.capital_ratio is not None else None,
         "max_positions": s.max_positions,
         "single_open_ratio": float(s.single_open_ratio) if s.single_open_ratio is not None else None,
@@ -103,6 +105,7 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             trailing_stop_ratio=s.trailing_stop_ratio,
             add_position_threshold=s.add_position_threshold, max_add_count=s.max_add_count,
             add_position_ratio=s.add_position_ratio, reduce_position_ratio=s.reduce_position_ratio,
+            stock_pool_id=s.stock_pool_id, slave_exit_mode=s.slave_exit_mode,
         )
         db.add(strat)
         inserted.append(strat)
@@ -193,6 +196,8 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.max_add_count = req.max_add_count
     s.add_position_ratio = req.add_position_ratio
     s.reduce_position_ratio = req.reduce_position_ratio
+    s.stock_pool_id = req.stock_pool_id
+    s.slave_exit_mode = req.slave_exit_mode
 
 
 def portfolio_exists(db: Session, pid: int) -> bool:

@@ -299,7 +299,7 @@ def _seed_record(db):
     db.flush()
     rec = BacktestRecord(portfolio_strategy_id=ps.id, name="bf",
                          start_date=date(2024, 1, 2), end_date=date(2024, 1, 5),
-                         status="completed", progress=100)
+                         status="completed")
     db.add(rec)
     db.commit()
     return rec, ps, strat

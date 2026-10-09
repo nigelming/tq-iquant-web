@@ -105,18 +105,12 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    # monkeypatch 数据获取层：返回 mock klines / signal_cache / open_prices
+    # monkeypatch 数据获取层：返回 mock klines / signal_cache
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
-    })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
     })
 
     payload = {
@@ -137,7 +131,6 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     rec = db.get(BacktestRecord, record_id)
     assert rec is not None
     assert rec.status == "completed"
-    assert rec.progress == 100
     assert rec.portfolio_strategy_id == ps_id
 
     trades = db.query(BacktestTrade).filter_by(backtest_record_id=record_id).all()
@@ -166,12 +159,11 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 
     stock = "000001.SZ"
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {stock: {}})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -201,16 +193,10 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 def _mock_data(monkeypatch):
     """统一 mock 数据获取层，供多测试复用。"""
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
-    })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {
-        "000001.SZ": {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
     })
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
@@ -244,7 +230,6 @@ def test_list_records_returns_persisted(client, monkeypatch):
     rec = next(r for r in body["data"] if r["id"] == record_id)
     assert rec["name"] == "bt_list_test"
     assert rec["status"] == "completed"
-    assert rec["progress"] == 100
     assert rec["portfolio_strategy_id"] == ps_id
     assert "created_at" in rec
 
@@ -340,6 +325,85 @@ def test_delete_record_not_found(client):
     assert body["code"] == 404
 
 
+def test_delete_record_running_returns_409(client):
+    """#4: 删除 status=running 的回测记录 → 409（运行中拒绝删除）。
+
+    防止并发删除运行中的回测引发 FK 500 / 数据竞争。回测同步内联执行，
+    运行中即代表有另一请求正在跑回测，删除会破坏其写入。
+    """
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps_id, name="running_one",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="running",
+    )
+    db.add(rec)
+    db.commit()
+    rid = rec.id
+    db.close()
+
+    resp = c.delete(f"/api/backtest/records/{rid}")
+    body = resp.json()
+    assert body["code"] == 409
+    assert "运行中" in body["message"]
+
+    # 记录仍在，状态不变
+    db = Session()
+    still = db.get(BacktestRecord, rid)
+    assert still is not None
+    assert still.status == "running"
+    db.close()
+
+
+def test_lifespan_recovers_stale_running_backtests_on_startup(monkeypatch):
+    """#5: 应用启动 lifespan 会调用 recover_stale_running_backtests 清理僵尸 running
+    记录（进程崩溃/重启残留），防止前端永久显示"运行中"。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from core.main import app
+
+    called = {"n": 0, "db_ok": False}
+
+    def fake_recover(db):
+        called["n"] += 1
+        # 校验传入的是可用 Session（表已建好）
+        from core.models import BacktestRecord
+        assert db.query(BacktestRecord).count() == 0  # 启动时本应空
+        called["db_ok"] = True
+        return 0
+
+    # 避免 lifespan 跑 Alembic 真实迁移 + 连真实 dev.db（只测 recover 接线）
+    monkeypatch.setattr("core.main.init_db", lambda: None)
+    monkeypatch.setattr("core.main.recover_stale_running_backtests", fake_recover)
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine)
+    monkeypatch.setattr("core.main.SessionLocal", TestSession)
+
+    def override_get_db():
+        db = TestSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app, raise_server_exceptions=False):
+            assert called["n"] == 1
+            assert called["db_ok"] is True
+    finally:
+        app.dependency_overrides.clear()
+
+
 # ===========================================================================
 # 日期区间校验 — start 必须 < end；起止不可在未来。
 # 防止 TQ 拉到空行情后静默"成功"标 completed（真机 bug 根因）。
@@ -394,8 +458,7 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
 
     # mock 三层全返回空 — 模拟 TQ 拉不到行情
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -472,8 +535,7 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
     db.close()
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     payload = _post_payload(ps_id, "conflict_test")
 
     # 持锁模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
@@ -514,8 +576,7 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0

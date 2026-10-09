@@ -246,9 +246,11 @@ onMounted(load)
         <select v-model="sig.signal_type">
           <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
         </select>
-        <select v-model="sig.trigger_value">
-          <option :value="1">1</option>
+        <select v-model="sig.trigger_value" title="触发值：公式输出线等于该值时产生信号。0 是无信号常态值，不可用">
+          <option :value="-2">-2</option>
           <option :value="-1">-1</option>
+          <option :value="1">1</option>
+          <option :value="2">2</option>
         </select>
         <button @click="removeSignal(idx)" class="btn btn-sm btn-danger">×</button>
       </div>

@@ -46,12 +46,20 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             "slippage": Decimal(str(ps.slippage)),
         },
     )
-    # 股票池成分（组合级，各策略共享）：非池内股票不产生公式信号，杜绝跨池下单。
-    pool_codes = {
+    # 组合级股票池成分（继承用）：策略 stock_pool_id 为空时回退到此
+    portfolio_pool_codes = {
         row.stock_code
         for row in db.query(StockPoolStock).filter_by(pool_id=ps.stock_pool_id).all()
     }
     for strat in strategies:
+        # 策略级股票池：strat.stock_pool_id 非空 → 查独立池；空 → 继承组合级
+        if strat.stock_pool_id is not None:
+            strategy_pool_codes = {
+                row.stock_code
+                for row in db.query(StockPoolStock).filter_by(pool_id=strat.stock_pool_id).all()
+            }
+        else:
+            strategy_pool_codes = set(portfolio_pool_codes)
         ctx = StrategyContext(
             strategy_id=strat.id,
             period=strat.period,
@@ -64,7 +72,8 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             reduce_position_ratio=Decimal(str(strat.reduce_position_ratio)),
             role=strat.role,
             master_strategy_id=strat.master_strategy_id,
-            stock_pool=pool_codes,
+            stock_pool=strategy_pool_codes,
+            slave_exit_mode=strat.slave_exit_mode,
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()

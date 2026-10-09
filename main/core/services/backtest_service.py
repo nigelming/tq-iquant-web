@@ -17,14 +17,14 @@ import json
 import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import polars as pl
 from sqlalchemy.orm import Session
 
 from core.models import (
-    StockPoolStock, Strategy, Formula, PortfolioStrategy,
+    StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
 )
@@ -292,28 +292,6 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
                 warm_raw.update(part)
         raw_by_period = _merge_raw_by_period(raw_by_period, warm_raw)
     return _convert_market_data_multi(raw_by_period, stocks)
-
-
-def build_open_prices(ps, klines: dict) -> dict:
-    """从 klines 提取 open 价表：{stock_code: {bar_time: Decimal}}。
-
-    供 SimulatedDispatcher 在下一 bar open 成交。取每只股票首个周期的 Open 列。
-    """
-    prices: dict = {}
-    for code, periods in klines.items():
-        if not periods:
-            continue
-        # 取任一周期（日线回测只有一个周期）
-        df = next(iter(periods.values()))
-        if "datetime" not in df.columns or "Open" not in df.columns:
-            continue
-        stock_prices: dict = {}
-        times = df["datetime"].to_list()
-        opens = df["Open"].to_list()
-        for t, o in zip(times, opens):
-            stock_prices[t] = o if isinstance(o, Decimal) else _to_decimal(o)
-        prices[code] = stock_prices
-    return prices
 
 
 def build_index_close_series(
@@ -1113,7 +1091,11 @@ _MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "1h"}
 
 
 def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
-    """从 klines 提取每只股票的时间轴（升序去重），供分钟级公式输出按索引对齐。"""
+    """从 klines 提取每只股票的时间轴（升序去重），供分钟级公式输出按索引对齐。
+
+    注意：此函数合并所有周期的时间戳。多周期组合回测时，5m 策略的公式输出
+    会与 1d 午夜时间戳混合对齐导致串位。新代码应改用 _bar_times_by_period。
+    """
     result: Dict[str, List[datetime]] = {}
     for code, periods in klines.items():
         times: List[datetime] = []
@@ -1132,7 +1114,43 @@ def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
     return result
 
 
-def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None) -> dict:
+def _bar_times_by_period(klines: dict, period: str) -> Dict[str, List[datetime]]:
+    """从 klines 提取每只股票指定周期的时间轴（升序），供分钟级公式输出按索引对齐。
+
+    与 _bar_times_by_code 的区别：只取本策略周期的时间戳，避免多周期并集导致
+    索引串位（5m 输出对齐到 [1d 00:00, 5m 09:30, ...] 混合时间轴）。
+    """
+    result: Dict[str, List[datetime]] = {}
+    for code, periods in klines.items():
+        df = periods.get(period)
+        if df is not None and "datetime" in df.columns:
+            result[code] = sorted(df["datetime"].to_list())
+    return result
+
+
+def _formula_diagnostics(raw, stocks: list):
+    """从 TQ 原始返回提取诊断：(error_msg|None, output_lines:set)。
+
+    ErrorId 非 0/19 → 公式执行错误（语法错误/引用公式缺失等）；
+    正常时收集所有股票的输出线名并集（过滤 ErrorId 等元信息键）。
+    """
+    if not isinstance(raw, dict) or not raw:
+        return "公式执行无返回（通达信未返回数据，请确认公式名与通达信内一致）", set()
+    err = raw.get("ErrorId")
+    if err is not None and str(err) not in ("0", "19"):
+        return f"ErrorId={err} Error={raw.get('Error')}", set()
+    lines: set = set()
+    for code in stocks:
+        stock_data = raw.get(code)
+        if isinstance(stock_data, dict):
+            lines.update(k for k in stock_data.keys() if k not in _FORMULA_META_KEYS)
+    return None, lines
+
+
+def build_signal_cache(
+    ps, klines: dict, db: Session = None, start: date = None,
+    diagnostics: Optional[dict] = None,
+) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
     对每个策略：读 Formula（公式名）+ FormulaSignal（信号配置），
@@ -1145,6 +1163,10 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
     start（回测开始日期）：klines 若含公式预热段（早于 start 的 bar），分钟级
     索引对齐必须基于全量时间轴（先对齐再过滤，否则索引串位）；转换完成后过滤掉
     bar_time < start 的预热条目，cache 只留主区间。start=None 不过滤（兼容单测）。
+
+    diagnostics（可选，调用方传入的 dict）：回填每策略公式执行诊断——
+    {"errors": {strategy_id: msg}, "output_lines": {strategy_id: set(线名)}}，
+    供 build_signal_warnings 做回测前信号预检（零信号/线名错误/公式报错）。
     """
     if db is None:
         return {}
@@ -1153,24 +1175,43 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
         return {}
     strategies = _portfolio_strategies(ps, db)
     tq_formula = TQFormula()
-    # 分钟级时间轴（所有策略共用同一 klines 时间轴，含预热段——与喂入公式引擎的数据同源）
-    bar_times_by_code = _bar_times_by_code(klines)
     cache: dict = {}
+    if diagnostics is not None:
+        # 两键始终初始化，消费方可直接索引（成功时 errors 为空 dict）
+        diagnostics.setdefault("errors", {})
+        diagnostics.setdefault("output_lines", {})
     for strat in strategies:
         formula = db.get(Formula, strat.formula_id)
         if formula is None:
             continue
         period = strat.period
+        # 策略级股票池：非空 → 仅本池股票跑公式；空 → 全部 klines 股票（继承组合级）
+        if strat.stock_pool_id is not None:
+            strat_stocks = [
+                code for code in stocks
+                if code in _pool_stock_set(db, strat.stock_pool_id)
+            ]
+        else:
+            strat_stocks = stocks
+        if not strat_stocks:
+            continue
         start_str, end_str = _kline_time_range(klines)
         raw = tq_formula.compute(
             formula_name=formula.name, formula_arg="",
-            stocks=stocks, period=period,
+            stocks=strat_stocks, period=period,
             count=-1, dividend_type=1,
             start_time=start_str, end_time=end_str,
         )
+        if diagnostics is not None:
+            err_msg, lines = _formula_diagnostics(raw, strat_stocks)
+            if err_msg:
+                diagnostics.setdefault("errors", {})[strat.id] = err_msg
+            else:
+                diagnostics.setdefault("output_lines", {})[strat.id] = lines
         # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
-        bt = bar_times_by_code if period in _MINUTE_PERIODS else None
-        entries = _convert_formula_output(raw, strat.id, stocks, bar_times_by_code=bt)
+        # 按策略周期过滤时间轴，避免多周期并集导致索引串位
+        bt = _bar_times_by_period(klines, period) if period in _MINUTE_PERIODS else None
+        entries = _convert_formula_output(raw, strat.id, strat_stocks, bar_times_by_code=bt)
         cache.update(entries)
     if start is not None:
         start_ts = datetime(start.year, start.month, start.day)
@@ -1178,13 +1219,113 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
     return cache
 
 
+# 信号类型 → 中文标签（预检警告文案用）
+_SIGNAL_TYPE_LABELS = {"OPEN": "开仓", "ADD": "加仓", "REDUCE": "减仓", "CLOSE": "清仓"}
+
+
+def build_signal_warnings(
+    db: Session, strategies: list, signal_cache: dict, diagnostics: Optional[dict]
+) -> List[str]:
+    """回测信号预检：返回非致命警告列表（空列表=一切正常）。
+
+    三类问题（公式能编译不代表信号有效，典型坑：30 分钟主图公式挂到日线策略上，
+    ErrorId=0 但区间内零信号，回测静默 completed）：
+    1. 公式执行报错（ErrorId 异常）——直接给根因，不再逐信号重复报；
+    2. 配置的信号输出线名在公式真实输出中不存在（线名写错/通达信公式版本不同）；
+    3. 输出线存在但回测区间内从未等于触发值（周期不匹配/触发值配错/市场无信号）。
+
+    diagnostics 为空/缺键（build_signal_cache 被旁路，如旧调用方）时不产生警告。
+    """
+    if not diagnostics or not strategies:
+        return []
+    errors = diagnostics.get("errors") or {}
+    output_lines = diagnostics.get("output_lines") or {}
+    warnings: List[str] = []
+    for strat in strategies:
+        period = getattr(strat, "period", "?")
+        if strat.id in errors:
+            warnings.append(
+                f"策略「{strat.name}」({period}) 公式执行失败：{errors[strat.id]}。"
+                f"请检查通达信公式语法及其引用的副图公式是否存在。"
+            )
+            continue
+        lines = output_lines.get(strat.id)
+        if lines is None:
+            # 该策略未产生诊断信息（非错误，可能被测试桩旁路）——跳过避免误报
+            continue
+        formula = db.get(Formula, strat.formula_id) if db is not None else None
+        formula_name = formula.name if formula is not None else f"id={strat.formula_id}"
+        sigs = (
+            db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()
+            if db is not None else []
+        )
+        for sig in sigs:
+            type_label = _SIGNAL_TYPE_LABELS.get(sig.signal_type, sig.signal_type)
+            if sig.signal_name not in lines:
+                warnings.append(
+                    f"策略「{strat.name}」({period}) 的{type_label}信号"
+                    f"「{sig.signal_name}」在公式「{formula_name}」的输出线中不存在。"
+                    f"请检查信号名称是否与通达信公式输出线完全一致（当前输出线："
+                    f"{'、'.join(sorted(lines)) or '无'}）。"
+                )
+                continue
+            triggered = any(
+                key[0] == strat.id
+                and any(
+                    o.get("name") == sig.signal_name
+                    and o.get("value") == sig.trigger_value
+                    for o in outs
+                )
+                for key, outs in signal_cache.items()
+            )
+            if not triggered:
+                warnings.append(
+                    f"策略「{strat.name}」({period}) 的{type_label}信号"
+                    f"「{sig.signal_name}」（触发值={sig.trigger_value}）"
+                    f"在回测区间内从未触发，本次回测不会产生该信号的交易。"
+                    f"请检查策略周期是否与公式主图周期一致、触发值配置是否正确。"
+                )
+    return warnings
+
+
 # --- 辅助：从 DB 读组装所需数据 ---
+_POOL_STOCK_CACHE: dict = {}  # pool_id → set(stock_code)，进程级缓存避免回测中重复查询
+
+
+def _pool_stock_set(db: Session, pool_id: int) -> set:
+    """股票池成分集合（带进程级缓存，避免 build_signal_cache 中逐策略重复查询）。"""
+    if pool_id in _POOL_STOCK_CACHE:
+        return _POOL_STOCK_CACHE[pool_id]
+    codes = {
+        row.stock_code
+        for row in db.query(StockPoolStock).filter_by(pool_id=pool_id).all()
+    }
+    _POOL_STOCK_CACHE[pool_id] = codes
+    return codes
+
+
 def _pool_stocks(ps, db: Session) -> list:
-    """股票池股票代码列表。db 为 None 时返回空。"""
+    """回测所需全部股票：组合级池 ∪ 各策略级独立池（去重保序）。
+
+    策略 stock_pool_id 为空的继承组合级（已在组合级中），非空才并入并集。
+    db 为 None 时返回空。
+    """
     if db is None:
         return []
-    rows = db.query(StockPoolStock).filter_by(pool_id=ps.stock_pool_id).all()
-    return [r.stock_code for r in rows]
+    pool_ids = {ps.stock_pool_id}
+    for s in _portfolio_strategies(ps, db):
+        if s.stock_pool_id is not None:
+            pool_ids.add(s.stock_pool_id)
+    if not pool_ids:
+        return []
+    rows = db.query(StockPoolStock).filter(
+        StockPoolStock.pool_id.in_(pool_ids)
+    ).all()
+    seen: list = []
+    for r in rows:
+        if r.stock_code not in seen:
+            seen.append(r.stock_code)
+    return seen
 
 
 def _strategy_periods(ps, db: Session) -> list:
@@ -1326,8 +1467,8 @@ def _serialize_record(r: BacktestRecord) -> dict:
         "start_date": r.start_date.isoformat() if r.start_date else None,
         "end_date": r.end_date.isoformat() if r.end_date else None,
         "status": r.status,
-        "progress": r.progress,
         "error_message": r.error_message,
+        "warnings": json.loads(r.warnings_json) if r.warnings_json else [],
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
     }
@@ -1696,20 +1837,51 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
     }
 
 
-def delete_record(db: Session, record_id: int) -> bool:
-    """删除回测记录 + 级联子表（trades/snapshots/evaluations）。
+def delete_record(db: Session, record_id: int) -> Tuple[bool, Optional[str]]:
+    """删除回测记录 + 级联子表（trades/snapshots/evaluations/decisions）。
     子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。
-    不存在返回 False（路由层据此 err(404)）。"""
+
+    返回 (ok, error_message)：
+    - 不存在 → (False, "回测记录不存在")，路由据此 404
+    - status=running → (False, "回测运行中，请先停止再删除")，路由据此 409
+      （#4: 回测同步内联执行，运行中即代表另一请求正在跑回测；并发删除会引发
+      FK IntegrityError 500 或破坏其写入——对照 live_service.delete_session 守卫）
+    - 删除成功 → (True, None)
+    """
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
-        return False
+        return False, "回测记录不存在"
+    if rec.status == "running":
+        return False, "回测运行中，请先停止再删除"
     db.query(BacktestTrade).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestDailySnapshot).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestEvaluation).filter_by(backtest_record_id=record_id).delete()
     db.query(BacktestDecisionEvent).filter_by(backtest_record_id=record_id).delete()
     db.delete(rec)
     db.commit()
-    return True
+    return True, None
+
+
+def recover_stale_running_backtests(db: Session) -> int:
+    """#5: 应用启动时清理僵尸 running 回测记录。
+
+    回测是同步内联执行，正常运行时 status=running 只在请求线程内短暂存在，
+    进程正常退出时不可能残留 running。残留即意味着上次进程崩溃/被强杀——
+    前端会永久显示"运行中"且无法重新发起回测（_BACKTEST_LOCK 是进程内锁，
+    重启后已释放，但 DB 状态仍是 running 误导用户）。
+
+    扫描所有 status=running 的记录，统一标记 failed 并附 error_message 说明，
+    让用户识别后重新发起。返回受影响记录数。
+    """
+    stale = db.query(BacktestRecord).filter_by(status="running").all()
+    if not stale:
+        return 0
+    msg = "应用启动时检测到中断状态（进程崩溃/重启），已自动标记为失败"
+    for rec in stale:
+        rec.status = "failed"
+        rec.error_message = msg
+    db.commit()
+    return len(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -1742,7 +1914,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
     前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
     内部：写 record(running) → assemble → build_klines → build_signal_cache →
-          build_open_prices → build_benchmark_data → 空行情保护 → engine.run →
+          build_benchmark_data → 空行情保护 → engine.run →
           _persist_result → 标 completed → 返回 {record_id, trades_count,
           snapshots_count, evaluations}。
     异常：标 record(failed) + re-raise（路由层全局异常处理器兜底转 {code:500}，
@@ -1763,7 +1935,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         start_date=req.start_date,
         end_date=req.end_date,
         status="running",
-        progress=0,
         params_snapshot=build_params_snapshot(ps),
     )
     db.add(rec)
@@ -1781,22 +1952,26 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
         _log_kline_summary(record_id, klines_full)
         # 信号计算喂全量（含预热段，分钟级索引对齐与喂入数据同源），start 起的条目才进 cache
-        signal_cache = build_signal_cache(ps, klines_full, db, start=req.start_date)
+        # diagnostics 收集公式执行错误与真实输出线名，供信号预检（零信号静默坑）
+        signal_diagnostics: dict = {}
+        signal_cache = build_signal_cache(
+            ps, klines_full, db, start=req.start_date, diagnostics=signal_diagnostics,
+        )
+        signal_warnings = build_signal_warnings(
+            db, strategies, signal_cache, signal_diagnostics,
+        )
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
-        open_prices = build_open_prices(ps, klines)
-        t4 = datetime.now()
         benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
-        t5 = datetime.now()
+        t4 = datetime.now()
 
         # 各阶段耗时日志（定位回测慢的根因）
         _log_timing(f"[回测#{record_id}] 组装组合: {(t1-t0).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ K线拉取: {(t2-t1).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ 公式计算: {(t3-t2).total_seconds():.1f}s")
-        _log_timing(f"[回测#{record_id}] 提取开盘价: {(t4-t3).total_seconds():.1f}s")
-        _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t5-t4).total_seconds():.1f}s")
-        _log_timing(f"[回测#{record_id}] 数据准备合计: {(t5-t0).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t4-t3).total_seconds():.1f}s")
+        _log_timing(f"[回测#{record_id}] 数据准备合计: {(t4-t0).total_seconds():.1f}s")
 
         # 空行情保护：TQ 在该区间/股票池拉不到任何 K 线 → 标 failed 而非静默 completed。
         # 这正是"启动了但没运行直接完成"的根因（日期填反/未来日/股票池空等）。
@@ -1816,7 +1991,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
-            open_prices=open_prices,
             benchmark_data=benchmark_data,
         )
         t7 = datetime.now()
@@ -1828,7 +2002,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         _log_timing(f"[回测#{record_id}] 总耗时: {(t8-t0).total_seconds():.1f}s")
 
         rec.status = "completed"
-        rec.progress = 100
+        # 信号预检警告（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
+        rec.warnings_json = (
+            json.dumps(signal_warnings, ensure_ascii=False) if signal_warnings else None
+        )
         rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
         db.commit()
     except Exception as e:
@@ -1851,4 +2028,5 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         "trades_count": len(result["trades"]),
         "snapshots_count": len(result["snapshots"]),
         "evaluations": result.get("evaluations") or {},
+        "warnings": signal_warnings,
     }

@@ -16,18 +16,16 @@ class BacktestEngine:
         portfolio: Portfolio,
         klines: dict = None,
         signal_cache: dict = None,
-        open_prices: Optional[Dict[str, Dict[datetime, Decimal]]] = None,
         benchmark_data: object = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
-        open_prices: {stock_code: {bar_time: open_price}}，待执行订单在下一 bar 的 open 价成交。
-        成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列）。
+        成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列），
+        成交价取 price_index 中该 bar 的 Open（open_prices 死参数已移除，#12）。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
-        open_prices = open_prices or {}
 
         # 决策闸门采集（调参可观测性）：注入组合与执行引擎，run 结束随结果返回
         recorder = DecisionRecorder()
@@ -38,6 +36,8 @@ class BacktestEngine:
         pending_orders: List[OrderEvent] = []
         trades: List[TradeEvent] = []
         snapshots: List[dict] = []
+        # #2：已记过 no_market_data 决策事件的订单 id（仅首次延后记 1 条，长停牌不刷屏）
+        no_price_recorded: set = set()
         # 策略层快照：strategy_id → 快照序列。共享现金按 capital_ratio 归一化分摊。
         strategy_snapshots: Dict[int, List[dict]] = {
             ctx.strategy_id: [] for ctx in portfolio.strategies
@@ -45,11 +45,34 @@ class BacktestEngine:
 
         for i, t in enumerate(times):
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
+            deferred: List[OrderEvent] = []
             if pending_orders:
                 bar_open_prices = self._bar_open_prices(price_index, t)
                 dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
                 engine = ExecutionEngine(dispatcher, SimulatedT1Checker(), recorder=recorder)
+                # 未来函数闸门：日线级信号（signal_bar_date 非 None）须在
+                # t.date() > signal_bar_date 的下一交易日成交，防止当日 00:00
+                # 日线 bar 的信号在当日 09:30 分钟 bar 成交。未满足的订单延后。
                 for order in pending_orders:
+                    if order.signal_bar_date is not None and t.date() <= order.signal_bar_date:
+                        deferred.append(order)
+                        continue
+                    # #2 静默丢弃修复：停牌/无行情（本 bar 该票无有效 open 价）→
+                    # 延后至下一有价 bar 重试，不静默丢弃（此前直接丢弃导致
+                    # 停牌期间止损/止盈单永久丢失）。仅首次延后记决策事件。
+                    if not bar_open_prices.get(order.stock_code):
+                        if id(order) not in no_price_recorded:
+                            no_price_recorded.add(id(order))
+                            recorder.record(
+                                gate="no_market_data", layer="execution", action="defer",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                message="停牌/无行情：本 bar 无开盘价，订单延后至下一有价 bar 重试",
+                            )
+                        deferred.append(order)
+                        continue
                     # 成交日 = 当前 bar 时间 t（T+1 据此判断）
                     order.bar_time = t
                     ctx = portfolio.find_strategy(order.strategy_id)
@@ -63,19 +86,21 @@ class BacktestEngine:
                     trade = engine.execute(order, portfolio.account, pos)
                     if trade is not None:
                         trades.append(trade)
-                pending_orders = []
 
             # 2. 构造 BarEvent（从预建索引 O(1) 查表）
             bar = self._build_bar(price_index, t)
 
             # 3. portfolio.on_bar → 新订单入 pending（下一 bar 成交）
-            pending_orders = portfolio.on_bar(bar, signal_cache=signal_cache)
+            #    deferred（未到成交日的日线信号）需携带至后续 bar 合并
+            new_orders = portfolio.on_bar(bar, signal_cache=signal_cache)
+            pending_orders = deferred + new_orders
 
             # 4. 日终快照（日线：每根 bar 即一日）
             total_value = portfolio.total_value(bar)
             snap = portfolio.snapshot(t.date(), total_value, bar)
             # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
-            # 缺失则沿用上一已知值（基准停牌/非交易日），全无则 None。
+            # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
+            # Evaluator 喂基准序列时会过滤 None 值，全无则 benchmark_return 退化为 0。
             snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
             snapshots.append(snap)
 
@@ -90,6 +115,10 @@ class BacktestEngine:
             portfolio.risk_manager.update(
                 total_value, t.date(), portfolio.account.initial_capital
             )
+
+        # 6. 补算最后一日 daily_loss（#8 对齐实盘 14:30 时点：循环内 update 只在
+        #    跨日时补算上一日，最后一日无后续跨日触发，需显式收尾）
+        portfolio.risk_manager.finalize_last_day(portfolio.account.initial_capital)
 
         # 基准序列喂 Evaluator
         # 形如 [{"value": Decimal}]。无任何基准值 → 传 None，benchmark_return 退化为 0。

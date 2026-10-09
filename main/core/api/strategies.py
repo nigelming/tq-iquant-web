@@ -43,6 +43,7 @@ router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 # VALID_PERIODS 被 test_backtest_data 直接 import 做白名单对齐，必须留路由。
 VALID_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"}
 VALID_ROLES = {"independent", "master", "slave"}  # draft:223
+VALID_SLAVE_EXIT_MODES = {"independent", "follow_master"}
 VALID_TRADING_SESSIONS = {"full", "am", "pm"}  # draft:499，非 morning/afternoon
 VALID_STATUSES = {"active", "archived"}  # draft:500
 
@@ -53,6 +54,8 @@ class StrategyItem(BaseModel):
     period: str
     role: str
     master_strategy_id: int | None = None  # 0=本批第N个；正整数=已存在 id；None=无
+    stock_pool_id: int | None = None  # None=继承组合级
+    slave_exit_mode: str = "independent"  # independent|follow_master（仅 slave 有意义）
     capital_ratio: float = 0.6
     max_positions: int = 5
     single_open_ratio: float = 0.1
@@ -114,9 +117,16 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         if s.role == "slave":
             if s.master_strategy_id is None:
                 return f"子策略[{idx}] role=slave 必须指定主策略（master_strategy_id）"
+            if s.slave_exit_mode not in VALID_SLAVE_EXIT_MODES:
+                return f"子策略[{idx}] slave_exit_mode 必须为 {sorted(VALID_SLAVE_EXIT_MODES)}，收到 {s.slave_exit_mode}"
         else:  # master / independent
             if s.master_strategy_id is not None:
                 return f"子策略[{idx}] role={s.role} 的 master_strategy_id 必须为空"
+            if s.slave_exit_mode != "independent":
+                return f"子策略[{idx}] role={s.role} 的 slave_exit_mode 必须为 independent"
+        # 策略级股票池校验
+        if s.stock_pool_id is not None and not db.query(StockPool).filter(StockPool.id == s.stock_pool_id).first():
+            return f"子策略[{idx}] 股票池 id={s.stock_pool_id} 不存在"
     # slave 的 master 指向必须是同批 master 角色（master_strategy_id=0..N 指本批索引）
     for idx, s in enumerate(req.strategies):
         if s.role == "slave" and s.master_strategy_id is not None and s.master_strategy_id >= 0:
@@ -186,6 +196,8 @@ class StrategyCreate(BaseModel):
     period: str
     role: str
     master_strategy_id: int | None = None  # 已存在的同组合 master id
+    stock_pool_id: int | None = None  # None=继承组合级
+    slave_exit_mode: str = "independent"  # independent|follow_master（仅 slave 有意义）
     capital_ratio: float = 0.6
     max_positions: int = 5
     single_open_ratio: float = 0.1
@@ -216,6 +228,8 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
     if req.role == "slave":
         if req.master_strategy_id is None:
             return "role=slave 必须指定主策略（master_strategy_id）"
+        if req.slave_exit_mode not in VALID_SLAVE_EXIT_MODES:
+            return f"slave_exit_mode 必须为 {sorted(VALID_SLAVE_EXIT_MODES)}，收到 {req.slave_exit_mode}"
         # master 必须是同组合下 role=master 的已存在策略
         master = db.query(Strategy).filter(Strategy.id == req.master_strategy_id).first()
         if not master:
@@ -227,6 +241,11 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
     else:  # master / independent
         if req.master_strategy_id is not None:
             return f"role={req.role} 的 master_strategy_id 必须为空"
+        if req.slave_exit_mode != "independent":
+            return f"role={req.role} 的 slave_exit_mode 必须为 independent"
+    # 策略级股票池校验
+    if req.stock_pool_id is not None and not db.query(StockPool).filter(StockPool.id == req.stock_pool_id).first():
+        return f"股票池 id={req.stock_pool_id} 不存在"
     return None
 
 

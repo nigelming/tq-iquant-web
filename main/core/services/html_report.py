@@ -285,7 +285,18 @@ def _overview(detail: dict) -> str:
         f'<div class="gen">报告生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
         "（离线单文件，数字与平台详情接口同源）</div></div>"
     )
-    return meta + '<div class="kpi-grid">' + "".join(cards) + "</div>"
+    # 信号预检警告（公式报错/输出线缺失/区间零信号）——置顶，解释"为什么没有交易"
+    warning_block = ""
+    warnings = rec.get("warnings") or []
+    if warnings:
+        items = "".join(f"<li>{esc(w)}</li>" for w in warnings)
+        warning_block = (
+            '<div class="spb"><div class="spb-t">'
+            f'⚠️ 信号预检发现 {len(warnings)} 项问题'
+            "<span>（回测已完成，但可能未产生预期交易）</span></div>"
+            f"<ul>{items}</ul></div>"
+        )
+    return meta + warning_block + '<div class="kpi-grid">' + "".join(cards) + "</div>"
 
 
 def _crisis_section(detail: dict) -> str:
@@ -431,6 +442,24 @@ def _neutral(d: dict) -> str:
     return f'<div class="kpi-grid">{cards}</div>'
 
 
+def _window_note(d: dict, dates: Optional[List[str]]) -> str:
+    """披露实际统计窗口；窗口短于回测区间时写明被指数历史长度截断。
+
+    五/六/七/七-B 均对「全体指数求交集」取周（regime_alpha._exposure_block），
+    科创50(000688.SH) 等历史较短的指数会把窗口整体截断——不写明用户无从判断
+    数字只覆盖了回测区间的一部分。口径与前端 weekWindowText 一致。
+    """
+    if not dates:
+        return ""
+    n = len(dates)
+    total = ((d.get("meta") or {}).get("n_weeks_labeled"))
+    base = f"实际统计窗口 {dates[0]} ~ {dates[n - 1]}（{n} 周）"
+    if isinstance(total, int) and n < total:
+        return f'<p class="note">{esc(base)}；短于回测区间 {total} 周' \
+               "（受宽基指数历史长度限制，仅在该窗口内计算）</p>"
+    return f'<p class="note">{esc(base)}</p>'
+
+
 def _style_block(d: dict) -> str:
     st = d.get("style") or {}
     matrix = st.get("matrix") or {}
@@ -448,6 +477,7 @@ def _style_block(d: dict) -> str:
     out = _table(["领涨风格", "周数", "占比", "策略收益", "领涨指数",
                   "超额", "胜率", "最大回撤"], rows, row_cls) if rows else _empty(
         "风格行情样本不足")
+    out += _window_note(d, [w.get("date") for w in (st.get("weeks") or [])])
     if st.get("skipped"):
         out += f'<p class="note">跳过指数：{esc("、".join(st["skipped"]))}</p>'
     return out
@@ -456,7 +486,8 @@ def _style_block(d: dict) -> str:
 def _dispersion_block(d: dict, charts: List[Tuple[str, dict]]) -> str:
     dp = d.get("dispersion") or {}
     chart = _dispersion_chart(dp)
-    out = _chart("chart-disp") if chart else ""
+    out = _window_note(d, [s.get("date") for s in (dp.get("series") or [])])
+    out += _chart("chart-disp") if chart else ""
     if chart:
         charts.append(chart)
     buckets = dp.get("buckets") or {}
@@ -473,7 +504,8 @@ def _dispersion_block(d: dict, charts: List[Tuple[str, dict]]) -> str:
     return out or _empty("宽基数据不足，分化度不可用")
 
 
-def _exposure_table(ex: dict, first_col: str, empty_text: str) -> str:
+def _exposure_table(ex: dict, first_col: str, empty_text: str,
+                    window_note: str = "") -> str:
     names = ex.get("available_names") or []
     codes = ex.get("available_codes") or []
     corr = ex.get("corr") or {}
@@ -488,13 +520,15 @@ def _exposure_table(ex: dict, first_col: str, empty_text: str) -> str:
         rows.append([esc(name), num(last_corr), num(last_beta)])
     out = _table([first_col, f"最新滚动相关（{ex.get('window', 52)}周）",
                   "最新 OLS Beta"], rows) if rows else _empty(empty_text)
+    out += window_note
     if ex.get("skipped"):
         out += f'<p class="note">跳过指数：{esc("、".join(ex["skipped"]))}</p>'
     return out
 
 
 def _exposure_block(d: dict) -> str:
-    return _exposure_table(d.get("exposure") or {}, "宽基指数", "宽基样本不足")
+    ex = d.get("exposure") or {}
+    return _exposure_table(ex, "宽基指数", "宽基样本不足", _window_note(d, ex.get("dates")))
 
 
 def _quadrant_block(d: dict) -> str:
@@ -502,7 +536,8 @@ def _quadrant_block(d: dict) -> str:
     ex = d.get("quadrant_exposure")
     if ex is None:
         return _empty("该记录暂无四象限暴露数据（老记录重算后可用）")
-    return _exposure_table(ex, "风格指数", "四象限指数样本不足")
+    return _exposure_table(ex, "风格指数", "四象限指数样本不足",
+                           _window_note(d, ex.get("dates")))
 
 
 def _industry_block(d: dict, charts: List[Tuple[str, dict]]) -> str:
@@ -681,6 +716,10 @@ th:first-child,td:first-child{text-align:left}th{background:#f3f4f6;color:#37415
 .pos{color:#c0392b}.neg{color:#1e7e4f}
 .empty{background:#f9fafb;border:1px dashed #d1d5db;border-radius:6px;padding:18px;text-align:center;color:#6b7280;font-size:13px}
 .note{font-size:12px;color:#9ca3af;margin:6px 0}
+.spb{background:rgba(180,83,9,.10);border:1px solid #e29b4f;border-left:4px solid #b45309;border-radius:6px;padding:12px 16px;margin:12px 0}
+.spb-t{color:#b45309;font-weight:700;font-size:13.5px;margin-bottom:6px}
+.spb-t span{font-weight:400;color:#6b7280;font-size:12px;margin-left:6px}
+.spb ul{margin:0;padding-left:20px;color:#374151;font-size:12.5px;line-height:1.7}
 .chart{width:100%;margin:8px 0}
 details{margin:8px 0}summary{cursor:pointer;font-size:13px;color:#4b5563}
 pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;font-size:11px;line-height:1.5;max-height:480px;overflow:auto;white-space:pre-wrap;word-break:break-all}

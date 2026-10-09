@@ -45,7 +45,7 @@ beforeEach(() => {
   ;(getPortfolios as any).mockResolvedValue([])
   ;(getBacktestRecords as any).mockResolvedValue([{
     id: 1, portfolio_strategy_id: 1, name: '回测A', start_date: '2026-01-01', end_date: '2026-01-31',
-    status: 'completed', progress: 1, error_message: null, created_at: null, completed_at: null,
+    status: 'completed', error_message: null, created_at: null, completed_at: null,
   }])
   ;(getLiveSessions as any).mockResolvedValue([])
   ;(getSystemConfigs as any).mockResolvedValue(mockCfg)

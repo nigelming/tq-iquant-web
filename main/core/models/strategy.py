@@ -16,6 +16,13 @@ class Strategy(Base):
     # 自引用：slave 指向同组合 master。ondelete=RESTRICT（审计 #18）——业务规则禁止
     # "slave 无 master"的孤儿行，delete_strategy 已有 app 层预检，DB 层 RESTRICT 兜底。
     master_strategy_id = Column(Integer, ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=True, index=True)
+    # 策略级股票池（可空）：空=继承组合级 stock_pool_id；非空=本策略独立池。
+    # 用于"不同股票池独立"模式：每个 slave/independent 可有自己的股票池，跨池不下单。
+    stock_pool_id = Column(Integer, ForeignKey("stock_pools.id", ondelete="RESTRICT"), nullable=True, index=True)
+    # 从策略卖出模式（仅 role="slave" 时有意义，其他角色忽略）：
+    #   independent = slave 自身信号/风控触发卖出，不联动 master
+    #   follow_master = master 卖出某股时 slave 强制同步卖出该股（若 slave 持有）
+    slave_exit_mode = Column(String(15), nullable=False, default="independent", server_default="independent")
     capital_ratio = Column(Numeric(5, 4), default=0.6000, server_default="0.6000", nullable=False)
     max_positions = Column(Integer, default=5, server_default="5", nullable=False)
     single_open_ratio = Column(Numeric(5, 4), default=0.1000, server_default="0.1000", nullable=False)

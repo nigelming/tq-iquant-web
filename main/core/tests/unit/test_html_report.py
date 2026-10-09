@@ -190,6 +190,42 @@ def test_robustness_ok_renders_tables_and_chart():
     assert "chart-rb" in html
 
 
+def test_market_regime_window_disclosure():
+    """五/六/七/七-B 披露实际统计窗口；短于回测区间时写明被指数历史截断。
+
+    背景：_exposure_block 对全体指数求交集，科创50(000688.SH) 仅 2019-12-31 起，
+    会把窗口整体截断（如 651 周回测只剩 343 周）而不告知用户。
+    """
+    detail = _detail()
+    data = detail["market_regime"]["data"]
+    data["meta"]["n_weeks_labeled"] = 651
+    data["style"]["weeks"] = [{"date": "2020-01-10"}, {"date": "2020-01-17"}]
+    data["dispersion"]["series"] = [
+        {"date": "2020-01-10", "dispersion": 0.02},
+        {"date": "2020-01-17", "dispersion": 0.03},
+    ]
+    data["exposure"].update({
+        "available_codes": ["000300.SH"], "available_names": ["沪深300"],
+        "dates": ["2020-01-10", "2020-01-17"],
+        "corr": {"000300.SH": [0.4, 0.5]}, "beta": {"000300.SH": [0.3, 0.35]},
+    })
+    # 七-B 覆盖全区间（651 周）→ 不应被标为截断
+    full_dates = ["2014-01-10"] + [f"2014-01-{17 + i}" for i in range(649)] + ["2026-09-18"]
+    assert len(full_dates) == 651
+    data["quadrant_exposure"] = {
+        "available_codes": ["399372.SZ"], "available_names": ["大盘成长"],
+        "skipped": [], "dates": full_dates,
+        "corr": {"399372.SZ": [0.4] * 651}, "beta": {"399372.SZ": [0.3] * 651},
+        "window": 52,
+    }
+    html = build_html_report(detail)
+    assert "实际统计窗口 2020-01-10 ~ 2020-01-17（2 周）" in html
+    assert "短于回测区间 651 周" in html
+    # 七-B 全区间窗口只报窗口，不报截断
+    assert "实际统计窗口 2014-01-10 ~ 2026-09-18（651 周）" in html
+    assert "实际统计窗口 2014-01-10 ~ 2026-09-18（651 周）；短于" not in html
+
+
 def test_appendix_embeds_raw_detail_json():
     """Minor-4：报告末尾附录折叠展示完整 detail 原始 JSON。"""
     html = build_html_report(_detail())
@@ -208,3 +244,31 @@ def test_appendix_escapes_html_in_payload():
     html = build_html_report(detail)
     assert '<script>alert("x")</script>' not in html.split(
         'class="json-dump"', 1)[1]
+
+
+def test_signal_preflight_warnings_render_at_top():
+    """record.warnings 非空 → 报告顶部渲染信号预检警告条及每条警告（转义）。"""
+    detail = _detail()
+    detail["record"]["warnings"] = [
+        '策略「s1」(1d) 的开仓信号「买」（触发值=2）在回测区间内从未触发。',
+        '<img src=x onerror=alert(1)>',
+    ]
+    html = build_html_report(detail)
+
+    assert 'class="spb"' in html
+    assert "信号预检发现 2 项问题" in html
+    assert "从未触发" in html
+    # 警告文案中的 HTML 必须转义
+    assert "<img src=x" not in html
+    assert "&lt;img src=x" in html
+    # 警告条必须在首个 KPI 网格之前（置顶）
+    assert html.index('class="spb"') < html.index('class="kpi-grid"')
+
+
+def test_no_signal_preflight_banner_when_warnings_empty():
+    """record.warnings 为空/缺省 → 不渲染警告条。"""
+    assert 'class="spb"' not in build_html_report(_detail())
+
+    detail = _detail()
+    detail["record"]["warnings"] = []
+    assert 'class="spb"' not in build_html_report(detail)

@@ -17,13 +17,14 @@ from core.services.formula_service import (
 router = APIRouter(prefix="/api/formulas", tags=["formulas"])
 
 VALID_SIGNAL_TYPES = {"OPEN", "ADD", "REDUCE", "CLOSE"}
-VALID_TRIGGER_VALUES = {1, -1}
+# 0 故意排除：0 是通达信信号输出线的"无信号"常态值，配成触发值会导致每根 bar 都匹配。
+VALID_TRIGGER_VALUES = {-2, -1, 1, 2}
 
 
 class SignalItem(BaseModel):
     signal_name: str
     signal_type: str  # OPEN|ADD|REDUCE|CLOSE
-    trigger_value: int  # 1 或 -1
+    trigger_value: int  # ±1/±2（0 为无信号常态值，禁止配置）
 
 
 class FormulaCreate(BaseModel):
@@ -43,8 +44,13 @@ def _validate_signals(signals: list[SignalItem]) -> str | None:
     for sig in signals:
         if sig.signal_type not in VALID_SIGNAL_TYPES:
             return f"signal_type 必须为 OPEN/ADD/REDUCE/CLOSE，收到 {sig.signal_type}"
+        if sig.trigger_value == 0:
+            return (
+                "trigger_value 不能为 0：0 是公式输出线的无信号常态值，"
+                "配置后会在每根 bar 都匹配，请改用实际信号值（±1/±2）"
+            )
         if sig.trigger_value not in VALID_TRIGGER_VALUES:
-            return f"trigger_value 必须为 1 或 -1，收到 {sig.trigger_value}"
+            return f"trigger_value 必须为 -2,-1,1,2，收到 {sig.trigger_value}"
     return None
 
 

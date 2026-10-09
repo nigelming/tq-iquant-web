@@ -1010,3 +1010,126 @@ def test_positions_detail_per_strategy_ctx_is_isolated():
     d2 = port.positions_detail(datetime(2026, 7, 30).date(), ctx=ctx2)
     assert [p["stock_code"] for p in d1] == ["000001.SZ"]
     assert [p["stock_code"] for p in d2] == ["600000.SH"]
+
+
+# ===========================================================================
+# follow_master 联动测试：slave_exit_mode="follow_master" 时，master 卖出某股
+# → slave 同步全平该股（若持有且本 bar 未自行卖出）。
+# ===========================================================================
+def _master_slave_with_follow(follow_master=True, slave_holds_stock="000001.SZ"):
+    """master(id=1) + slave(id=2, master=1, slave_exit_mode=follow_master) 组合。
+    master 有 000001.SZ 持仓，slave 也有。master 配 CLOSE 信号。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+
+    master = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5, role="master",
+    )
+    master.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    master.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.1"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    # master 持仓
+    mpos = Position("000001.SZ")
+    mpos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    master.positions["000001.SZ"] = mpos
+
+    slave = StrategyContext(
+        strategy_id=2, period="1d",
+        capital_ratio=Decimal("0.4"), max_positions=5,
+        role="slave", master_strategy_id=1,
+        slave_exit_mode="follow_master" if follow_master else "independent",
+    )
+    slave.formula_signals = []
+    slave.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.1"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    # slave 持仓
+    if slave_holds_stock:
+        spos = Position(slave_holds_stock)
+        spos.apply_trade(_buy("10", 500, datetime(2026, 7, 29, 9, 30)))
+        slave.positions[slave_holds_stock] = spos
+
+    port.strategies.extend([master, slave])
+    return port, master, slave
+
+
+def test_slave_follow_master_sells_when_master_closes():
+    """follow_master：master CLOSE 卖 000001.SZ，slave 持有 → 自动追加 SELL。"""
+    port, master, slave = _master_slave_with_follow()
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    # master SELL
+    master_sells = [o for o in orders if o.trade_type == TradeType.SELL and o.strategy_id == 1]
+    assert len(master_sells) == 1
+    # slave follow_master SELL
+    follow_sells = [o for o in orders if o.trade_type == TradeType.SELL
+                    and o.strategy_id == 2 and o.signal_name == "follow_master"]
+    assert len(follow_sells) == 1
+    assert follow_sells[0].quantity == 500  # slave 持仓全平
+    assert follow_sells[0].stock_code == "000001.SZ"
+
+
+def test_slave_follow_master_skips_if_slave_not_holding():
+    """follow_master：master 卖 X，slave 未持 X → 不出追加订单。"""
+    port, master, slave = _master_slave_with_follow(slave_holds_stock=None)
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    follow_sells = [o for o in orders if o.signal_name == "follow_master"]
+    assert follow_sells == []
+
+
+def test_slave_follow_master_dedup_with_own_sell():
+    """follow_master：slave 本 bar 已自行 SELL X → 不再追加 follow_master SELL。"""
+    port, master, slave = _master_slave_with_follow()
+    # slave 也配 CLOSE 信号，本 bar 会自行卖出
+    slave.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {
+        (1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}],
+        (2, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}],
+    }
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    # master SELL + slave 自行 SELL，但 follow_master 不再追加（去重）
+    follow_sells = [o for o in orders if o.signal_name == "follow_master"]
+    assert follow_sells == []
+    # slave 仍有一条 SELL（自行触发的）
+    slave_sells = [o for o in orders if o.trade_type == TradeType.SELL
+                   and o.strategy_id == 2 and o.signal_name != "follow_master"]
+    assert len(slave_sells) == 1
+
+
+def test_slave_independent_no_follow_master():
+    """independent（默认行为）：master 卖 X → slave 不出追加订单。"""
+    port, master, slave = _master_slave_with_follow(follow_master=False)
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    follow_sells = [o for o in orders if o.signal_name == "follow_master"]
+    assert follow_sells == []
+
+
+def test_follow_master_order_carries_signal_bar_date_for_daily_slave():
+    """日线 slave 的 follow_master 订单也带 signal_bar_date（延迟到次日成交）。"""
+    from datetime import date as _date
+    port, master, slave = _master_slave_with_follow()
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+
+    follow_sells = [o for o in orders if o.signal_name == "follow_master"]
+    assert len(follow_sells) == 1
+    assert follow_sells[0].signal_bar_date == _date(2026, 7, 30)

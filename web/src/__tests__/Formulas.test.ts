@@ -86,6 +86,18 @@ describe('Formulas.vue', () => {
     expect(w.findAll('.signal-row').length).toBe(before + 1)
   })
 
+  it('触发值下拉不含 0（0 是无信号常态值，只保留 ±1/±2）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开 Modal
+    await w.find('button.signal-add').trigger('click')  // 新增信号行
+
+    const triggerSelect = w.findAll('.signal-row select')[1]  // 第二个 select=触发值
+    const values = triggerSelect.findAll('option').map(o => o.attributes().value)
+    expect(values).not.toContain('0')
+    expect(values).toEqual(expect.arrayContaining(['-2', '-1', '1', '2']))
+  })
+
   it('填表 + 提交 → 调 createFormula 且参数含 name/content/signals', async () => {
     ;(createFormula as any).mockResolvedValue({ id: 99 })
     const w = mount(Formulas)

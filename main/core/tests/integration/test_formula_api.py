@@ -200,7 +200,7 @@ def test_create_formula_invalid_signal_type(client):
 
 
 def test_create_formula_invalid_trigger_value(client):
-    """trigger_value 不在 {1,-1} → code 400。"""
+    """trigger_value 不在 {-2,-1,1,2} → code 400。"""
     c, Session = client
     payload = {
         "name": "BAD", "content": "X",
@@ -209,6 +209,20 @@ def test_create_formula_invalid_trigger_value(client):
     resp = c.post("/api/formulas", json=payload)
     assert resp.status_code == 200
     assert resp.json()["code"] == 400
+
+
+def test_create_formula_trigger_zero_rejected(client):
+    """trigger_value=0 被拒：0 是公式无信号常态值，配置后每根 bar 都会匹配。"""
+    c, Session = client
+    payload = {
+        "name": "BADZERO", "content": "X",
+        "signals": [{"signal_name": "x", "signal_type": "OPEN", "trigger_value": 0}],
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 400
+    assert "0" in body["message"]
 
 
 # ---------------------------------------------------------------------------

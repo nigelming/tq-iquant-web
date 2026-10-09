@@ -100,7 +100,7 @@ onMounted(load)
       <h3 style="margin:0 0 8px">最近回测</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>名称</th><th>区间</th><th>状态</th><th>进度</th></tr></thead>
+          <thead><tr><th>名称</th><th>区间</th><th>状态</th></tr></thead>
           <tbody>
             <tr v-for="r in recentBacktests" :key="r.id">
               <td>{{ r.name }}</td>
@@ -110,7 +110,6 @@ onMounted(load)
                 <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
                 <span v-else class="badge badge-gray">{{ r.status }}</span>
               </td>
-              <td>{{ r.progress != null ? r.progress + '%' : '-' }}</td>
             </tr>
           </tbody>
         </table>

@@ -44,6 +44,10 @@ const TRADING_SESSIONS = [
   { value: 'am', label: '仅上午' },
   { value: 'pm', label: '仅下午' },
 ]
+const SLAVE_EXIT_MODES = [
+  { value: 'independent', label: '独立卖出' },
+  { value: 'follow_master', label: '跟随主策略' },
+]
 
 // 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
 const PORTFOLIO_RATIO_FIELDS = new Set([
@@ -88,6 +92,8 @@ const STRATEGY_GROUPS = [
     { key: 'period', label: '周期', span: 2, type: 'select', options: 'periods' },
     { key: 'role', label: '角色', span: 2, type: 'select', options: 'roles' },
     { key: 'master_strategy_id', label: '主策略', span: 2, type: 'select', options: 'masters', showIf: 'slave' },
+    { key: 'stock_pool_id', label: '股票池', span: 2, type: 'select', options: 'strategyPools' },
+    { key: 'slave_exit_mode', label: '卖出模式', span: 2, type: 'select', options: 'slaveExitModes', showIf: 'slave' },
   ]},
   { title: '资金参数', fields: [
     { key: 'capital_ratio', label: '资金占比', span: 2, type: 'percent', placeholder: '60' },
@@ -110,7 +116,8 @@ const STRATEGY_GROUPS = [
 function emptyStrategyForm(): Record<string, any> {
   return {
     name: '', formula_id: 0, period: '1d', role: 'independent',
-    master_strategy_id: null, capital_ratio: 0.6, max_positions: 5,
+    master_strategy_id: null, stock_pool_id: null, slave_exit_mode: 'independent',
+    capital_ratio: 0.6, max_positions: 5,
     single_open_ratio: 0.1,
     stop_loss_ratio: 0.05, take_profit_ratio: 0.15, trailing_stop_ratio: 0.03,
     add_position_threshold: -1, max_add_count: 2,  // -1=任何价都加（页面默认即跳过回撤检查）
@@ -217,7 +224,10 @@ function buildStrategyPayload(): StrategyRequest {
     out[fld.key] = fromPercent(f[fld.key], fld)
   }
   // showIf 跳过 master_strategy_id 时，独立/主策略置 null
-  if (f.role !== 'slave') out.master_strategy_id = null
+  if (f.role !== 'slave') {
+    out.master_strategy_id = null
+    out.slave_exit_mode = 'independent'
+  }
   return out as unknown as StrategyRequest
 }
 
@@ -315,7 +325,10 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
   editingStrategyId.value = s.id
   strategyForm.value = {
     name: s.name, formula_id: s.formula_id, period: s.period, role: s.role,
-    master_strategy_id: s.master_strategy_id, capital_ratio: s.capital_ratio,
+    master_strategy_id: s.master_strategy_id,
+    stock_pool_id: s.stock_pool_id ?? null,
+    slave_exit_mode: s.slave_exit_mode ?? 'independent',
+    capital_ratio: s.capital_ratio,
     max_positions: s.max_positions, single_open_ratio: s.single_open_ratio,
     stop_loss_ratio: s.stop_loss_ratio, take_profit_ratio: s.take_profit_ratio,
     trailing_stop_ratio: s.trailing_stop_ratio,
@@ -376,10 +389,15 @@ function fieldVisible(fld: { showIf?: string }, form: Record<string, any>): bool
 function optionsOf(src: string | undefined, pid?: number) {
   if (!src) return []
   if (src === 'pools') return stockPools.value.map(p => ({ value: p.id, label: `${p.name}（${p.code}）` }))
+  if (src === 'strategyPools') return [
+    { value: null, label: '继承组合级' },
+    ...stockPools.value.map(p => ({ value: p.id, label: `${p.name}（${p.code}）` })),
+  ]
   if (src === 'sessions') return TRADING_SESSIONS.map(t => ({ value: t.value, label: `${t.label}（${t.value}）` }))
   if (src === 'formulas') return formulas.value.map(f => ({ value: f.id, label: f.name }))
   if (src === 'periods') return PERIODS.map(p => ({ value: p, label: p }))
   if (src === 'roles') return ROLES.map(r => ({ value: r.value, label: r.label }))
+  if (src === 'slaveExitModes') return SLAVE_EXIT_MODES.map(m => ({ value: m.value, label: m.label }))
   if (src === 'masters') return (pid ? masterOptions(pid) : []).map(m => ({ value: m.id, label: m.name }))
   return []
 }
@@ -459,7 +477,7 @@ onMounted(loadPortfolios)
               :placeholder="fld.placeholder"
             />
             <select v-else :data-field="fld.key" v-model="portfolioForm[fld.key]">
-              <option v-for="o in optionsOf(fld.options)" :key="o.value" :value="o.value">{{ o.label }}</option>
+              <option v-for="o in optionsOf(fld.options)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
             </select>
             <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
           </div>
@@ -489,7 +507,7 @@ onMounted(loadPortfolios)
               :placeholder="fld.placeholder"
             />
             <select v-else :data-field="fld.key" v-model="strategyForm[fld.key]">
-              <option v-for="o in optionsOf(fld.options, strategyPortfolioId!)" :key="o.value" :value="o.value">{{ o.label }}</option>
+              <option v-for="o in optionsOf(fld.options, strategyPortfolioId!)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
             </select>
             <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
           </div>

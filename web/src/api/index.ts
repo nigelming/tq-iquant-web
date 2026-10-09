@@ -56,7 +56,7 @@ export interface FormulaSignalItem {
   id: number
   signal_name: string
   signal_type: string  // OPEN|ADD|REDUCE|CLOSE
-  trigger_value: number  // 1 | -1
+  trigger_value: number  // -2|-1|0|1|2
 }
 
 // 公式（GET/POST/PUT /formulas）— 对齐 formulas._serialize_formula
@@ -100,8 +100,8 @@ export interface BacktestRecordItem {
   start_date: string | null
   end_date: string | null
   status: string  // running|completed|failed
-  progress: number | null
   error_message: string | null
+  warnings: string[]  // 信号预检非致命警告（零信号/输出线缺失/公式报错）
   created_at: string | null
   completed_at: string | null
 }
@@ -547,6 +547,8 @@ export interface StrategyItem {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 0=本批第N个；null=无
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number
@@ -605,6 +607,8 @@ export interface StrategyDetail {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number
@@ -623,6 +627,8 @@ export interface StrategyRequest {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number

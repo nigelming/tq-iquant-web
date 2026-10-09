@@ -59,6 +59,8 @@ class PortfolioRiskManager:
         # 分钟级实盘（E5/E6）：跨日检测记录上一根 bar 的日期与 total_value
         self._last_bar_date: Optional[date] = None
         self._last_bar_total_value: Optional[Decimal] = None
+        # #8: 已补算 daily_loss 的日期，防止同日重复评估（跨日补算 + finalize_last_day 不重叠）
+        self._last_daily_date: Optional[date] = None
         # 决策闸门采集（调参可观测性）：默认空采集器，Portfolio.set_recorder 注入
         self.recorder = NULL_RECORDER
         self.portfolio_id: Optional[int] = None
@@ -101,13 +103,29 @@ class PortfolioRiskManager:
         return self.circuit_breaker_active or self.daily_pause_active
 
     def update(self, total_value: Decimal, current_date: date, initial_capital: Decimal) -> None:
-        """每根 bar 日终调用（回测）：= update_peak + update_daily 合集，向后兼容。
+        """每根 bar 日终调用（回测）：跨日时补算上一日 daily_loss，同日仅更新峰值。
 
-        日线回测每 bar 跨日：update_peak 刷新 prev_close = 上一 bar total_value，
-        update_daily 用其算 daily_pnl = 今日-昨日，语义与旧 update 完全一致。
+        日线回测每 bar 跨日：跨日补算上一日 = 逐日检查 daily_loss，语义与旧 update 兼容。
+        分钟回测同日多 bar：只调 update_peak，不误触 daily_loss（日内亏损只在日终算）。
+        循环结束后由 backtest_engine 调 finalize_last_day 补算最后一日（无后续跨日触发）。
         """
+        if self._last_bar_date is not None and self._last_bar_date != current_date:
+            # 跨日：用上一日最后一根 bar 的 total_value 补算上一日 daily_loss
+            # recovery_date 传 current_date（当日），使次日恢复用当前日而非上一日判断
+            self.update_daily(
+                self._last_bar_total_value, self._last_bar_date, initial_capital,
+                recovery_date=current_date,
+            )
         self.update_peak(total_value, current_date)
-        self.update_daily(total_value, current_date, initial_capital)
+
+    def finalize_last_day(self, initial_capital: Decimal) -> None:
+        """回测循环结束后补算最后一日 daily_loss。
+
+        循环内 update 在跨日时补算上一日，最后一日因无后续跨日触发，
+        需由引擎在 run 结束时显式调用此方法收尾。
+        """
+        if self._last_bar_date is not None:
+            self.update_daily(self._last_bar_total_value, self._last_bar_date, initial_capital)
 
     def update_peak(self, total_value: Decimal, current_date: date) -> None:
         """每根 bar 调用（实盘分钟级）：跨日刷新 prev_close、更新峰值、检测 max_drawdown 熔断 + 次日恢复。
@@ -157,28 +175,40 @@ class PortfolioRiskManager:
                     ),
                 )
 
-    def update_daily(self, total_value: Decimal, current_date: date, initial_capital: Decimal) -> None:
-        """日终一次调用（实盘 14:30）：算日内盈亏、检测 daily_loss 暂停 + 次日恢复。
+    def update_daily(
+        self, total_value: Decimal, current_date: date, initial_capital: Decimal,
+        recovery_date: Optional[date] = None,
+    ) -> None:
+        """日终一次调用（实盘 14:30 / 回测跨日补算）：算日内盈亏、检测 daily_loss 暂停 + 次日恢复。
 
         日内盈亏 daily_pnl = total_value - prev_close_value（昨日收盘基准，由 update_peak 跨日刷新）。
-        分钟级不误触：daily_loss 只在此处算，不被每 bar 的 update_peak 抖动影响（E6）。
+        recovery_date 用于次日恢复判断：回测跨日补算时传当日（current_date 是上一日），
+        实盘 14:30 调用时默认 = current_date（当日）。同一日期不重复评估（_last_daily_date 守卫）。
         """
-        # 1. 次日恢复
+        if recovery_date is None:
+            recovery_date = current_date
+
+        # 1. 次日恢复（用 recovery_date 判断，而非 current_date）
         if self.daily_pause_active:
-            if self.daily_loss_trigger_date is not None and current_date > self.daily_loss_trigger_date:
+            if self.daily_loss_trigger_date is not None and recovery_date > self.daily_loss_trigger_date:
                 self.daily_pause_active = False
                 self._record_recover(
                     "daily_loss 日内亏损暂停次日恢复（触发日 %s）" % self.daily_loss_trigger_date,
-                    current_date,
+                    recovery_date,
                 )
 
-        # 2. 日内盈亏（首日无前值，pnl=0）
+        # 2. 同日不重复评估（跨日补算与 finalize_last_day 不会对同一日二次触发）
+        if self._last_daily_date == current_date:
+            return
+        self._last_daily_date = current_date
+
+        # 3. 日内盈亏（首日无前值，pnl=0）
         if self.prev_close_value is None:
             daily_pnl = Decimal("0")
         else:
             daily_pnl = total_value - self.prev_close_value
 
-        # 3. 检测 daily_loss（当日未暂停时）
+        # 4. 检测 daily_loss（当日未暂停时）
         if not self.daily_pause_active:
             if self.check_daily_loss(daily_pnl, initial_capital):
                 loss = (

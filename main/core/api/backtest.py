@@ -35,7 +35,6 @@ class BacktestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 from core.services.backtest_service import (  # noqa: E402
     build_klines,
-    build_open_prices,
     build_benchmark_data,
     build_signal_cache,
     warmup_counts_by_period,
@@ -75,10 +74,16 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/records/{record_id}")
 def delete_record(record_id: int, db: Session = Depends(get_db)):
-    """删除回测记录 + 级联子表（trades/snapshots/evaluations）。
-    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。"""
-    if not _svc_delete_record(db, record_id):
-        return err(404, "回测记录不存在")
+    """删除回测记录 + 级联子表（trades/snapshots/evaluations/decisions）。
+    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。
+
+    #4: status=running 时拒绝删除（409），防止并发删除运行中的回测引发
+    FK IntegrityError 500 或破坏其写入——对照 live 删除守卫。
+    """
+    ok_flag, msg = _svc_delete_record(db, record_id)
+    if not ok_flag:
+        status = 409 if (msg and "运行中" in msg) else 404
+        return err(status, msg)
     return ok()
 
 

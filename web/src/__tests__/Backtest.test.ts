@@ -78,11 +78,11 @@ const scrollTargets: any[] = []
 
 const mockRecords = [
   {
-    id: 1, name: '回测A', portfolio_strategy_id: 1, status: 'completed', progress: 100,
+    id: 1, name: '回测A', portfolio_strategy_id: 1, status: 'completed',
     start_date: '2026-07-01', end_date: '2026-07-31', created_at: '2026-08-01T10:00:00',
   },
   {
-    id: 2, name: '回测B', portfolio_strategy_id: 2, status: 'failed', progress: 30,
+    id: 2, name: '回测B', portfolio_strategy_id: 2, status: 'failed',
     start_date: '2026-06-01', end_date: '2026-06-30', created_at: '2026-08-02T10:00:00',
   },
 ]
@@ -131,12 +131,11 @@ describe('Backtest.vue — 列表视图', () => {
     expect(w.text()).toContain('回测B')
   })
 
-  it('记录状态显示中文（已完成/失败），含进度', async () => {
+  it('记录状态显示中文（已完成/失败）', async () => {
     const w = mount(Backtest)
     await flushPromises()
     expect(w.text()).toContain('已完成')
     expect(w.text()).toContain('失败')
-    expect(w.text()).toContain('100%')
   })
 
   it('每行含[查看]按钮', async () => {
@@ -323,6 +322,42 @@ describe('Backtest.vue — 详情视图', () => {
     expect(link?.exists()).toBe(true)
     expect(link?.attributes('href')).toBe('/api/backtest/records/1/export/html')
     expect(link?.attributes('target')).toBe('_blank')
+  })
+
+  it('record.warnings 非空 → 详情顶部显示信号预检警告条及每条警告', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      record: {
+        ...mockDetail.record,
+        warnings: [
+          '策略「s1」(1d) 的开仓信号「最终强交易买」（触发值=2）在回测区间内从未触发，本次回测不会产生该信号的交易。',
+        ],
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const banner = w.find('.signal-preflight-banner')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('信号预检')
+    expect(banner.text()).toContain('最终强交易买')
+    expect(banner.text()).toContain('从未触发')
+    expect(banner.findAll('.spb-list li').length).toBe(1)
+  })
+
+  it('record.warnings 为空数组 → 不渲染信号预检警告条', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      record: { ...mockDetail.record, warnings: [] },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    expect(w.find('.signal-preflight-banner').exists()).toBe(false)
   })
 
   it('详情有[←返回] → 回列表', async () => {
@@ -2032,6 +2067,38 @@ describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section',
     await mrBtns(w)[0].trigger('click')
     await flushPromises()
     expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算失败')
+  })
+})
+
+describe('Backtest.vue — 综合评分时间因子', () => {
+  function snapsN(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      snap_date: `2021-01-${String((i % 28) + 1).padStart(2, '0')}`,
+      total_value: 100000 + i, cash: 0, market_value: 100000 + i,
+      daily_return: 0, cumulative_return: 0, benchmark_value: 3000,
+    }))
+  }
+
+  it('评分卡显示样本时长与置信度（满 3 年为 100%）', async () => {
+    const w = await mountDetail({
+      ...mockDetail, snapshots: snapsN(800),
+      strategy_evaluations: [{ strategy_id: 1, strategy_name: 'S1', total_return: 0.05 }],
+    })
+    const conf = w.find('.score-confidence')
+    expect(conf.exists()).toBe(true)
+    expect(conf.text()).toContain('样本时长')
+    expect(conf.text()).toContain('置信度 100%')
+  })
+
+  it('相同指标下样本越短总分越低', async () => {
+    const strat = [{ strategy_id: 1, strategy_name: 'S1', total_return: 0.05 }]
+    const long = await mountDetail({ ...mockDetail, snapshots: snapsN(800), strategy_evaluations: strat })
+    const short = await mountDetail({ ...mockDetail, snapshots: snapsN(200), strategy_evaluations: strat })
+    const longTotal = Number(long.find('.score-total').text())
+    const shortTotal = Number(short.find('.score-total').text())
+    expect(longTotal).toBeGreaterThan(0)
+    expect(shortTotal).toBeLessThan(longTotal)
+    expect(short.find('.score-confidence').text()).toContain('不足 3 年')
   })
 })
 
