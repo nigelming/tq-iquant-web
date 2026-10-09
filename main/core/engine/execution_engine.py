@@ -218,6 +218,39 @@ class ExecutionEngine:
         if not trade:
             return None
 
+        # 跳空高开保护：BUY 实际成交成本（含滑点+佣金+印花税）超可用现金 →
+        # 用实际成交价 trade.price（已含滑点）重新审批，缩量到 100 股整数倍或拒单。
+        # 原因：cap_quantity 用信号 bar 收盘价审批，place_order 用下一 bar 开盘价成交，
+        # 跳空高开时实际成本 > 审批金额，不加此守卫则 deduct_cash 后现金为负。
+        if apply and order.trade_type == TradeType.BUY:
+            cost = trade.amount + trade.commission + trade.stamp_duty
+            if cost > account.cash:
+                approved, qty = account.approve_order(
+                    order.quantity, trade.price,
+                    position.market_value if position else Decimal("0"),
+                )
+                if not approved or qty < 100:
+                    self._rec_gate(
+                        "insufficient_funds", "reject", order, "capital_gate",
+                        requested=order.quantity, final=0,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="跳空高开资金不足：成交价 %s，需 %s，可用 %s"
+                                % (trade.price, cost, account.cash),
+                    )
+                    return None
+                if qty < order.quantity:
+                    self._rec_gate(
+                        "order_shrunk", "shrink", order, "capital_gate",
+                        requested=order.quantity, final=qty,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="跳空高开缩量：%d → %d @ %s"
+                                % (order.quantity, qty, trade.price),
+                    )
+                    order.quantity = qty
+                    trade = self._dispatcher.place_order(order)
+                    if not trade:
+                        return None
+
         if apply:
             # 统一用 apply_trade 更新账户和持仓
             account.apply_trade(trade)
