@@ -484,7 +484,7 @@ def test_same_timestamp_multi_period_both_processed():
         "1d": [(d0, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
                (d1, Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 1000)],
         "1m": [(d0, Decimal("9.8"), Decimal("10.1"), Decimal("9.7"), Decimal("10.0"), 100),
-               (d1, Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 100)],
+               (d1, Decimal("11.0"), Decimal("11.3"), Decimal("10.9"), Decimal("11.1"), 100)],
     })
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("200000"), risk_manager=pm)
@@ -500,9 +500,14 @@ def test_same_timestamp_multi_period_both_processed():
         (2, stock, d0): [{"name": "open_sig", "value": 1}],
     }
     result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
-    buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
-    assert {t.strategy_id for t in buys} == {1, 2}
-    assert all(t.price == Decimal("10.5") for t in buys)
+    fills = {
+        t.strategy_id: t.price
+        for t in result["trades"]
+        if t.trade_type == TradeType.BUY
+    }
+    # 同刻 d1 两周期 open 不同：1d 策略只按其 1d open 成交，1m 策略只按其 1m open 成交。
+    # 旧合并索引用同一行驱动两策略 → 两笔价格必然相同 → 此断言无法通过。
+    assert fills == {1: Decimal("10.5"), 2: Decimal("11.0")}
 
 
 def test_daily_snapshot_once_per_trading_day():
