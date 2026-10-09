@@ -1661,7 +1661,7 @@ interface StrategyScore {
   dimensions: ScoreDimension[]; summary: string[]
 }
 
-function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategyScore | null {
+function scoreStrategy(m: BacktestEvaluationItem | null | undefined, years?: number): StrategyScore | null {
   if (!m) return null
   const sharpe = m.sharpe_ratio ?? 0
   const calmar = m.calmar_ratio ?? 0
@@ -1673,14 +1673,18 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   const winRate = m.win_rate ?? 0
   const util = m.avg_position_utilization ?? 0
   const emptyDays = m.empty_days_ratio ?? 0
+  const y = Math.max(years ?? 0, 0.5)
 
   const riskAdj = Math.min(sharpe / 3, 1) * 15 + Math.min(calmar / 3, 1) * 10 + Math.min(sortino / 3, 1) * 5
   const ddCtrl = Math.max(0, 15 - maxDd * 50) + Math.max(0, 5 - ulcer * 100)
   const stabScore = stability * 15
   const costScore = Math.max(0, 10 - costRatio * 20) + winRate * 5
-  const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10)
+  const sampleBonus = Math.min(y / 5, 1) * 5 // 时长加分（0-5分），5年满分
+  const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10) + sampleBonus - (y < 1 ? 2 : 0) // 短期样本扣分
 
-  const total = Math.round(riskAdj + ddCtrl + stabScore + costScore + utilScore)
+
+  let total = Math.round(riskAdj + ddCtrl + stabScore + costScore + utilScore)
+  total = Math.max(0, Math.min(100, total))
   const grade = total >= 80 ? 'A' : total >= 60 ? 'B' : total >= 40 ? 'C' : 'D'
   const gradeLabel = { A: '优秀', B: '良好', C: '一般', D: '较差' }[grade]
 
@@ -1699,7 +1703,8 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
   if (costRatio > 0.08) issues.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，年化换手 ${(m.annual_turnover ?? 0).toFixed(1)} 次，成本侵蚀明显`)
   if (util < 0.3) issues.push(`仓位利用率 ${(util * 100).toFixed(1)}%，空仓日 ${(emptyDays * 100).toFixed(1)}%，资金闲置较多`)
   if ((m.return_kurtosis ?? 0) > 10) issues.push(`收益峰度 ${(m.return_kurtosis ?? 0).toFixed(1)}，尾部风险大（最差日 ${((m.worst_daily_return ?? 0) * 100).toFixed(2)}%）`)
-  if ((m.max_consecutive_profit_days ?? 0) > 500) issues.push(`最长连盈 ${m.max_consecutive_profit_days} 天，交易信号触发频率低`)
+  if (y < 2) issues.push(`回测时长 ${(y).toFixed(1)} 年（小于2年），样本偏少，统计稳健性一般`)
+  if (y >= 5) highlights.push(`回测时长 ${(y).toFixed(1)} 年，样本较充分，结论更具参考价值`)
 
   // 超额回撤说明
   const beta = m.beta ?? 0
@@ -1723,12 +1728,24 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined): StrategySc
       { label: '收益稳定性', score: Math.round(stabScore), max: 15, comment: `R²=${stability.toFixed(2)}` },
       { label: '交易效率', score: Math.round(costScore), max: 15, comment: `成本${(costRatio * 100).toFixed(1)}%` },
       { label: '仓位利用', score: Math.round(utilScore), max: 20, comment: `利用率${(util * 100).toFixed(1)}%` },
+      { label: '样本充分性', score: Math.round(sampleBonus + (y < 2 ? -2 : 0)), max: 10, comment: `时长 ${y.toFixed(1)} 年` },
     ],
     summary,
   }
 }
 
-const portfolioScore = computed(() => scoreStrategy(detail.value?.evaluations))
+const portfolioScore = computed(() => {
+  const e = detail.value?.evaluations
+  const snaps = detail.value?.snapshots || []
+  let years = 0
+  if (snaps.length >= 2) {
+    const days = snaps.length - 1
+    years = days / 252
+  } else if (e?.annual_return && e?.total_return) {
+    years = Math.abs(e.total_return) > 0 ? Math.abs(e.total_return / (e.annual_return || 1)) : 0
+  }
+  return scoreStrategy(e, years)
+})
 
 // 策略对比卡片
 const strategyCards = computed(() => {

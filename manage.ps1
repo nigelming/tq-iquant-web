@@ -3,7 +3,7 @@ param(
     [string]$Action = "status"
 )
 
-$backend_port = 8000
+$backend_port = 8888
 $frontend_port = 5173
 $backend_dir = "D:\project\tq-iquant-web\main"
 $frontend_dir = "D:\project\tq-iquant-web\web"
