@@ -14,6 +14,7 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 """
 
 import json
+import logging
 import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
@@ -48,6 +49,9 @@ from core.engine.portfolio_builder import (
 )
 from core.tq.data import TQData
 from core.tq.formula import TQFormula
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,6 +1051,11 @@ def _convert_formula_output(
                 continue
             if not isinstance(val_list, list):
                 continue
+            if bar_times is not None and len(val_list) != len(bar_times):
+                logger.warning(
+                    "公式 %s 输出长度 %d != bar 数 %d（code=%s），按索引截断对齐",
+                    var_name, len(val_list), len(bar_times), code,
+                )
             for i, entry in enumerate(val_list):
                 if not isinstance(entry, dict):
                     continue
@@ -1110,6 +1119,20 @@ def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
     return result
 
 
+def _bar_times_by_code_period(klines: dict) -> Dict[str, Dict[str, List[datetime]]]:
+    """{code: {period: [升序去重 times]}}，供按策略周期精确索引对齐（#3）。"""
+    result: Dict[str, Dict[str, List[datetime]]] = {}
+    for code, periods in klines.items():
+        per: Dict[str, List[datetime]] = {}
+        for period, df in periods.items():
+            if "datetime" not in df.columns or df.height == 0:
+                continue
+            per[period] = sorted(df["datetime"].to_list())
+        if per:
+            result[code] = per
+    return result
+
+
 def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
@@ -1131,8 +1154,9 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
         return {}
     strategies = _portfolio_strategies(ps, db)
     tq_formula = TQFormula()
-    # 分钟级时间轴（所有策略共用同一 klines 时间轴，含预热段——与喂入公式引擎的数据同源）
-    bar_times_by_code = _bar_times_by_code(klines)
+    # 分周期时间轴：分钟级策略只按自身周期对齐（含预热段——与喂入公式引擎的数据同源），
+    # 避免多周期组合时把其他周期 bar（如 1d 午夜 bar）混入导致索引串位（#3）
+    bar_times_by_code_period = _bar_times_by_code_period(klines)
     cache: dict = {}
     for strat in strategies:
         formula = db.get(Formula, strat.formula_id)
@@ -1146,8 +1170,13 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
             count=-1, dividend_type=1,
             start_time=start_str, end_time=end_str,
         )
-        # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
-        bt = bar_times_by_code if period in _MINUTE_PERIODS else None
+        # 分钟级传该策略周期的时间轴按索引对齐；日线不传走 Date 匹配
+        if period in _MINUTE_PERIODS:
+            bt = {code: per[period]
+                  for code, per in bar_times_by_code_period.items()
+                  if period in per}
+        else:
+            bt = None
         entries = _convert_formula_output(raw, strat.id, stocks, bar_times_by_code=bt)
         cache.update(entries)
     if start is not None:
