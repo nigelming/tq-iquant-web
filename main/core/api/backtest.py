@@ -4,13 +4,13 @@ from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
-from core.models import PortfolioStrategy
+from core.models import BacktestRecord, PortfolioStrategy
 from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
@@ -75,7 +75,16 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
 @router.delete("/records/{record_id}")
 def delete_record(record_id: int, db: Session = Depends(get_db)):
     """删除回测记录 + 级联子表（trades/snapshots/evaluations）。
-    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。"""
+    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。
+
+    running 记录拒绝删除：FK=ON 下删 running 会与子表插入竞争 → IntegrityError → 500。
+    返回真实 HTTP 409（非 body-code）——前端 axios 对 HTTP 错误自动 reject；body 仍为
+    统一 envelope（err 辅助）。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return err(404, "回测记录不存在")
+    if rec.status == "running":
+        return JSONResponse(status_code=409, content=err(409, "回测运行中，无法删除"))
     if not _svc_delete_record(db, record_id):
         return err(404, "回测记录不存在")
     return ok()

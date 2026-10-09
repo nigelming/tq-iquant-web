@@ -604,6 +604,37 @@ def test_export_html_not_found(client):
     assert resp.json()["code"] == 404
 
 
+def test_delete_running_record_returns_409(client):
+    """#4：删除 running 记录返回 HTTP 409，且保留该行（FK=ON 下删 running 会与子表插入
+    竞争 → IntegrityError → 500）。
+
+    brief 原用 conftest 的 test_client/db_session，但该 fixture 把同一个 Session 跨线程
+    交给请求处理（TestClient 在工作线程跑端点），SQLite 默认 check_same_thread=True 抛
+    ProgrammingError。改用本文件既有的 client fixture（StaticPool + check_same_thread=False，
+    见 client:21-47），与同文件其它集成测试的 seed+调用模式一致。
+    """
+    from datetime import date
+    from core.models.backtest_record import BacktestRecord
+
+    c, Session = client
+    db = Session()
+    rec = BacktestRecord(
+        portfolio_strategy_id=1, name="run", status="running", progress=30,
+        start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+    )
+    db.add(rec)
+    db.commit()
+    rec_id = rec.id
+    db.close()
+
+    resp = c.delete(f"/api/backtest/records/{rec_id}")
+    assert resp.status_code == 409
+
+    db = Session()
+    assert db.get(BacktestRecord, rec_id) is not None
+    db.close()
+
+
 def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     c, Session = client
     db = Session()
@@ -641,4 +672,21 @@ def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     assert ca["error"] == "probe error text"
     assert ca["computed_at"] == "2026-09-25T10:00:00"
     assert ca["data"] == {"total_score": 3}
+
+
+def test_delete_running_record_returns_409(test_client, db_session):
+    from datetime import date
+    from core.models.backtest_record import BacktestRecord
+
+    def _rec(status, progress):
+        return BacktestRecord(
+            portfolio_strategy_id=1, name="run", status=status, progress=progress,
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+
+    rec = _rec("running", 30)
+    db_session.add(rec); db_session.commit()
+    resp = test_client.delete(f"/api/backtest/records/{rec.id}")
+    assert resp.status_code == 409
+    assert db_session.get(BacktestRecord, rec.id) is not None
 
