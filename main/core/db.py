@@ -28,16 +28,19 @@ _db_file = _db_path()
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{_db_file.as_posix()}"
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 5},
 )
 SessionLocal = sessionmaker(bind=engine)
 
 
 @event.listens_for(engine, "connect")
-def _enable_sqlite_fk(dbapi_conn, connection_record):
-    """SQLite 外键约束默认关闭，逐连接开启以让 ondelete CASCADE/RESTRICT 生效。"""
+def _set_sqlite_pragmas(dbapi_conn, connection_record):
+    """SQLite 外键默认关闭；开启 WAL（读写并发）+ busy_timeout（写锁等待）。"""
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 
