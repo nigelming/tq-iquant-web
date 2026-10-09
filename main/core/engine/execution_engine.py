@@ -15,6 +15,10 @@ class OrderDispatcher(ABC):
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         ...
 
+    def fill_price(self, order: OrderEvent) -> Optional[Decimal]:
+        """成交价（若可知）。默认 None=不重校验。回测 SimulatedDispatcher 覆盖。"""
+        return None
+
 
 class T1Checker(ABC):
     @abstractmethod
@@ -40,6 +44,15 @@ class SimulatedDispatcher(OrderDispatcher):
         self.sell_commission_rate = sell_commission_rate
         self.stamp_duty_rate = stamp_duty_rate
         self.slippage = slippage
+
+    def fill_price(self, order: OrderEvent) -> Optional[Decimal]:
+        """含滑点的成交价，与 place_order 的定价算法一致；无价则 None。"""
+        price = self.open_prices.get(order.stock_code)
+        if not price:
+            return None
+        if order.trade_type.value == "BUY":
+            return price * (Decimal("1") + self.slippage)
+        return price * (Decimal("1") - self.slippage)
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         price = self.open_prices.get(order.stock_code)
@@ -213,6 +226,27 @@ class ExecutionEngine:
         if capped is None:
             return None
         order.quantity = capped
+
+        if order.trade_type.value == "BUY":
+            price = self._dispatcher.fill_price(order)
+            if price is not None and price > 0:
+                lot = 100
+                affordable = int((account.cash / price) // lot) * lot
+                if affordable < lot:
+                    self._rec_gate(
+                        "gap_up_insufficient", "reject", order, "execution",
+                        requested=order.quantity, final=0,
+                        message="跳空后资金不足一手，拒单 %s @ %s" % (order.stock_code, price),
+                    )
+                    return None
+                if affordable < order.quantity:
+                    self._rec_gate(
+                        "gap_up_insufficient", "shrink", order, "execution",
+                        requested=order.quantity, final=affordable,
+                        message="跳空后资金不足，缩量 %s %d→%d 股 @ %s"
+                                % (order.stock_code, order.quantity, affordable, price),
+                    )
+                    order.quantity = affordable
 
         trade = self._dispatcher.place_order(order)
         if not trade:
