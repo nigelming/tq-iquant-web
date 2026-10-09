@@ -1581,3 +1581,27 @@ def test_resolve_crisis_benchmark_cases_without_db():
         SimpleNamespace(params_snapshot=None), None,
         SimpleNamespace(benchmark_index=None))
     assert defaulted["benchmark_code"] == "000300.SH"
+
+
+# ---------------------------------------------------------------------------
+# 僵尸 running 记录恢复（#5）
+# ---------------------------------------------------------------------------
+def test_recover_stale_running_marks_old_running_as_failed(db_session):
+    from datetime import date, datetime, timedelta
+    from core.models.backtest_record import BacktestRecord
+
+    def _rec(status, progress, created_at):
+        return BacktestRecord(
+            portfolio_strategy_id=1, name="run", status=status, progress=progress,
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+            created_at=created_at,
+        )
+
+    old = _rec("running", 40, datetime.now() - timedelta(hours=2))
+    fresh = _rec("running", 10, datetime.now())
+    db_session.add_all([old, fresh]); db_session.commit()
+    n = svc.recover_stale_running(db_session, max_age_minutes=30)
+    db_session.refresh(old); db_session.refresh(fresh)
+    assert n == 1
+    assert old.status == "failed"
+    assert fresh.status == "running"

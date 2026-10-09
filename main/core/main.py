@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
 
-from core.db import init_db
+from core.db import init_db, SessionLocal
 from core.api.stock_pools import router as stock_pools_router
 from core.api.formulas import router as formulas_router
 from core.api.strategies import router as strategies_router
@@ -12,6 +12,7 @@ from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
 from core.logging_config import setup_logging
+from core.services.backtest_service import recover_stale_running
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     setup_logging()
     init_db()
+    try:
+        with SessionLocal() as _db:
+            recover_stale_running(_db)
+    except Exception:
+        logger.exception("recover_stale_running failed")
     yield
 
 

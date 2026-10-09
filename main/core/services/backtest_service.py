@@ -1863,3 +1863,15 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         "snapshots_count": len(result["snapshots"]),
         "evaluations": result.get("evaluations") or {},
     }
+
+
+def recover_stale_running(db: Session, max_age_minutes: int = 30) -> int:
+    """启动时把超时仍 running 的记录置 failed（进程崩溃/重启恢复，#5）。"""
+    cutoff = datetime.now() - timedelta(minutes=max_age_minutes)
+    rows = db.query(BacktestRecord).filter(
+        BacktestRecord.status == "running", BacktestRecord.created_at < cutoff
+    ).all()
+    for r in rows:
+        r.status = "failed"
+    db.commit()
+    return len(rows)
