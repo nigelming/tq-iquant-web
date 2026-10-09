@@ -294,28 +294,6 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
     return _convert_market_data_multi(raw_by_period, stocks)
 
 
-def build_open_prices(ps, klines: dict) -> dict:
-    """从 klines 提取 open 价表：{stock_code: {bar_time: Decimal}}。
-
-    供 SimulatedDispatcher 在下一 bar open 成交。取每只股票首个周期的 Open 列。
-    """
-    prices: dict = {}
-    for code, periods in klines.items():
-        if not periods:
-            continue
-        # 取任一周期（日线回测只有一个周期）
-        df = next(iter(periods.values()))
-        if "datetime" not in df.columns or "Open" not in df.columns:
-            continue
-        stock_prices: dict = {}
-        times = df["datetime"].to_list()
-        opens = df["Open"].to_list()
-        for t, o in zip(times, opens):
-            stock_prices[t] = o if isinstance(o, Decimal) else _to_decimal(o)
-        prices[code] = stock_prices
-    return prices
-
-
 def build_index_close_series(
     codes: List[str], start: date, end: date, batch_size: int = 0
 ) -> Dict[str, Dict[date, Decimal]]:
@@ -1742,7 +1720,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
     前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
     内部：写 record(running) → assemble → build_klines → build_signal_cache →
-          build_open_prices → build_benchmark_data → 空行情保护 → engine.run →
+          build_benchmark_data → 空行情保护 → engine.run →
           _persist_result → 标 completed → 返回 {record_id, trades_count,
           snapshots_count, evaluations}。
     异常：标 record(failed) + re-raise（路由层全局异常处理器兜底转 {code:500}，
@@ -1785,7 +1763,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
-        open_prices = build_open_prices(ps, klines)
         t4 = datetime.now()
         benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
         t5 = datetime.now()
@@ -1794,7 +1771,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         _log_timing(f"[回测#{record_id}] 组装组合: {(t1-t0).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ K线拉取: {(t2-t1).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ 公式计算: {(t3-t2).total_seconds():.1f}s")
-        _log_timing(f"[回测#{record_id}] 提取开盘价: {(t4-t3).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t5-t4).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] 数据准备合计: {(t5-t0).total_seconds():.1f}s")
 
@@ -1816,7 +1792,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
-            open_prices=open_prices,
             benchmark_data=benchmark_data,
         )
         t7 = datetime.now()

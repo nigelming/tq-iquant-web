@@ -1,4 +1,4 @@
-"""build_klines / build_signal_cache / build_open_prices 数据对接层测试。
+"""build_klines / build_signal_cache 数据对接层测试。
 
 这些函数桥接 TQ 原始格式与回测引擎内部格式。TQ 调用本身依赖通达信进程，
 不可单测；故将逻辑拆为纯转换函数（_convert_market_data / _convert_formula_output）
@@ -166,37 +166,6 @@ def test_convert_market_data_multi_period():
     assert "5m" in klines["000001.SZ"]
     assert klines["000001.SZ"]["1d"].height == 3
     assert klines["000001.SZ"]["5m"].height == 2
-
-
-# ---------------------------------------------------------------------------
-# build_open_prices：klines → {stock: {bar_time: Decimal open}}
-# ---------------------------------------------------------------------------
-def test_build_open_prices_from_klines():
-    """open 价表直接从 klines 的 Open 列提取，key 为 datetime。"""
-    df = pl.DataFrame({
-        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)],
-        "Open": [Decimal("10"), Decimal("10.2"), Decimal("9.0")],
-        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("9.2")],
-        "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("8.8")],
-        "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("9.1")],
-        "Volume": [1000, 1000, 1000],
-    })
-    klines = {"000001.SZ": {"1d": df}}
-    prices = bt_api.build_open_prices(None, klines)
-
-    assert "000001.SZ" in prices
-    stock_prices = prices["000001.SZ"]
-    assert stock_prices[datetime(2026, 7, 29)] == Decimal("10")
-    assert stock_prices[datetime(2026, 7, 30)] == Decimal("10.2")
-    assert stock_prices[datetime(2026, 7, 31)] == Decimal("9.0")
-    # 值为 Decimal
-    for v in stock_prices.values():
-        assert isinstance(v, Decimal)
-
-
-def test_build_open_prices_empty_klines():
-    """空 klines → 空 open_prices。"""
-    assert bt_api.build_open_prices(None, {}) == {}
 
 
 # ---------------------------------------------------------------------------

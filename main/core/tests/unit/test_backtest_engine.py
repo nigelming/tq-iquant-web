@@ -68,16 +68,8 @@ def test_run_minimal_buy_then_stop_loss():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    # open 价表供 SimulatedDispatcher 成交
-    open_prices = {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),  # bar2 open 成交 BUY
-            datetime(2026, 7, 31): Decimal("9.0"),   # bar3 open 成交 SELL
-        }
-    }
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     trades = result["trades"]
     snapshots = result["snapshots"]
@@ -120,14 +112,7 @@ def test_run_collects_decision_events():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
-    }
-
-    result = BacktestEngine().run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
 
     decisions = result["decisions"]
     stop = [d for d in decisions if d["gate"] == "stop_loss"]
@@ -153,10 +138,8 @@ def test_run_no_signal_no_trade():
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {datetime(2026, 7, 30): Decimal("10.2")}}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     assert result["trades"] == []
     assert len(result["snapshots"]) == 2
@@ -217,14 +200,8 @@ def test_run_breaker_triggers_on_drawdown_and_halts_next_bar_buy():
         (1, stock, datetime(2026, 7, 31)): [{"name": "add_sig", "signal_type": SignalType.ADD, "value": 1}],
         (1, stock, datetime(2026, 8, 1)): [{"name": "add_sig", "signal_type": SignalType.ADD, "value": 1}],
     }
-    open_prices = {stock: {
-        datetime(2026, 7, 30): Decimal("30"),
-        datetime(2026, 7, 31): Decimal("30"),
-        datetime(2026, 8, 1): Decimal("30"),
-    }}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     # bar1(7/29) 收盘价 40 → 峰值 100000，无回撤；ADD 生成 bar1 订单（bar2 open 成交 #1）。
     # bar2(7/30) 收盘价 30 → 总值 80000，回撤 20% → update 触发熔断；
@@ -275,8 +252,7 @@ def test_strategy_snapshots_additivity():
     }
 
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache,
-                        open_prices={stock: {}})
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     strategy_snaps = result["strategy_snapshots"]
     # 两个策略各 2 个快照
@@ -309,10 +285,8 @@ def test_strategy_evaluations_present():
         (2, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (2, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {datetime(2026, 7, 30): Decimal("10.2")}}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     # s1 有交易（BUY@10.2），其评估应存在
     sev = result["strategy_evaluations"]
@@ -347,7 +321,7 @@ def test_benchmark_filled_into_snapshots_and_evaluated():
     engine = BacktestEngine()
     result = engine.run(
         port, klines=klines, signal_cache=cache,
-        open_prices={stock: {}}, benchmark_data=benchmark_data,
+        benchmark_data=benchmark_data,
     )
 
     # 每个组合快照都带 benchmark_value
@@ -375,9 +349,7 @@ def test_no_benchmark_data_no_curve():
     }
 
     engine = BacktestEngine()
-    result = engine.run(
-        port, klines=klines, signal_cache=cache, open_prices={stock: {}}
-    )
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     snaps = result["snapshots"]
     assert all(s["benchmark_value"] is None for s in snaps)

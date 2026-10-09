@@ -35,7 +35,6 @@ class BacktestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 from core.services.backtest_service import (  # noqa: E402
     build_klines,
-    build_open_prices,
     build_benchmark_data,
     build_signal_cache,
     warmup_counts_by_period,

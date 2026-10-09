@@ -105,18 +105,12 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    # monkeypatch 数据获取层：返回 mock klines / signal_cache / open_prices
+    # monkeypatch 数据获取层：返回 mock klines / signal_cache
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
-    })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {
-        stock: {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
     })
 
     payload = {
@@ -171,7 +165,6 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {stock: {}})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -205,12 +198,6 @@ def _mock_data(monkeypatch):
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
-    })
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {
-        "000001.SZ": {
-            datetime(2026, 7, 30): Decimal("10.2"),
-            datetime(2026, 7, 31): Decimal("9.0"),
-        }
     })
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
@@ -392,10 +379,9 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
     ps_id, _, _ = _seed(db)
     db.close()
 
-    # mock 三层全返回空 — 模拟 TQ 拉不到行情
+    # mock 数据层全返回空 — 模拟 TQ 拉不到行情
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -473,7 +459,6 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     payload = _post_payload(ps_id, "conflict_test")
 
     # 持锁模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
@@ -515,7 +500,6 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0

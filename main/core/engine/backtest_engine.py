@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -16,18 +16,15 @@ class BacktestEngine:
         portfolio: Portfolio,
         klines: dict = None,
         signal_cache: dict = None,
-        open_prices: Optional[Dict[str, Dict[datetime, Decimal]]] = None,
         benchmark_data: object = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
-        open_prices: {stock_code: {bar_time: open_price}}，待执行订单在下一 bar 的 open 价成交。
         成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列）。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
-        open_prices = open_prices or {}
 
         # 决策闸门采集（调参可观测性）：注入组合与执行引擎，run 结束随结果返回
         recorder = DecisionRecorder()
@@ -46,7 +43,7 @@ class BacktestEngine:
         for i, t in enumerate(times):
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
             if pending_orders:
-                bar_open_prices = self._bar_open_prices(price_index, t)
+                bar_open_prices = {c: d["open"] for c, d in price_index.get(t, {}).items()}
                 dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
                 engine = ExecutionEngine(dispatcher, SimulatedT1Checker(), recorder=recorder)
                 for order in pending_orders:
@@ -166,11 +163,6 @@ class BacktestEngine:
                     }
                     index.setdefault(t, {})[stock_code] = row
         return index
-
-    def _bar_open_prices(self, price_index: dict, t: datetime) -> Dict[str, Decimal]:
-        """O(1) 查表取时间 t 所有股票的 open 价。"""
-        row = price_index.get(t, {})
-        return {code: data["open"] for code, data in row.items()}
 
     def _build_bar(self, price_index: dict, t: datetime) -> BarEvent:
         """O(1) 查表取时间 t 的 OHLCV 构造 BarEvent。"""

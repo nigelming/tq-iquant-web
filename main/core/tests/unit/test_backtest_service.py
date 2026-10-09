@@ -125,7 +125,6 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
     # patch 数据获取层（避开真实 TQ/TDX）
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -180,7 +179,6 @@ def test_run_backtest_persists_positions_json(db_session, monkeypatch):
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, k: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -219,7 +217,6 @@ def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkey
 
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -245,7 +242,6 @@ def test_run_backtest_exception_marks_failed_and_reraises(db_session, monkeypatc
 
     monkeypatch.setattr(svc, "build_klines", _boom)
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
@@ -272,7 +268,6 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
@@ -318,7 +313,6 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
@@ -378,7 +372,6 @@ def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch)
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
@@ -420,7 +413,6 @@ def test_delete_record_cascades_decisions(db_session, monkeypatch):
     ps, strat_id = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
@@ -444,7 +436,6 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     svc.run_backtest(db_session, ps, _req(name="r1"))
@@ -790,7 +781,6 @@ def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkey
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
 
     def _boom(*a, **kw):
@@ -827,7 +817,6 @@ def test_run_backtest_calls_crisis_alpha_after_main_commit(db_session, monkeypat
     ps, _ = _seed(db_session)
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     snapshots = [
         {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
@@ -1401,7 +1390,6 @@ _NO_TRADES_RESULT = {
 def _patch_data_layer(monkeypatch, result=None):
     monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
-    monkeypatch.setattr(svc, "build_open_prices", lambda ps, klines: {})
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     if result is not None:
