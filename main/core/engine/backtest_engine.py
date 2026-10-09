@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Callable, Dict, List
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
@@ -17,6 +17,7 @@ class BacktestEngine:
         klines: dict = None,
         signal_cache: dict = None,
         benchmark_data: object = None,
+        on_progress: Callable[[int], None] = None,
     ) -> dict:
         """逐刻回测主链路（按周期分层驱动）。
 
@@ -31,6 +32,8 @@ class BacktestEngine:
         portfolio.set_recorder(recorder)
 
         times = self._build_timeline(klines)
+        total_bars = len(times)
+        report_every = max(1, total_bars // 100)
         period_index = self._build_price_index_by_period(klines)   # {period: {t: {code: row}}}
         periods_at: Dict[datetime, List[str]] = {}
         for period, by_t in period_index.items():
@@ -114,6 +117,10 @@ class BacktestEngine:
                     s_snap["benchmark_value"] = snap["benchmark_value"]
                     strategy_snapshots[s_snap["target_id"]].append(s_snap)
                 portfolio.risk_manager.update_daily(total_value, t.date(), initial)
+
+            # 6) 进度上报：节流至最多约 100 次，末根 bar 必报 100
+            if on_progress is not None and (i % report_every == 0 or i == total_bars - 1):
+                on_progress(int((i + 1) * 100 / total_bars))
 
         # 基准序列喂 Evaluator
         # 形如 [{"value": Decimal}]。无任何基准值 → 传 None，benchmark_return 退化为 0。

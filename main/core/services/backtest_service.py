@@ -1788,11 +1788,18 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
         t6 = datetime.now()
         engine = BacktestEngine()
+
+        def _on_progress(pct):
+            # 引擎已节流（约 ≤100 次），此处逐次提交，运行中 progress 真实递增（#10）
+            rec.progress = pct
+            db.commit()
+
         result = engine.run(
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
             benchmark_data=benchmark_data,
+            on_progress=_on_progress,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")

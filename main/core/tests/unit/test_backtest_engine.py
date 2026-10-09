@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 
 import polars as pl
@@ -146,6 +146,20 @@ def test_run_no_signal_no_trade():
     # 全程无交易，现金不变
     assert port.account.cash == Decimal("100000")
 
+
+
+def test_run_reports_progress_increments():
+    """run 运行中通过 on_progress 上报 0–100 递增整数，末值 100（#10）。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29) + timedelta(days=k), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000)
+        for k in range(5)
+    ])
+    port, ctx = _portfolio_with_strategy()
+    seen = []
+    BacktestEngine().run(port, klines=klines, signal_cache={}, on_progress=seen.append)
+    assert seen and seen == sorted(seen)
+    assert seen[-1] == 100
 
 
 def _buy_trade(price, quantity, trade_time):
