@@ -547,3 +547,40 @@ def test_risk_peak_intrabar_but_daily_loss_only_at_day_end():
     BacktestEngine().run(port, klines=klines, signal_cache={})
     assert counts["peak"] == 3
     assert counts["daily"] == 1
+
+
+def test_pending_order_retries_until_next_same_period_bar():
+    """信号在 D0 触发；该股 D1 无 bar、D2 复牌 → D2 日线 open 成交（保留重试）。"""
+    stock = "000001.SZ"
+    d0, d2 = datetime(2026, 7, 29), datetime(2026, 7, 31)   # 缺 7/30
+    klines = _klines(stock, [
+        (d0, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (d2, Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    cache = {(1, stock, d0): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+    assert len(result["trades"]) == 1
+    assert result["trades"][0].price == Decimal("10.5")
+    assert result["trades"][0].trade_time == d2
+
+
+def test_pending_order_expires_after_next_trading_day():
+    """信号在 D0 触发；该股此后一直无 bar，超过次一交易日 → 取消并记事件（不再静默丢弃）。"""
+    stock = "000001.SZ"
+    other = "600519.SH"
+    d0, d1, d2 = datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)
+    klines = {
+        stock: {"1d": _klines(stock, [
+            (d0, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        ])[stock]["1d"]},
+        other: {"1d": _klines(other, [
+            (d1, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+            (d2, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        ])[other]["1d"]},
+    }
+    port, ctx = _portfolio_with_strategy()
+    cache = {(1, stock, d0): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+    assert result["trades"] == []
+    assert any(d["gate"] == "order_expired_no_fill" for d in result["decisions"])

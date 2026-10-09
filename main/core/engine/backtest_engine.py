@@ -1,5 +1,5 @@
 from typing import Dict, List
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 
 from .portfolio import Portfolio
@@ -60,7 +60,17 @@ class BacktestEngine:
                 remaining: List[OrderEvent] = []
                 for order in pending_by_period[period]:
                     if order.stock_code not in opens:
-                        remaining.append(order)      # 无 bar 保留（#2 TTL 在 Task 4）
+                        # 无 bar：保留重试；超过"信号日次一交易日"仍未成交则取消
+                        if t.date() > order.bar_time.date() + timedelta(days=1):
+                            recorder.record(
+                                gate="order_expired_no_fill", layer="execution",
+                                action="cancel", portfolio_id=portfolio.portfolio_id,
+                                strategy_id=order.strategy_id, stock_code=order.stock_code,
+                                bar_time=t, requested_qty=order.quantity,
+                                message="订单超时未成交取消 %s（%s）" % (order.stock_code, order.signal_name),
+                            )
+                            continue
+                        remaining.append(order)
                         continue
                     order.bar_time = t
                     ctx = portfolio.find_strategy(order.strategy_id)
