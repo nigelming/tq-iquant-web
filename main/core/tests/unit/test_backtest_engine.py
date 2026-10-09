@@ -435,3 +435,110 @@ def test_run_first_day_signal_burst_respects_max_positions():
     buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
     assert len(buys) == 5  # max_positions=5，不超开
     assert len({t.stock_code for t in buys}) == 5
+
+
+def _klines_multi(stock, period_rows):
+    """period_rows: {period: [(date, o,h,l,c,v), ...]} → {stock: {period: df}}"""
+    out = {}
+    for period, rows in period_rows.items():
+        out[period] = pl.DataFrame({
+            "datetime": [r[0] for r in rows],
+            "Open": [r[1] for r in rows], "High": [r[2] for r in rows],
+            "Low": [r[3] for r in rows], "Close": [r[4] for r in rows],
+            "Volume": [r[5] for r in rows],
+        })
+    return {stock: out}
+
+
+def test_mixed_period_daily_order_fills_next_daily_open_not_intraday():
+    """#1a：日线信号在 D 收盘触发，只能在 D+1 日线 open 成交，不得在 D 盘中 1m bar 成交。"""
+    stock = "000001.SZ"
+    klines = _klines_multi(stock, {
+        "1d": [
+            (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+            (datetime(2026, 7, 30), Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 1000),
+        ],
+        "1m": [
+            (datetime(2026, 7, 29, 9, 31), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 100),
+            (datetime(2026, 7, 29, 9, 32), Decimal("10.2"), Decimal("10.4"), Decimal("10.1"), Decimal("10.3"), 100),
+            (datetime(2026, 7, 30, 9, 31), Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 100),
+        ],
+    })
+    port, ctx = _portfolio_with_strategy()
+    ctx.period = "1d"
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.BUY
+    # 若在 D 盘中 1m 成交，价格为 9:32 的 open=10.2；正确应等 D+1 日线 open=10.5
+    assert trades[0].price == Decimal("10.5")
+    assert trades[0].trade_time == datetime(2026, 7, 30)
+
+
+def test_same_timestamp_multi_period_both_processed():
+    """#1b：同一时间点并存 1d 与 1m bar，两周期策略都应被驱动并各自成交，不得互相覆盖。"""
+    stock = "000001.SZ"
+    d0, d1 = datetime(2026, 7, 29), datetime(2026, 7, 30)
+    klines = _klines_multi(stock, {
+        "1d": [(d0, Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+               (d1, Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 1000)],
+        "1m": [(d0, Decimal("9.8"), Decimal("10.1"), Decimal("9.7"), Decimal("10.0"), 100),
+               (d1, Decimal("10.5"), Decimal("10.7"), Decimal("10.1"), Decimal("10.6"), 100)],
+    })
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("200000"), risk_manager=pm)
+    for sid, period in ((1, "1d"), (2, "1m")):
+        ctx = StrategyContext(strategy_id=sid, period=period, capital_ratio=Decimal("0.3"), max_positions=5)
+        ctx.formula_signals = [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}]
+        ctx.strategy_risk = StrategyRiskManager(stop_loss_ratio=Decimal("0.9"),
+                                                 take_profit_ratio=Decimal("0.9"),
+                                                 trailing_stop_ratio=Decimal("0"))
+        port.strategies.append(ctx)
+    cache = {
+        (1, stock, d0): [{"name": "open_sig", "value": 1}],
+        (2, stock, d0): [{"name": "open_sig", "value": 1}],
+    }
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+    buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
+    assert {t.strategy_id for t in buys} == {1, 2}
+    assert all(t.price == Decimal("10.5") for t in buys)
+
+
+def test_daily_snapshot_once_per_trading_day():
+    """#6：同一天多根 1m bar，只生成 1 条每日快照（日末最后一根）。"""
+    stock = "000001.SZ"
+    d0 = datetime(2026, 7, 29)
+    klines = _klines_multi(stock, {"1m": [
+        (d0.replace(hour=9, minute=31), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 100),
+        (d0.replace(hour=9, minute=32), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10.1"), 100),
+        (d0.replace(hour=9, minute=33), Decimal("10.1"), Decimal("10.3"), Decimal("10"), Decimal("10.2"), 100),
+    ]})
+    port, ctx = _portfolio_with_strategy()
+    ctx.period = "1m"
+    result = BacktestEngine().run(port, klines=klines, signal_cache={})
+    assert len(result["snapshots"]) == 1
+    assert result["snapshots"][0]["snap_date"] == d0.date()
+
+
+def test_risk_peak_intrabar_but_daily_loss_only_at_day_end():
+    """#8：峰值/回撤按每根 bar 更新，日内亏损仅日末更新一次。
+    用 spy 记录 update_peak/update_daily 调用次数：3 根 1m bar 同天 → peak 3 次、daily 1 次。"""
+    stock = "000001.SZ"
+    d0 = datetime(2026, 7, 29)
+    klines = _klines_multi(stock, {"1m": [
+        (d0.replace(hour=9, minute=31), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 100),
+        (d0.replace(hour=9, minute=32), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10.1"), 100),
+        (d0.replace(hour=9, minute=33), Decimal("10.1"), Decimal("10.3"), Decimal("10"), Decimal("10.2"), 100),
+    ]})
+    port, ctx = _portfolio_with_strategy()
+    ctx.period = "1m"
+    rm = port.risk_manager
+    orig_peak, orig_daily = rm.update_peak, rm.update_daily
+    counts = {"peak": 0, "daily": 0}
+    def spy_peak(v, d): counts["peak"] += 1; return orig_peak(v, d)
+    def spy_daily(v, d, cap): counts["daily"] += 1; return orig_daily(v, d, cap)
+    rm.update_peak, rm.update_daily = spy_peak, spy_daily
+    BacktestEngine().run(port, klines=klines, signal_cache={})
+    assert counts["peak"] == 3
+    assert counts["daily"] == 1

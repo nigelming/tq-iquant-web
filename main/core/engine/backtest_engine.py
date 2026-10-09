@@ -18,10 +18,10 @@ class BacktestEngine:
         signal_cache: dict = None,
         benchmark_data: object = None,
     ) -> dict:
-        """逐 bar 回测主链路。
+        """逐刻回测主链路（按周期分层驱动）。
 
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
-        成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列）。
+        成交时机：订单只在其所属周期的下一根同周期 bar open 成交（pending_by_period 队列）。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
@@ -31,62 +31,79 @@ class BacktestEngine:
         portfolio.set_recorder(recorder)
 
         times = self._build_timeline(klines)
-        price_index = self._build_price_index(klines)
-        pending_orders: List[OrderEvent] = []
+        period_index = self._build_price_index_by_period(klines)   # {period: {t: {code: row}}}
+        periods_at: Dict[datetime, List[str]] = {}
+        for period, by_t in period_index.items():
+            for t in by_t:
+                periods_at.setdefault(t, []).append(period)
+        for t in periods_at:
+            periods_at[t].sort()
+
+        pending_by_period: Dict[str, List[OrderEvent]] = {p: [] for p in period_index}
         trades: List[TradeEvent] = []
         snapshots: List[dict] = []
         # 策略层快照：strategy_id → 快照序列。共享现金按 capital_ratio 归一化分摊。
         strategy_snapshots: Dict[int, List[dict]] = {
             ctx.strategy_id: [] for ctx in portfolio.strategies
         }
+        initial = portfolio.account.initial_capital
 
         for i, t in enumerate(times):
-            # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
-            if pending_orders:
-                bar_open_prices = {c: d["open"] for c, d in price_index.get(t, {}).items()}
-                dispatcher = SimulatedDispatcher(bar_open_prices, **portfolio.cost_params)
-                engine = ExecutionEngine(dispatcher, SimulatedT1Checker(), recorder=recorder)
-                for order in pending_orders:
-                    # 成交日 = 当前 bar 时间 t（T+1 据此判断）
+            # 1) 成交步：逐周期、对"本周期本刻有 bar"的挂单成交
+            for period in periods_at.get(t, ()):
+                rows = period_index[period].get(t, {})
+                if not rows:
+                    continue
+                opens = {c: d["open"] for c, d in rows.items()}
+                dispatcher = SimulatedDispatcher(opens, **portfolio.cost_params)
+                executor = ExecutionEngine(dispatcher, SimulatedT1Checker(), recorder=recorder)
+                remaining: List[OrderEvent] = []
+                for order in pending_by_period[period]:
+                    if order.stock_code not in opens:
+                        remaining.append(order)      # 无 bar 保留（#2 TTL 在 Task 4）
+                        continue
                     order.bar_time = t
                     ctx = portfolio.find_strategy(order.strategy_id)
                     if ctx is None:
                         continue
-                    # BUY 首次建仓：确保 Position 存在于 ctx.positions
                     pos = ctx.positions.get(order.stock_code)
                     if pos is None and order.trade_type.value == "BUY":
                         pos = Position(order.stock_code)
                         ctx.positions[order.stock_code] = pos
-                    trade = engine.execute(order, portfolio.account, pos)
+                    trade = executor.execute(order, portfolio.account, pos)
                     if trade is not None:
                         trades.append(trade)
-                pending_orders = []
+                pending_by_period[period] = remaining
 
-            # 2. 构造 BarEvent（从预建索引 O(1) 查表）
-            bar = self._build_bar(price_index, t)
+            # 2) 信号步：逐周期构造 bar 驱动对应周期策略
+            for period in periods_at.get(t, ()):
+                rows = period_index[period].get(t, {})
+                if not rows:
+                    continue
+                bar = BarEvent(stocks=rows, bar_time=t, period=period)
+                new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
+                for o in new_orders:
+                    o.period = period
+                pending_by_period[period].extend(new_orders)
 
-            # 3. portfolio.on_bar → 新订单入 pending（下一 bar 成交）
-            pending_orders = portfolio.on_bar(bar, signal_cache=signal_cache)
+            # 3) 估值 bar（合并本刻所有周期行，按周期升序遍历，粗周期覆盖细）
+            value_bar = BarEvent(stocks=self._merge_rows(period_index, periods_at.get(t, ()), t), bar_time=t)
+            total_value = portfolio.total_value(value_bar)
 
-            # 4. 日终快照（日线：每根 bar 即一日）
-            total_value = portfolio.total_value(bar)
-            snap = portfolio.snapshot(t.date(), total_value, bar)
-            # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
-            # 缺失则沿用上一已知值（基准停牌/非交易日），全无则 None。
-            snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
-            snapshots.append(snap)
+            # 4) 每 bar 更新峰值/回撤（intraday peak，#8）
+            portfolio.risk_manager.update_peak(total_value, t.date())
 
-            # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
-            #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。
-            #     注入与组合同日的 benchmark_value，使策略层相对指标（FR-1）可算。
-            for s_snap in self._strategy_snapshots(portfolio, bar, t.date()):
-                s_snap["benchmark_value"] = snap["benchmark_value"]
-                strategy_snapshots[s_snap["target_id"]].append(s_snap)
-
-            # 5. 熔断检测：日终更新峰值/日内盈亏，按 §88 推进熔断次日恢复时序
-            portfolio.risk_manager.update(
-                total_value, t.date(), portfolio.account.initial_capital
-            )
+            # 5) 日末（本日最后一根 bar）：快照 + 更新日内亏损
+            is_day_end = (i == len(times) - 1) or (times[i + 1].date() != t.date())
+            if is_day_end:
+                snap = portfolio.snapshot(t.date(), total_value, value_bar)
+                # 基准值按 bar 日期取；缺失即 None（不沿用上一已知值——原注释与实现不符，#13）
+                snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
+                snapshots.append(snap)
+                for s_snap in self._strategy_snapshots(portfolio, value_bar, t.date()):
+                    s_snap["benchmark_value"] = snap["benchmark_value"]
+                    strategy_snapshots[s_snap["target_id"]].append(s_snap)
+                portfolio.risk_manager.update_daily(total_value, t.date(), initial)
 
         # 基准序列喂 Evaluator
         # 形如 [{"value": Decimal}]。无任何基准值 → 传 None，benchmark_return 退化为 0。
@@ -133,40 +150,31 @@ class BacktestEngine:
                 unique.append(t)
         return unique
 
-    def _build_price_index(self, klines: dict) -> Dict[datetime, Dict[str, dict]]:
-        """预建 {datetime: {stock_code: {open,high,low,close,volume}}} 索引。
-
-        一次 O(total_rows) 扫描替代逐 bar 的 O(n²) polars df.filter()，将每 bar
-        的 72 次 Python↔Rust FFI 查表降为 O(1) 字典查找。
-        多周期重叠时间点时，后周期覆盖前周期（与旧 _build_bar 行为兼容）。
-        """
-        index: Dict[datetime, Dict[str, dict]] = {}
+    def _build_price_index_by_period(self, klines: dict) -> Dict[str, Dict[datetime, Dict[str, dict]]]:
+        """{period: {datetime: {stock_code: {open,high,low,close,volume}}}}（#1b 同刻多周期分层）。"""
+        index: Dict[str, Dict[datetime, Dict[str, dict]]] = {}
         for stock_code, periods in klines.items():
             for period, df in periods.items():
-                if "datetime" not in df.columns:
+                if "datetime" not in df.columns or "Open" not in df.columns:
                     continue
                 times = df["datetime"].to_list()
-                if "Open" not in df.columns:
-                    continue
-                opens = df["Open"].to_list()
-                highs = df["High"].to_list()
-                lows = df["Low"].to_list()
-                closes = df["Close"].to_list()
-                volumes = df["Volume"].to_list()
-                for i, t in enumerate(times):
-                    row = {
-                        "open": opens[i],
-                        "high": highs[i],
-                        "low": lows[i],
-                        "close": closes[i],
-                        "volume": volumes[i],
+                opens = df["Open"].to_list(); highs = df["High"].to_list()
+                lows = df["Low"].to_list(); closes = df["Close"].to_list()
+                vols = df["Volume"].to_list()
+                by_t = index.setdefault(period, {})
+                for k, tb in enumerate(times):
+                    by_t.setdefault(tb, {})[stock_code] = {
+                        "open": opens[k], "high": highs[k], "low": lows[k],
+                        "close": closes[k], "volume": vols[k],
                     }
-                    index.setdefault(t, {})[stock_code] = row
         return index
 
-    def _build_bar(self, price_index: dict, t: datetime) -> BarEvent:
-        """O(1) 查表取时间 t 的 OHLCV 构造 BarEvent。"""
-        return BarEvent(stocks=price_index.get(t, {}), bar_time=t)
+    def _merge_rows(self, period_index: dict, periods: List[str], t: datetime) -> Dict[str, dict]:
+        """合并本刻所有周期行。period 列表已排序，后（粗）周期覆盖先（细）周期。"""
+        rows: Dict[str, dict] = {}
+        for period in periods:
+            rows.update(period_index[period].get(t, {}))
+        return rows
 
     def _strategy_snapshots(
         self, portfolio: Portfolio, bar: BarEvent, snap_date: date
