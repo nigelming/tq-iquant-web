@@ -16,8 +16,8 @@ import { getSystemConfigs, updateSystemConfigs } from '../api'
 
 // 与 config.yaml / core/config.py 一致的真实字段
 const mockConfig = {
-      tdx_path: 'D:\\zd_zyb',
-      iquant_path: 'D:\\iquant',
+  tdx_path: 'D:\\zd_zyb',
+  iquant_path: 'D:\\iquant',
   max_concurrent_backtest: 1,
   database: { sqlite_path: 'data/dev.db' },
   iquant_bridge: {
@@ -70,7 +70,7 @@ describe('SystemConfig.vue', () => {
     await flushPromises()
 
     expect(updateSystemConfigs).toHaveBeenCalledWith(expect.objectContaining({
-  tdx_path: 'D:\\zd_zyb',
+      tdx_path: 'D:\\zd_zyb',
       iquant_path: 'D:\\iquant',
       max_concurrent_backtest: 1,
       database: expect.objectContaining({ sqlite_path: 'data/dev.db' }),
