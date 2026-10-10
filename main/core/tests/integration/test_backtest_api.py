@@ -690,3 +690,15 @@ def test_delete_running_record_returns_409(test_client, db_session):
     assert resp.status_code == 409
     assert db_session.get(BacktestRecord, rec.id) is not None
 
+
+def test_recompute_running_record_returns_409(test_client, db_session):
+    from datetime import date
+    from core.models.backtest_record import BacktestRecord
+    rec = BacktestRecord(
+        portfolio_strategy_id=1, name="run", status="running", progress=50,
+        start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+    )
+    db_session.add(rec); db_session.commit()
+    resp = test_client.post(f"/api/backtest/records/{rec.id}/evaluations/recompute")
+    assert resp.status_code == 409
+

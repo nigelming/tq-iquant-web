@@ -18,7 +18,7 @@ import logging
 import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import polars as pl
@@ -884,14 +884,15 @@ _EVALUATION_FIELDS = (
 )
 
 
-def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
+def recompute_evaluation(db: Session, record_id: int) -> Union[None, str, dict]:
     """从 DB 快照 + 成交离线重算评估并 upsert（老记录补新增指标用）。
 
     不重跑回测、不触碰行情；相对指标依赖快照 benchmark_value（老记录已落该列）。
     组合级：直接重算。策略级：策略快照未落 benchmark_value（历史），按日注入组合
     快照的基准值后重算——相对/磨损/路径指标可补；持仓结构仍依赖 positions_json，
     老快照无此列时保持 None（前端提示「仅影响老记录」）。
-    记录不存在返回 None（路由 404）；快照不足返回 failed 状态。
+    记录不存在返回 None（路由 404）；running 返回字符串 "running"（路由 409）；
+    快照不足返回 failed 状态。
     """
     from types import SimpleNamespace
     from collections import defaultdict
@@ -899,6 +900,8 @@ def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
         return None
+    if rec.status == "running":
+        return "running"
 
     snaps = (
         db.query(BacktestDailySnapshot)
