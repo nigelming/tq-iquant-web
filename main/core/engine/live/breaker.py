@@ -239,17 +239,12 @@ class BreakerService:
         """日终对单个组合推进日内亏损：update_daily + daily_loss 触发/次日恢复 + risk 事件。
 
         搬自 _maybe_daily_close 的 per-portfolio 循环体。日终总市值用组合最新现金 + 持仓市值
-        （无最新 bar 时以当前持仓成本近似；有 bar 由 on_bar_update(update_peak) 已覆盖）。
+        （最近已知价口径，与回测统一为市值基准 #8；_price_snapshot 由 on_bar_update 每 bar 刷新，
+        无价回退持仓成本）。
         """
         try:
-            # 日终总市值：用组合最新现金 + 持仓市值（无最新 bar 时以当前持仓市值近似）
-            total = portfolio.account.cash
-            for ctx in portfolio.strategies:
-                for stock_code, pos in ctx.positions.items():
-                    if pos.quantity == 0:
-                        continue
-                    # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
-                    total += pos.avg_cost * pos.quantity
+            # 日终总市值：现金 + 持仓按最近已知价的市值（_price_snapshot 由 on_bar_update 每 bar 刷新）
+            total = portfolio.current_value()
             was_paused = portfolio.risk_manager.daily_pause_active
             portfolio.risk_manager.update_daily(
                 total, today, portfolio.account.initial_capital

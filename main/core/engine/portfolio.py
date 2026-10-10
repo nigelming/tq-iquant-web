@@ -515,6 +515,11 @@ class Portfolio:
         """组合总市值 = 现金 + 所有策略持仓按最近已知价的市值（回测/实盘共用，审计 #25 去重）。"""
         return self.account.cash + self._refresh_and_value_holdings(bar)
 
+    def current_value(self) -> Decimal:
+        """最近已知价口径的组合总市值（现金 + 持仓市值），无需新 bar。
+        日终熔断每日亏损用（#8）：14:30 时 _price_snapshot 已由 on_bar_update 刷新。"""
+        return self.account.cash + self._holdings_value()
+
     def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
         """按 strategy_id 在本组合策略列表中找上下文。"""
         if strategy_id is None:
