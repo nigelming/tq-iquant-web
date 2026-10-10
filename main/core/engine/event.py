@@ -47,6 +47,8 @@ class OrderEvent:
     bar_time: Optional[datetime] = None
     # 触发该订单的信号名（公式变量名如 open_sig，风控如 stop_loss/take_profit/trailing_stop）
     signal_name: str = ""
+    # 产生该订单的 bar 周期（"1m"/"1d"...）：订单只在同周期下一根 bar 成交（回测 #1a）
+    period: Optional[str] = None
 
 
 @dataclass

@@ -218,9 +218,9 @@ onUnmounted(closeEventStream)
       <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
-          <td style="color:#888">#{{ s.id }}</td>
+          <td style="color:var(--ink-soft)">#{{ s.id }}</td>
           <td>{{ s.name }}</td>
-          <td style="color:#666">
+          <td style="color:var(--ink-soft)">
             <span v-for="p in portfolioStatuses(s)" :key="p.portfolio_id" class="portfolio-chip">
               {{ portfolioName(p.portfolio_id) }}
               <span v-if="p.status === 'circuit_broken'" class="badge badge-red" style="margin-left:4px">熔断</span>
@@ -260,7 +260,7 @@ onUnmounted(closeEventStream)
         <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th></tr></thead>
         <tbody>
           <tr v-for="(p, i) in positions" :key="positionRowKey(p)">
-            <td style="color:#888">{{ i + 1 }}</td>
+            <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
             <td>{{ p.portfolio_id !== null && p.portfolio_id !== undefined ? portfolioName(p.portfolio_id) : '—' }}</td>
             <td>{{ strategyName(p.portfolio_id, p.strategy_id) }}</td>
             <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_cost }}</td><td>{{ p.market_value }}</td>
@@ -276,7 +276,7 @@ onUnmounted(closeEventStream)
         <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th></tr></thead>
         <tbody>
           <tr v-for="o in orders" :key="o.key">
-            <td style="color:#888">{{ o.time }}</td>
+            <td style="color:var(--ink-soft)">{{ o.time }}</td>
             <td>{{ TRADE_TYPE_LABEL[o.trade_type] || o.trade_type }}</td>
             <td>{{ o.stock_code }}</td>
             <td><span class="badge" :class="o.status === 'filled' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-gray'">{{ ORDER_STATUS_LABEL[o.status] || o.status }}</span></td>
@@ -295,7 +295,7 @@ onUnmounted(closeEventStream)
         <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>价格</th><th>数量</th><th>金额</th></tr></thead>
         <tbody>
           <tr v-for="t in trades" :key="t.key">
-            <td style="color:#888">{{ t.time }}</td>
+            <td style="color:var(--ink-soft)">{{ t.time }}</td>
             <td>{{ TRADE_TYPE_LABEL[t.trade_type] || t.trade_type }}</td>
             <td>{{ t.stock_code }}</td>
             <td>{{ t.price }}</td><td>{{ t.quantity }}</td><td>{{ t.amount }}</td>
@@ -318,11 +318,11 @@ onUnmounted(closeEventStream)
             <td>{{ gateLabel(s.gate) }} <span class="gate-code">{{ s.gate }}</span></td>
             <td>{{ layerLabel(s.layer) }}</td>
             <td>{{ actionLabel(s.action) }}</td>
-            <td style="color:#667eea;font-family:monospace">{{ s.param_name || '—' }}</td>
+            <td style="color:var(--accent);font-family:monospace">{{ s.param_name || '—' }}</td>
             <td>{{ fmtGateVal(s.param_value) }}</td>
-            <td style="text-align:right;font-weight:700;color:#ef4444">{{ s.count }}</td>
-            <td style="color:#888;font-size:11px">{{ s.first_bar_time ? s.first_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
-            <td style="color:#888;font-size:11px">{{ s.last_bar_time ? s.last_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
+            <td style="text-align:right;font-weight:700;color:var(--red)">{{ s.count }}</td>
+            <td style="color:var(--ink-soft);font-size:11px">{{ s.first_bar_time ? s.first_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
+            <td style="color:var(--ink-soft);font-size:11px">{{ s.last_bar_time ? s.last_bar_time.replace('T',' ').slice(11,19) : '—' }}</td>
             <td style="text-align:right">{{ s.stock_count }}</td>
             <td style="text-align:right">{{ qtyPair(s.requested_qty_sum, s.final_qty_sum) }}</td>
           </tr>
@@ -334,15 +334,15 @@ onUnmounted(closeEventStream)
         <thead><tr><th>时间</th><th>闸门</th><th>层</th><th>代码</th><th>策略</th><th>阈值</th><th>实际</th><th>请求/实发</th><th>原因</th></tr></thead>
         <tbody>
           <tr v-for="d in decisions" :key="d.key">
-            <td style="color:#888">{{ d.time }}</td>
+            <td style="color:var(--ink-soft)">{{ d.time }}</td>
             <td><span class="badge badge-purple">{{ gateLabel(d.gate) }}</span></td>
-            <td style="color:#888;font-size:11px">{{ layerLabel(d.layer) }}</td>
+            <td style="color:var(--ink-soft);font-size:11px">{{ layerLabel(d.layer) }}</td>
             <td>{{ d.stock_code || '—' }}</td>
             <td>{{ d.strategy_id ? `#${d.strategy_id}` : '组合' }}</td>
             <td>{{ fmtGateVal(d.param_value) }}</td>
             <td>{{ fmtGateVal(d.actual_value) }}</td>
             <td style="text-align:right">{{ qtyPair(d.requested_qty, d.final_qty) }}</td>
-            <td style="color:#555;white-space:normal;min-width:160px">{{ d.message || '—' }}</td>
+            <td style="color:var(--ink-soft);white-space:normal;min-width:160px">{{ d.message || '—' }}</td>
           </tr>
         </tbody>
       </table>
@@ -373,12 +373,12 @@ onUnmounted(closeEventStream)
       <h3>新建实盘</h3>
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
       <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
-      <p style="font-size:12px;color:#999;margin:2px 0 12px">仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。模拟/实盘下单由 iQuant 客户端启动按钮控制，此处仅选账号环境。</p>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。模拟/实盘下单由 iQuant 客户端启动按钮控制，此处仅选账号环境。</p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
           <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" />
-          {{ p.name }}<span style="color:#999">（#{{ p.id }}）</span>
+          {{ p.name }}<span style="color:var(--ink-faint)">（#{{ p.id }}）</span>
         </label>
       </div>
       <div v-if="portfolios.length === 0" class="empty-state" style="padding:8px">
@@ -396,21 +396,21 @@ onUnmounted(closeEventStream)
 .event-log {
   max-height: 420px;
   overflow-y: auto;
-  border: 1px solid #eee;
+  border: 1px solid var(--line);
   border-radius: 6px;
   padding: 4px 8px;
   font-size: 13px;
-  background: #fafafa;
+  background: var(--hover-bg);
 }
 .event-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
   padding: 4px 0;
-  border-bottom: 1px dashed #eee;
+  border-bottom: 1px dashed var(--line);
 }
 .event-row:last-child { border-bottom: none; }
-.event-time { color: #999; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.event-time { color: var(--ink-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .event-text { word-break: break-all; }
 .portfolio-check-list {
   display: flex;
@@ -423,11 +423,11 @@ onUnmounted(closeEventStream)
   align-items: center;
   gap: 4px;
   padding: 6px 10px;
-  border: 1px solid #eee;
+  border: 1px solid var(--line);
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
-  background: #fafafa;
+  background: var(--hover-bg);
 }
 .portfolio-chip {
   display: inline-block;
@@ -437,8 +437,8 @@ onUnmounted(closeEventStream)
   margin-left: 6px;
   padding: 0 6px;
   border-radius: 4px;
-  background: #f0f1f3;
-  color: #999;
+  background: var(--hover-bg);
+  color: var(--ink-faint);
   font-size: 11px;
   font-weight: 400;
 }

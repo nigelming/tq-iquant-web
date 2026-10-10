@@ -1,4 +1,4 @@
-"""build_klines / build_signal_cache / build_open_prices 数据对接层测试。
+"""build_klines / build_signal_cache 数据对接层测试。
 
 这些函数桥接 TQ 原始格式与回测引擎内部格式。TQ 调用本身依赖通达信进程，
 不可单测；故将逻辑拆为纯转换函数（_convert_market_data / _convert_formula_output）
@@ -166,37 +166,6 @@ def test_convert_market_data_multi_period():
     assert "5m" in klines["000001.SZ"]
     assert klines["000001.SZ"]["1d"].height == 3
     assert klines["000001.SZ"]["5m"].height == 2
-
-
-# ---------------------------------------------------------------------------
-# build_open_prices：klines → {stock: {bar_time: Decimal open}}
-# ---------------------------------------------------------------------------
-def test_build_open_prices_from_klines():
-    """open 价表直接从 klines 的 Open 列提取，key 为 datetime。"""
-    df = pl.DataFrame({
-        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)],
-        "Open": [Decimal("10"), Decimal("10.2"), Decimal("9.0")],
-        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("9.2")],
-        "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("8.8")],
-        "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("9.1")],
-        "Volume": [1000, 1000, 1000],
-    })
-    klines = {"000001.SZ": {"1d": df}}
-    prices = bt_api.build_open_prices(None, klines)
-
-    assert "000001.SZ" in prices
-    stock_prices = prices["000001.SZ"]
-    assert stock_prices[datetime(2026, 7, 29)] == Decimal("10")
-    assert stock_prices[datetime(2026, 7, 30)] == Decimal("10.2")
-    assert stock_prices[datetime(2026, 7, 31)] == Decimal("9.0")
-    # 值为 Decimal
-    for v in stock_prices.values():
-        assert isinstance(v, Decimal)
-
-
-def test_build_open_prices_empty_klines():
-    """空 klines → 空 open_prices。"""
-    assert bt_api.build_open_prices(None, {}) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -842,4 +811,58 @@ def test_build_signal_cache_minute_warmup_align_then_filter(db_session, monkeypa
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
     assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
     assert (strat.id, "000001.SZ", datetime(2026, 7, 28, 14, 55)) not in cache
+
+
+def test_build_signal_cache_minute_aligns_to_strategy_period_only(db_session, monkeypatch):
+    """#3：klines 同时含 1d 与 5m 时，5m 策略信号须只按 5m bar 对齐，
+    不得把 1d 午夜 bar 混入时间轴导致串位。"""
+    from core.models import Strategy
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Strategy).filter_by(id=strat.id).update({"period": "5m"})
+    db.commit()
+
+    klines = {"000001.SZ": {
+        "1d": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29)],
+            "Open": [Decimal("10")], "High": [Decimal("10.3")],
+            "Low": [Decimal("9.9")], "Close": [Decimal("10.2")], "Volume": [1000],
+        }),
+        "5m": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29, 9, 35), datetime(2026, 7, 29, 9, 40)],
+            "Open": [Decimal("10"), Decimal("10.2")], "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")], "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
+        }),
+    }}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        return {"000001.SZ": {"open_sig": [
+            {"Date": "20260729", "Value": 1},   # → 5m bar 09:35
+            {"Date": "20260729", "Value": -1},  # → 5m bar 09:40
+        ]}}
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
+    # 不得把 1d 午夜 bar 混入对齐（否则 09:35 会拿到 None 或错位值）
+    assert all(k[2] != datetime(2026, 7, 29, 0, 0) for k in cache)
+
+
+def test_convert_formula_output_warns_on_length_mismatch(caplog):
+    """#3：公式输出条数 != bar 数时记 warning（不崩溃，仍按索引截断）。"""
+    import logging
+    bar_times = [datetime(2026, 7, 28, 9, 35)]   # 1 根 bar
+    raw = {"000001.SZ": {"open_sig": [
+        {"Date": "20260728", "Value": 1},
+        {"Date": "20260728", "Value": -1},       # 多出 1 条
+    ]}}
+    with caplog.at_level(logging.WARNING):
+        entries = bt_api._convert_formula_output(
+            raw, 1, ["000001.SZ"], bar_times_by_code={"000001.SZ": bar_times}
+        )
+    assert (1, "000001.SZ", bar_times[0]) in entries
+    assert any("长度" in r.message for r in caplog.records)
 

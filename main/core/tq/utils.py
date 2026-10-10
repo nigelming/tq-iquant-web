@@ -22,7 +22,7 @@ def get_tdx_lock():
 def _tdx_path() -> str:
     """从 config.yaml 读 tdx_path；缺失回退默认。"""
     cfg = load_config()
-    p = cfg.get("tdx_path", "") or "D:\\new_tdx64"
+    p = cfg.get("tdx_path", "") or "D:\\zd_zyb"
     return p
 
 

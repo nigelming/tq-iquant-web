@@ -16,8 +16,8 @@ import { getSystemConfigs, updateSystemConfigs } from '../api'
 
 // 与 config.yaml / core/config.py 一致的真实字段
 const mockConfig = {
-  tdx_path: 'D:\\new_tdx64',
-  iquant_path: 'D:\\iquant',
+      tdx_path: 'D:\\zd_zyb',
+      iquant_path: 'D:\\iquant',
   max_concurrent_backtest: 1,
   database: { sqlite_path: 'data/dev.db' },
   iquant_bridge: {
@@ -44,7 +44,7 @@ describe('SystemConfig.vue', () => {
     expect(getSystemConfigs).toHaveBeenCalled()
     const inputs = w.findAll('input')
     const v = (el: any) => (el.element as HTMLInputElement).value
-    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('tdx')))).toBe('D:\\new_tdx64')
+    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('zd_zyb')))).toBe('D:\\zd_zyb')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('iquant')))).toBe('D:\\iquant')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('dev.db')))).toBe('data/dev.db')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('8790')))).toBe('http://127.0.0.1:8790')
@@ -70,7 +70,7 @@ describe('SystemConfig.vue', () => {
     await flushPromises()
 
     expect(updateSystemConfigs).toHaveBeenCalledWith(expect.objectContaining({
-      tdx_path: 'D:\\new_tdx64',
+  tdx_path: 'D:\\zd_zyb',
       iquant_path: 'D:\\iquant',
       max_concurrent_backtest: 1,
       database: expect.objectContaining({ sqlite_path: 'data/dev.db' }),

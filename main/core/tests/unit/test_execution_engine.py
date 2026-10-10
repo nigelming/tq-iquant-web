@@ -213,3 +213,42 @@ def test_signal_name_defaults_empty_when_unset():
         _order_open("000001.SZ", TradeType.BUY, 100, "10")  # 不传 signal_name
     )
     assert trade.signal_name == ""
+
+
+def test_buy_insufficient_cash_at_fill_is_scaled_to_whole_lots():
+    """审批量 1000 股（10 元预算 1 万），成交价跳空 100 元 → 只够 100 股 → 缩量到 100。"""
+    from core.engine.execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
+    from core.engine.account import Account
+    from core.engine.decision import DecisionRecorder
+    from core.engine.event import OrderEvent
+    from core.engine.position import Position
+    from tq_iquant_shared.constants import SignalType, TradeType
+
+    rec = DecisionRecorder()
+    acct = Account(initial_capital=Decimal("10000"))
+    pos = Position("000001.SZ")
+    order = OrderEvent(strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+                       trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+                       quantity=1000, signal_name="open_sig")
+    disp = SimulatedDispatcher({"000001.SZ": Decimal("100")}, buy_commission_rate=Decimal("0"),
+                               sell_commission_rate=Decimal("0"), stamp_duty_rate=Decimal("0"),
+                               min_commission=Decimal("0"))
+    trade = ExecutionEngine(disp, SimulatedT1Checker(), recorder=rec).execute(order, acct, pos)
+    assert trade is not None
+    assert trade.quantity == 100
+    assert acct.cash >= Decimal("0")
+
+
+def test_buy_cash_below_one_lot_is_rejected():
+    from core.engine.decision import DecisionRecorder
+    rec = DecisionRecorder()
+    acct = Account(initial_capital=Decimal("50"))
+    pos = Position("000001.SZ")
+    order = OrderEvent(strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+                       trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+                       quantity=100, signal_name="open_sig")
+    disp = SimulatedDispatcher({"000001.SZ": Decimal("100")}, buy_commission_rate=Decimal("0"),
+                               sell_commission_rate=Decimal("0"), stamp_duty_rate=Decimal("0"),
+                               min_commission=Decimal("0"))
+    trade = ExecutionEngine(disp, SimulatedT1Checker(), recorder=rec).execute(order, acct, pos)
+    assert trade is None

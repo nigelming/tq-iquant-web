@@ -456,6 +456,51 @@ class Portfolio:
         """单策略持仓按最近已知价的市值（回测策略层快照用，口径同 total_value）。"""
         return self._holdings_value(ctx)
 
+    def positions_detail(self, snap_date: date, ctx: Optional[StrategyContext] = None) -> list:
+        """当日持仓明细（供回测快照 positions_json；实盘不调用）。
+
+        - ctx=None：组合层，跨策略按 stock_code 聚合（数量/可卖/市值/成本相加）；
+          ctx 指定：仅该策略持仓（策略层快照）。
+        - 估值价与 total_value/holdings_value 同口径（最近已知价，无效价回退 avg_cost）。
+        - sellable_quantity 走 Position T+1 分桶（snap_date 前买入的份额）。
+        - Decimal 字段序列化为字符串，保证 json.dumps 安全；按股票代码升序确定输出。
+        """
+        contexts = (ctx,) if ctx is not None else self.strategies
+        agg: Dict[str, dict] = {}
+        for c in contexts:
+            for code, pos in c.positions.items():
+                if pos.quantity == 0:
+                    continue
+                price = self._price_snapshot.get(code)
+                if price is None or price <= 0:
+                    price = pos.avg_cost
+                slot = agg.get(code)
+                if slot is None:
+                    slot = {
+                        "stock_code": code,
+                        "quantity": 0,
+                        "sellable_quantity": 0,
+                        "market_value": Decimal("0"),
+                        "cost_value": Decimal("0"),
+                    }
+                    agg[code] = slot
+                slot["quantity"] += pos.quantity
+                slot["sellable_quantity"] += pos.available_shares_on(snap_date)
+                slot["market_value"] += price * pos.quantity
+                slot["cost_value"] += pos.avg_cost * pos.quantity
+
+        detail = []
+        for code in sorted(agg):
+            slot = agg[code]
+            detail.append({
+                "stock_code": slot["stock_code"],
+                "quantity": slot["quantity"],
+                "sellable_quantity": slot["sellable_quantity"],
+                "market_value": str(slot["market_value"]),
+                "cost_value": str(slot["cost_value"]),
+            })
+        return detail
+
     def _refresh_and_value_holdings(self, bar: BarEvent) -> Decimal:
         """刷新价格快照并返回所有持仓市值合计（不含现金）。
 
@@ -469,6 +514,11 @@ class Portfolio:
     def total_value(self, bar: BarEvent) -> Decimal:
         """组合总市值 = 现金 + 所有策略持仓按最近已知价的市值（回测/实盘共用，审计 #25 去重）。"""
         return self.account.cash + self._refresh_and_value_holdings(bar)
+
+    def current_value(self) -> Decimal:
+        """最近已知价口径的组合总市值（现金 + 持仓市值），无需新 bar。
+        日终熔断每日亏损用（#8）：14:30 时 _price_snapshot 已由 on_bar_update 刷新。"""
+        return self.account.cash + self._holdings_value()
 
     def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
         """按 strategy_id 在本组合策略列表中找上下文。"""
@@ -495,4 +545,6 @@ class Portfolio:
             "total_value": current_value,
             "cash": self.account.cash,
             "market_value": market_value,
+            # 当日持仓明细（仅回测落 positions_json；只增字段，实盘不读本键）
+            "positions": self.positions_detail(snap_date),
         }

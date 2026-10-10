@@ -1,14 +1,17 @@
 from datetime import date
 from threading import Lock
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
-from core.models import PortfolioStrategy
+from core.models import BacktestRecord, PortfolioStrategy
+from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -32,7 +35,6 @@ class BacktestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 from core.services.backtest_service import (  # noqa: E402
     build_klines,
-    build_open_prices,
     build_benchmark_data,
     build_signal_cache,
     warmup_counts_by_period,
@@ -46,6 +48,9 @@ from core.services.backtest_service import (  # noqa: E402
     get_record_detail as _svc_get_record_detail,
     delete_record as _svc_delete_record,
     run_backtest as _svc_run_backtest,
+    recompute_crisis_alpha as _svc_recompute_crisis_alpha,
+    recompute_market_regime as _svc_recompute_market_regime,
+    recompute_evaluation as _svc_recompute_evaluation,
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
 from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
@@ -70,10 +75,66 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
 @router.delete("/records/{record_id}")
 def delete_record(record_id: int, db: Session = Depends(get_db)):
     """删除回测记录 + 级联子表（trades/snapshots/evaluations）。
-    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。"""
+    子表 FK 虽配 ondelete=CASCADE，但显式删更稳妥（不依赖连接级 PRAGMA）。
+
+    running 记录拒绝删除：FK=ON 下删 running 会与子表插入竞争 → IntegrityError → 500。
+    返回真实 HTTP 409（非 body-code）——前端 axios 对 HTTP 错误自动 reject；body 仍为
+    统一 envelope（err 辅助）。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return err(404, "回测记录不存在")
+    if rec.status == "running":
+        return JSONResponse(status_code=409, content=err(409, "回测运行中，无法删除"))
     if not _svc_delete_record(db, record_id):
         return err(404, "回测记录不存在")
     return ok()
+
+
+@router.post("/records/{record_id}/crisis-alpha/recompute")
+def recompute_record_crisis_alpha(record_id: int, db: Session = Depends(get_db)):
+    result = _svc_recompute_crisis_alpha(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/market-regime/recompute")
+def recompute_record_market_regime(record_id: int, db: Session = Depends(get_db)):
+    """离线重算市场状态×绩效分析（机遇/中性Alpha，不重跑回测）。"""
+    result = _svc_recompute_market_regime(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/evaluations/recompute")
+def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
+    """离线重算组合级评估（不重跑回测），供老记录补算基准相对等新增指标。"""
+    result = _svc_recompute_evaluation(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    if result == "running":
+        return JSONResponse(status_code=409, content=err(409, "回测运行中，无法重算评估"))
+    return ok(result)
+
+
+@router.get("/records/{record_id}/export/html")
+def export_record_html(record_id: int, db: Session = Depends(get_db)):
+    """导出单文件离线 HTML 分析报告（FR-21/22，Task 19）。
+
+    例外于统一 envelope：文件下载直接返回 text/html + Content-Disposition，
+    前端以直链/a 标签触发浏览器下载（不经 axios 拦截器）。数字与详情接口同源。
+    """
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    report = build_html_report(detail)
+    rec = detail.get("record") or {}
+    fname = quote(f"回测报告-{rec.get('name') or record_id}.html")
+    return HTMLResponse(
+        content=report,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
 
 
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:

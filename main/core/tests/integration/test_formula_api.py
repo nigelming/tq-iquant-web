@@ -200,7 +200,7 @@ def test_create_formula_invalid_signal_type(client):
 
 
 def test_create_formula_invalid_trigger_value(client):
-    """trigger_value 不在 {1,-1} → code 400。"""
+    """trigger_value 不在 {-2,-1,1,2} → code 400。"""
     c, Session = client
     payload = {
         "name": "BAD", "content": "X",
@@ -209,6 +209,19 @@ def test_create_formula_invalid_trigger_value(client):
     resp = c.post("/api/formulas", json=payload)
     assert resp.status_code == 200
     assert resp.json()["code"] == 400
+
+
+def test_create_formula_accepts_tdx_trigger_values(client):
+    """trigger_value -2/-1/1/2（通达信 buy=2/sell=-2）均被接受。"""
+    c, Session = client
+    for tv in (2, 1, -1, -2):
+        payload = {
+            "name": f"TV{tv}", "content": "X",
+            "signals": [{"signal_name": "x", "signal_type": "OPEN", "trigger_value": tv}],
+        }
+        resp = c.post("/api/formulas", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0, f"trigger_value={tv} 应被接受"
 
 
 # ---------------------------------------------------------------------------

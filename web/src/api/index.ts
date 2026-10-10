@@ -154,6 +154,29 @@ export interface BacktestEvaluationItem {
   max_recovery_days: number | null
   ulcer_index: number | null
   return_stability: number | null
+  // 基准相对 8 指标（regime-alpha suite）
+  beta: number | null
+  jensen_alpha: number | null
+  excess_annual_return: number | null
+  tracking_error: number | null
+  information_ratio: number | null
+  up_capture_ratio: number | null
+  down_capture_ratio: number | null
+  excess_max_drawdown: number | null
+  // 磨损/仓位/结构 6 指标
+  annual_turnover: number | null
+  total_cost_ratio: number | null
+  avg_position_utilization: number | null
+  empty_days_ratio: number | null
+  max_single_weight: number | null
+  hhi: number | null
+  // 路径 6 指标
+  max_consecutive_loss_days: number | null
+  max_consecutive_profit_days: number | null
+  worst_daily_return: number | null
+  worst_weekly_return: number | null
+  return_skewness: number | null
+  return_kurtosis: number | null
 }
 
 // 策略评估（详情内嵌，含 strategy_id/name）— 对齐 backtest get_record strategy_evaluations
@@ -210,6 +233,190 @@ export interface DecisionData {
   events: DecisionEventItem[]
 }
 
+// 月度收益热力图矩阵（年度×12月）
+export interface BacktestMonthlyMatrix {
+  years: number[]
+  months: string[]           // ["1月", "2月", ..., "12月"]
+  matrix: (number | null)[][] // matrix[yearIdx][monthIdx] = 月收益% 或 null
+  text: string[][]           // 同 shape，格式 "+1.23%"
+}
+
+// 年度统计（日收益分箱 + 月收益 + 年累计）
+export interface BacktestYearlyStats {
+  year: number
+  daily_returns: number[]    // 该年日收益（小数）
+  monthly_returns: number[]  // 该年月收益（小数）
+  annual_return: number | null  // 年度累计收益（小数，复利；无收益年份为 null）
+}
+
+// 收益分布桶（月度热力图 + 年度箱线图数据源）
+export interface BacktestReturnsBucket {
+  monthly_matrix: BacktestMonthlyMatrix
+  yearly: BacktestYearlyStats[]
+}
+
+export interface CrisisAlphaQuadrant {
+  n_crisis: number
+  n_down: number
+  n_total: number
+  hit_rate: number
+  up_rate: number
+  alpha_ratio: number
+  follow_ratio: number
+  odds: number | null
+  counts: Record<string, number>
+  avg_ret: Record<string, number>
+  down_avg_s: number
+  down_avg_b: number
+  win_avg: number | null
+  loss_avg: number
+}
+
+export interface CrisisAlphaCondition {
+  threshold: number
+  n: number
+  b_avg: number
+  s_avg: number
+  up_rate: number
+}
+
+export interface CrisisAlphaWeekRow {
+  日期: string
+  基准?: number
+  策略?: number
+  基准收益?: number
+  策略收益?: number
+  超额?: number
+  分类: string
+}
+
+export interface CrisisAlphaEvent {
+  start: string
+  end: string
+  benchmark_ret: number
+  strategy_ret: number
+  excess: number
+  hedged: boolean
+  verdict: string
+  max_dd: number
+  days: number
+}
+
+export interface CrisisAlphaPoint {
+  date: string
+  value: number | null
+}
+
+export interface CrisisAlphaMonthState {
+  n: number
+  s_avg: number
+  b_avg: number
+  win_rate: number
+}
+
+export interface CrisisAlphaAnnual {
+  年份: number
+  下跌周: number
+  危机Alpha: number
+  策略收益: number
+  基准收益: number
+  完整: boolean
+}
+
+export interface CrisisAlphaCost {
+  drag: number
+  sync_up: number
+  elasticity: number
+  tail_corr: number | null
+  q1_corr: number | null
+  n_up: number
+}
+
+export interface CrisisAlphaPerfSide {
+  cum: number
+  ann: number
+  vol: number | null
+  mdd: number
+}
+
+export interface CrisisAlphaPerformance {
+  s: CrisisAlphaPerfSide
+  b: CrisisAlphaPerfSide
+  corr: number | null
+  start: string
+  end: string
+}
+
+export interface CrisisAlphaDimension {
+  维度: string
+  类型: string
+  权重: number
+  得分: number
+  评级: string
+  贡献: number
+}
+
+export interface CrisisAlphaScore {
+  total_score: number
+  rating: string
+  dimensions: CrisisAlphaDimension[]
+}
+
+export interface CrisisAlphaMultiBench {
+  key: string
+  name: string
+  code: string
+  alpha_ratio: number
+  n_down: number
+  up_rate: number
+  is_main: boolean
+}
+
+export interface CrisisAlphaNav {
+  dates: string[]
+  strategy: (number | null)[]
+  benchmark: (number | null)[]
+  shade_spans: string[][]
+}
+
+export interface CrisisAlphaData {
+  strategy_name: string
+  benchmark_code: string
+  benchmark_name: string
+  alpha_rating: string
+  n_weeks: number
+  quadrant: CrisisAlphaQuadrant
+  conditions: CrisisAlphaCondition[]
+  extreme_top: CrisisAlphaWeekRow[]
+  deep_dd_events: CrisisAlphaEvent[]
+  rolling_corr: CrisisAlphaPoint[]
+  expanding_corr: CrisisAlphaPoint[]
+  monthly: {
+    states: Record<string, CrisisAlphaMonthState>
+    hedge_ratio: number
+    n_down_month: number
+    big_down: Array<{ 日期: string; 基准: number; 策略: number }>
+  }
+  annual: CrisisAlphaAnnual[]
+  cost: CrisisAlphaCost
+  performance: CrisisAlphaPerformance
+  score: CrisisAlphaScore
+  weekly_detail: CrisisAlphaWeekRow[]
+  down_weeks: CrisisAlphaWeekRow[]
+  nav: CrisisAlphaNav
+  multi_bench: CrisisAlphaMultiBench[]
+}
+
+export interface BacktestCrisisAlphaItem {
+  status: 'completed' | 'insufficient' | 'failed'
+  error: string | null
+  skipped_benchmarks: string[]
+  computed_at: string | null
+  benchmark_code: string
+  benchmark_name: string
+  data: CrisisAlphaData | null
+}
+
 // 回测详情（GET /backtest/records/{id}）— 对齐 backtest.get_record
 export interface BacktestDetailItem {
   record: BacktestRecordItem
@@ -220,6 +427,9 @@ export interface BacktestDetailItem {
   strategy_snapshots: BacktestStrategySnapshotItem[]
   decision_summary: DecisionSummaryItem[]  // 风控与拦截统计（调参可观测性）
   decisions: DecisionEventItem[]           // 逐闸门事件（下钻）
+  returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
+  crisis_alpha: BacktestCrisisAlphaItem | null
+  market_regime: BacktestMarketRegimeItem | null
 }
 
 export async function getStockPools() {
@@ -470,6 +680,326 @@ export async function getBacktestDetail(id: number) {
 
 export async function deleteBacktestRecord(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/backtest/records/${id}`)
+  return res.data.data
+}
+
+export interface CrisisAlphaBenchmarkResolution {
+  from_snapshot: boolean
+  mismatch: boolean
+  benchmark_code: string
+  benchmark_name: string
+  live_benchmark_code: string
+  live_benchmark_name: string
+  stored_benchmark_code: string | null
+  stored_benchmark_name: string | null
+}
+
+export interface CrisisAlphaRecomputeResult {
+  status: string
+  error: string | null
+  computed_at: string | null
+  benchmark_resolution?: CrisisAlphaBenchmarkResolution
+}
+
+export async function recomputeCrisisAlpha(id: number) {
+  const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
+    `/backtest/records/${id}/crisis-alpha/recompute`)
+  return res.data.data
+}
+
+// ---- 市场状态×绩效分析（机遇/中性Alpha，regime-alpha 阶段二）----
+
+export interface MarketRegimeStateRow {
+  label: string
+  label_cn: string
+  weeks: number
+  ratio: number | null
+  strategy_return: number | null
+  benchmark_return: number | null
+  excess_return: number | null
+  win_rate: number | null
+  max_drawdown: number | null
+  turnover: number | null
+  cost_ratio: number | null
+}
+
+export interface MarketRegimeBigUpTest {
+  threshold: number
+  n: number
+  avg_strategy: number | null
+  avg_benchmark: number | null
+  win_rate: number | null
+}
+
+export interface MarketRegimeOppCat {
+  count: number
+  avg_strategy: number | null
+}
+
+export interface MarketRegimeReboundSegment {
+  start_date: string
+  end_date: string
+  trough_date: string
+  weeks: number
+  benchmark_rebound_pct: number | null
+  strategy_rebound_pct: number | null
+  elasticity: number | null
+  benchmark_recover_days: number | null
+  benchmark_recovered: boolean
+  strategy_recover_days: number | null
+  strategy_recovered: boolean
+}
+
+export interface MarketRegimeData {
+  meta: {
+    strategy_name: string
+    benchmark_name: string
+    n_weeks_labeled: number
+    n_weeks_total: number
+    state_week_counts: Record<string, number>
+  }
+  regime_table: Record<string, MarketRegimeStateRow>
+  opportunity: {
+    n_bull_weeks: number
+    up_capture: number | null
+    miss_ratio: number
+    big_up_tests: MarketRegimeBigUpTest[]
+    cats: Record<string, MarketRegimeOppCat>
+  }
+  rebound: {
+    n_segments: number
+    avg_elasticity: number | null
+    segments: MarketRegimeReboundSegment[]
+  }
+  neutral: {
+    n_range_weeks: number
+    range_ratio: number | null
+    cumulative_return: number | null
+    annualized_return: number | null
+    win_rate: number | null
+    n_range_days: number
+    monthly_trades: number | null
+    annual_turnover: number | null
+    cost_gross_ratio: number | null
+    whipsaw_count: number
+    whipsaw_days: number
+    avg_trade_pnl: {
+      trend: number | null
+      trend_count: number
+      range: number | null
+      range_count: number
+    }
+  }
+  style: StyleBlock
+  dispersion: DispersionBlock
+  exposure: ExposureBlock
+  // 增强A：巨潮四象限纯风格暴露（规模×成长/价值，399372~399377）；老记录无此键
+  quadrant_exposure?: ExposureBlock
+  industry_attribution: IndustryAttributionBlock
+  robustness: RobustnessBlock
+}
+
+// ---- 轻量稳健性（FR-20）----
+
+export interface RobustHalfYearRow {
+  period: string
+  start_date: string
+  end_date: string
+  strategy_return: number
+  benchmark_return: number
+  excess_return: number
+  max_drawdown: number
+  sharpe: number | null
+}
+
+export interface RobustDist {
+  median: number | null
+  min: number | null
+  max: number | null
+  negative_ratio: number | null
+}
+
+export interface RobustWindow {
+  window: number
+  n_samples: number
+  returns: RobustDist
+  sharpe: RobustDist
+  histogram: { label: string; count: number }[]
+}
+
+export interface RobustSensitivityRow {
+  code: string
+  name: string
+  is_primary: boolean
+  available: boolean
+  n_days: number
+  strategy_total_return: number | null
+  benchmark_total_return: number | null
+  beta: number | null
+  jensen_alpha: number | null
+  excess_annual_return: number | null
+  tracking_error: number | null
+  information_ratio: number | null
+  up_capture_ratio: number | null
+  down_capture_ratio: number | null
+  excess_max_drawdown: number | null
+}
+
+export interface RobustnessBlock {
+  status: 'ok' | 'insufficient' | 'failed'
+  error?: string
+  n_days?: number
+  start_date?: string
+  end_date?: string
+  half_year_matrix?: RobustHalfYearRow[]
+  rolling?: {
+    weekly_points: number
+    windows: RobustWindow[]
+  }
+  longest_loss_window?: {
+    start_date: string | null
+    trough_date: string | null
+    end_date: string | null
+    days: number
+    drawdown: number | null
+  }
+  benchmark_sensitivity?: RobustSensitivityRow[]
+}
+
+// ---- 风格轮动 / 分化度 / 隐含风格暴露（FR-13 ~ FR-16）----
+
+export interface StyleWeekRow {
+  date: string
+  label: string
+  leader_code: string | null
+  leader_return: number
+  // FR-13 双窗口（Minor-2 修复）：20W 快窗口标签，老记录 payload 无此键
+  fast_label?: string
+  fast_leader_code?: string | null
+}
+
+export interface StyleMatrixRow {
+  label: string
+  weeks: number
+  ratio: number
+  strategy_return: number | null
+  leader_return: number | null
+  excess_return: number | null
+  win_rate: number | null
+  max_drawdown: number | null
+}
+
+export interface StyleBlock {
+  available_codes: string[]
+  skipped: string[]
+  weeks: StyleWeekRow[]
+  matrix: Record<string, StyleMatrixRow>
+  // FR-13 双窗口：快窗口周数与 20W/60W 标签一致周占比（老记录无此键）
+  fast_window?: number
+  label_agree_ratio?: number | null
+}
+
+export interface DispersionPoint {
+  date: string
+  dispersion: number
+}
+
+export interface DispersionBucket {
+  count: number
+  mean_excess: number | null
+  win_rate: number | null
+  threshold: number | null
+}
+
+export interface DispersionBlock {
+  available_codes: string[]
+  skipped: string[]
+  series: DispersionPoint[]
+  buckets: {
+    low: DispersionBucket
+    mid: DispersionBucket
+    high: DispersionBucket
+  }
+}
+
+export interface ExposureBlock {
+  available_codes: string[]
+  available_names: string[]
+  skipped: string[]
+  dates: string[]
+  corr: Record<string, (number | null)[]>
+  beta: Record<string, (number | null)[]>
+  window: number
+}
+
+// ---- 行业归因（FR-17，通达信二级行业 881）----
+
+export interface IndustryExposureSeries {
+  code: string
+  name: string
+  avg_weight: number
+  weights: number[]
+}
+
+export interface IndustryExposureBlock {
+  dates: string[]
+  series: IndustryExposureSeries[]
+  cash: number[]
+}
+
+export interface IndustryHitRatePeriod {
+  top_n: number
+  periods: number
+  periods_holding: number
+  hits: number
+  hit_rate: number | null
+  details: {
+    period: string
+    held: string[]
+    leaders: string[]
+    hit: boolean
+  }[]
+}
+
+export interface IndustryContributionRow {
+  code: string
+  name: string
+  avg_weight: number
+  index_return: number | null
+  contribution: number
+}
+
+export interface IndustryAttributionBlock {
+  status: 'ok' | 'needs_rerun' | 'failed'
+  taxonomy: string
+  reason?: string
+  error?: string
+  n_days?: number
+  unmapped_codes?: string[]
+  exposure?: IndustryExposureBlock
+  hit_rate?: {
+    weekly: IndustryHitRatePeriod
+    monthly: IndustryHitRatePeriod
+  }
+  contribution?: {
+    available: boolean
+    rows: IndustryContributionRow[]
+    total_contribution: number | null
+  }
+}
+
+export interface BacktestMarketRegimeItem {
+  status: 'completed' | 'insufficient' | 'failed'
+  error: string | null
+  computed_at: string | null
+  benchmark_code: string
+  benchmark_name: string
+  data: MarketRegimeData | null
+}
+
+export async function recomputeMarketRegime(id: number) {
+  const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
+    `/backtest/records/${id}/market-regime/recompute`)
   return res.data.data
 }
 

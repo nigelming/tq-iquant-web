@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -8,25 +9,38 @@ from core.config import load_config
 # 从哪个 cwd 启动都解析到同一绝对路径，消除对进程工作目录的依赖。
 _MAIN_DIR = Path(__file__).resolve().parent.parent
 
-_cfg = load_config()
-_sqlite_path = _cfg.get("database", {}).get("sqlite_path", "data/dev.db")
-# 相对路径锚定到 main/；若 config 给绝对路径则原样使用
-_db_file = Path(_sqlite_path)
-if not _db_file.is_absolute():
-    _db_file = _MAIN_DIR / _sqlite_path
+
+def _db_path() -> Path:
+    """数据库路径：优先 config.yaml，fallback 到 exe 同级目录。"""
+    cfg = load_config()
+    sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
+    p = Path(sqlite_path)
+    if not p.is_absolute():
+        if hasattr(sys, 'frozen'):
+            exe_dir = Path(sys.argv[0]).resolve().parent
+        else:
+            exe_dir = Path(__file__).resolve().parent.parent
+        p = exe_dir / p
+    return p
+
+
+_db_file = _db_path()
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{_db_file.as_posix()}"
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 5},
 )
 SessionLocal = sessionmaker(bind=engine)
 
 
 @event.listens_for(engine, "connect")
-def _enable_sqlite_fk(dbapi_conn, connection_record):
-    """SQLite 外键约束默认关闭，逐连接开启以让 ondelete CASCADE/RESTRICT 生效。"""
+def _set_sqlite_pragmas(dbapi_conn, connection_record):
+    """SQLite 外键默认关闭；开启 WAL（读写并发）+ busy_timeout（写锁等待）。"""
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

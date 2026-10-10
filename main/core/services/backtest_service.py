@@ -13,9 +13,12 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 故测试零改动。纯重构，行为不变。
 """
 
+import json
+import logging
+import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import polars as pl
@@ -24,15 +27,31 @@ from sqlalchemy.orm import Session
 from core.models import (
     StockPoolStock, Strategy, Formula, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
-    BacktestDecisionEvent,
+    BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
 )
 from core.engine.backtest_engine import BacktestEngine
+from core.engine.evaluator import Evaluator
+from core.engine.crisis_alpha import (
+    CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
+)
+from core.engine.regime import segment_regime
+from core.engine.regime_alpha import (
+    QUADRANT_STYLE_INDICES,
+    RegimeAlphaAnalyzer,
+)
+from core.engine.industry_attribution import (
+    compute_industry_attribution, needs_rerun_block, TAXONOMY as INDUSTRY_TAXONOMY,
+)
+from core.engine.robustness import compute_robustness
 from core.engine.decision import summarize_decisions
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
 )
 from core.tq.data import TQData
 from core.tq.formula import TQFormula
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -279,64 +298,718 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
     return _convert_market_data_multi(raw_by_period, stocks)
 
 
-def build_open_prices(ps, klines: dict) -> dict:
-    """从 klines 提取 open 价表：{stock_code: {bar_time: Decimal}}。
-
-    供 SimulatedDispatcher 在下一 bar open 成交。取每只股票首个周期的 Open 列。
-    """
-    prices: dict = {}
-    for code, periods in klines.items():
-        if not periods:
+def build_index_close_series(
+    codes: List[str], start: date, end: date, batch_size: int = 0
+) -> Dict[str, Dict[date, Decimal]]:
+    """取指数日线收盘价。batch_size>0 时分批取数（行业指数 128 个用）。"""
+    wanted = [c for c in dict.fromkeys(codes) if c]
+    if not wanted:
+        return {}
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    chunks = ([wanted[i:i + batch_size]
+               for i in range(0, len(wanted), batch_size)]
+              if batch_size else [wanted])
+    out: Dict[str, Dict[date, Decimal]] = {}
+    for chunk in chunks:
+        try:
+            raw = TQData().get_history_raw(
+                stocks=chunk,
+                periods=["1d"],
+                start=start_str,
+                end=end_str,
+                dividend_type="front",
+                count=-1,
+            )
+        except Exception:
             continue
-        # 取任一周期（日线回测只有一个周期）
-        df = next(iter(periods.values()))
-        if "datetime" not in df.columns or "Open" not in df.columns:
+        if not isinstance(raw, dict) or not raw:
             continue
-        stock_prices: dict = {}
-        times = df["datetime"].to_list()
-        opens = df["Open"].to_list()
-        for t, o in zip(times, opens):
-            stock_prices[t] = o if isinstance(o, Decimal) else _to_decimal(o)
-        prices[code] = stock_prices
-    return prices
+        period = raw.get("1d")
+        if not isinstance(period, dict):
+            continue
+        close_df = period.get("Close")
+        if close_df is None:
+            continue
+        columns = getattr(close_df, "columns", [])
+        for code in chunk:
+            if code not in columns or code in out:
+                continue
+            series: Dict[date, Decimal] = {}
+            for ts in close_df.index:
+                val = close_df.loc[ts, code]
+                if _is_nan(val):
+                    continue
+                d = ts.date() if hasattr(ts, "date") else ts
+                if isinstance(d, datetime):
+                    d = d.date()
+                series[d] = _to_decimal(val)
+            if series:
+                out[code] = series
+    return out
 
 
 def build_benchmark_data(
     ps, start: date, end: date, db: Session = None
 ) -> Dict[date, Decimal]:
-    """拉基准指数收盘价：{snap_date: close_value}。
+    index_code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
+    return build_index_close_series([index_code], start, end).get(index_code, {})
 
-    基准代码取 ps.benchmark_index（默认 000300.SH）。用 TQ 拉指数日线 Close，
-    按日期（date）建索引，供 BacktestEngine 逐 bar 填入快照 benchmark_value。
-    拉取失败/无数据返回空 dict（前端据此隐藏基准线，Evaluator 退化为 0）。
+
+def _crisis_benchmark_code(ps) -> str:
+    return getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
+
+
+def _crisis_benchmark_name(code: str) -> str:
+    for spec in CRISIS_BENCHMARKS:
+        if spec["code"] == code:
+            return spec["name"]
+    return code
+
+
+PARAMS_SNAPSHOT_FIELDS = (
+    "benchmark_index",
+    "initial_capital",
+    "max_drawdown",
+    "daily_loss_limit",
+    "max_holdings",
+    "min_commission",
+    "buy_commission_rate",
+    "sell_commission_rate",
+    "stamp_duty_rate",
+    "slippage",
+    "trading_session",
+    "stock_pool_id",
+)
+
+
+def _snapshot_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def _json_safe(obj):
+    """递归清洗分析 payload：NaN/±Inf 浮点 → None。
+
+    分析器在样本不足或零方差场景可能产出非有限浮点（如相关系数 0/0），
+    落库用 allow_nan=False 严格 JSON，故在序列化边界统一转 null（与前端
+    「安全空值」约定一致），不逐个分析点特判。非 float 类型原样返回。
     """
-    index_code = getattr(ps, "benchmark_index", None) or "000300.SH"
-    start_str = start.strftime("%Y%m%d")
-    end_str = end.strftime("%Y%m%d")
-    tq = TQData()
-    raw = tq.get_history_raw(
-        stocks=[index_code], periods=["1d"],
-        start=start_str, end=end_str, dividend_type="front", count=-1,
-    )
-    if not isinstance(raw, dict) or not raw:
-        return {}
-    raw_1d = raw.get("1d")
-    if not isinstance(raw_1d, dict):
-        return {}
-    close_df = raw_1d.get("Close")
-    if close_df is None or index_code not in getattr(close_df, "columns", []):
-        return {}
-    result: Dict[date, Decimal] = {}
-    for ts in close_df.index:
-        val = close_df.loc[ts, index_code]
-        if _is_nan(val):
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def build_params_snapshot(ps) -> str:
+    payload = {
+        field: _snapshot_value(getattr(ps, field, None))
+        for field in PARAMS_SNAPSHOT_FIELDS
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def snapshot_benchmark_code(params_snapshot) -> Optional[str]:
+    if not params_snapshot or not isinstance(params_snapshot, (str, bytes, bytearray)):
+        return None
+    try:
+        data = json.loads(params_snapshot)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = data.get("benchmark_index")
+    if isinstance(code, str) and code:
+        return code
+    return None
+
+
+def resolve_crisis_benchmark(rec, row, ps) -> dict:
+    live_code = _crisis_benchmark_code(ps)
+    stored_code = getattr(row, "benchmark_code", None) if row is not None else None
+    stored_name = getattr(row, "benchmark_name", None) if row is not None else None
+    snap_code = snapshot_benchmark_code(getattr(rec, "params_snapshot", None))
+    from_snapshot = snap_code is not None
+    if from_snapshot:
+        used_code = snap_code
+    elif stored_code:
+        used_code = stored_code
+    else:
+        used_code = live_code
+    return {
+        "from_snapshot": from_snapshot,
+        "mismatch": used_code != live_code,
+        "benchmark_code": used_code,
+        "benchmark_name": _crisis_benchmark_name(used_code),
+        "live_benchmark_code": live_code,
+        "live_benchmark_name": _crisis_benchmark_name(live_code),
+        "stored_benchmark_code": stored_code,
+        "stored_benchmark_name": stored_name,
+    }
+
+
+def _crisis_nav_from_snapshots(snapshots: List[dict]) -> pd.Series:
+    points = {}
+    for snap in snapshots:
+        d = snap.get("snap_date")
+        v = snap.get("total_value")
+        if d is None or v is None:
             continue
-        # ts 可能是 Timestamp/datetime/date，统一取 .date()
-        d = ts.date() if hasattr(ts, "date") else ts
         if isinstance(d, datetime):
             d = d.date()
-        result[d] = _to_decimal(val)
-    return result
+        points[d] = float(v)
+    if not points:
+        return pd.Series(dtype=float)
+    return pd.Series(points, dtype=float).sort_index()
+
+
+def _to_close_series(points: Dict[date, Decimal]) -> pd.Series:
+    return pd.Series(
+        {d: float(v) for d, v in points.items()}, dtype=float
+    ).sort_index()
+
+
+def _upsert_crisis_alpha(
+    db: Session,
+    record_id: int,
+    benchmark_code: str,
+    benchmark_name: str,
+    status: str,
+    error: Optional[str] = None,
+    skipped: Optional[List[str]] = None,
+    payload: Optional[dict] = None,
+) -> BacktestCrisisAlpha:
+    row = (
+        db.query(BacktestCrisisAlpha)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestCrisisAlpha(backtest_record_id=record_id)
+        db.add(row)
+    row.benchmark_code = benchmark_code
+    row.benchmark_name = benchmark_name
+    row.status = status
+    row.error = error
+    row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False)
+    row.payload_json = (
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
+        if payload is not None
+        else None
+    )
+    row.computed_at = datetime.now()
+    db.commit()
+    return row
+
+
+def _merge_crisis_skipped(base: List[str], extra: List[str]) -> List[str]:
+    out = list(base)
+    for name in extra:
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def compute_and_store_crisis_alpha(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> BacktestCrisisAlpha:
+    benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
+    benchmark_name = _crisis_benchmark_name(benchmark_code)
+    codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
+    closes = build_index_close_series(codes, start, end)
+    skipped = [
+        spec["name"] for spec in CRISIS_BENCHMARKS if spec["code"] not in closes
+    ]
+    main_closes = closes.get(benchmark_code) or {}
+    payload_skipped: List[str] = []
+    if not main_closes:
+        return _upsert_crisis_alpha(
+            db, record_id, benchmark_code, benchmark_name,
+            status="failed",
+            error="主基准指数无数据（TQ 取数失败或代码不被支持）",
+            skipped=_merge_crisis_skipped(skipped, payload_skipped),
+        )
+    benchmark_closes = {}
+    for spec in CRISIS_BENCHMARKS:
+        got = closes.get(spec["code"])
+        if got:
+            benchmark_closes[spec["code"]] = _to_close_series(got)
+    try:
+        payload, payload_skipped = build_crisis_alpha_payload(
+            _crisis_nav_from_snapshots(snapshots),
+            benchmark_code,
+            benchmark_name,
+            _to_close_series(main_closes),
+            benchmark_closes,
+            getattr(ps, "name", "组合"),
+        )
+    except ValueError as exc:
+        return _upsert_crisis_alpha(
+            db, record_id, benchmark_code, benchmark_name,
+            status="insufficient", error=str(exc),
+            skipped=_merge_crisis_skipped(skipped, payload_skipped),
+        )
+    return _upsert_crisis_alpha(
+        db, record_id, benchmark_code, benchmark_name,
+        status="completed", payload=payload,
+        skipped=_merge_crisis_skipped(skipped, payload_skipped),
+    )
+
+
+def safe_compute_crisis_alpha(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> Optional[BacktestCrisisAlpha]:
+    try:
+        return compute_and_store_crisis_alpha(
+            db, record_id, ps, snapshots, start, end,
+            benchmark_code=benchmark_code,
+        )
+    except Exception as exc:
+        db.rollback()
+        code = benchmark_code or _crisis_benchmark_code(ps)
+        try:
+            return _upsert_crisis_alpha(
+                db, record_id, code, _crisis_benchmark_name(code),
+                status="failed", error=str(exc),
+            )
+        except Exception:
+            db.rollback()
+            return None
+
+
+def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+    existing = (
+        db.query(BacktestCrisisAlpha)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    resolution = resolve_crisis_benchmark(rec, existing, ps)
+    row = safe_compute_crisis_alpha(
+        db, record_id, ps,
+        [{"snap_date": s.snap_date, "total_value": s.total_value} for s in snaps],
+        rec.start_date, rec.end_date,
+        benchmark_code=resolution["benchmark_code"],
+    )
+    if row is None:
+        return {"status": "failed", "error": "危机Alpha 结果落库失败"}
+    return {
+        "status": row.status,
+        "error": row.error,
+        "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "benchmark_resolution": resolution,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 市场状态×绩效分析（FR-11）：regime 分段 + RegimeAlphaAnalyzer，沿用危机模式
+# ---------------------------------------------------------------------------
+def _upsert_market_regime(
+    db: Session,
+    record_id: int,
+    benchmark_code: str,
+    benchmark_name: str,
+    status: str,
+    error: Optional[str] = None,
+    skipped: Optional[List[str]] = None,
+    payload: Optional[dict] = None,
+) -> BacktestMarketRegimeAnalysis:
+    row = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestMarketRegimeAnalysis(backtest_record_id=record_id)
+        db.add(row)
+    row.benchmark_code = benchmark_code
+    row.benchmark_name = benchmark_name
+    row.status = status
+    row.error = error
+    row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False)
+    row.payload_json = (
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
+        if payload is not None
+        else None
+    )
+    row.computed_at = datetime.now()
+    db.commit()
+    return row
+
+
+# 与危机一致的共同交易日下限（不足标 insufficient，不落 payload）
+_MARKET_REGIME_MIN_DAYS = 30
+_INDUSTRY_FETCH_BATCH = 40
+
+
+def _build_industry_attribution(
+    snapshots: List[dict], start: date, end: date
+) -> dict:
+    """行业归因块（TQ I/O 层）。任何异常不影响市场态主链路。
+
+    老记录（快照无 positions_json）→ needs_rerun；
+    TQ 行业数据整体不可得 → failed 块；部分不可得则按可得集合计算。
+    """
+    if not any(s.get("positions") is not None for s in snapshots):
+        return needs_rerun_block()
+    try:
+        tq_data = TQData()
+        industries = tq_data.get_industry_list()
+        names = {ind["code"]: ind["name"] for ind in industries}
+        held_codes = set()
+        for snap in snapshots:
+            for pos in snap.get("positions") or []:
+                code = pos.get("stock_code")
+                if code:
+                    held_codes.add(code)
+        stock_industry: Dict[str, Optional[dict]] = {}
+        for code in held_codes:
+            try:
+                stock_industry[code] = tq_data.get_stock_industry(code)
+            except Exception:
+                stock_industry[code] = None
+        # 命中率排名需要全量行业指数；分批取数
+        all_codes = [ind["code"] for ind in industries]
+        raw_closes = (build_index_close_series(
+            all_codes, start, end, batch_size=_INDUSTRY_FETCH_BATCH)
+            if all_codes else {})
+        industry_closes = {code: _to_close_series(pts)
+                           for code, pts in raw_closes.items()}
+        return compute_industry_attribution(
+            snapshots, stock_industry, names, industry_closes)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "taxonomy": INDUSTRY_TAXONOMY,
+            "error": f"行业归因取数失败：{exc}",
+        }
+
+
+def compute_and_store_market_regime(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    trades: List[BacktestTrade],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> BacktestMarketRegimeAnalysis:
+    benchmark_code = benchmark_code or _crisis_benchmark_code(ps)
+    benchmark_name = _crisis_benchmark_name(benchmark_code)
+    # 主基准 + 6 宽基 + 巨潮四象限（风格轮动/分化度/隐含暴露复用 crisis 取数）
+    codes = ([benchmark_code]
+             + [spec["code"] for spec in CRISIS_BENCHMARKS]
+             + [spec["code"] for spec in QUADRANT_STYLE_INDICES])
+    closes = build_index_close_series(codes, start, end)
+    main_closes = closes.get(benchmark_code) or {}
+    if not main_closes:
+        return _upsert_market_regime(
+            db, record_id, benchmark_code, benchmark_name,
+            status="failed",
+            error="主基准指数无数据（TQ 取数失败或代码不被支持）",
+        )
+    benchmark = _to_close_series(main_closes)
+    benchmark_closes: Dict[str, pd.Series] = {}
+    for spec in CRISIS_BENCHMARKS:
+        got = closes.get(spec["code"])
+        if got:
+            benchmark_closes[spec["code"]] = _to_close_series(got)
+    quadrant_closes: Dict[str, pd.Series] = {}
+    for spec in QUADRANT_STYLE_INDICES:
+        got = closes.get(spec["code"])
+        if got:
+            quadrant_closes[spec["code"]] = _to_close_series(got)
+    nav = _crisis_nav_from_snapshots(snapshots)
+    common = nav.index.intersection(benchmark.index)
+    if len(common) < _MARKET_REGIME_MIN_DAYS:
+        return _upsert_market_regime(
+            db, record_id, benchmark_code, benchmark_name,
+            status="insufficient",
+            error=(f"策略与基准共同交易日不足{_MARKET_REGIME_MIN_DAYS}天"
+                   f"（{len(common)}），无法分析"),
+        )
+    regime = segment_regime(benchmark)
+    analyzer = RegimeAlphaAnalyzer(
+        nav, benchmark,
+        trades=trades, regime_weeks=regime,
+        strategy_name=getattr(ps, "name", "组合"),
+        benchmark_name=benchmark_name,
+        benchmark_closes=benchmark_closes,
+        quadrant_closes=quadrant_closes,
+    )
+    payload = analyzer.analyze()
+    payload["industry_attribution"] = _build_industry_attribution(
+        snapshots, start, end)
+    # FR-20 稳健性：纯快照+基准计算，不触发回测重跑；失败隔离不影响主链路
+    names = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+    names[benchmark_code] = benchmark_name
+    try:
+        payload["robustness"] = compute_robustness(
+            nav, benchmark,
+            benchmark_closes=benchmark_closes,
+            benchmark_names=names, primary_code=benchmark_code)
+    except Exception as exc:
+        payload["robustness"] = {
+            "status": "failed", "error": f"稳健性分析计算失败：{exc}"}
+    return _upsert_market_regime(
+        db, record_id, benchmark_code, benchmark_name,
+        status="completed", payload=payload,
+    )
+
+
+def safe_compute_market_regime(
+    db: Session,
+    record_id: int,
+    ps: PortfolioStrategy,
+    snapshots: List[dict],
+    trades: List[BacktestTrade],
+    start: date,
+    end: date,
+    benchmark_code: Optional[str] = None,
+) -> Optional[BacktestMarketRegimeAnalysis]:
+    try:
+        return compute_and_store_market_regime(
+            db, record_id, ps, snapshots, trades, start, end,
+            benchmark_code=benchmark_code,
+        )
+    except Exception as exc:
+        db.rollback()
+        code = benchmark_code or _crisis_benchmark_code(ps)
+        try:
+            return _upsert_market_regime(
+                db, record_id, code, _crisis_benchmark_name(code),
+                status="failed", error=str(exc),
+            )
+        except Exception:
+            db.rollback()
+            return None
+
+
+def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
+    """离线重算市场状态分析（不重跑回测）：组合快照净值 + 主基准日线 +
+    成交流水 → regime 分段 + RegimeAlphaAnalyzer → upsert。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+    existing = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    resolution = resolve_crisis_benchmark(rec, existing, ps)
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestTrade.bar_time, BacktestTrade.id)
+        .all()
+    )
+    row = safe_compute_market_regime(
+        db, record_id, ps,
+        [{"snap_date": s.snap_date, "total_value": s.total_value,
+          "positions": (json.loads(s.positions_json)
+                        if s.positions_json is not None else None)}
+         for s in snaps],
+        trades,
+        rec.start_date, rec.end_date,
+        benchmark_code=resolution["benchmark_code"],
+    )
+    if row is None:
+        return {"status": "failed", "error": "市场状态分析结果落库失败"}
+    return {
+        "status": row.status,
+        "error": row.error,
+        "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "benchmark_resolution": resolution,
+    }
+
+
+# 评估指标落库字段（运行落库与离线重算共用，避免两处漂移）
+_EVALUATION_FIELDS = (
+    "total_return", "annual_return", "max_drawdown", "volatility",
+    "sharpe_ratio", "sortino_ratio", "calmar_ratio", "win_rate",
+    "profit_factor", "total_trades", "benchmark_return", "avg_holding_days",
+    "var_95", "cvar_95", "avg_recovery_days", "max_recovery_days",
+    "ulcer_index", "return_stability",
+    "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
+    "information_ratio", "up_capture_ratio", "down_capture_ratio",
+    "excess_max_drawdown",
+    "annual_turnover", "total_cost_ratio", "avg_position_utilization",
+    "empty_days_ratio", "max_single_weight", "hhi",
+    "max_consecutive_loss_days", "max_consecutive_profit_days",
+    "worst_daily_return", "worst_weekly_return",
+    "return_skewness", "return_kurtosis",
+)
+
+
+def recompute_evaluation(db: Session, record_id: int) -> Union[None, str, dict]:
+    """从 DB 快照 + 成交离线重算评估并 upsert（老记录补新增指标用）。
+
+    不重跑回测、不触碰行情；相对指标依赖快照 benchmark_value（老记录已落该列）。
+    组合级：直接重算。策略级：策略快照未落 benchmark_value（历史），按日注入组合
+    快照的基准值后重算——相对/磨损/路径指标可补；持仓结构仍依赖 positions_json，
+    老快照无此列时保持 None（前端提示「仅影响老记录」）。
+    记录不存在返回 None（路由 404）；running 返回字符串 "running"（路由 409）；
+    快照不足返回 failed 状态。
+    """
+    from types import SimpleNamespace
+    from collections import defaultdict
+
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    if rec.status == "running":
+        return "running"
+
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if len(snaps) < 2:
+        return {"status": "failed", "error": "组合日快照不足 2 条，无法重算评估"}
+
+    snap_dicts = [
+        {
+            "snap_date": s.snap_date,
+            "total_value": s.total_value,
+            "cash": s.cash,
+            "market_value": s.market_value,
+            "benchmark_value": s.benchmark_value,
+            # 仅新回测有 positions_json；"[]" 也是有效负载（空仓日计入 HHI）
+            "positions": json.loads(s.positions_json) if s.positions_json else None,
+        }
+        for s in snaps
+    ]
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .order_by(BacktestTrade.bar_time)
+        .all()
+    )
+    trade_objs = [
+        SimpleNamespace(
+            strategy_id=t.strategy_id,
+            stock_code=t.stock_code,
+            # Evaluator FIFO 只读 trade_type.value
+            trade_type=SimpleNamespace(value=t.trade_type),
+            price=t.price,
+            quantity=t.quantity,
+            amount=t.amount,
+            commission=t.commission,
+            stamp_duty=t.stamp_duty,
+            trade_time=t.bar_time,
+        )
+        for t in trades
+    ]
+    ev = Evaluator().evaluate(snap_dicts, trades=trade_objs)
+    if not ev:
+        return {"status": "failed", "error": "快照序列无法产出评估结果"}
+
+    row = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestEvaluation(
+            backtest_record_id=record_id,
+            target_type="portfolio",
+            target_id=rec.portfolio_strategy_id,
+        )
+        db.add(row)
+    for f in _EVALUATION_FIELDS:
+        setattr(row, f, ev.get(f))
+    db.commit()
+
+    # ---- 策略层离线重算（注入组合基准值后补相对/磨损/路径指标） ----
+    strat_snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="strategy")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    # 按 (date, strategy_id) 索引，合并时注入 portfolio 基准值
+    benchmark_by_date = {s.snap_date: s.benchmark_value for s in snaps}
+    strategy_snap_groups: dict = defaultdict(list)
+    for s in strat_snaps:
+        strategy_snap_groups[s.target_id].append(s)
+    for sid, srows in strategy_snap_groups.items():
+        s_dicts = [
+            {
+                "snap_date": s.snap_date,
+                "total_value": s.total_value,
+                "cash": s.cash,
+                "market_value": s.market_value,
+                "benchmark_value": benchmark_by_date.get(s.snap_date),
+                "positions": json.loads(s.positions_json) if s.positions_json else None,
+            }
+            for s in srows
+        ]
+        s_trades = [t for t in trade_objs if t.strategy_id == sid]
+        sev = Evaluator().evaluate(s_dicts, trades=s_trades)
+        if not sev:
+            continue
+        ser = (
+            db.query(BacktestEvaluation)
+            .filter_by(backtest_record_id=record_id, target_type="strategy", target_id=sid)
+            .one_or_none()
+        )
+        if ser is None:
+            ser = BacktestEvaluation(
+                backtest_record_id=record_id,
+                target_type="strategy",
+                target_id=sid,
+            )
+            db.add(ser)
+        for f in _EVALUATION_FIELDS:
+            setattr(ser, f, sev.get(f))
+    db.commit()
+
+    return {"status": "ok", "evaluations": _serialize_evaluation(row)}
 
 
 
@@ -381,6 +1054,11 @@ def _convert_formula_output(
                 continue
             if not isinstance(val_list, list):
                 continue
+            if bar_times is not None and len(val_list) != len(bar_times):
+                logger.warning(
+                    "公式 %s 输出长度 %d != bar 数 %d（code=%s），按索引截断对齐",
+                    var_name, len(val_list), len(bar_times), code,
+                )
             for i, entry in enumerate(val_list):
                 if not isinstance(entry, dict):
                     continue
@@ -444,6 +1122,20 @@ def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
     return result
 
 
+def _bar_times_by_code_period(klines: dict) -> Dict[str, Dict[str, List[datetime]]]:
+    """{code: {period: [升序去重 times]}}，供按策略周期精确索引对齐（#3）。"""
+    result: Dict[str, Dict[str, List[datetime]]] = {}
+    for code, periods in klines.items():
+        per: Dict[str, List[datetime]] = {}
+        for period, df in periods.items():
+            if "datetime" not in df.columns or df.height == 0:
+                continue
+            per[period] = sorted(df["datetime"].to_list())
+        if per:
+            result[code] = per
+    return result
+
+
 def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
@@ -465,8 +1157,9 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
         return {}
     strategies = _portfolio_strategies(ps, db)
     tq_formula = TQFormula()
-    # 分钟级时间轴（所有策略共用同一 klines 时间轴，含预热段——与喂入公式引擎的数据同源）
-    bar_times_by_code = _bar_times_by_code(klines)
+    # 分周期时间轴：分钟级策略只按自身周期对齐（含预热段——与喂入公式引擎的数据同源），
+    # 避免多周期组合时把其他周期 bar（如 1d 午夜 bar）混入导致索引串位（#3）
+    bar_times_by_code_period = _bar_times_by_code_period(klines)
     cache: dict = {}
     for strat in strategies:
         formula = db.get(Formula, strat.formula_id)
@@ -480,8 +1173,13 @@ def build_signal_cache(ps, klines: dict, db: Session = None, start: date = None)
             count=-1, dividend_type=1,
             start_time=start_str, end_time=end_str,
         )
-        # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
-        bt = bar_times_by_code if period in _MINUTE_PERIODS else None
+        # 分钟级传该策略周期的时间轴按索引对齐；日线不传走 Date 匹配
+        if period in _MINUTE_PERIODS:
+            bt = {code: per[period]
+                  for code, per in bar_times_by_code_period.items()
+                  if period in per}
+        else:
+            bt = None
         entries = _convert_formula_output(raw, strat.id, stocks, bar_times_by_code=bt)
         cache.update(entries)
     if start is not None:
@@ -565,30 +1263,18 @@ def _persist_result(
             daily_return=snap.get("daily_return"),
             cumulative_return=snap.get("cumulative_return"),
             benchmark_value=snap.get("benchmark_value"),
+            # 新回测才有 positions 键；空仓写 "[]"（有效负载），老引擎结果为 None
+            positions_json=(
+                json.dumps(snap["positions"], default=str)
+                if snap.get("positions") is not None else None
+            ),
         ))
     ev = result.get("evaluations") or {}
     db.add(BacktestEvaluation(
         backtest_record_id=record_id,
         target_type="portfolio",
         target_id=ps_id,
-        total_return=ev.get("total_return"),
-        annual_return=ev.get("annual_return"),
-        max_drawdown=ev.get("max_drawdown"),
-        volatility=ev.get("volatility"),
-        sharpe_ratio=ev.get("sharpe_ratio"),
-        sortino_ratio=ev.get("sortino_ratio"),
-        calmar_ratio=ev.get("calmar_ratio"),
-        win_rate=ev.get("win_rate"),
-        profit_factor=ev.get("profit_factor"),
-        total_trades=ev.get("total_trades"),
-        benchmark_return=ev.get("benchmark_return"),
-        avg_holding_days=ev.get("avg_holding_days"),
-        var_95=ev.get("var_95"),
-        cvar_95=ev.get("cvar_95"),
-        avg_recovery_days=ev.get("avg_recovery_days"),
-        max_recovery_days=ev.get("max_recovery_days"),
-        ulcer_index=ev.get("ulcer_index"),
-        return_stability=ev.get("return_stability"),
+        **{f: ev.get(f) for f in _EVALUATION_FIELDS},
     ))
 
     # ---- 策略层快照 + 评估 ----
@@ -604,30 +1290,19 @@ def _persist_result(
                 total_value=snap["total_value"],
                 cash=snap.get("cash", Decimal("0")),
                 market_value=snap.get("market_value", Decimal("0")),
+                # 引擎已注入与组合同日的基准值（FR-1 策略层相对指标数据源）
+                benchmark_value=snap.get("benchmark_value"),
+                positions_json=(
+                    json.dumps(snap["positions"], default=str)
+                    if snap.get("positions") is not None else None
+                ),
             ))
     for sid, sev in strategy_evals.items():
         db.add(BacktestEvaluation(
             backtest_record_id=record_id,
             target_type="strategy",
             target_id=sid,
-            total_return=sev.get("total_return"),
-            annual_return=sev.get("annual_return"),
-            max_drawdown=sev.get("max_drawdown"),
-            volatility=sev.get("volatility"),
-            sharpe_ratio=sev.get("sharpe_ratio"),
-            sortino_ratio=sev.get("sortino_ratio"),
-            calmar_ratio=sev.get("calmar_ratio"),
-            win_rate=sev.get("win_rate"),
-            profit_factor=sev.get("profit_factor"),
-            total_trades=sev.get("total_trades"),
-            benchmark_return=sev.get("benchmark_return"),
-            avg_holding_days=sev.get("avg_holding_days"),
-            var_95=sev.get("var_95"),
-            cvar_95=sev.get("cvar_95"),
-            avg_recovery_days=sev.get("avg_recovery_days"),
-            max_recovery_days=sev.get("max_recovery_days"),
-            ulcer_index=sev.get("ulcer_index"),
-            return_stability=sev.get("return_stability"),
+            **{f: sev.get(f) for f in _EVALUATION_FIELDS},
         ))
 
     # ---- 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条，调参可观测性）----
@@ -766,7 +1441,134 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "max_recovery_days": e.max_recovery_days,
         "ulcer_index": _f(e.ulcer_index),
         "return_stability": _f(e.return_stability),
+        "beta": _f(e.beta),
+        "jensen_alpha": _f(e.jensen_alpha),
+        "excess_annual_return": _f(e.excess_annual_return),
+        "tracking_error": _f(e.tracking_error),
+        "information_ratio": _f(e.information_ratio),
+        "up_capture_ratio": _f(e.up_capture_ratio),
+        "down_capture_ratio": _f(e.down_capture_ratio),
+        "excess_max_drawdown": _f(e.excess_max_drawdown),
+        "annual_turnover": _f(e.annual_turnover),
+        "total_cost_ratio": _f(e.total_cost_ratio),
+        "avg_position_utilization": _f(e.avg_position_utilization),
+        "empty_days_ratio": _f(e.empty_days_ratio),
+        "max_single_weight": _f(e.max_single_weight),
+        "hhi": _f(e.hhi),
+        "max_consecutive_loss_days": e.max_consecutive_loss_days,
+        "max_consecutive_profit_days": e.max_consecutive_profit_days,
+        "worst_daily_return": _f(e.worst_daily_return),
+        "worst_weekly_return": _f(e.worst_weekly_return),
+        "return_skewness": _f(e.return_skewness),
+        "return_kurtosis": _f(e.return_kurtosis),
     }
+
+
+def build_return_buckets(snaps: list) -> dict:
+    """从组合级每日快照构建月度矩阵 + 年度统计，供热力图/箱线图/年柱使用。
+
+    snaps: BacktestDailySnapshot ORM 列表（按 snap_date 升序）。
+    返回: {
+        "monthly_matrix": {"years": [...], "months": [...], "matrix": [[...]], "text": [[...]]},
+        "yearly": [{"year": int, "daily_returns": [...], "monthly_returns": [...], "annual_return": float}, ...],
+    }
+    每日净值取同日最后一条（日内多 bar 回测取日收盘），与 Evaluator._daily_returns 口径一致。
+    """
+    from collections import OrderedDict
+
+    # --- 日净值序列（同日末条去重）---
+    daily_map: OrderedDict = OrderedDict()
+    for s in snaps:
+        d = s.snap_date
+        v = float(s.total_value) if s.total_value is not None else 0.0
+        daily_map[d] = v  # 同日覆盖，保留最后一条
+    dates = list(daily_map.keys())
+    values = list(daily_map.values())
+    if len(dates) < 2:
+        return {"monthly_matrix": {"years": [], "months": [], "matrix": [], "text": []}, "yearly": []}
+
+    # --- 日收益序列 ---
+    daily_returns = []
+    for i in range(1, len(values)):
+        prev = values[i - 1]
+        daily_returns.append((values[i] - prev) / prev if prev != 0 else 0.0)
+    daily_dates = dates[1:]
+
+    # --- 月度收益：按月末净值 pct_change ---
+    # 按 (year, month) 分组，取组内最后一个日净值
+    monthly_vals: OrderedDict = OrderedDict()  # (year, month) → 日净值
+    for d, v in daily_map.items():
+        key = (d.year, d.month)
+        monthly_vals[key] = v  # 同月覆盖，保留月末最后一条
+    month_keys = list(monthly_vals.keys())
+    month_vals = list(monthly_vals.values())
+    monthly_returns = {}
+    for i in range(1, len(month_keys)):
+        key = month_keys[i]
+        prev_val = month_vals[i - 1]
+        cur_val = month_vals[i]
+        monthly_returns[key] = (cur_val - prev_val) / prev_val if prev_val != 0 else 0.0
+
+    # 构建年/月矩阵
+    all_years = sorted(set(k[0] for k in month_keys))
+    all_months = list(range(1, 13))
+    matrix = []  # matrix[i][j] = 百分比数值或 None
+    text = []
+    for y in all_years:
+        row_z = []
+        row_t = []
+        for m in all_months:
+            val = monthly_returns.get((y, m))
+            if val is not None:
+                row_z.append(round(val * 100, 2))
+                row_t.append(f"{val * 100:+.2f}%")
+            else:
+                row_z.append(None)
+                row_t.append("")
+        matrix.append(row_z)
+        text.append(row_t)
+
+    monthly_matrix = {
+        "years": all_years,
+        "months": [f"{m}月" for m in all_months],
+        "matrix": matrix,
+        "text": text,
+    }
+
+    # --- 年度统计：日收益按年分组（覆盖净值存在的每一年，含无收益的起点/残年）---
+    yearly_map: OrderedDict = OrderedDict()
+    for d in dates:
+        yearly_map.setdefault(d.year, [])
+    for d, dr in zip(daily_dates, daily_returns):
+        yearly_map[d.year].append(dr)
+
+    yearly = []
+    for year in sorted(yearly_map.keys()):
+        rets = yearly_map[year]
+        # 月收益按月分组（从 daily_returns + dates）
+        monthly_by_year: dict = {}
+        for d, dr in zip(daily_dates, daily_returns):
+            if d.year == year:
+                monthly_by_year.setdefault(d.month, []).append(dr)
+        monthly_rets = []
+        for m in sorted(monthly_by_year.keys()):
+            mr = 1.0
+            for r in monthly_by_year[m]:
+                mr *= (1 + r)
+            monthly_rets.append(mr - 1.0)
+        # 年度累计收益（复利）
+        annual = 1.0
+        for r in rets:
+            annual *= (1 + r)
+        annual_return = annual - 1.0 if rets else None
+        yearly.append({
+            "year": year,
+            "daily_returns": rets,
+            "monthly_returns": monthly_rets,
+            "annual_return": annual_return,
+        })
+
+    return {"monthly_matrix": monthly_matrix, "yearly": yearly}
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1652,45 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         _serialize_decision_summary(s) for s in summarize_decisions(decision_rows)
     ]
 
+    # ---- 收益分布桶（月度热力图 / 年度箱线图）----
+    returns_buckets = build_return_buckets(snaps)
+
+    ca = (
+        db.query(BacktestCrisisAlpha)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    crisis_alpha = None
+    if ca is not None:
+        crisis_alpha = {
+            "status": ca.status,
+            "error": ca.error,
+            "skipped_benchmarks": (
+                json.loads(ca.skipped_benchmarks_json)
+                if ca.skipped_benchmarks_json else []
+            ),
+            "computed_at": ca.computed_at.isoformat() if ca.computed_at else None,
+            "benchmark_code": ca.benchmark_code,
+            "benchmark_name": ca.benchmark_name,
+            "data": json.loads(ca.payload_json) if ca.payload_json else None,
+        }
+
+    mr = (
+        db.query(BacktestMarketRegimeAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    market_regime = None
+    if mr is not None:
+        market_regime = {
+            "status": mr.status,
+            "error": mr.error,
+            "computed_at": mr.computed_at.isoformat() if mr.computed_at else None,
+            "benchmark_code": mr.benchmark_code,
+            "benchmark_name": mr.benchmark_name,
+            "data": json.loads(mr.payload_json) if mr.payload_json else None,
+        }
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -859,6 +1700,9 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         "strategy_snapshots": strategy_snapshots,
         "decision_summary": decision_summary,
         "decisions": [_serialize_decision(d) for d in decision_rows],
+        "returns_buckets": returns_buckets,
+        "crisis_alpha": crisis_alpha,
+        "market_regime": market_regime,
     }
 
 
@@ -908,7 +1752,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
     前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
     内部：写 record(running) → assemble → build_klines → build_signal_cache →
-          build_open_prices → build_benchmark_data → 空行情保护 → engine.run →
+          build_benchmark_data → 空行情保护 → engine.run →
           _persist_result → 标 completed → 返回 {record_id, trades_count,
           snapshots_count, evaluations}。
     异常：标 record(failed) + re-raise（路由层全局异常处理器兜底转 {code:500}，
@@ -930,6 +1774,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         end_date=req.end_date,
         status="running",
         progress=0,
+        params_snapshot=build_params_snapshot(ps),
     )
     db.add(rec)
     db.commit()
@@ -950,7 +1795,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
-        open_prices = build_open_prices(ps, klines)
         t4 = datetime.now()
         benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
         t5 = datetime.now()
@@ -959,7 +1803,6 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         _log_timing(f"[回测#{record_id}] 组装组合: {(t1-t0).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ K线拉取: {(t2-t1).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ 公式计算: {(t3-t2).total_seconds():.1f}s")
-        _log_timing(f"[回测#{record_id}] 提取开盘价: {(t4-t3).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] TQ 基准指数: {(t5-t4).total_seconds():.1f}s")
         _log_timing(f"[回测#{record_id}] 数据准备合计: {(t5-t0).total_seconds():.1f}s")
 
@@ -977,12 +1820,18 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
         t6 = datetime.now()
         engine = BacktestEngine()
+
+        def _on_progress(pct):
+            # 引擎已节流（约 ≤100 次），此处逐次提交，运行中 progress 真实递增（#10）
+            rec.progress = pct
+            db.commit()
+
         result = engine.run(
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
-            open_prices=open_prices,
             benchmark_data=benchmark_data,
+            on_progress=_on_progress,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
@@ -1007,9 +1856,25 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
             db.commit()
         raise
 
+    safe_compute_crisis_alpha(
+        db, rec.id, ps, result["snapshots"], req.start_date, req.end_date
+    )
+
     return {
         "record_id": record_id,
         "trades_count": len(result["trades"]),
         "snapshots_count": len(result["snapshots"]),
         "evaluations": result.get("evaluations") or {},
     }
+
+
+def recover_stale_running(db: Session, max_age_minutes: int = 30) -> int:
+    """启动时把超时仍 running 的记录置 failed（进程崩溃/重启恢复，#5）。"""
+    cutoff = datetime.now() - timedelta(minutes=max_age_minutes)
+    rows = db.query(BacktestRecord).filter(
+        BacktestRecord.status == "running", BacktestRecord.created_at < cutoff
+    ).all()
+    for r in rows:
+        r.status = "failed"
+    db.commit()
+    return len(rows)

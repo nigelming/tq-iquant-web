@@ -168,7 +168,7 @@ onMounted(load)
     <button @click="openCreate" class="btn btn-primary">+ 新建公式</button>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
   </div>
 
@@ -178,10 +178,10 @@ onMounted(load)
       <thead><tr><th>ID</th><th>名称</th><th>公式内容</th><th>count</th><th>信号</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="f in formulas" :key="f.id">
-          <td style="color:#888">#{{ f.id }}</td>
+          <td style="color:var(--ink-soft)">#{{ f.id }}</td>
           <td>{{ f.name }}</td>
-          <td style="color:#888;font-size:13px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.content }}</td>
-          <td style="color:#888">{{ f.formula_count ?? 200 }}</td>
+          <td style="color:var(--ink-soft);font-size:13px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.content }}</td>
+          <td style="color:var(--ink-soft)">{{ f.formula_count ?? 200 }}</td>
           <td><span class="badge badge-blue">{{ f.signals.length }} 个信号</span></td>
           <td>
             <button @click="openEdit(f)" class="btn btn-sm btn-primary">编辑</button>
@@ -196,7 +196,7 @@ onMounted(load)
   <div v-if="showTdx" class="modal-overlay" @click.self="showTdx = false">
     <div class="modal-content">
       <h3>从通达信导入公式</h3>
-      <p style="color:#888;font-size:13px">列出通达信自编公式（isSys=0）；导入后请在编辑弹窗中配置信号。</p>
+      <p style="color:var(--ink-soft);font-size:13px">列出通达信自编公式（isSys=0）；导入后请在编辑弹窗中配置信号。</p>
       <input v-model="tdxQuery" class="tdx-search" placeholder="搜索公式名 / 中文名" style="margin-bottom:8px;width:100%" />
       <div v-if="tdxLoading" style="padding:12px">加载中…</div>
       <template v-else>
@@ -205,7 +205,7 @@ onMounted(load)
           <tbody>
             <tr v-for="it in pagedTdx" :key="it.acCode">
               <td>{{ it.acCode }}</td>
-              <td style="color:#888">{{ it.acName || '—' }}</td>
+              <td style="color:var(--ink-soft)">{{ it.acName || '—' }}</td>
               <td>
                 <span v-if="it.imported" class="badge badge-blue">已导入</span>
                 <button v-else @click="doImport(it)" class="btn btn-sm btn-primary">导入</button>
@@ -216,7 +216,7 @@ onMounted(load)
         <div v-if="filteredTdx.length === 0" class="empty-state"><p>无匹配公式</p></div>
         <div v-if="tdxTotalPages > 1" class="tdx-pagination" style="display:flex;align-items:center;gap:12px;margin-top:8px">
           <button class="btn btn-sm" :disabled="tdxPage <= 1" @click="tdxPage--">上一页</button>
-          <span style="color:#888;font-size:13px">第 {{ tdxPage }} / {{ tdxTotalPages }} 页（共 {{ filteredTdx.length }} 条）</span>
+          <span style="color:var(--ink-soft);font-size:13px">第 {{ tdxPage }} / {{ tdxTotalPages }} 页（共 {{ filteredTdx.length }} 条）</span>
           <button class="btn btn-sm" :disabled="tdxPage >= tdxTotalPages" @click="tdxPage++">下一页</button>
         </div>
       </template>
@@ -247,8 +247,10 @@ onMounted(load)
           <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
         </select>
         <select v-model="sig.trigger_value">
+          <option :value="2">2</option>
           <option :value="1">1</option>
           <option :value="-1">-1</option>
+          <option :value="-2">-2</option>
         </select>
         <button @click="removeSignal(idx)" class="btn btn-sm btn-danger">×</button>
       </div>

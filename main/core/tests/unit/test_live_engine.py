@@ -5472,3 +5472,30 @@ def test_handle_bar_inflight_dup_open_skipped_across_bars():
     db = factory()
     assert db.query(LiveOrder).count() == 1  # 未重复下单
     db.close()
+
+
+def test_on_daily_update_uses_market_value_not_cost():
+    """#8：日终 daily_loss 用最近已知收盘市值（含浮盈），非持仓成本。"""
+    from decimal import Decimal
+    from datetime import date, datetime
+    from core.engine.position import Position
+
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    ctx = port.strategies[0]
+    code = "000002.SZ"
+    pos = Position(code)
+    pos.buy(100, Decimal("10"), datetime(2026, 8, 20))   # 成本 10 → 成本市值 1000
+    ctx.positions[code] = pos
+    port._price_snapshot[code] = Decimal("12")           # 现价 12 → 市值 1200
+
+    captured = {}
+    orig = port.risk_manager.update_daily
+    def spy(total, today, init):
+        captured["total"] = total
+        return orig(total, today, init)
+    port.risk_manager.update_daily = spy
+
+    engine._breaker.on_daily_update(port, date(2026, 8, 21))
+
+    assert captured["total"] == port.account.cash + Decimal("1200")

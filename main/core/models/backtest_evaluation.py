@@ -29,6 +29,29 @@ class BacktestEvaluation(Base):
     max_recovery_days = Column(Integer, nullable=True)
     ulcer_index = Column(Numeric(10, 4), nullable=True)
     return_stability = Column(Numeric(10, 4), nullable=True)
+    # ---- 基准相对指标（2026-09 regime-alpha 套件，仅组合级评估可能出数）----
+    beta = Column(Numeric(10, 4), nullable=True)
+    jensen_alpha = Column(Numeric(10, 4), nullable=True)
+    excess_annual_return = Column(Numeric(10, 4), nullable=True)
+    tracking_error = Column(Numeric(10, 4), nullable=True)
+    information_ratio = Column(Numeric(10, 4), nullable=True)
+    up_capture_ratio = Column(Numeric(10, 4), nullable=True)
+    down_capture_ratio = Column(Numeric(10, 4), nullable=True)
+    excess_max_drawdown = Column(Numeric(10, 4), nullable=True)
+    # ---- 交易磨损 / 仓位 / 结构（FR-2）----
+    annual_turnover = Column(Numeric(10, 4), nullable=True)
+    total_cost_ratio = Column(Numeric(10, 6), nullable=True)
+    avg_position_utilization = Column(Numeric(10, 4), nullable=True)
+    empty_days_ratio = Column(Numeric(10, 4), nullable=True)
+    max_single_weight = Column(Numeric(10, 4), nullable=True)
+    hhi = Column(Numeric(10, 4), nullable=True)
+    # ---- 路径 / 分布（FR-3）----
+    max_consecutive_loss_days = Column(Integer, nullable=True)
+    max_consecutive_profit_days = Column(Integer, nullable=True)
+    worst_daily_return = Column(Numeric(10, 4), nullable=True)
+    worst_weekly_return = Column(Numeric(10, 4), nullable=True)
+    return_skewness = Column(Numeric(10, 4), nullable=True)
+    return_kurtosis = Column(Numeric(10, 4), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (
