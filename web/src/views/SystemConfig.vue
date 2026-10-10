@@ -7,7 +7,7 @@ import { getSystemConfigs, updateSystemConfigs, type SystemConfig } from '../api
 // iquant_bridge.simulation/live.base_url(双桥地址：仿真8790/实盘8791，按 session 模式选桥)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
-  tdx_path: '',
+  tdx_path: 'D:\\zd_zyb',
   iquant_path: '',
   max_concurrent_backtest: 1,
   database: { sqlite_path: '' },
@@ -70,7 +70,7 @@ async function save() {
       </p>
       <div class="field">
         <label>通达信目录</label>
-        <input v-model="config.tdx_path" placeholder="D:\new_tdx64" />
+        <input v-model="config.tdx_path" placeholder="D:\zd_zyb" />
       </div>
 
       <h3 style="margin:20px 0 4px">iQuant</h3>
