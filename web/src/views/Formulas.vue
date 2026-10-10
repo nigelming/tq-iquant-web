@@ -247,8 +247,10 @@ onMounted(load)
           <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
         </select>
         <select v-model="sig.trigger_value">
+          <option :value="2">2</option>
           <option :value="1">1</option>
           <option :value="-1">-1</option>
+          <option :value="-2">-2</option>
         </select>
         <button @click="removeSignal(idx)" class="btn btn-sm btn-danger">×</button>
       </div>
