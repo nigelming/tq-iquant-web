@@ -466,15 +466,28 @@ const caDownRows = computed(() => (ca.value?.down_weeks ?? []).map((r) => ({
   color: CRISIS_COLORS[r.分类] || cssVar('--ink'),
 })))
 
-// ===== 模块十二：下跌周明细分页（与交易明细同款）=====
-const caDownPage = ref(1)
-const caDownPageSize = 20
-const caDownTotalPages = computed(() => Math.max(1, Math.ceil(caDownRows.value.length / caDownPageSize)))
-const pagedCaDownRows = computed(() => {
-  const page = Math.min(caDownPage.value, caDownTotalPages.value)
-  const start = (page - 1) * caDownPageSize
-  return caDownRows.value.slice(start, start + caDownPageSize)
-})
+// ===== 模块十二：下跌周明细交互 =====
+const caDownTable = useTable(
+  computed(() => caDownRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '分类' },
+    columns: [
+      { key: '日期', label: '日期', sortable: true },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parseFloat(String(r.基准).replace('%', '')) },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => parseFloat(String(r.策略).replace('%', '')) },
+      { key: '超额', label: '超额', sortable: true, sortValue: (r: any) => parseFloat(String(r.超额).replace('%', '')) },
+      { key: '分类', label: '分类', searchable: true },
+    ],
+    filters: [
+      { kind: 'select', key: '分类', label: '分类', get: (r: any) => r.分类,
+        options: () => Array.from(new Set(caDownRows.value.map((r: any) => r.分类).filter(Boolean)))
+          .map((v: any) => ({ value: v, label: v })) },
+      { kind: 'dateRange', key: '日期', label: '时间', get: (r: any) => String(r.日期).slice(0, 10) },
+      { kind: 'numRange', key: '超额', label: '超额%', get: (r: any) => parseFloat(String(r.超额).replace('%', '')) },
+    ],
+  },
+)
 
 function caBenchmarkWarnText(br: CrisisAlphaBenchmarkResolution): string {
   const used = br.benchmark_name
@@ -915,7 +928,6 @@ async function openDetail(id: number) {
     return
   }
   currentRecord.value = detail.value?.record || null
-  caDownPage.value = 1
   selectedKey.value = null
   caCollapsed.value = true
   mrCollapsed.value = true
@@ -2721,10 +2733,28 @@ watch(theme, () => {
           <div class="empty-state"><p>分析区间内无基准下跌周。</p></div>
         </div>
         <div v-else class="table-container">
+          <TableToolbar
+            :filters="caDownTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '分类' }"
+            :search-text="caDownTable.searchText.value"
+            :filter-state="caDownTable.filterState.value"
+            :displayed-count="caDownTable.displayedCount.value"
+            :total-count="caDownTable.totalCount.value"
+            @update:search-text="(v: string) => (caDownTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (caDownTable.filterState.value = v)"
+            @reset="caDownTable.reset"
+          />
           <table class="ca-down-table">
-            <thead><tr><th>日期</th><th>基准</th><th>策略</th><th>超额</th><th>分类</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in caDownTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && caDownTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="caDownTable.sortKey.value === c.key">{{ caDownTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in pagedCaDownRows" :key="r.日期">
+              <tr v-for="r in caDownTable.pagedRows.value" :key="r.日期">
                 <td>{{ r.日期 }}</td>
                 <td class="text-green">{{ r.基准 }}</td>
                 <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
@@ -2733,11 +2763,13 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
-          <div v-if="caDownRows.length > caDownPageSize" class="pagination">
-            <button :disabled="caDownPage === 1" @click="caDownPage--" class="page-btn">上一页</button>
-            <span class="page-info">第 {{ Math.min(caDownPage, caDownTotalPages) }} / {{ caDownTotalPages }} 页</span>
-            <button :disabled="caDownPage >= caDownTotalPages" @click="caDownPage++" class="page-btn">下一页</button>
-          </div>
+          <div v-if="caDownTable.displayedCount.value === 0" class="empty-state"><p>无匹配下跌周</p></div>
+          <TablePager
+            :page="caDownTable.page.value" :page-size="caDownTable.pageSize.value"
+            :total-pages="caDownTable.totalPages.value"
+            :displayed-count="caDownTable.displayedCount.value" :total-count="caDownTable.totalCount.value"
+            @update:page="caDownTable.setPage" @update:page-size="caDownTable.setPageSize"
+          />
         </div>
       </template>
       </template>

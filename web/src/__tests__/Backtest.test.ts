@@ -350,6 +350,29 @@ describe('Backtest.vue — 详情视图', () => {
     expect(rows[0].text()).toContain('600000.SH')
   })
 
+  it('下跌周明细支持按分类筛选', async () => {
+    const ca: any = JSON.parse(JSON.stringify(crisisAlphaCompleted))
+    ca.data.quadrant.n_down = 10
+    ca.data.down_weeks = [
+      { 日期: '2024-01-01', 基准收益: -0.01, 策略收益: 0.001, 超额: 0.011, 分类: '逆势上涨' },
+      { 日期: '2024-01-02', 基准收益: -0.02, 策略收益: -0.005, 超额: 0.015, 分类: '逆势上涨' },
+      { 日期: '2024-01-03', 基准收益: -0.03, 策略收益: 0.002, 超额: 0.032, 分类: '逆势上涨' },
+      { 日期: '2024-01-04', 基准收益: -0.04, 策略收益: -0.01, 超额: 0.03, 分类: '跌得少' },
+      { 日期: '2024-01-05', 基准收益: -0.05, 策略收益: 0.0, 超额: 0.05, 分类: '跌得少' },
+      { 日期: '2024-01-06', 基准收益: -0.06, 策略收益: -0.02, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-07', 基准收益: -0.07, 策略收益: -0.03, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-08', 基准收益: -0.08, 策略收益: -0.04, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-09', 基准收益: -0.09, 策略收益: -0.08, 超额: 0.01, 分类: '跟着跌' },
+      { 日期: '2024-01-10', 基准收益: -0.1, 策略收益: -0.12, 超额: -0.02, 分类: '跌更多' },
+    ]
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: ca })
+    const sel = w.findAll('select').find((s) => s.text().includes('逆势上涨'))!
+    await sel.setValue('逆势上涨')
+    await flushPromises()
+    const rows = w.findAll('table.ca-down-table tbody tr')
+    expect(rows.length).toBe(3)
+  })
+
   it('详情页含导出 HTML 报告按钮（指向 /api/backtest/records/{id}/export/html）', async () => {
     const w = mount(Backtest)
     await flushPromises()
