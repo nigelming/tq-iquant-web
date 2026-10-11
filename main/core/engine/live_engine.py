@@ -839,7 +839,7 @@ class LiveEngine:
                     "order_id": live_order.id,
                     "strategy_id": live_order.strategy_id,
                     "stock_code": live_order.stock_code,
-                    "trade_type": live_order.trade_type,
+                    "trade_type": (live_order.trade_type or "").upper(),
                     "status": "submitted",
                     "quantity": live_order.quantity,
                     "price": float(live_order.price) if live_order.price is not None else None,
@@ -864,6 +864,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()
@@ -883,6 +886,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()
@@ -902,6 +908,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()

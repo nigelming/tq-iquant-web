@@ -37,6 +37,22 @@ def inject_tqcenter_path(tdx_path: str) -> bool:
     return True
 
 
+def _import_tq():
+    """导入 tqcenter.tq；失败统一转成 TDXConnectionError（而非裸 ModuleNotFoundError）。
+
+    裸 ModuleNotFoundError 不会被路由层识别，会冒泡成"服务器内部错误"，
+    用户无法知道是通达信路径配置问题。
+    """
+    try:
+        from tqcenter import tq
+    except ModuleNotFoundError as e:
+        raise TDXConnectionError(
+            "无法加载 tqcenter（未在通达信目录的 PYPlugins 下找到 tqcenter.py）。"
+            f"请检查配置中的通达信路径是否正确，当前路径：{_tdx_path()}"
+        ) from e
+    return tq
+
+
 def get_tq():
     """获取 tqcenter.tq 单例，首次调用惰性 initialize 连接。
 
@@ -46,10 +62,14 @@ def get_tq():
     global _tq, _tq_initialized
     if _tq is None:
         inject_tqcenter_path(_tdx_path())
-        from tqcenter import tq
-        _tq = tq
+        _tq = _import_tq()
     if not _tq_initialized:
-        _tq.initialize(__file__)
+        try:
+            _tq.initialize(__file__)
+        except TDXConnectionError:
+            raise
+        except Exception as e:
+            raise TDXConnectionError(f"连接通达信失败，请确认通达信已启动并登录：{e}") from e
         _tq_initialized = True
     return _tq
 
@@ -59,9 +79,13 @@ def init_tq(tdx_path: str):
     global _tq, _tq_initialized
     inject_tqcenter_path(tdx_path)
     if _tq is None:
-        from tqcenter import tq
-        _tq = tq
-    _tq.initialize(__file__)
+        _tq = _import_tq()
+    try:
+        _tq.initialize(__file__)
+    except TDXConnectionError:
+        raise
+    except Exception as e:
+        raise TDXConnectionError(f"连接通达信失败，请确认通达信已启动并登录：{e}") from e
     _tq_initialized = True
 
 

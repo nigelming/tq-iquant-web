@@ -143,6 +143,28 @@ def test_get_formula_not_found(client):
 # ---------------------------------------------------------------------------
 # POST /api/formulas — 创建公式 + 信号（事务）
 # ---------------------------------------------------------------------------
+def test_create_formula_empty_signal_name_rejected(client):
+    """signal_name 为空 → 400。"""
+    c, Session = client
+    payload = {
+        "name": "EMPTYSIG",
+        "content": "MA(CLOSE,5);",
+        "signals": [{"signal_name": "  ", "signal_type": "OPEN", "trigger_value": 1}],
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+
+
+def test_create_formula_empty_name_rejected(client):
+    """公式名为空 → 400。"""
+    c, Session = client
+    payload = {"name": "  ", "content": "MA(CLOSE,5);", "signals": []}
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+
+
 def test_create_formula_with_signals(client):
     """POST 创建公式 + 2 信号 → DB 落库 Formula + 2 FormulaSignal。"""
     c, Session = client

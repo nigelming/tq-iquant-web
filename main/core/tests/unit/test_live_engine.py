@@ -3336,7 +3336,7 @@ def test_handle_bar_emits_signal_and_order_submitted():
     assert events[1]["portfolio_id"] == 1
     assert events[1]["order_id"] is not None
     assert events[1]["stock_code"] == stock
-    assert events[1]["trade_type"] == "buy"
+    assert events[1]["trade_type"] == "BUY"
     assert events[1]["quantity"] > 0
     assert q.empty()  # 未成交回报前不 emit trade/position
 
@@ -3489,7 +3489,7 @@ def test_backfill_emits_order_filled_trade_position():
     assert events[1]["portfolio_id"] == 1
     assert events[1]["trade_id"] is not None
     assert events[1]["stock_code"] == "600000.SH"
-    assert events[1]["trade_type"] == "buy"
+    assert events[1]["trade_type"] == "BUY"
     assert events[1]["quantity"] == 1000
     assert events[1]["price"] == 9.0
     assert events[1]["amount"] == 9000

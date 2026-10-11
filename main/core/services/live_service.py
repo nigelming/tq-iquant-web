@@ -238,6 +238,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "name": session.name,
         "mode": session.mode,
         "status": session.status,
+        "started_at": session.started_at,
+        "stopped_at": session.stopped_at,
+        "portfolio_ids": sorted(p.portfolio_strategy_id for p in portfolios),
         "portfolios": [
             {"portfolio_id": p.portfolio_strategy_id, "status": p.status}
             for p in portfolios
@@ -404,7 +407,8 @@ def serialize_order(o: LiveOrder) -> dict:
         "portfolio_strategy_id": o.portfolio_strategy_id,
         "strategy_id": o.strategy_id,
         "stock_code": o.stock_code,
-        "trade_type": o.trade_type,
+        # 引擎写入 lower（buy/sell），统一大写对齐回测与前端标签（历史行兼容）。
+        "trade_type": (o.trade_type or "").upper(),
         "order_type": o.order_type,
         "price": float(o.price) if o.price is not None else None,
         "quantity": o.quantity,
@@ -430,7 +434,7 @@ def serialize_trade(t: LiveTrade) -> dict:
         "portfolio_strategy_id": t.portfolio_strategy_id,
         "strategy_id": t.strategy_id,
         "stock_code": t.stock_code,
-        "trade_type": t.trade_type,
+        "trade_type": (t.trade_type or "").upper(),
         "price": float(t.price) if t.price is not None else None,
         "quantity": t.quantity,
         "amount": float(t.amount) if t.amount is not None else None,

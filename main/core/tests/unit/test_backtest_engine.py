@@ -215,6 +215,60 @@ def test_run_breaker_triggers_on_drawdown_and_halts_next_bar_buy():
     assert len(buy_trades) == 2  # 仅熔断生效前两笔；后续被剥
 
 
+def test_daily_loss_halts_next_day_and_recovers_after():
+    """daily_loss「当日暂停，次日恢复」在日线回测中正确落位（熔断 off-by-one 修复）。
+
+    旧实现：update() 在 on_bar 之后跨日补算 daily_loss → 暂停日 B 首根 bar 的
+    on_bar 未剥（日线周期整日失效），恢复日 C 首根 bar 却仍被剥。
+    新实现：enter_day() 在 on_bar 之前补算 → 暂停日 B 整日剥 BUY、恢复日 C 不剥。
+
+    场景：预置 2000 股 @40 + 现金 20000 = 总值 100000（7/30 收盘基准）。
+    7/31 收盘跌到 30 → 总值 80000，日内 -20% ≥ 5% → 触发 daily_loss。
+    8/1 暂停日（on_bar 剥 ADD）、8/2 恢复日（不再剥）。
+    """
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 30), Decimal("40"), Decimal("40"), Decimal("40"), Decimal("40"), 1000),
+        (datetime(2026, 7, 31), Decimal("40"), Decimal("40"), Decimal("30"), Decimal("30"), 1000),
+        (datetime(2026, 8, 1), Decimal("30"), Decimal("30"), Decimal("30"), Decimal("30"), 1000),
+        (datetime(2026, 8, 2), Decimal("30"), Decimal("30"), Decimal("30"), Decimal("30"), 1000),
+    ])
+    # max_drawdown 抬高到 50%，隔离 daily_loss（20% 回撤不触发熔断，避免干扰剥单归属）
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.5"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(strategy_id=1, period="1d", capital_ratio=Decimal("0.6"), max_positions=5)
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.2"), trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    ctx.add_position_threshold = Decimal("0")
+    ctx.max_add_count = 10
+    ctx.formula_signals = [
+        {"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1},
+    ]
+    pos = ctx.positions.setdefault(stock, Position(stock))
+    pos.apply_trade(_buy_trade("40", 2000, datetime(2026, 7, 29, 9, 30)))
+    port.account.cash = Decimal("20000")  # 总值 80000+20000=100000
+
+    cache = {
+        (1, stock, t): [{"name": "add_sig", "signal_type": SignalType.ADD, "value": 1}]
+        for t in (datetime(2026, 7, 30), datetime(2026, 7, 31),
+                  datetime(2026, 8, 1), datetime(2026, 8, 2))
+    }
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    # 触发日在亏损日 7/31
+    assert port.risk_manager.daily_loss_trigger_date == date(2026, 7, 31)
+    # 剥单只发生在暂停日 8/1（旧实现：剥在恢复日 8/2、暂停日 8/1 漏剥）
+    strips = [d for d in result["decisions"] if d["gate"] == "halted_buy_strip"]
+    strip_dates = {d["bar_time"].date() for d in strips}
+    assert strip_dates == {date(2026, 8, 1)}, strip_dates
+    # 恢复事件在恢复日 8/2（暂停日后一个交易日）
+    recovers = [d for d in result["decisions"] if d["gate"] == "risk_recover"]
+    assert {d["bar_time"].date() for d in recovers} == {date(2026, 8, 2)}
+
+
 def _portfolio_two_strategies():
     """两策略组合：s1 capital_ratio=0.6，s2=0.4，各自有公式信号。"""
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.5"), daily_loss_limit=Decimal("0.5"))
@@ -703,3 +757,128 @@ def test_run_suspended_sell_stop_loss_carried_until_quoted():
     assert trades[0].price == Decimal("21")  # 8/1 复牌 open 成交
     no_md = [d for d in result["decisions"] if d["gate"] == "no_market_data"]
     assert len(no_md) == 1
+
+
+# ===========================================================================
+# 主从策略端到端回测：master 建仓 → slave 次 bar 跟进建仓 → master 清仓
+# → slave 按 slave_exit_mode 跟随全平。走完整 BacktestEngine（下单次 bar open
+# 成交 + 日线 signal_bar_date 延迟闸门 + T+1），验证 portfolio.py 主从编排在
+# 真实多 bar 时序下闭环，而非单 bar 单测。
+# ===========================================================================
+_FLAT_ROWS = [  # 单股 5 根日线，价格全程平稳（避开止损/止盈/移动止损）
+    (datetime(2026, 7, 29), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 1000),
+    (datetime(2026, 7, 30), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 1000),
+    (datetime(2026, 7, 31), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 1000),
+    (datetime(2026, 8, 1), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 1000),
+    (datetime(2026, 8, 4), Decimal("10"), Decimal("10.1"), Decimal("9.9"), Decimal("10"), 1000),
+]
+
+
+def _master_slave_portfolio(slave_exit_mode="follow_master"):
+    """master(id=1) + slave(id=2, master=1) 组合。
+    master 配 OPEN/CLOSE 公式；slave 只配 OPEN；两者风控阈值放宽避免干扰。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+
+    master = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5, role="master",
+    )
+    master.formula_signals = [
+        {"signal_name": "m_open", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        {"signal_name": "m_close", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    master.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.5"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+
+    slave = StrategyContext(
+        strategy_id=2, period="1d",
+        capital_ratio=Decimal("0.4"), max_positions=5,
+        role="slave", master_strategy_id=1, slave_exit_mode=slave_exit_mode,
+    )
+    slave.formula_signals = [
+        {"signal_name": "s_open", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    slave.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.5"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+
+    port.strategies.extend([master, slave])
+    return port, master, slave
+
+
+def _master_slave_cache(stock):
+    """信号时序：master 7/29 开仓、7/31 清仓；slave 7/29 与 7/30 各发一次 OPEN。
+    7/29 slave OPEN 时 master 尚无持仓（被闸门拦）；7/30 master 已持仓 → 放行。"""
+    return {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "m_open", "value": 1}],
+        (2, stock, datetime(2026, 7, 29)): [{"name": "s_open", "value": 1}],
+        (2, stock, datetime(2026, 7, 30)): [{"name": "s_open", "value": 1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "m_close", "value": 1}],
+    }
+
+
+def test_e2e_master_follow_buy_then_follow_sell():
+    """follow_master 闭环（状态镜像语义）：5 根日线 bar。
+
+    7/29 master OPEN + slave OPEN（master 未持仓→slave 被拦）
+    7/30 master 买单成交（@10）；slave 再发 OPEN → 放行，排单
+    7/31 slave 买单成交（@10）；master CLOSE → master 卖单（master 仍持仓→slave 不跟随）
+    8/1  master 卖单成交（清仓）→ slave 检出 master 已清仓 → 追加跟随卖单
+    8/4  slave 跟随卖成交 → 双方清仓
+    期待 4 笔成交：master BUY / slave BUY / master SELL / slave follow SELL。
+    """
+    stock = "000001.SZ"
+    port, master, slave = _master_slave_portfolio("follow_master")
+    result = BacktestEngine().run(
+        port, klines=_klines(stock, _FLAT_ROWS), signal_cache=_master_slave_cache(stock),
+    )
+    trades = result["trades"]
+
+    assert len(trades) == 4
+    m_buy, s_buy, m_sell, s_sell = trades
+    # master 先建仓（7/30 成交），slave 次 bar 跟进（7/31 成交）
+    assert (m_buy.strategy_id, m_buy.trade_type, m_buy.signal_name) == (1, TradeType.BUY, "m_open")
+    assert (s_buy.strategy_id, s_buy.trade_type, s_buy.signal_name) == (2, TradeType.BUY, "s_open")
+    assert m_buy.trade_time == datetime(2026, 7, 30)
+    assert s_buy.trade_time == datetime(2026, 7, 31)
+    assert s_buy.quantity == 400  # 0.1 × (0.4×100000) / 10
+    assert m_buy.quantity == 600  # 0.1 × (0.6×100000) / 10
+    # master 清仓（8/1 成交）→ slave 下一 bar 检出并全平（8/4 成交）
+    assert (m_sell.strategy_id, m_sell.trade_type, m_sell.signal_name) == (1, TradeType.SELL, "m_close")
+    assert m_sell.trade_time == datetime(2026, 8, 1)
+    assert (s_sell.strategy_id, s_sell.trade_type) == (2, TradeType.SELL)
+    assert s_sell.signal_name == "follow_master"
+    assert s_sell.quantity == s_buy.quantity
+    # slave 跟随发生在 master 清仓成交之后的下一 slave bar（晚一拍，非同期）
+    assert s_sell.trade_time > m_sell.trade_time
+    # 末态双方清仓
+    assert master.positions[stock].quantity == 0
+    assert slave.positions[stock].quantity == 0
+    # 决策闸门：7/29 slave 被拦截 + follow_master 触发
+    gates = {d["gate"] for d in result["decisions"]}
+    assert "slave_master_block" in gates
+    assert "follow_master_sell" in gates
+
+
+def test_e2e_master_slave_independent_slave_keeps_position():
+    """slave_exit_mode=independent：master 清仓 → slave 不跟随，保留存量持仓。
+
+    同一信号/行情下只应成交 3 笔（master 买、slave 买、master 卖），
+    slave 末态仍持有 400 股，且无 follow_master 决策事件。
+    """
+    stock = "000001.SZ"
+    port, master, slave = _master_slave_portfolio("independent")
+    result = BacktestEngine().run(
+        port, klines=_klines(stock, _FLAT_ROWS), signal_cache=_master_slave_cache(stock),
+    )
+    trades = result["trades"]
+
+    assert len(trades) == 3
+    assert [t.signal_name for t in trades] == ["m_open", "s_open", "m_close"]
+    assert master.positions[stock].quantity == 0
+    assert slave.positions[stock].quantity == 400
+    assert "follow_master_sell" not in {d["gate"] for d in result["decisions"]}

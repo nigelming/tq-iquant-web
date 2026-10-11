@@ -210,6 +210,65 @@ def test_run_backtest_persists_positions_json(db_session, monkeypatch):
     assert payload[0]["sellable_quantity"] == 1000
 
 
+def test_run_backtest_persists_daily_dedup_last_bar(db_session, monkeypatch):
+    """存储口径：引擎快照为 bar 级（30m 每天多行），落库每日只存最后一根 bar（日收盘），
+    与 Evaluator._daily_rows / build_return_buckets 口径一致；snapshots_count 返回日级行数。"""
+    ps, strat_id = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+
+    # 组合层：7-29 两根 bar、7-30 一根；策略层同理
+    snapshots = [
+        {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
+         "cash": Decimal("100000"), "market_value": Decimal("0"), "positions": []},
+        {"snap_date": date(2026, 7, 29), "total_value": Decimal("100500"),
+         "cash": Decimal("99500"), "market_value": Decimal("1000"), "positions": []},
+        {"snap_date": date(2026, 7, 30), "total_value": Decimal("101000"),
+         "cash": Decimal("100000"), "market_value": Decimal("1000"), "positions": []},
+    ]
+    strategy_snapshots = {
+        strat_id: [
+            {"snap_date": date(2026, 7, 29), "total_value": Decimal("50000"),
+             "cash": Decimal("50000"), "market_value": Decimal("0"), "positions": []},
+            {"snap_date": date(2026, 7, 29), "total_value": Decimal("50100"),
+             "cash": Decimal("49800"), "market_value": Decimal("300"), "positions": []},
+            {"snap_date": date(2026, 7, 30), "total_value": Decimal("50200"),
+             "cash": Decimal("49900"), "market_value": Decimal("300"), "positions": []},
+        ]
+    }
+    fake_result = {
+        "trades": [],
+        "snapshots": snapshots,
+        "evaluations": {"total_return": Decimal("0.01")},
+        "strategy_snapshots": strategy_snapshots,
+        "strategy_evaluations": {strat_id: {"total_return": Decimal("0.004")}},
+    }
+    monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: fake_result)
+    result = svc.run_backtest(db_session, ps, _req())
+
+    # 组合层落库按日去重：2 行，同日取最后一根 bar（日收盘）
+    p_rows = db_session.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=result["record_id"], target_type="portfolio",
+    ).order_by(BacktestDailySnapshot.snap_date).all()
+    assert len(p_rows) == 2
+    assert p_rows[0].snap_date == date(2026, 7, 29)
+    assert p_rows[0].total_value == Decimal("100500")
+    assert p_rows[1].total_value == Decimal("101000")
+
+    # 策略层同样按日去重
+    s_rows = db_session.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=result["record_id"], target_type="strategy",
+    ).order_by(BacktestDailySnapshot.snap_date).all()
+    assert len(s_rows) == 2
+    assert s_rows[0].total_value == Decimal("50100")
+    assert s_rows[1].total_value == Decimal("50200")
+
+    # snapshots_count 返回日级行数（组合层）
+    assert result["snapshots_count"] == 2
+
+
 def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkeypatch):
     """空行情保护：TQ 拉不到 K 线 → 标 failed 并写明原因，返回零计数，不抛异常。"""
     ps, _ = _seed(db_session)
@@ -1852,3 +1911,35 @@ def test_run_backtest_triggered_signal_has_no_warning(db_session, monkeypatch):
     assert rec.warnings_json is None
     detail = svc.get_record_detail(db_session, rec.id)
     assert detail["record"]["warnings"] == []
+
+
+def test_run_backtest_missing_pool_stock_persists_data_warning(db_session, monkeypatch):
+    """个别股票行情取不到（逐股兜底已跳过）→ 回测仍 completed，
+    但 warnings_json 落库记录被跳过的股票，详情接口可读。"""
+    ps, strat = _seed_strat(db_session, trigger=2, sig_name="open_sig")
+    db_session.add(StockPoolStock(
+        pool_id=ps.stock_pool_id, stock_code="920000.BJ", stock_name="坏数据"))
+    db_session.commit()
+    _patch_common_backtest_deps(monkeypatch)  # build_klines 只返回 000001.SZ
+
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+        if diagnostics is not None:
+            diagnostics["errors"] = {}
+            diagnostics["output_lines"] = {strat.id: {"open_sig"}}
+        t = datetime(2026, 7, 29)
+        return {(strat.id, "000001.SZ", t): [{"name": "open_sig", "value": 2}]}
+
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc.BacktestEngine, "run",
+                        lambda self, portfolio, **kw: _fake_engine_result())
+
+    result = svc.run_backtest(db_session, ps, _req())
+
+    rec = db_session.get(BacktestRecord, result["record_id"])
+    assert rec.status == "completed"
+    warnings = json.loads(rec.warnings_json)
+    assert any("920000.BJ" in w for w in warnings)
+    assert any("920000.BJ" in w for w in result["warnings"])
+
+    detail = svc.get_record_detail(db_session, rec.id)
+    assert any("920000.BJ" in w for w in detail["record"]["warnings"])

@@ -42,6 +42,8 @@ class FormulaImport(BaseModel):
 def _validate_signals(signals: list[SignalItem]) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
     for sig in signals:
+        if not sig.signal_name.strip():
+            return "signal_name 不能为空"
         if sig.signal_type not in VALID_SIGNAL_TYPES:
             return f"signal_type 必须为 OPEN/ADD/REDUCE/CLOSE，收到 {sig.signal_type}"
         if sig.trigger_value == 0:
@@ -101,6 +103,8 @@ def get_formula(formula_id: int, db: Session = Depends(get_db)):
 
 @router.post("")
 def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
+    if not req.name.strip():
+        return err(400, "公式名称不能为空")
     err_msg = _validate_signals(req.signals)
     if err_msg:
         return err(400, err_msg)
@@ -114,6 +118,8 @@ def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(ge
     # 校验参数（400）→ 再调 service（内部判 404 + 应用 + 提交）。
     # 原实现顺序是 404→400，但 service 把「判存在 + 应用 + 提交」合并后，须先校验
     # 避免把非法字段写库；「不存在 id + 非法信号」无测试覆盖且语义上 400 更合理。
+    if not req.name.strip():
+        return err(400, "公式名称不能为空")
     err_msg = _validate_signals(req.signals)
     if err_msg:
         return err(400, err_msg)

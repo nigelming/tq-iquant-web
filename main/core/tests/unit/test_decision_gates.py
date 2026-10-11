@@ -282,6 +282,18 @@ class TestStrategyRiskTriggers:
         assert ev.param_name == "trailing_stop_ratio" and ev.param_value == 0.03
         assert abs(ev.actual_value - 0.05) < 1e-9
 
+    def test_trailing_stop_tracks_peak_price(self):
+        """移动止损随持仓期间的价格新高上移，而非仅按建仓价。"""
+        port, ctx, r = self._fire(stop_loss="0.5", take_profit="0.5", trailing="0.03")
+        _hold(ctx, "000001.SZ", 10)  # 建仓价 10
+        port.on_bar(_bar({"000001.SZ": _ohlcv(12)}, datetime(2026, 7, 30, 10, 0)),
+                    signal_cache={})  # 价格新高 12 → 最高价上移
+        port.on_bar(_bar({"000001.SZ": _ohlcv(11.5)}, datetime(2026, 7, 30, 11, 0)),
+                    signal_cache={})  # 自 12 回撤 4.17% ≥ 3%
+        ev = _find(r.drain(), "trailing_stop")
+        assert ev.action == "trigger"
+        assert abs(ev.actual_value - (12 - 11.5) / 12) < 1e-9
+
     def test_missing_strategy_risk_recorded(self):
         r = DecisionRecorder()
         port, ctx = _portfolio(recorder=r, attach_risk=False)

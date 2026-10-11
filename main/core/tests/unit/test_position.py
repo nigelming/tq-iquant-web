@@ -64,6 +64,28 @@ def test_apply_trade_sell_reduces_quantity():
     assert pos.quantity == 600
 
 
+def test_full_close_resets_highest_price_on_reentry():
+    """全平后再建仓，最高价应重置为新的建仓价，不得沿用旧持仓的高点。"""
+    pos = Position("000001.SZ")
+    pos.apply_trade(_trade(TradeType.BUY, "50", 1000, datetime(2026, 7, 29, 9, 30)))
+    assert pos.highest_price == Decimal("50")
+    pos.apply_trade(_trade(TradeType.SELL, "45", 1000, datetime(2026, 7, 30, 9, 30)))
+    assert pos.quantity == 0
+    pos.apply_trade(_trade(TradeType.BUY, "40", 1000, datetime(2026, 8, 3, 9, 30)))
+    assert pos.highest_price == Decimal("40")
+
+
+def test_update_high_raises_only():
+    """移动止损的持仓最高价只升不降。"""
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"))
+    assert pos.highest_price == Decimal("10")
+    pos.update_high(Decimal("12"))
+    assert pos.highest_price == Decimal("12")
+    pos.update_high(Decimal("11"))
+    assert pos.highest_price == Decimal("12")
+
+
 def test_buy_time_records_first_buy_only():
     pos = Position("000001.SZ")
     first = datetime(2026, 7, 29, 9, 30)

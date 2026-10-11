@@ -537,6 +537,90 @@ def test_minute_periods_aligned_with_valid_periods():
     assert non_minute == {"1d", "1w", "1mon"}
 
 
+def test_convert_formula_output_minute_alignment_phantom_drift():
+    """午休幽灵 bar 回归：批量取数 fill_data=True 注入 13:00 bar（9 根/日 vs 公式 8 根/日）。
+
+    公式输出按索引对齐到含幽灵的时间轴会整体前移一根——15:00 触发的信号被钉到
+    14:30（隐性未来函数，30m 回测换手/胜率异常的根因）。剔除幽灵后的标准 8 根/日
+    时间轴才映射到正确 bar。此测试固定两端行为，防止数据层修复后回退。
+    """
+    raw = {"000001.SZ": {"buy": [{"Date": "20260107", "Value": 0} for _ in range(7)]
+                         + [{"Date": "20260107", "Value": 1}]}}
+    phantom_axis = [
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),
+        datetime(2026, 1, 7, 11, 0), datetime(2026, 1, 7, 11, 30),
+        datetime(2026, 1, 7, 13, 0), datetime(2026, 1, 7, 13, 30),
+        datetime(2026, 1, 7, 14, 0), datetime(2026, 1, 7, 14, 30),
+        datetime(2026, 1, 7, 15, 0),
+    ]
+    # 现状（BUG）：输出第 8 条（15:00 信号）落到含幽灵轴的 index[7]=14:30
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": phantom_axis})
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 14, 30)) in entries
+
+    # 修复后：数据层剔除 13:00，时间轴恢复 8 根/日 → 信号正确落在 15:00
+    import core.tq.data as tq_data
+    import pandas as pd
+    phantom_raw = {f: pd.DataFrame({"000001.SZ": list(range(9))}, index=pd.to_datetime(phantom_axis))
+                   for f in ("Open", "High", "Low", "Close", "Volume", "Amount")}
+    stripped = tq_data.strip_lunch_phantom(phantom_raw, "30m")
+    # 真机 klines 的 bar_times 来自 polars datetime 列 → Python datetime，
+    # 与 pandas Timestamp 不相等（dict key 比对），故转 pydatetime 对齐
+    clean_axis = [t.to_pydatetime() for t in stripped["Close"].index]
+    assert len(clean_axis) == 8
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": clean_axis})
+    # 信号线（Value=1）应在 15:00，绝不应提前到 14:30（其他条目的 0 值无信号意义）
+    assert ("buy", 1) in [(e["name"], e["value"]) for e in entries.get(
+        (12, "000001.SZ", datetime(2026, 1, 7, 15, 0)), [])]
+    assert ("buy", 1) not in [(e["name"], e["value"]) for e in entries.get(
+        (12, "000001.SZ", datetime(2026, 1, 7, 14, 30)), [])]
+
+
+def test_convert_formula_output_minute_perday_new_listing_no_drift():
+    """新股对齐回归：批量取数 fill_data=True 会给上市前也补 carry-forward bar，
+    klines 轴比公式输出多一段「上市前假 bar」。全局索引对齐会把上市后的信号
+    错贴到上市前（漂移 N 根=上市前 bar 数，实测 688808.SH 漂 784 根）。
+    必须按 Date 逐日对齐：公式某日的第 j 条 → 该日 klines 第 j 根。
+    """
+    axis = [
+        datetime(2026, 1, 5, 10, 0), datetime(2026, 1, 5, 10, 30),  # 上市前（假）
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),  # 上市后（真）
+    ]
+    raw = {"000001.SZ": {"buy": [
+        {"Date": "20260107", "Value": 0},
+        {"Date": "20260107", "Value": 1},   # 上市后 10:30 出信号
+    ]}}
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": axis})
+    # 信号必须落在上市后 2026-01-07 10:30
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 10, 30)) in entries
+    # 全局索引会把 entry[1] 贴到 axis[1]=2026-01-05 10:30（漂移到上市前）→ 禁止
+    assert (12, "000001.SZ", datetime(2026, 1, 5, 10, 30)) not in entries
+    assert all(k[2].date() == datetime(2026, 1, 7).date() for k in entries)
+
+
+def test_convert_formula_output_minute_perday_suspension_skip():
+    """停牌日对齐回归：klines 停牌日有 carry-forward bar（fill_data），公式输出当天
+    为 0 条。恢复日后信号必须落到正确的当天 bar，不被停牌日的多余 bar 前移，
+    停牌日本身也不应产生任何 signal key。"""
+    axis = [
+        datetime(2026, 1, 5, 10, 0), datetime(2026, 1, 5, 10, 30),  # 正常日
+        datetime(2026, 1, 6, 10, 0), datetime(2026, 1, 6, 10, 30),  # 停牌日（klines 有，公式无）
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),  # 恢复日
+    ]
+    raw = {"000001.SZ": {"buy": [
+        {"Date": "20260105", "Value": 0}, {"Date": "20260105", "Value": 0},
+        {"Date": "20260107", "Value": 0}, {"Date": "20260107", "Value": 1},  # 恢复日 10:30 出信号
+    ]}}
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": axis})
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 10, 30)) in entries
+    # 全局索引会把恢复日 entry 贴到停牌日（01-06）→ 禁止
+    assert (12, "000001.SZ", datetime(2026, 1, 6, 10, 30)) not in entries
+    assert all(k[2].date() != datetime(2026, 1, 6).date() for k in entries)
+
+
 def test_build_signal_cache_1h_uses_index_align(db_session, monkeypatch):
     """1h bar 时间带时分（10:00/11:00），TQ 输出 Date 只标到日，
     须按 bar_times 索引对齐（同 5m），否则 cache key 落午夜 → 引擎逐 bar 查不到信号。"""

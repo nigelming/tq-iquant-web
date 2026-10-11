@@ -24,6 +24,7 @@ class Position:
 
     def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None, is_add: bool = False) -> None:
         # 新开仓（原无持仓）重置加仓计数；加仓（原有持仓）累加
+        is_new = self.quantity == 0
         if is_add and self.quantity > 0:
             self.add_count += 1
         elif self.quantity == 0:
@@ -31,12 +32,18 @@ class Position:
         total_cost = self.avg_cost * self.quantity + price * quantity
         self.quantity += quantity
         self.avg_cost = total_cost / self.quantity
-        if price > self.highest_price:
+        # 新开仓重置最高价（避免沿用上一笔持仓的旧高点）；加仓时只升不降
+        if is_new or price > self.highest_price:
             self.highest_price = price
         if trade_time is not None:
             self._lots[trade_time.date()] = self._lots.get(trade_time.date(), 0) + quantity
             if self.buy_time is None:
                 self.buy_time = trade_time
+
+    def update_high(self, price: Decimal) -> None:
+        """移动止损用：以最新价刷新持仓期间最高价（只升不降）。"""
+        if price > self.highest_price:
+            self.highest_price = price
 
     def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None) -> tuple:
         if quantity > self.quantity:

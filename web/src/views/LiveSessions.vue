@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, TRADE_TYPE_LABEL, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, type LiveEvent } from '../utils/liveEvents'
 import {
   orderEventToRow, orderHistoryToRows,
   tradeEventToRow, tradeHistoryToRows,
@@ -277,7 +277,7 @@ onUnmounted(closeEventStream)
         <tbody>
           <tr v-for="o in orders" :key="o.key">
             <td style="color:var(--ink-soft)">{{ o.time }}</td>
-            <td>{{ TRADE_TYPE_LABEL[o.trade_type] || o.trade_type }}</td>
+            <td>{{ tradeTypeLabel(o.trade_type) }}</td>
             <td>{{ o.stock_code }}</td>
             <td><span class="badge" :class="o.status === 'filled' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-gray'">{{ ORDER_STATUS_LABEL[o.status] || o.status }}</span></td>
             <td>{{ o.quantity }}</td>
@@ -296,7 +296,7 @@ onUnmounted(closeEventStream)
         <tbody>
           <tr v-for="t in trades" :key="t.key">
             <td style="color:var(--ink-soft)">{{ t.time }}</td>
-            <td>{{ TRADE_TYPE_LABEL[t.trade_type] || t.trade_type }}</td>
+            <td>{{ tradeTypeLabel(t.trade_type) }}</td>
             <td>{{ t.stock_code }}</td>
             <td>{{ t.price }}</td><td>{{ t.quantity }}</td><td>{{ t.amount }}</td>
           </tr>

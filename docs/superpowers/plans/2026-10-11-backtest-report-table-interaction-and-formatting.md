@@ -165,30 +165,49 @@ from datetime import date
 from core.engine.risk_manager import PortfolioRiskManager
 
 
-def _mk(initial=Decimal("1000000")):
-    return PortfolioRiskManager(
-        initial_capital=initial,
-        stop_loss_ratio=Decimal("0.05"),
-        take_profit_ratio=Decimal("0.15"),
-        trailing_stop_ratio=Decimal("0.03"),
-        max_drawdown=Decimal("0.20"),
-        daily_loss_limit=Decimal("0.05"),
+class _ListRecorder:
+    def __init__(self):
+        self.events = []
+
+    def record(self, **kw):
+        self.events.append(kw)
+
+
+def _mk(rec):
+    rm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.20"), daily_loss_limit=Decimal("0.05"),
     )
+    rm.recorder = rec
+    return rm
 
 
 def test_daily_loss_message_has_no_long_decimal():
-    rm = _mk()
-    rm.update_peak(Decimal("1369882.7275"), date(2014, 2, 24))
-    rm.enter_day(date(2014, 2, 25), Decimal("1000000"))
-    rm.update_daily(Decimal("1304160.2587"), Decimal("1000000"), date(2014, 2, 25))
-    msgs = [e.message for e in rm.events]
+    rec = _ListRecorder()
+    rm = _mk(rec)
+    initial = Decimal("1000000")
+    rm.update_peak(Decimal("1000000"), date(2014, 2, 24))          # 首日收盘
+    rm.update_peak(Decimal("1000000"), date(2014, 2, 25))          # 跨日：prev_close=1000000
+    rm.update_peak(Decimal("940000"), date(2014, 2, 25))           # 当日最后 bar 收盘
+    rm.update_daily(Decimal("940000"), date(2014, 2, 25), initial)  # pnl=-60000(6%) → 暂停
+    msgs = [e.get("message", "") for e in rec.events if e.get("gate") == "daily_loss"]
     assert msgs, "应产生 daily_loss 事件"
     joined = " ".join(msgs)
     assert not re.search(r"\.\d{4,}", joined), joined
-    assert "6.23%" in joined.replace(",", "")
+    assert "6.00%" in joined
+
+
+def test_max_drawdown_message_has_no_long_decimal():
+    rec = _ListRecorder()
+    rm = _mk(rec)
+    rm.update_peak(Decimal("1369882.7275"), date(2014, 2, 24))
+    rm.update_peak(Decimal("1070000.2587"), date(2014, 2, 25))     # 回撤 21.9% → 熔断
+    msgs = [e.get("message", "") for e in rec.events if e.get("gate") == "max_drawdown"]
+    assert msgs, "应产生 max_drawdown 事件"
+    joined = " ".join(msgs)
+    assert not re.search(r"\.\d{4,}", joined), joined
 ```
 
-> 说明：`PortfolioRiskManager` 的事件容器属性名以现有实现为准（`self.events` 或 recorder）；若为 `recorder`，测试内改用 `rm.recorder.events` 取 message。实现前先读 `main/core/engine/risk_manager.py:50-95` 确认。
+> 说明：`PortfolioRiskManager.__init__(max_drawdown, daily_loss_limit)`；事件经 `self.recorder.record(**kw)` 采集（默认 `NULL_RECORDER`），测试用 `_ListRecorder` 注入并读取 message。
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -276,25 +295,112 @@ git commit -m "feat: 风险/熔断 message 统一数值精度"
 
 - [ ] **Step 1: 写失败测试（追加到 test_format_messages.py）**
 
+行为化测试（真实触发闸门、读事件 message）：
+
 ```python
 import re
+from datetime import datetime
+from decimal import Decimal
+
+from core.engine.portfolio import Portfolio
+from core.engine.strategy_context import StrategyContext
+from core.engine.risk_manager import StrategyRiskManager, PortfolioRiskManager
+from core.engine.position import Position
+from core.engine.account import Account
+from core.engine.execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
+from core.engine.event import BarEvent, SignalEvent, TradeEvent, OrderEvent
+from core.engine.decision import DecisionRecorder
+from tq_iquant_shared.constants import SignalType, TradeType
+
+_LONG_DEC = re.compile(r"\.\d{4,}")
 
 
-def test_engine_messages_no_long_decimal():
-    from core.engine.format import fmt_money, fmt_price, fmt_pct
-    # 直接校验替换后的模板产物（模板与实现一致）
-    s = "止损：成本 %s 现价 %s 亏 %s" % (fmt_price("7.42"), fmt_price("6.99"), fmt_pct(0.0581))
-    assert s == "止损：成本 7.420 现价 6.990 亏 5.81%"
-    s2 = "ADD 逢跌加仓：现价较成本回撤 %s < 阈值 %s（成本 %s 现价 %s）" % (
-        fmt_pct(0.021), fmt_pct(0.05), fmt_price("7.42"), fmt_price("7.27"))
-    assert s2 == "ADD 逢跌加仓：现价较成本回撤 2.10% < 阈值 5.00%（成本 7.420 现价 7.270）"
-    assert not re.search(r"\.\d{4,}", s + s2)
+def _engine(rec):
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d", capital_ratio=Decimal("0.6"), max_positions=5,
+        single_open_ratio=Decimal("0.1"), add_position_threshold=Decimal("0.05"),
+        max_add_count=2, add_position_ratio=Decimal("0.1"),
+        reduce_position_ratio=Decimal("0.3"),
+    )
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.15"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    port.strategies.append(ctx)
+    port.set_recorder(rec)
+    return port, ctx
+
+
+def _hold(ctx, code, price, qty=1000):
+    when = datetime(2026, 7, 29, 9, 30)
+    pos = Position(code)
+    pos.apply_trade(TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code=code, trade_type=TradeType.BUY,
+        price=Decimal(str(price)), quantity=qty, amount=Decimal(str(price)) * qty,
+        commission=Decimal("0"), stamp_duty=Decimal("0"), trade_time=when,
+    ))
+    ctx.positions[code] = pos
+    return pos
+
+
+def _ohlcv(close):
+    c = Decimal(str(close))
+    return {"open": c, "high": c, "low": c, "close": c, "volume": 1000}
+
+
+def _messages(rec, gate):
+    return [e.message for e in rec.drain() if e.gate == gate]
+
+
+def test_portfolio_stop_loss_message_no_long_decimal():
+    rec = DecisionRecorder()
+    port, ctx = _engine(rec)
+    _hold(ctx, "000001.SZ", "7.42")
+    bar = BarEvent(stocks={"000001.SZ": _ohlcv("6.99")}, bar_time=datetime(2026, 7, 30, 15, 0))
+    port.on_bar(bar, signal_cache={})
+    msgs = _messages(rec, "stop_loss")
+    assert msgs and not _LONG_DEC.search(msgs[0]), msgs
+
+
+def test_portfolio_add_threshold_message_no_long_decimal():
+    rec = DecisionRecorder()
+    port, ctx = _engine(rec)
+    _hold(ctx, "000001.SZ", "7.42")
+    bar = BarEvent(stocks={"000001.SZ": _ohlcv("7.30")}, bar_time=datetime(2026, 7, 30, 15, 0))
+    sig = SignalEvent(strategy_id=1, stock_code="000001.SZ",
+                      signal_name="add_sig", signal_type=SignalType.ADD, bar_time=bar.bar_time)
+    assert port._signal_to_order(ctx, sig, bar) is None
+    msgs = _messages(rec, "add_threshold_not_met")
+    assert msgs and not _LONG_DEC.search(msgs[0]), msgs
+
+
+def test_execution_engine_capital_messages_no_long_decimal():
+    rec = DecisionRecorder()
+    eng = ExecutionEngine(SimulatedDispatcher(), SimulatedT1Checker(), recorder=rec)
+    order = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ", trade_type=TradeType.BUY,
+        signal_type=SignalType.OPEN, signal_name="open_sig", quantity=10000,
+        price=Decimal("7.4233333"), bar_time=datetime(2026, 7, 30, 15, 0),
+    )
+    acc = Account(initial_capital=Decimal("100000"))
+
+    acc.cash = Decimal("500.12345")                       # < 1 手 → 拒单
+    assert eng.cap_quantity(order, acc, None) is None
+    msgs = _messages(rec, "insufficient_funds")
+    assert msgs and not _LONG_DEC.search(msgs[0]), msgs
+
+    acc.cash = Decimal("2500.12345")                      # 够 1 手不足额 → 缩量
+    assert eng.cap_quantity(order, acc, None) == 300
+    msgs = _messages(rec, "order_shrunk")
+    assert msgs and not _LONG_DEC.search(msgs[0]), msgs
 ```
 
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `uv run pytest core/tests/unit/test_format_messages.py -v`
-Expected: FAIL（当前实现未用 fmt_*，字符串不符）
+Expected: FAIL（message 含 `7.4233333` / `2500.1234500000000000` 之类，正则 `\.\d{4,}` 命中）
 
 - [ ] **Step 3: 实现**
 

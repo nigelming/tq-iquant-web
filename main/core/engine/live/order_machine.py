@@ -380,6 +380,9 @@ class OrderStateMachine:
                     "order_id": lo.id,
                     "status": "rejected",
                     "stock_code": lo.stock_code,
+                    "trade_type": (lo.trade_type or "").upper(),
+                    "quantity": lo.quantity,
+                    "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
                     "filled_quantity": int(lo.filled_quantity or 0),
                     "error_message": lo.error_message,
                 })
@@ -416,6 +419,9 @@ class OrderStateMachine:
                 "order_id": lo.id,
                 "status": "canceled",
                 "stock_code": lo.stock_code,
+                "trade_type": (lo.trade_type or "").upper(),
+                "quantity": lo.quantity,
+                "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
                 "filled_quantity": int(lo.filled_quantity or 0),
                 "error_message": lo.error_message,
             })
@@ -499,6 +505,9 @@ class OrderStateMachine:
                 "order_id": lo.id,
                 "status": "rejected",
                 "stock_code": lo.stock_code,
+                "trade_type": (lo.trade_type or "").upper(),
+                "quantity": lo.quantity,
+                "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
                 "error_message": lo.error_message,
             })
 
@@ -555,6 +564,9 @@ class OrderStateMachine:
             "order_id": live_order.id,
             "status": live_order.status,
             "stock_code": live_order.stock_code,
+            "trade_type": (live_order.trade_type or "").upper(),
+            "quantity": live_order.quantity,
+            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
             "filled_quantity": live_order.filled_quantity,
             "filled_price": float(avg_price),
         })
@@ -595,7 +607,7 @@ class OrderStateMachine:
             "portfolio_id": live_order.portfolio_strategy_id,
             "trade_id": trade_rec.id,
             "stock_code": trade_rec.stock_code,
-            "trade_type": trade_rec.trade_type,
+            "trade_type": (trade_rec.trade_type or "").upper(),
             "price": float(avg_price),
             "quantity": total_qty,
             "amount": float(total_amount),

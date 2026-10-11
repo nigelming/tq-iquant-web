@@ -256,7 +256,7 @@ def test_signal_preflight_warnings_render_at_top():
     html = build_html_report(detail)
 
     assert 'class="spb"' in html
-    assert "信号预检发现 2 项问题" in html
+    assert "回测告警 2 项" in html
     assert "从未触发" in html
     # 警告文案中的 HTML 必须转义
     assert "<img src=x" not in html

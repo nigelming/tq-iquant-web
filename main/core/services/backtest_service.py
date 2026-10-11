@@ -602,10 +602,10 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
         .all()
     )
     if not snaps:
-        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算", "computed_at": None, "skipped_benchmarks": []}
     ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
     if ps is None:
-        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数", "computed_at": None, "skipped_benchmarks": []}
     existing = (
         db.query(BacktestCrisisAlpha)
         .filter_by(backtest_record_id=record_id)
@@ -619,11 +619,15 @@ def recompute_crisis_alpha(db: Session, record_id: int) -> Optional[dict]:
         benchmark_code=resolution["benchmark_code"],
     )
     if row is None:
-        return {"status": "failed", "error": "危机Alpha 结果落库失败"}
+        return {"status": "failed", "error": "危机Alpha 结果落库失败", "computed_at": None, "skipped_benchmarks": []}
     return {
         "status": row.status,
         "error": row.error,
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "skipped_benchmarks": (
+            json.loads(row.skipped_benchmarks_json)
+            if row.skipped_benchmarks_json else []
+        ),
         "benchmark_resolution": resolution,
     }
 
@@ -826,10 +830,10 @@ def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
         .all()
     )
     if not snaps:
-        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算", "computed_at": None, "skipped_benchmarks": []}
     ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
     if ps is None:
-        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数"}
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数", "computed_at": None, "skipped_benchmarks": []}
     existing = (
         db.query(BacktestMarketRegimeAnalysis)
         .filter_by(backtest_record_id=record_id)
@@ -853,11 +857,15 @@ def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
         benchmark_code=resolution["benchmark_code"],
     )
     if row is None:
-        return {"status": "failed", "error": "市场状态分析结果落库失败"}
+        return {"status": "failed", "error": "市场状态分析结果落库失败", "computed_at": None, "skipped_benchmarks": []}
     return {
         "status": row.status,
         "error": row.error,
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "skipped_benchmarks": (
+            json.loads(row.skipped_benchmarks_json)
+            if row.skipped_benchmarks_json else []
+        ),
         "benchmark_resolution": resolution,
     }
 
@@ -1026,8 +1034,12 @@ def _convert_formula_output(
     - 日线（bar_times_by_code=None）：公式输出 Date=YYYYMMDD 转午夜 datetime 作 key。
       日线 bar 也是日粒度，1:1 对齐。
     - 分钟级（bar_times_by_code 传入）：TQ 输出 Date 只标到日（丢时分），但输出条目
-      按 bar 顺序排列。按索引对齐：第 i 条输出 → bar_times_by_code[code][i]。
-      输出条数 < bar 数 → 多余 bar 无信号；> bar 数 → 多余输出丢弃。
+      按 bar 顺序排列。**按 Date 逐日对齐**：公式某日的第 j 条 → 该日 klines 第 j 根 bar
+      （bar_times_by_code[code] 中同一 date 的有序子集）。不能用全局索引——批量取数
+      fill_data=True 会给新股上市前/停牌日也补 carry-forward bar，全局索引会把公式
+      输出整体前移（漂移=上市前/停牌日多余的 klines bar 数，实测新股 688808.SH 漂 784 根）。
+      某日 klines 无真实 bar（停牌/上市前）→ 该日公式输出直接丢弃；输出条数超过
+      该日 bar 数 → 多余输出丢弃。
     """
     if not isinstance(raw, dict) or not raw:
         return {}
@@ -1042,32 +1054,56 @@ def _convert_formula_output(
         bar_times = bar_times_by_code.get(code) if bar_times_by_code else None
         # 按 bar_time 聚合该股票所有变量
         by_time: dict = {}
-        for var_name, val_list in stock_data.items():
-            if var_name in _FORMULA_META_KEYS:
-                continue
-            if not isinstance(val_list, list):
-                continue
-            for i, entry in enumerate(val_list):
-                if not isinstance(entry, dict):
+        if bar_times is not None:
+            # 分钟级：预构建 date → [当日 bar 时间（升序）]
+            bars_by_date: Dict[date, List[datetime]] = {}
+            for bt in bar_times:
+                bars_by_date.setdefault(bt.date(), []).append(bt)
+            for var_name, val_list in stock_data.items():
+                if var_name in _FORMULA_META_KEYS or not isinstance(val_list, list):
                     continue
-                v = entry.get("Value")
-                if v is None:
+                day_counter: Dict[date, int] = {}
+                for entry in val_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    v = entry.get("Value")
+                    if v is None:
+                        continue
+                    d = _parse_date_str(entry.get("Date"))
+                    if d is None:
+                        continue
+                    bars = bars_by_date.get(d.date())
+                    if not bars:
+                        # 该日 klines 无真实 bar（停牌/新股上市前）→ 公式输出丢弃
+                        continue
+                    j = day_counter.get(d.date(), 0)
+                    day_counter[d.date()] = j + 1
+                    if j >= len(bars):
+                        # 输出条数超过该日 bar 数 → 多余丢弃
+                        continue
+                    key = (strategy_id, code, bars[j])
+                    by_time.setdefault(key, []).append(
+                        {"name": var_name, "value": _to_int(v)})
+        else:
+            # 日线：按 Date 转午夜 datetime
+            for var_name, val_list in stock_data.items():
+                if var_name in _FORMULA_META_KEYS or not isinstance(val_list, list):
                     continue
-                if bar_times is not None:
-                    # 分钟级：按索引对齐 bar_times；越界（i >= len）丢弃
-                    if i >= len(bar_times):
-                        break
-                    bar_time = bar_times[i]
-                else:
-                    # 日线：按 Date 转午夜 datetime
+                for entry in val_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    v = entry.get("Value")
+                    if v is None:
+                        continue
                     d = entry.get("Date")
                     if not d:
                         continue
                     bar_time = _parse_date_str(d)
                     if bar_time is None:
                         continue
-                key = (strategy_id, code, bar_time)
-                by_time.setdefault(key, []).append({"name": var_name, "value": _to_int(v)})
+                    key = (strategy_id, code, bar_time)
+                    by_time.setdefault(key, []).append(
+                        {"name": var_name, "value": _to_int(v)})
         entries.update(by_time)
     return entries
 
@@ -1362,6 +1398,20 @@ def _kline_time_range(klines: dict):
 # ---------------------------------------------------------------------------
 # 持久化引擎产出
 # ---------------------------------------------------------------------------
+def _dedup_daily_by_date(snaps: list) -> list:
+    """bar 级快照 → 日级：每日只保留最后一根 bar（日收盘）。
+
+    引擎快照按 30m 等周期逐 bar 生成（一天多行）。落库/计数统一按日去重，
+    与 Evaluator._daily_rows / build_return_buckets 口径一致（否则前端
+    净值曲线一天多个点、逐行算"日收益"会混入日内收益）。快照按时间有序，
+    同日覆盖即可取到最后一根 bar，返回结果保持日期升序。
+    """
+    by_date: dict = {}
+    for snap in snaps:
+        by_date[snap["snap_date"]] = snap
+    return list(by_date.values())
+
+
 def _persist_result(
     db: Session, record_id: int, ps_id: int, result: dict, strategies: list
 ) -> None:
@@ -1382,7 +1432,7 @@ def _persist_result(
             stamp_duty=trade.stamp_duty,
             bar_time=trade.trade_time,
         ))
-    for snap in result["snapshots"]:
+    for snap in _dedup_daily_by_date(result["snapshots"]):
         db.add(BacktestDailySnapshot(
             backtest_record_id=record_id,
             target_type="portfolio",
@@ -1412,7 +1462,7 @@ def _persist_result(
     strategy_snaps = result.get("strategy_snapshots") or {}
     strategy_evals = result.get("strategy_evaluations") or {}
     for sid, snaps in strategy_snaps.items():
-        for snap in snaps:
+        for snap in _dedup_daily_by_date(snaps):
             db.add(BacktestDailySnapshot(
                 backtest_record_id=record_id,
                 target_type="strategy",
@@ -1532,6 +1582,7 @@ def _serialize_decision(d: BacktestDecisionEvent) -> dict:
         "requested_qty": d.requested_qty,
         "final_qty": d.final_qty,
         "message": d.message,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
     }
 
 
@@ -1817,6 +1868,10 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
             "status": mr.status,
             "error": mr.error,
             "computed_at": mr.computed_at.isoformat() if mr.computed_at else None,
+            "skipped_benchmarks": (
+                json.loads(mr.skipped_benchmarks_json)
+                if mr.skipped_benchmarks_json else []
+            ),
             "benchmark_code": mr.benchmark_code,
             "benchmark_name": mr.benchmark_name,
             "data": json.loads(mr.payload_json) if mr.payload_json else None,
@@ -1960,6 +2015,19 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         signal_warnings = build_signal_warnings(
             db, strategies, signal_cache, signal_diagnostics,
         )
+        # 数据告警：个别股票行情取不到（通达信返回非法日期被逐股兜底跳过）→
+        # 该股票不会出现在 klines_full 中。非致命，回测仍 completed 并落库告警。
+        pool_codes = _pool_stocks(ps, db)
+        skipped_stocks = [c for c in pool_codes if c not in klines_full]
+        data_warnings: List[str] = []
+        if skipped_stocks:
+            shown = "、".join(skipped_stocks[:20])
+            more = f" 等 {len(skipped_stocks)} 只" if len(skipped_stocks) > 20 else ""
+            data_warnings.append(
+                f"股票池中 {len(skipped_stocks)} 只股票行情数据异常或缺失，已跳过："
+                f"{shown}{more}。请在通达信中补齐数据后重跑。"
+            )
+        warnings = data_warnings + signal_warnings
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
@@ -2002,9 +2070,9 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         _log_timing(f"[回测#{record_id}] 总耗时: {(t8-t0).total_seconds():.1f}s")
 
         rec.status = "completed"
-        # 信号预检警告（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
+        # 告警：行情跳过 + 信号预检（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
         rec.warnings_json = (
-            json.dumps(signal_warnings, ensure_ascii=False) if signal_warnings else None
+            json.dumps(warnings, ensure_ascii=False) if warnings else None
         )
         rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
         db.commit()
@@ -2026,7 +2094,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     return {
         "record_id": record_id,
         "trades_count": len(result["trades"]),
-        "snapshots_count": len(result["snapshots"]),
+        "snapshots_count": len(_dedup_daily_by_date(result["snapshots"])),
         "evaluations": result.get("evaluations") or {},
-        "warnings": signal_warnings,
+        "warnings": warnings,
     }

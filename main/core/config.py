@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -5,8 +6,22 @@ from typing import Optional
 import yaml
 
 
+def is_frozen_app() -> bool:
+    """是否为打包后的独立程序（exe）。
+
+    Nuitka 与 PyInstaller 不同：standalone 编译后**不会**设置 sys.frozen，
+    必须额外用 argv[0] 是否为 .exe 判断；否则所有"包内资源定位"都会错误
+    回退到 __file__ 推算路径（实测导致读到空配置、tdx_path 回退错误目录）。
+
+    pytest 下 argv[0] 可能是 pytest.exe，需显式排除，避免测试误判为打包环境。
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") is not None or "pytest" in sys.modules:
+        return False
+    return hasattr(sys, "frozen") or Path(sys.argv[0]).suffix.lower() == ".exe"
+
+
 def _default_config_path() -> Path:
-    if hasattr(sys, 'frozen'):
+    if is_frozen_app():
         return Path(sys.argv[0]).resolve().parent / "config.yaml"
     return Path(__file__).resolve().parent.parent.parent / "config.yaml"
 

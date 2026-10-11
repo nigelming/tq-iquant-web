@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
-from core.models import PortfolioStrategy, Strategy, StockPool, Formula
+from core.models import PortfolioStrategy, Strategy, StockPool, StockPoolStock, Formula
 from core.services.strategy_service import (
     list_portfolios as _svc_list_portfolios,
     get_portfolio as _svc_get_portfolio,
@@ -86,8 +86,68 @@ class PortfolioCreate(BaseModel):
     strategies: list[StrategyItem] = []
 
 
+def _effective_pool_codes(
+    db: Session, portfolio_pool_id: int | None, strategy_pool_id: int | None
+) -> set[str]:
+    """策略有效股票池成分：strategy_pool_id 非空用独立池，否则继承组合级。"""
+    pool_id = strategy_pool_id if strategy_pool_id is not None else portfolio_pool_id
+    if pool_id is None:
+        return set()
+    return {
+        row.stock_code
+        for row in db.query(StockPoolStock).filter_by(pool_id=pool_id).all()
+    }
+
+
+def _check_slave_pool_subset(
+    db: Session,
+    portfolio_pool_id: int | None,
+    slave_pool_id: int | None,
+    master_pool_id: int | None,
+    label: str = "",
+) -> str | None:
+    """从策略有效池必须 ⊆ 主策略有效池。
+
+    否则该股 master 永远不会持有 → slave 的 OPEN 被主从闸门永久拦截，属静默失效；
+    配置期显式拒绝。返回错误消息或 None（通过）。
+    """
+    slave_codes = _effective_pool_codes(db, portfolio_pool_id, slave_pool_id)
+    master_codes = _effective_pool_codes(db, portfolio_pool_id, master_pool_id)
+    extra = slave_codes - master_codes
+    if extra:
+        preview = "、".join(sorted(extra)[:5])
+        return (
+            "%s从策略股票池必须包含于主策略股票池，越界 %d 只：%s"
+            % (label, len(extra), preview)
+        )
+    return None
+
+
+def _check_portfolio_slaves_subset(
+    db: Session, pid: int, portfolio_pool_id: int | None
+) -> str | None:
+    """组合级池变更后，重校该组合内所有 (slave, master) 对的池子集约束。"""
+    strategies = db.query(Strategy).filter(Strategy.portfolio_id == pid).all()
+    by_id = {s.id: s for s in strategies}
+    for s in strategies:
+        if s.role != "slave" or s.master_strategy_id is None:
+            continue
+        master = by_id.get(s.master_strategy_id)
+        if master is None:
+            continue
+        msg = _check_slave_pool_subset(
+            db, portfolio_pool_id, s.stock_pool_id, master.stock_pool_id,
+            label=f"从策略 {s.name} ",
+        )
+        if msg:
+            return msg
+    return None
+
+
 def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
+    if not req.name.strip():
+        return "组合名称不能为空"
     if req.trading_session not in VALID_TRADING_SESSIONS:
         return f"trading_session 必须为 {sorted(VALID_TRADING_SESSIONS)}，收到 {req.trading_session}"
     if req.status not in VALID_STATUSES:
@@ -100,6 +160,8 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         return f"股票池 id={req.stock_pool_id} 不存在"
     # 子策略校验
     for idx, s in enumerate(req.strategies):
+        if not s.name.strip():
+            return f"子策略[{idx}] 名称不能为空"
         if s.role not in VALID_ROLES:
             return f"子策略[{idx}] role 必须为 {sorted(VALID_ROLES)}，收到 {s.role}"
         if s.period not in VALID_PERIODS:
@@ -117,6 +179,8 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         if s.role == "slave":
             if s.master_strategy_id is None:
                 return f"子策略[{idx}] role=slave 必须指定主策略（master_strategy_id）"
+            if s.master_strategy_id < 0:
+                return f"子策略[{idx}] master_strategy_id 非法：负数（正数=本批索引）"
             if s.slave_exit_mode not in VALID_SLAVE_EXIT_MODES:
                 return f"子策略[{idx}] slave_exit_mode 必须为 {sorted(VALID_SLAVE_EXIT_MODES)}，收到 {s.slave_exit_mode}"
         else:  # master / independent
@@ -136,6 +200,16 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             target = req.strategies[target_idx]
             if target.role != "master":
                 return f"子策略[{idx}] 指向的主策略[{target_idx}] 角色为 {target.role}，必须为 master"
+    # slave 池 ⊆ master 池（越界 → 该股 slave 永久无法开仓，静默失效）
+    for idx, s in enumerate(req.strategies):
+        if s.role == "slave" and s.master_strategy_id is not None and 0 <= s.master_strategy_id < len(req.strategies):
+            target = req.strategies[s.master_strategy_id]
+            msg = _check_slave_pool_subset(
+                db, req.stock_pool_id, s.stock_pool_id, target.stock_pool_id,
+                label=f"子策略[{idx}] ",
+            )
+            if msg:
+                return msg
     return None
 
 
@@ -168,6 +242,10 @@ def update_portfolio(pid: int, req: PortfolioCreate, db: Session = Depends(get_d
     err_msg = _validate_portfolio(req, db)
     if err_msg:
         return err(400, err_msg)
+    # 组合级池变更会影响 slave 继承的有效池 → 重校既有主从对的子集约束。
+    sub_msg = _check_portfolio_slaves_subset(db, pid, req.stock_pool_id)
+    if sub_msg:
+        return err(400, sub_msg)
     data = _svc_update_portfolio(db, pid, req)
     if data is None:
         return err(404, "组合策略不存在")
@@ -210,8 +288,15 @@ class StrategyCreate(BaseModel):
     reduce_position_ratio: float = 0.3
 
 
-def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None:
-    """单个子策略校验。master_strategy_id 必须是同组合下 role=master 的已存在 strategy。"""
+def _validate_strategy(
+    req: StrategyCreate, db: Session, pid: int, sid: int | None = None
+) -> str | None:
+    """单个子策略校验。master_strategy_id 必须是同组合下 role=master 的已存在 strategy。
+
+    sid 非空（编辑场景）：额外校验"改主策略/降级"对既有主从关系的影响。
+    """
+    if not req.name.strip():
+        return "策略名称不能为空"
     if req.role not in VALID_ROLES:
         return f"role 必须为 {sorted(VALID_ROLES)}，收到 {req.role}"
     if req.period not in VALID_PERIODS:
@@ -236,8 +321,18 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
             return f"主策略 id={req.master_strategy_id} 不存在"
         if master.portfolio_id != pid:
             return "主策略不属于本组合"
+        if sid is not None and req.master_strategy_id == sid:
+            return "主策略不能指向自身"
         if master.role != "master":
             return "主策略角色必须为 master"
+        # slave 有效池必须 ⊆ master 有效池（越界 → 该股永久无法开仓）
+        ps = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
+        portfolio_pool_id = ps.stock_pool_id if ps else None
+        msg = _check_slave_pool_subset(
+            db, portfolio_pool_id, req.stock_pool_id, master.stock_pool_id,
+        )
+        if msg:
+            return msg
     else:  # master / independent
         if req.master_strategy_id is not None:
             return f"role={req.role} 的 master_strategy_id 必须为空"
@@ -246,6 +341,22 @@ def _validate_strategy(req: StrategyCreate, db: Session, pid: int) -> str | None
     # 策略级股票池校验
     if req.stock_pool_id is not None and not db.query(StockPool).filter(StockPool.id == req.stock_pool_id).first():
         return f"股票池 id={req.stock_pool_id} 不存在"
+    # 编辑场景：改主策略 / 降级对既有主从关系的影响
+    if sid is not None:
+        slaves = db.query(Strategy).filter(Strategy.master_strategy_id == sid).all()
+        if slaves and req.role != "master":
+            return "该主策略被从策略引用，role 不能改为 %s" % req.role
+        # 编辑的是 master：其股票池变更后，各 slave 有效池仍须 ⊆ 新 master 池
+        if req.role == "master":
+            ps = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
+            portfolio_pool_id = ps.stock_pool_id if ps else None
+            for slave in slaves:
+                msg = _check_slave_pool_subset(
+                    db, portfolio_pool_id, slave.stock_pool_id, req.stock_pool_id,
+                    label=f"从策略 {slave.name} ",
+                )
+                if msg:
+                    return msg
     return None
 
 
@@ -269,7 +380,7 @@ def create_strategy(pid: int, req: StrategyCreate, db: Session = Depends(get_db)
 @router.put("/{pid}/strategies/{sid}")
 def update_strategy(pid: int, sid: int, req: StrategyCreate, db: Session = Depends(get_db)):
     # 校验参数（400）→ 再调 service（判 404 + 应用 + 提交），同 update_portfolio。
-    err_msg = _validate_strategy(req, db, pid)
+    err_msg = _validate_strategy(req, db, pid, sid)
     if err_msg:
         return err(400, err_msg)
     data = _svc_update_strategy(db, pid, sid, req)

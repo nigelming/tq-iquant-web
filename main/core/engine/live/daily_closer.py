@@ -337,6 +337,8 @@ class DailyCloser:
                     "order_id": lo.id,
                     "status": "canceled",
                     "stock_code": lo.stock_code,
+                    "trade_type": (lo.trade_type or "").upper(),
+                    "quantity": lo.quantity,
                     "filled_quantity": int(lo.filled_quantity or 0),
                     "error_message": lo.error_message,
                 })

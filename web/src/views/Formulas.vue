@@ -134,6 +134,19 @@ function removeSignal(idx: number) {
 }
 
 async function submit() {
+  if (!form.value.name.trim()) {
+    alert('公式名称不能为空')
+    return
+  }
+  // formula_count 空/非法回落默认 200（后端要求 ≥1）
+  const count = Number(form.value.formula_count)
+  if (!Number.isFinite(count) || count < 1) form.value.formula_count = 200
+  for (const sig of form.value.signals) {
+    if (!String(sig.signal_name ?? '').trim()) {
+      alert('信号名称不能为空')
+      return
+    }
+  }
   try {
     if (editingId.value === null) {
       await createFormula(form.value)

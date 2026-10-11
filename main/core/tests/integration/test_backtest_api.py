@@ -524,11 +524,11 @@ def _post_payload(ps_id, name):
 
 
 def test_post_backtest_409_when_already_running(client, monkeypatch):
-    """并发保护：已有回测在跑（模块锁被持有）→ 新 POST 返回 HTTP 409，不被放行。
+    """并发保护：已达并发上限（占满 slot）→ 新 POST 返回 HTTP 409，不被放行。
 
     回测是同步内联执行（一个请求阻塞到跑完），两并发请求不会真的重叠，故用
-    「直接持有 _BACKTEST_LOCK」模拟"回测进行中"：持锁时 acquire(blocking=False)
-    失败 → 409。释放后正常放行。"""
+    「直接占满并发 slot」模拟"回测进行中"：占满后 _try_acquire_slot 失败 → 409。
+    释放 slot 后正常放行。"""
     c, Session = client
     db = Session()
     ps_id, _, _ = _seed(db)
@@ -538,8 +538,9 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
     payload = _post_payload(ps_id, "conflict_test")
 
-    # 持锁模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
-    bt_api._BACKTEST_LOCK.acquire()
+    # 占满并发 slot 模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
+    monkeypatch.setattr(bt_api, "_max_concurrent_backtest", lambda: 1)
+    bt_api._running_backtests = 1
     try:
         resp = c.post("/api/backtest", json=payload)
         assert resp.status_code == 409
@@ -549,9 +550,9 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
         assert db.query(BacktestRecord).filter_by(name="conflict_test").count() == 0
         db.close()
     finally:
-        bt_api._BACKTEST_LOCK.release()
+        bt_api._running_backtests = 0
 
-    # 锁释放后 → 正常放行
+    # slot 释放后 → 正常放行
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0

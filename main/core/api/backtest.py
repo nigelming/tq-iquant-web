@@ -9,15 +9,43 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
+from core.config import load_config
 from core.db import get_db
 from core.models import PortfolioStrategy
 from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
-# 并发保护：同一时刻全局只允许 1 个回测在跑（回测是同步内联执行，双并发会抢 TQ
-# 资源 + 重复写库）。与实盘互不互斥——实盘有自己的 B6 单 session 守卫（live.py）。
-_BACKTEST_LOCK = Lock()
+# 并发保护：回测为同步内联执行，同时运行数上限由 config.max_concurrent_backtest
+# 控制（默认 1）。超限时新请求返回 HTTP 409。与实盘互不互斥——实盘有自己的单
+# session 守卫（live.py）。
+_BACKTEST_GUARD = Lock()
+_running_backtests = 0
+
+
+def _max_concurrent_backtest() -> int:
+    try:
+        n = int(load_config().get("max_concurrent_backtest", 1) or 1)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, n)
+
+
+def _try_acquire_slot() -> bool:
+    global _running_backtests
+    with _BACKTEST_GUARD:
+        if _running_backtests >= _max_concurrent_backtest():
+            return False
+        _running_backtests += 1
+        return True
+
+
+def _release_slot() -> None:
+    global _running_backtests
+    with _BACKTEST_GUARD:
+        if _running_backtests > 0:
+            _running_backtests -= 1
+
 
 
 class BacktestRequest(BaseModel):
@@ -145,9 +173,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
 
 @router.post("")
 def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
-    """启动回测（同步内联执行）。并发保护：同一时刻全局最多 1 个回测，已有在跑则 409。
+    """启动回测（同步内联执行）。并发保护：并发上限由 config.max_concurrent_backtest
+    控制（默认 1），达到上限则 409。
 
-    校验（404/400）在锁外，只对合法请求抢锁；锁由 finally 保证异常路径也释放。
+    校验（404/400）在抢槽外，只对合法请求抢槽；槽由 finally 保证异常路径也释放。
     主链路在 core.services.backtest_service.run_backtest（P1 #9 阶段 3 迁出）。
     """
     ps = db.get(PortfolioStrategy, req.portfolio_strategy_id)
@@ -158,15 +187,15 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     if err_msg:
         return err(400, err_msg)
 
-    if not _BACKTEST_LOCK.acquire(blocking=False):
+    if not _try_acquire_slot():
         # 有意保留真实 HTTP 409（非 body-code）：并发契约 + 测试断言 status_code==409
         # （test_post_backtest_409_when_already_running）。body-code 会破坏前端对并发冲突
         # 的 HTTP 状态码判断。与统一 envelope 的模式 A 不同——此为刻意的模式 B 例外。
         raise HTTPException(
             status_code=409,
-            detail="回测正在进行中，请等待当前回测完成后再启动（同一时刻仅允许 1 个回测）",
+            detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
         return ok(_svc_run_backtest(db, ps, req))
     finally:
-        _BACKTEST_LOCK.release()
+        _release_slot()

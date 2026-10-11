@@ -106,8 +106,9 @@ describe('Formulas.vue', () => {
 
     // 填名称
     await w.find('input[placeholder*="名称"]').setValue('NEW_F')
-    // 填公式内容
     await w.find('textarea').setValue('MA(CLOSE,5);')
+    // 信号名必填
+    await w.find('.signal-row input').setValue('sig1')
     // 提交
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()
@@ -139,6 +140,7 @@ describe('Formulas.vue', () => {
     // 填表 + 修改 count=500
     await w.find('input[placeholder*="名称"]').setValue('NEW_F')
     await w.find('textarea').setValue('MA(CLOSE,5);')
+    await w.find('.signal-row input').setValue('sig1')
     await w.find('input[type="number"]').setValue('500')
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()

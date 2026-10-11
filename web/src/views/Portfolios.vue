@@ -199,9 +199,9 @@ function formulaName(id: number) {
   return formulas.value.find(f => f.id === id)?.name || `#${id}`
 }
 
-// 同组合下 role=master 的子策略（供 slave 选主策略）
-function masterOptions(pid: number) {
-  return (strategyCache.value[pid] || []).filter(s => s.role === 'master')
+// 同组合下 role=master 的子策略（供 slave 选主策略）；编辑时排除自身，避免自引用
+function masterOptions(pid: number, excludeId: number | null = null) {
+  return (strategyCache.value[pid] || []).filter(s => s.role === 'master' && s.id !== excludeId)
 }
 
 // 提交组合表单：比例字段从百分比转回小数
@@ -361,6 +361,7 @@ async function submitStrategy() {
     // 刷新失败不阻塞主操作（保存已成功），清缓存让下次展开重新拉
     delete strategyCache.value[pid]
   }
+  loadPortfolios()  // 刷新列表徽章（子策略计数来自组合列表数据）
 }
 
 async function removeStrategy(pid: number, s: StrategyDetail) {
@@ -377,6 +378,7 @@ async function removeStrategy(pid: number, s: StrategyDetail) {
   } catch (e) {
     delete strategyCache.value[pid]
   }
+  loadPortfolios()  // 刷新列表徽章
 }
 
 // 表单字段是否显示（showIf 条件）
@@ -398,7 +400,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'periods') return PERIODS.map(p => ({ value: p, label: p }))
   if (src === 'roles') return ROLES.map(r => ({ value: r.value, label: r.label }))
   if (src === 'slaveExitModes') return SLAVE_EXIT_MODES.map(m => ({ value: m.value, label: m.label }))
-  if (src === 'masters') return (pid ? masterOptions(pid) : []).map(m => ({ value: m.id, label: m.name }))
+  if (src === 'masters') return (pid ? masterOptions(pid, editingStrategyId.value) : []).map(m => ({ value: m.id, label: m.name }))
   return []
 }
 

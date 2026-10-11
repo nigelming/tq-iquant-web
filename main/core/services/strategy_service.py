@@ -168,10 +168,17 @@ def delete_portfolio(db: Session, pid: int) -> bool:
     """删组合（Strategy 随 ondelete=CASCADE 删）。
 
     False=不存在；被回测记录/实盘 session 引用时 ondelete=RESTRICT 抛 IntegrityError（路由 catch→409）。
+
+    删除前先解除组合内子策略的主从自引用（strategies.master_strategy_id 亦为 RESTRICT）：
+    否则级联删子策略时先删 master 会因仍被 slave 引用触发 IntegrityError，被路由误报为
+    "被回测记录或实盘 session 引用"。master_strategy_id 只可能指向同组合策略，故置空安全。
     """
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if p is None:
         return False
+    db.query(Strategy).filter(Strategy.portfolio_id == pid).update(
+        {Strategy.master_strategy_id: None}, synchronize_session=False
+    )
     db.delete(p)
     db.commit()
     return True

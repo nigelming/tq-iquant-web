@@ -44,6 +44,12 @@ class BacktestEngine:
         }
 
         for i, t in enumerate(times):
+            # 0. 跨日补算上一日 daily_loss（在 on_bar 之前）：使日内亏损暂停从
+            #    "亏损日的次一交易日"首根 bar 即生效、恢复日首根即解除（消 off-by-one）。
+            portfolio.risk_manager.enter_day(
+                t.date(), portfolio.account.initial_capital
+            )
+
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
             deferred: List[OrderEvent] = []
             if pending_orders:
@@ -111,10 +117,9 @@ class BacktestEngine:
                 s_snap["benchmark_value"] = snap["benchmark_value"]
                 strategy_snapshots[s_snap["target_id"]].append(s_snap)
 
-            # 5. 熔断检测：日终更新峰值/日内盈亏，按 §88 推进熔断次日恢复时序
-            portfolio.risk_manager.update(
-                total_value, t.date(), portfolio.account.initial_capital
-            )
+            # 5. 熔断检测：更新峰值/检测 max_drawdown，推进熔断次日恢复时序
+            #    （daily_loss 已在本 bar 起始 enter_day 补算，此处只做峰值/回撤）
+            portfolio.risk_manager.update_peak(total_value, t.date())
 
         # 6. 补算最后一日 daily_loss（#8 对齐实盘 14:30 时点：循环内 update 只在
         #    跨日时补算上一日，最后一日无后续跨日触发，需显式收尾）

@@ -58,13 +58,13 @@ onMounted(load)
     <button @click="load" class="btn">刷新</button>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:16px">
     {{ errorMsg }}
   </div>
 
-  <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+  <div v-if="loading" class="card" style="padding:16px"><p>加载中…</p></div>
   <template v-else>
-    <div class="metric-grid">
+    <div class="metric-grid" style="gap:12px">
       <div class="metric-card">
         <span class="metric-label">股票池</span>
         <span class="metric-value">{{ poolCount }}</span>
@@ -97,14 +97,14 @@ onMounted(load)
     </div>
 
     <div class="card" style="margin-bottom:16px">
-      <h3 style="margin:0 0 8px">最近回测</h3>
+      <h3 style="margin:0 0 12px;padding:0 4px 8px;border-bottom:1px solid var(--border)">最近回测</h3>
       <div class="table-wrap">
         <table>
           <thead><tr><th>名称</th><th>区间</th><th>状态</th></tr></thead>
           <tbody>
             <tr v-for="r in recentBacktests" :key="r.id">
               <td>{{ r.name }}</td>
-              <td style="color:var(--ink-soft)">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
+              <td style="color:var(--ink-soft);font-variant-numeric:tabular-nums">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
               <td>
                 <span v-if="r.status === 'completed'" class="badge badge-green">完成</span>
                 <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
@@ -118,8 +118,8 @@ onMounted(load)
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 8px">系统配置</h3>
-      <p v-if="cfg" style="margin:0;color:var(--ink-soft)">
+      <h3 style="margin:0 0 10px;padding:0 4px 8px;border-bottom:1px solid var(--border)">系统配置</h3>
+      <p v-if="cfg" style="margin:0;color:var(--ink-soft);line-height:1.8">
         通达信路径：{{ cfg.tdx_path }}<br>
         iQuant 路径：{{ cfg.iquant_path }}<br>
         仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>

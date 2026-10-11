@@ -54,6 +54,10 @@ switch ($Action) {
 
         Write-Host "`nBackend:  http://127.0.0.1:$backend_port" -ForegroundColor Cyan
         Write-Host "Frontend: http://127.0.0.1:$frontend_port" -ForegroundColor Cyan
+
+        # 自动在默认浏览器打开前端页面
+        Start-Process "http://127.0.0.1:$frontend_port"
+        Write-Host "Browser:  opened http://127.0.0.1:$frontend_port" -ForegroundColor Cyan
     }
 
     "stop" {

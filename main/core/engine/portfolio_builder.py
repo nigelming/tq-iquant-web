@@ -14,6 +14,10 @@ from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from tq_iquant_shared.constants import SignalType
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def signal_type_from_str(s: str) -> SignalType:
     """字符串信号类型 → SignalType 枚举（DB 存字符串，引擎用枚举）。"""
@@ -91,4 +95,22 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             trailing_stop_ratio=Decimal(str(strat.trailing_stop_ratio)),
         )
         port.strategies.append(ctx)
+    # 防御性告警：历史脏数据下 slave 池 ⊄ master 池 → 越界股 slave 永远开不了仓。
+    # 配置接口已 400 拒绝，此处兜底让运行时可见（不 raise，避免中断回测/实盘）。
+    for ctx in port.strategies:
+        if ctx.role != "slave" or ctx.master_strategy_id is None:
+            continue
+        master = next(
+            (c for c in port.strategies if c.strategy_id == ctx.master_strategy_id), None
+        )
+        if master is None:
+            continue
+        extra = (ctx.stock_pool or set()) - (master.stock_pool or set())
+        if extra:
+            logger.warning(
+                "portfolio %s slave %s 股票池越出 master %s：%d 只（样例 %s），"
+                "越界股将无法开仓",
+                ps.id, ctx.strategy_id, ctx.master_strategy_id, len(extra),
+                sorted(extra)[:5],
+            )
     return port

@@ -48,7 +48,7 @@ export interface TdxPoolItem {
 // 通达信板块实时成分股（GET /stock-pools/tdx/{code}/stocks）— 对齐 tq.data.get_pool_stocks
 export interface TdxPoolStockItem {
   stock_code: string
-  stock_name: string
+  stock_name: string | null
 }
 
 // 公式信号（响应侧，含 id）— 对齐 formulas._serialize_formula signals 子项
@@ -101,7 +101,7 @@ export interface BacktestRecordItem {
   end_date: string | null
   status: string  // running|completed|failed
   error_message: string | null
-  warnings: string[]  // 信号预检非致命警告（零信号/输出线缺失/公式报错）
+  warnings: string[]  // 回测非致命告警（行情跳过/零信号/输出线缺失/公式报错）
   created_at: string | null
   completed_at: string | null
 }
@@ -509,11 +509,11 @@ export interface TdxFormulaListItem {
 
 export interface TdxFormulaInfo {
   acCode: string
-  acName: string
-  isSys: number
-  ParaNum: number
+  acName?: string
+  isSys?: number
+  ParaNum?: number
   Para?: { ParaName: string; Min: string; Max: string; Default: string }[]
-  LineNum: number
+  LineNum?: number
   Line?: { LineName: string }[]
 }
 
@@ -576,7 +576,7 @@ export interface PortfolioRequest {
   slippage: number
   trading_session: string  // full|am|pm
   status: string  // active|archived
-  strategies: StrategyItem[]
+  strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
 
 export async function getPortfolioDetail(id: number) {
@@ -704,6 +704,7 @@ export interface CrisisAlphaRecomputeResult {
   status: string
   error: string | null
   computed_at: string | null
+  skipped_benchmarks?: string[]
   benchmark_resolution?: CrisisAlphaBenchmarkResolution
 }
 
@@ -998,6 +999,7 @@ export interface BacktestMarketRegimeItem {
   status: 'completed' | 'insufficient' | 'failed'
   error: string | null
   computed_at: string | null
+  skipped_benchmarks: string[]
   benchmark_code: string
   benchmark_name: string
   data: MarketRegimeData | null

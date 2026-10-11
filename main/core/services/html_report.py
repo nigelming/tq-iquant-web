@@ -285,15 +285,15 @@ def _overview(detail: dict) -> str:
         f'<div class="gen">报告生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
         "（离线单文件，数字与平台详情接口同源）</div></div>"
     )
-    # 信号预检警告（公式报错/输出线缺失/区间零信号）——置顶，解释"为什么没有交易"
+    # 回测告警（行情跳过/公式报错/输出线缺失/区间零信号）——置顶，解释"为什么没有交易"
     warning_block = ""
     warnings = rec.get("warnings") or []
     if warnings:
         items = "".join(f"<li>{esc(w)}</li>" for w in warnings)
         warning_block = (
             '<div class="spb"><div class="spb-t">'
-            f'⚠️ 信号预检发现 {len(warnings)} 项问题'
-            "<span>（回测已完成，但可能未产生预期交易）</span></div>"
+            f'⚠️ 回测告警 {len(warnings)} 项'
+            "<span>（回测已完成，但可能存在行情数据或信号问题）</span></div>"
             f"<ul>{items}</ul></div>"
         )
     return meta + warning_block + '<div class="kpi-grid">' + "".join(cards) + "</div>"
