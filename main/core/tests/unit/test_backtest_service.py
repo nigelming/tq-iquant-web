@@ -101,12 +101,14 @@ def _mock_klines():
 
 
 class _Req:
-    """轻量请求替身——service.run_backtest 只读 .name/.start_date/.end_date。"""
+    """轻量请求替身——service.run_backtest 只读 .name/.start_date/.end_date/.dividend_mode。"""
 
-    def __init__(self, name="svc_test", start=date(2026, 7, 29), end=date(2026, 7, 31)):
+    def __init__(self, name="svc_test", start=date(2026, 7, 29), end=date(2026, 7, 31),
+                 dividend_mode="front"):
         self.name = name
         self.start_date = start
         self.end_date = end
+        self.dividend_mode = dividend_mode
 
 
 def _req(**kw):
@@ -123,9 +125,9 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
     ps, strat_id = _seed(db_session)
 
     # patch 数据获取层（避开真实 TQ/TDX）
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     # patch 引擎：返回受控 result（避免构造真实 Trade 对象）
@@ -176,9 +178,9 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
 def test_run_backtest_persists_positions_json(db_session, monkeypatch):
     """新回测：快照 positions 明细落 positions_json；空仓日落 "[]" 而非 NULL。"""
     ps, _ = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     snapshots = [
@@ -214,9 +216,9 @@ def test_run_backtest_persists_daily_dedup_last_bar(db_session, monkeypatch):
     """存储口径：引擎快照为 bar 级（30m 每天多行），落库每日只存最后一根 bar（日收盘），
     与 Evaluator._daily_rows / build_return_buckets 口径一致；snapshots_count 返回日级行数。"""
     ps, strat_id = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, k, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     # 组合层：7-29 两根 bar、7-30 一根；策略层同理
@@ -273,9 +275,9 @@ def test_run_backtest_empty_klines_marks_failed_not_completed(db_session, monkey
     """空行情保护：TQ 拉不到 K 线 → 标 failed 并写明原因，返回零计数，不抛异常。"""
     ps, _ = _seed(db_session)
 
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     result = svc.run_backtest(db_session, ps, _req(name="empty"))
@@ -295,12 +297,12 @@ def test_run_backtest_exception_marks_failed_and_reraises(db_session, monkeypatc
     （路由层全局处理器兜底，与原 _run_backtest_locked 行为一致）。"""
     ps, _ = _seed(db_session)
 
-    def _boom(ps, start, end, db=None):
+    def _boom(ps, start, end, db=None, dividend_mode="front"):
         raise RuntimeError("polars panic: str cannot be int")
 
     monkeypatch.setattr(svc, "build_klines", _boom)
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
     with pytest.raises(RuntimeError, match="polars panic"):
@@ -324,9 +326,9 @@ def test_get_record_detail_returns_none_when_missing(db_session):
 def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
     """完整详情：record + snapshots + trades + evaluations + 策略层四件套齐全。"""
     ps, strat_id = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
         strategy_id=strat_id, signal_name="open_sig",
@@ -371,9 +373,9 @@ def test_delete_record_returns_false_when_missing(db_session):
 def test_delete_record_removes_record_and_children(db_session, monkeypatch):
     """存在返回 True；record + trades/snapshots/evaluations 全清。"""
     ps, strat_id = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     trade = SimpleNamespace(
         strategy_id=strat_id, signal_name="open_sig",
@@ -432,9 +434,9 @@ def _fake_decisions(strat_id):
 def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch):
     """result["decisions"] 逐行落 backtest_decision_events；详情带聚合统计 + 明细。"""
     ps, strat_id = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
         "trades": [], "snapshots": [], "evaluations": {},
@@ -473,9 +475,9 @@ def test_decisions_persisted_and_detail_returns_summary(db_session, monkeypatch)
 def test_delete_record_cascades_decisions(db_session, monkeypatch):
     """删除回测记录时 decision 事件一并清空。"""
     ps, strat_id = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     fake_result = {
         "trades": [], "snapshots": [], "evaluations": {},
@@ -574,9 +576,9 @@ def test_list_records_returns_newest_first(db_session, monkeypatch):
     """list_records：序列化字段齐全；按 created_at 倒序（同秒插入时
     created_at 相等，故断言非递增而非严格递减——避免对亚秒分辨率过约束）。"""
     ps, _ = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     svc.run_backtest(db_session, ps, _req(name="r1"))
     svc.run_backtest(db_session, ps, _req(name="r2"))
@@ -737,6 +739,31 @@ def _ca_snapshots(points):
 
 def _ca_decimal_frames(points):
     return {d: Decimal(str(v)) for d, v in points.items()}
+
+
+def test_build_index_close_series_back_dividend_mode(monkeypatch):
+    days = [date(2026, 1, 5)]
+    fake = _FakeIndexTQ({"000300.SH": {days[0]: 3000.0}})
+    monkeypatch.setattr(svc, "TQData", lambda: fake)
+    out = svc.build_index_close_series(
+        ["000300.SH"], date(2026, 1, 1), date(2026, 1, 31), dividend_mode="back"
+    )
+    assert set(out) == {"000300.SH"}
+    assert fake.calls[0]["dividend_type"] == "back"
+
+
+def test_build_params_snapshot_includes_dividend_mode():
+    ps = SimpleNamespace(
+        benchmark_index="000300.SH", initial_capital=Decimal("1000000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+        max_holdings=10, min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"), sell_commission_rate=Decimal("0.00025"),
+        stamp_duty_rate=Decimal("0.0005"), slippage=Decimal("0"),
+        trading_session="full", stock_pool_id=2,
+    )
+    snap = json.loads(svc.build_params_snapshot(ps, dividend_mode="back"))
+    assert snap["dividend_mode"] == "back"
+    assert snap["benchmark_index"] == "000300.SH"
 
 
 def test_build_index_close_series_batches_codes_and_skips_missing(monkeypatch):
@@ -919,9 +946,9 @@ def test_safe_compute_crisis_alpha_swallows_and_marks_failed(db_session, monkeyp
 
 def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkeypatch):
     ps, _ = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
 
     def _boom(*a, **kw):
         raise RuntimeError("crisis_alpha_boom")
@@ -954,9 +981,9 @@ def test_run_backtest_still_completed_when_crisis_alpha_fails(db_session, monkey
 
 def test_run_backtest_calls_crisis_alpha_after_main_commit(db_session, monkeypatch):
     ps, _ = _seed(db_session)
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     snapshots = [
         {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
          "cash": Decimal("100000"), "market_value": Decimal("0")},
@@ -1517,7 +1544,7 @@ _SNAPSHOT_KEYS = {
     "benchmark_index", "initial_capital", "max_drawdown", "daily_loss_limit",
     "max_holdings", "min_commission", "buy_commission_rate",
     "sell_commission_rate", "stamp_duty_rate", "slippage", "trading_session",
-    "stock_pool_id",
+    "stock_pool_id", "dividend_mode",
 }
 
 _NO_TRADES_RESULT = {
@@ -1527,9 +1554,9 @@ _NO_TRADES_RESULT = {
 
 
 def _patch_data_layer(monkeypatch, result=None):
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     if result is not None:
         monkeypatch.setattr(svc.BacktestEngine, "run", lambda self, portfolio, **kw: result)
@@ -1845,8 +1872,8 @@ def test_build_signal_cache_collects_output_lines(db_session, monkeypatch):
 
 def _patch_common_backtest_deps(monkeypatch):
     """run_backtest 周边依赖（信号/基准/危机Alpha走桩，引擎由各用例自行替换）。"""
-    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, s, e, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, s, e, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
 
@@ -1868,7 +1895,7 @@ def test_run_backtest_zero_signal_persists_warning(db_session, monkeypatch):
     ps, strat = _seed_strat(db_session, trigger=2, sig_name="最终强交易买")
     _patch_common_backtest_deps(monkeypatch)
 
-    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
         if diagnostics is not None:
             diagnostics["errors"] = {}
             diagnostics["output_lines"] = {strat.id: {"最终强交易买"}}
@@ -1894,7 +1921,7 @@ def test_run_backtest_triggered_signal_has_no_warning(db_session, monkeypatch):
     ps, strat = _seed_strat(db_session, trigger=2)
     _patch_common_backtest_deps(monkeypatch)
 
-    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
         if diagnostics is not None:
             diagnostics["errors"] = {}
             diagnostics["output_lines"] = {strat.id: {"open_sig"}}
@@ -1922,7 +1949,7 @@ def test_run_backtest_missing_pool_stock_persists_data_warning(db_session, monke
     db_session.commit()
     _patch_common_backtest_deps(monkeypatch)  # build_klines 只返回 000001.SZ
 
-    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None):
+    def _fake_cache(ps_, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
         if diagnostics is not None:
             diagnostics["errors"] = {}
             diagnostics["output_lines"] = {strat.id: {"open_sig"}}

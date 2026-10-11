@@ -253,7 +253,8 @@ def _slice_klines_from(klines: dict, start: date) -> dict:
     return result
 
 
-def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
+def build_klines(ps, start: date, end: date, db: Session = None,
+                 dividend_mode: str = "front") -> dict:
     """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}（含公式预热段）。
 
     股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
@@ -264,6 +265,7 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
 
     返回值含预热 bar（早于 start）；引擎视野由调用方 _slice_klines_from 切回主区间，
     预热段只喂 build_signal_cache。
+    dividend_mode：复权模式（"front" 前复权 / "back" 后复权），K线取数透传给 TQ。
     """
     stocks = _pool_stocks(ps, db)
     if not stocks:
@@ -274,7 +276,7 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
     tq = TQData()
     raw_by_period = tq.get_history_raw(
         stocks=stocks, periods=periods,
-        start=start_str, end=end_str, dividend_type="front", count=-1,
+        start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
     )
     warmup_counts = warmup_counts_by_period(ps, db)
     if warmup_counts:
@@ -286,7 +288,7 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
                 continue
             part = tq.get_history_raw(
                 stocks=stocks, periods=[period],
-                start="", end=warm_end, dividend_type="front", count=cnt,
+                start="", end=warm_end, dividend_type=dividend_mode, count=cnt,
             )
             if isinstance(part, dict):
                 warm_raw.update(part)
@@ -295,7 +297,8 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
 
 
 def build_index_close_series(
-    codes: List[str], start: date, end: date, batch_size: int = 0
+    codes: List[str], start: date, end: date, batch_size: int = 0,
+    dividend_mode: str = "front",
 ) -> Dict[str, Dict[date, Decimal]]:
     """取指数日线收盘价。batch_size>0 时分批取数（行业指数 128 个用）。"""
     wanted = [c for c in dict.fromkeys(codes) if c]
@@ -314,7 +317,7 @@ def build_index_close_series(
                 periods=["1d"],
                 start=start_str,
                 end=end_str,
-                dividend_type="front",
+                dividend_type=dividend_mode,
                 count=-1,
             )
         except Exception:
@@ -346,10 +349,12 @@ def build_index_close_series(
 
 
 def build_benchmark_data(
-    ps, start: date, end: date, db: Session = None
+    ps, start: date, end: date, db: Session = None, dividend_mode: str = "front"
 ) -> Dict[date, Decimal]:
     index_code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
-    return build_index_close_series([index_code], start, end).get(index_code, {})
+    return build_index_close_series(
+        [index_code], start, end, dividend_mode=dividend_mode,
+    ).get(index_code, {})
 
 
 def _crisis_benchmark_code(ps) -> str:
@@ -378,6 +383,11 @@ PARAMS_SNAPSHOT_FIELDS = (
     "stock_pool_id",
 )
 
+# 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
+# 公式信号传整数（front=1/back=2）。缺省前复权，保持历史行为。
+DIVIDEND_MODES = ("front", "back")
+_FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2}
+
 
 def _snapshot_value(value):
     if value is None or isinstance(value, (str, bool, int)):
@@ -403,11 +413,12 @@ def _json_safe(obj):
     return obj
 
 
-def build_params_snapshot(ps) -> str:
+def build_params_snapshot(ps, dividend_mode: str = "front") -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
     }
+    payload["dividend_mode"] = dividend_mode
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -1185,7 +1196,7 @@ def _formula_diagnostics(raw, stocks: list):
 
 def build_signal_cache(
     ps, klines: dict, db: Session = None, start: date = None,
-    diagnostics: Optional[dict] = None,
+    diagnostics: Optional[dict] = None, dividend_mode: str = "front",
 ) -> dict:
     """预计算公式信号：{(strategy_id, stock_code, bar_time): [{name, value}]}。
 
@@ -1235,7 +1246,7 @@ def build_signal_cache(
         raw = tq_formula.compute(
             formula_name=formula.name, formula_arg="",
             stocks=strat_stocks, period=period,
-            count=-1, dividend_type=1,
+            count=-1, dividend_type=_FORMULA_DIVIDEND_TYPE.get(dividend_mode, 1),
             start_time=start_str, end_time=end_str,
         )
         if diagnostics is not None:
@@ -1983,6 +1994,11 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         .all()
     )
 
+    # 复权模式：读请求参数，非法值回退前复权（保持历史行为 + 防脏数据）
+    dividend_mode = getattr(req, "dividend_mode", "front") or "front"
+    if dividend_mode not in DIVIDEND_MODES:
+        dividend_mode = "front"
+
     # 写 record（running）
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id,
@@ -1990,7 +2006,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         start_date=req.start_date,
         end_date=req.end_date,
         status="running",
-        params_snapshot=build_params_snapshot(ps),
+        params_snapshot=build_params_snapshot(ps, dividend_mode=dividend_mode),
     )
     db.add(rec)
     db.commit()
@@ -2002,7 +2018,9 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         portfolio = _assemble_portfolio(ps, strategies, db)
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
-        klines_full = build_klines(ps, req.start_date, req.end_date, db)
+        klines_full = build_klines(
+            ps, req.start_date, req.end_date, db, dividend_mode=dividend_mode,
+        )
         t2 = datetime.now()
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
         _log_kline_summary(record_id, klines_full)
@@ -2011,6 +2029,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         signal_diagnostics: dict = {}
         signal_cache = build_signal_cache(
             ps, klines_full, db, start=req.start_date, diagnostics=signal_diagnostics,
+            dividend_mode=dividend_mode,
         )
         signal_warnings = build_signal_warnings(
             db, strategies, signal_cache, signal_diagnostics,
@@ -2031,7 +2050,9 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
-        benchmark_data = build_benchmark_data(ps, req.start_date, req.end_date, db)
+        benchmark_data = build_benchmark_data(
+            ps, req.start_date, req.end_date, db, dividend_mode=dividend_mode,
+        )
         t4 = datetime.now()
 
         # 各阶段耗时日志（定位回测慢的根因）

@@ -106,8 +106,8 @@ def test_post_backtest_end_to_end(client, monkeypatch):
 
     stock = "000001.SZ"
     # monkeypatch 数据获取层：返回 mock klines / signal_cache
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -151,6 +151,71 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     db.close()
 
 
+def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
+    """dividend_mode='back' 穿透到 build_klines/build_signal_cache/build_benchmark_data，
+    且写入 params_snapshot。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.close()
+
+    seen = {}
+
+    def _fake_klines(ps, start, end, db=None, dividend_mode="front"):
+        seen["klines"] = dividend_mode
+        return _mock_klines()
+
+    def _fake_cache(ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
+        seen["cache"] = dividend_mode
+        return {}
+
+    def _fake_bench(ps, start, end, db=None, dividend_mode="front"):
+        seen["bench"] = dividend_mode
+        return {}
+
+    monkeypatch.setattr(svc, "build_klines", _fake_klines)
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc, "build_benchmark_data", _fake_bench)
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_back",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "back",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert seen == {"klines": "back", "cache": "back", "bench": "back"}
+
+    record_id = resp.json()["data"]["record_id"]
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    snap = json.loads(rec.params_snapshot)
+    assert snap["dividend_mode"] == "back"
+    db.close()
+
+
+def test_post_backtest_invalid_dividend_mode_returns_400(client):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_bad",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "hfq",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    body = resp.json()
+    assert body["code"] == 400
+    assert "front/back" in body["message"]
+
+
 def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     c, Session = client
     db = Session()
@@ -158,8 +223,8 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -192,13 +257,13 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 # ===========================================================================
 def _mock_data(monkeypatch):
     """统一 mock 数据获取层，供多测试复用。"""
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     })
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
 
 
@@ -457,8 +522,8 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
     db.close()
 
     # mock 三层全返回空 — 模拟 TQ 拉不到行情
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -486,7 +551,7 @@ def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
     db.close()
 
     # build_klines 抛异常 — 模拟 polars PanicException 等真机错误
-    def _boom(ps, start, end, db=None):
+    def _boom(ps, start, end, db=None, dividend_mode="front"):
         raise RuntimeError("polars panic: str cannot be int")
     monkeypatch.setattr(svc, "build_klines", _boom)
 
@@ -534,8 +599,8 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
     ps_id, _, _ = _seed(db)
     db.close()
 
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     payload = _post_payload(ps_id, "conflict_test")
 
     # 占满并发 slot 模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
@@ -576,8 +641,8 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     assert resp.json()["code"] == 500
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0

@@ -423,6 +423,49 @@ def test_build_klines_orchestration(db_session, monkeypatch):
     assert klines["000001.SZ"]["1d"].height == 2
 
 
+def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):
+    """dividend_mode='back' → get_history_raw 主段/预热段均传 dividend_type='back'。"""
+    import pandas as pd
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    ts = [datetime(2026, 7, 29)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0]}, index=ts),
+    }
+    calls = []
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        calls.append(dividend_type)
+        return {"1d": raw}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+    bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db, dividend_mode="back")
+    assert calls == ["back", "back"]
+
+
+def test_build_signal_cache_back_dividend_passes_2(db_session, monkeypatch):
+    """dividend_mode='back' → TQFormula.compute dividend_type=2（后复权）。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    klines = {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29)],
+        "Open": [Decimal("10")], "High": [Decimal("10.3")],
+        "Low": [Decimal("9.9")], "Close": [Decimal("10.2")],
+        "Volume": [1000],
+    })}}
+    captured = {}
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                      start_time="", end_time="", return_count=-1, return_date=True):
+        captured["dividend_type"] = dividend_type
+        return {}
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+    bt_api.build_signal_cache(ps, klines, db, dividend_mode="back")
+    assert captured["dividend_type"] == 2
+
+
 def test_build_signal_cache_orchestration(db_session, monkeypatch):
     """build_signal_cache 读 Strategy+Formula，调 compute，转 cache。"""
     db = db_session

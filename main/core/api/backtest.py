@@ -53,6 +53,8 @@ class BacktestRequest(BaseModel):
     name: str
     start_date: date
     end_date: date
+    # 复权模式：front 前复权（默认，历史行为） / back 后复权
+    dividend_mode: str = "front"
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +164,15 @@ def export_record_html(record_id: int, db: Session = Depends(get_db)):
 
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     """回测请求基础校验，返回错误消息或 None（通过）。
-    校验日期区间：start < end，且 start 不在未来（TQ 拉不到未来行情）。"""
+    校验日期区间：start < end，且 start 不在未来（TQ 拉不到未来行情）。
+    校验复权模式取值。"""
     if req.start_date >= req.end_date:
         return f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}"
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.dividend_mode not in ("front", "back"):
+        return f"复权模式仅支持 front/back，收到 {req.dividend_mode!r}"
     return None
 
 
