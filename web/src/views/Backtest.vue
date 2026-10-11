@@ -1976,6 +1976,55 @@ const selectedEvents = computed<DecisionEventItem[]>(() => {
     (e) => e.gate === sel.gate && (e.param_name || '') === (sel.param_name || ''))
 })
 
+// ===== 风控与拦截：聚合摘要 + 下钻明细交互 =====
+const decisionTable = useTable(
+  computed(() => decisionSummary.value),
+  {
+    pageSize: 20,
+    initialSort: { key: 'count', dir: 'desc' },
+    keyword: { label: '搜索', placeholder: '闸门 / 参数名' },
+    columns: [
+      { key: 'gate', label: '闸门', searchable: true },
+      { key: 'layer', label: '层' },
+      { key: 'action', label: '动作' },
+      { key: 'param_name', label: '参数', searchable: true },
+      { key: 'param_value', label: '阈值' },
+      { key: 'count', label: '触发次数', sortable: true },
+      { key: 'first_bar_time', label: '首次', sortable: true },
+      { key: 'last_bar_time', label: '末次', sortable: true },
+      { key: 'stock_count', label: '涉及股票', sortable: true },
+      { key: 'qty', label: '请求/实发' },
+    ],
+    filters: [
+      { kind: 'select', key: 'layer', label: '层', get: (s: any) => s.layer,
+        options: () => Array.from(new Set(decisionSummary.value.map((s: any) => s.layer).filter(Boolean)))
+          .map((l: any) => ({ value: l, label: layerLabel(l) })) },
+      { kind: 'select', key: 'action', label: '动作', get: (s: any) => s.action,
+        options: () => Array.from(new Set(decisionSummary.value.map((s: any) => s.action).filter(Boolean)))
+          .map((a: any) => ({ value: a, label: actionLabel(a) })) },
+    ],
+  },
+)
+const decisionDetailTable = useTable(
+  computed(() => selectedEvents.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '代码 / 原因' },
+    columns: [
+      { key: 'bar_time', label: '时间', sortable: true, searchable: false },
+      { key: 'strategy_id', label: '策略', searchable: false },
+      { key: 'stock_code', label: '代码', searchable: true },
+      { key: 'param_value', label: '阈值', searchable: false },
+      { key: 'actual_value', label: '实际', searchable: false },
+      { key: 'final_qty', label: '请求/实发', searchable: false },
+      { key: 'message', label: '原因', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: 'bar_time', label: '时间', get: (e: any) => (e.bar_time || '').slice(0, 10) },
+    ],
+  },
+)
+
 // ===== echarts 初始化 =====
 function initCharts() {
   initEquityChart()
@@ -3319,15 +3368,30 @@ watch(theme, () => {
     </div>
     <template v-else>
       <div class="table-container">
+        <TableToolbar
+          :filters="decisionTable.filterSpecs"
+          :keyword="{ label: '搜索', placeholder: '闸门 / 参数名' }"
+          :search-text="decisionTable.searchText.value"
+          :filter-state="decisionTable.filterState.value"
+          :displayed-count="decisionTable.displayedCount.value"
+          :total-count="decisionTable.totalCount.value"
+          @update:search-text="(v: string) => (decisionTable.searchText.value = v)"
+          @update:filter-state="(v: any) => (decisionTable.filterState.value = v)"
+          @reset="decisionTable.reset"
+        />
         <table class="decision-table">
           <thead>
             <tr>
-              <th>闸门</th><th>层</th><th>动作</th><th>参数</th><th>阈值</th>
-              <th>触发次数</th><th>首次</th><th>末次</th><th>涉及股票</th><th>请求/实发(股)</th>
+              <th v-for="c in decisionTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && decisionTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="decisionTable.sortKey.value === c.key">{{ decisionTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="s in decisionSummary" :key="gateKey(s)"
+            <tr v-for="s in decisionTable.pagedRows.value" :key="gateKey(s)"
                 class="decision-row" :class="{ active: gateKey(s) === selectedKey }"
                 @click="toggleGate(s)">
               <td>
@@ -3346,6 +3410,13 @@ watch(theme, () => {
             </tr>
           </tbody>
         </table>
+        <div v-if="decisionTable.displayedCount.value === 0" class="empty-state"><p>无匹配记录</p></div>
+        <TablePager
+          :page="decisionTable.page.value" :page-size="decisionTable.pageSize.value"
+          :total-pages="decisionTable.totalPages.value"
+          :displayed-count="decisionTable.displayedCount.value" :total-count="decisionTable.totalCount.value"
+          @update:page="decisionTable.setPage" @update:page-size="decisionTable.setPageSize"
+        />
       </div>
 
       <!-- 下钻：选中闸门的逐笔事件 -->
@@ -3354,15 +3425,30 @@ watch(theme, () => {
           「{{ gateLabel(selectedSummary.gate) }}」明细 · 共 {{ selectedEvents.length }} 条
           <span class="drill-close" @click="selectedKey = null">收起 ✕</span>
         </div>
+        <TableToolbar
+          :filters="decisionDetailTable.filterSpecs"
+          :keyword="{ label: '搜索', placeholder: '代码 / 原因' }"
+          :search-text="decisionDetailTable.searchText.value"
+          :filter-state="decisionDetailTable.filterState.value"
+          :displayed-count="decisionDetailTable.displayedCount.value"
+          :total-count="decisionDetailTable.totalCount.value"
+          @update:search-text="(v: string) => (decisionDetailTable.searchText.value = v)"
+          @update:filter-state="(v: any) => (decisionDetailTable.filterState.value = v)"
+          @reset="decisionDetailTable.reset"
+        />
         <table class="trade-table">
           <thead>
             <tr>
-              <th>时间</th><th>策略</th><th>代码</th><th>阈值</th><th>实际</th>
-              <th>请求/实发</th><th>原因</th>
+              <th v-for="c in decisionDetailTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && decisionDetailTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="decisionDetailTable.sortKey.value === c.key">{{ decisionDetailTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="e in selectedEvents" :key="e.id">
+            <tr v-for="e in decisionDetailTable.pagedRows.value" :key="e.id">
               <td class="time">{{ fmtBarTime(e.bar_time) }}</td>
               <td>{{ e.strategy_id ? `#${e.strategy_id}` : '组合' }}</td>
               <td>{{ e.stock_code || '—' }}</td>
@@ -3373,6 +3459,13 @@ watch(theme, () => {
             </tr>
           </tbody>
         </table>
+        <div v-if="decisionDetailTable.displayedCount.value === 0" class="empty-state"><p>无匹配事件</p></div>
+        <TablePager
+          :page="decisionDetailTable.page.value" :page-size="decisionDetailTable.pageSize.value"
+          :total-pages="decisionDetailTable.totalPages.value"
+          :displayed-count="decisionDetailTable.displayedCount.value" :total-count="decisionDetailTable.totalCount.value"
+          @update:page="decisionDetailTable.setPage" @update:page-size="decisionDetailTable.setPageSize"
+        />
       </div>
     </template>
 

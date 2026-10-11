@@ -384,6 +384,32 @@ describe('Backtest.vue — 详情视图', () => {
     expect(link?.attributes('target')).toBe('_blank')
   })
 
+  it('决策事件下钻明细支持关键词过滤', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      decision_summary: [{ gate: 'stop_loss', layer: 'strategy_risk', action: 'trigger',
+        param_name: 'stop_loss_ratio', param_value: 0.05, count: 2, stock_count: 2,
+        first_bar_time: '2026-07-02T09:30:00', last_bar_time: '2026-07-03T09:30:00',
+        requested_qty_sum: 200, final_qty_sum: 200 }],
+      decisions: [
+        { id: 1, gate: 'stop_loss', param_name: 'stop_loss_ratio', bar_time: '2026-07-02T09:30:00', strategy_id: 1, stock_code: '000001.SZ', param_value: 0.05, actual_value: 0.06, requested_qty: 100, final_qty: 100, message: '止损：成本 7.42 现价 6.99 跌 5.81%' },
+        { id: 2, gate: 'stop_loss', param_name: 'stop_loss_ratio', bar_time: '2026-07-03T09:30:00', strategy_id: 1, stock_code: '600000.SH', param_value: 0.05, actual_value: 0.07, requested_qty: 100, final_qty: 100, message: '止损：成本 9.0 现价 8.3 跌 7.2%' },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    await w.find('tr.decision-row').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.drill-box table.trade-table tbody tr').length).toBe(2)
+    const kw = w.find('.drill-box input.tb-keyword')
+    await kw.setValue('600000')
+    await flushPromises()
+    expect(w.findAll('.drill-box table.trade-table tbody tr').length).toBe(1)
+    expect(w.find('.drill-box table.trade-table tbody tr').text()).toContain('600000.SH')
+  })
+
   it('record.warnings 非空 → 详情顶部显示回测告警条及每条告警', async () => {
     ;(getBacktestDetail as any).mockResolvedValueOnce({
       ...mockDetail,
