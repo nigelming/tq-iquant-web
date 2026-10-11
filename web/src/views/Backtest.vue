@@ -15,6 +15,7 @@ import type {
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTheme } from '../composables/useTheme'
 
 function cssVar(name: string): string {
@@ -1548,15 +1549,10 @@ function backToList() {
 }
 
 // ===== 格式化 =====
-function pct(v: number | null | undefined): string {
-  if (v === null || v === undefined) return '—'
-  return `${(Number(v) * 100).toFixed(2)}%`
-}
-function num(v: number | null | undefined, digits = 4): string {
-  if (v === null || v === undefined) return '—'
-  if (!Number.isFinite(Number(v))) return '—'
-  return Number(v).toFixed(digits)
-}
+function pct(v: number | null | undefined): string { return fmtPct(v, 2) }
+function num(v: number | null | undefined, digits = 4): string { return fmtRatio(v, digits) }
+function pct1(v: number | null | undefined): string { return fmtPct(v, 1) }
+function pctSigned(v: number | null | undefined, digits = 2): string { return fmtSignedPct(v, digits) }
 
 function lastVal(arr: (number | null)[] | undefined): number | null {
   if (!arr || !arr.length) return null
@@ -1575,16 +1571,6 @@ function fmtCorr(v: number | null): string {
 function valueClass(v: number | null | undefined): string {
   if (v === null || v === undefined) return ''
   return Number(v) >= 0 ? 'text-red' : 'text-green'
-}
-
-function pct1(v: number | null | undefined): string {
-  if (v === null || v === undefined) return '—'
-  return `${(Number(v) * 100).toFixed(1)}%`
-}
-
-function pctSigned(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined) return '—'
-  return `${Number(v) >= 0 ? '+' : ''}${(Number(v) * 100).toFixed(digits)}%`
 }
 
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
@@ -2362,12 +2348,12 @@ watch(theme, () => {
       </a>
     </div>
 
-    <!-- 信号预检警告：回测 completed 但公式报错/输出线缺失/区间零信号 -->
+    <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->
     <div v-if="currentRecord.warnings && currentRecord.warnings.length"
          class="card signal-preflight-banner">
       <div class="spb-title">
-        ⚠️ 信号预检发现 {{ currentRecord.warnings.length }} 项问题
-        <span>（回测已完成，但可能未产生预期交易）</span>
+        ⚠️ 回测告警 {{ currentRecord.warnings.length }} 项
+        <span>（回测已完成，但可能存在行情数据或信号问题）</span>
       </div>
       <ul class="spb-list">
         <li v-for="(w, i) in currentRecord.warnings" :key="i">{{ w }}</li>
@@ -3357,11 +3343,11 @@ watch(theme, () => {
             </td>
             <td :class="t.trade_type === 'BUY' ? 'text-green' : 'text-red'">{{ t.trade_type === 'BUY' ? '买入' : '卖出' }}</td>
             <td>{{ t.stock_code }}</td>
-            <td>{{ t.quantity }}</td>
-            <td>{{ Number(t.price).toFixed(3) }}</td>
-            <td>{{ Number(t.amount).toLocaleString() }}</td>
-            <td>{{ Number(t.commission).toFixed(2) }}</td>
-            <td>{{ Number(t.stamp_duty).toFixed(2) }}</td>
+            <td>{{ fmtQty(t.quantity) }}</td>
+            <td>{{ fmtPrice(t.price) }}</td>
+            <td>{{ fmtMoney(t.amount) }}</td>
+            <td>{{ fmtMoney(t.commission) }}</td>
+            <td>{{ fmtMoney(t.stamp_duty) }}</td>
           </tr>
         </tbody>
       </table>

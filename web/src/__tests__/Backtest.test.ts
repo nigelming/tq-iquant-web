@@ -313,6 +313,23 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('买入')
   })
 
+  it('交易明细价格/金额/数量按统一精度渲染', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      trades: [{ id: 9, stock_code: '000001.SZ', trade_type: 'BUY', price: 7.42,
+        quantity: 27100, amount: 201082.35, commission: 50.27, stamp_duty: 0,
+        bar_time: '2019-09-17T00:00:00', signal_name: '转强', signal_type: 'OPEN' }],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('7.420')
+    expect(w.text()).toContain('27,100')
+    expect(w.text()).toContain('201,082.35')
+    expect(w.text()).toContain('50.27')
+  })
+
   it('详情页含导出 HTML 报告按钮（指向 /api/backtest/records/{id}/export/html）', async () => {
     const w = mount(Backtest)
     await flushPromises()
@@ -324,7 +341,7 @@ describe('Backtest.vue — 详情视图', () => {
     expect(link?.attributes('target')).toBe('_blank')
   })
 
-  it('record.warnings 非空 → 详情顶部显示信号预检警告条及每条警告', async () => {
+  it('record.warnings 非空 → 详情顶部显示回测告警条及每条告警', async () => {
     ;(getBacktestDetail as any).mockResolvedValueOnce({
       ...mockDetail,
       record: {
@@ -341,13 +358,13 @@ describe('Backtest.vue — 详情视图', () => {
 
     const banner = w.find('.signal-preflight-banner')
     expect(banner.exists()).toBe(true)
-    expect(banner.text()).toContain('信号预检')
+    expect(banner.text()).toContain('回测告警')
     expect(banner.text()).toContain('最终强交易买')
     expect(banner.text()).toContain('从未触发')
     expect(banner.findAll('.spb-list li').length).toBe(1)
   })
 
-  it('record.warnings 为空数组 → 不渲染信号预检警告条', async () => {
+  it('record.warnings 为空数组 → 不渲染回测告警条', async () => {
     ;(getBacktestDetail as any).mockResolvedValueOnce({
       ...mockDetail,
       record: { ...mockDetail.record, warnings: [] },
