@@ -16,6 +16,9 @@ import type {
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
+import { useTable } from '../composables/useTable'
+import TableToolbar from '../components/TableToolbar.vue'
+import TablePager from '../components/TablePager.vue'
 import { useTheme } from '../composables/useTheme'
 
 function cssVar(name: string): string {
@@ -825,10 +828,7 @@ function initCaDimChart() {
   })
 }
 
-// 交易明细分页
-const currentPage = ref(1)
-const pageSize = 20
-
+// 信号状态标签
 const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
 }
@@ -915,7 +915,6 @@ async function openDetail(id: number) {
     return
   }
   currentRecord.value = detail.value?.record || null
-  currentPage.value = 1
   caDownPage.value = 1
   selectedKey.value = null
   caCollapsed.value = true
@@ -1892,13 +1891,35 @@ function boxplotData(arr: number[]): [number, number, number, number, number] | 
   return [sorted[0], q(0.25), q(0.5), q(0.75), sorted[sorted.length - 1]]
 }
 
-// ===== 交易明细分页 =====
-const totalPages = computed(() => Math.max(1, Math.ceil((detail.value?.trades || []).length / pageSize)))
-const paginatedTrades = computed(() => {
-  const trades = detail.value?.trades || []
-  const start = (currentPage.value - 1) * pageSize
-  return trades.slice(start, start + pageSize)
-})
+// ===== 交易明细交互（排序/筛选/分页）=====
+const tradesTable = useTable(
+  computed(() => detail.value?.trades ?? []),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '代码 / 信号来源 / 策略名' },
+    columns: [
+      { key: 'bar_time', label: '时间', sortable: true },
+      { key: 'strategy_name', label: '策略' },
+      { key: 'signal_name', label: '信号来源', searchable: true },
+      { key: 'trade_type', label: '买卖' },
+      { key: 'stock_code', label: '代码', searchable: true },
+      { key: 'quantity', label: '数量', sortable: true, sortValue: (t: any) => Number(t.quantity) },
+      { key: 'price', label: '价格', sortable: true, sortValue: (t: any) => Number(t.price) },
+      { key: 'amount', label: '金额', sortable: true, sortValue: (t: any) => Number(t.amount) },
+      { key: 'commission', label: '佣金', sortable: true, sortValue: (t: any) => Number(t.commission) },
+      { key: 'stamp_duty', label: '印花税', sortable: true, sortValue: (t: any) => Number(t.stamp_duty) },
+    ],
+    filters: [
+      { kind: 'select', key: 'trade_type', label: '买卖', get: (t: any) => t.trade_type,
+        options: [{ value: 'BUY', label: '买入' }, { value: 'SELL', label: '卖出' }] },
+      { kind: 'select', key: 'signal_type', label: '信号', get: (t: any) => t.signal_type,
+        options: () => Array.from(new Set((detail.value?.trades ?? []).map((t: any) => t.signal_type).filter(Boolean)))
+          .map((v: any) => ({ value: v, label: signalTypeLabel(v) })) },
+      { kind: 'dateRange', key: 'bar_time', label: '时间', get: (t: any) => (t.bar_time || '').slice(0, 10) },
+      { kind: 'numRange', key: 'amount', label: '金额', unit: '元', get: (t: any) => Number(t.amount) },
+    ],
+  },
+)
 
 // ===== 风控与拦截统计（决策闸门，调参可观测性）=====
 // 闸门阈值/实际值：比率类（0<|v|<1）转百分比，数量类（max_positions 等）原样显示。
@@ -3326,15 +3347,30 @@ watch(theme, () => {
     <!-- 交易明细 -->
     <div class="section-title">交易明细</div>
     <div class="table-container">
+      <TableToolbar
+        :filters="tradesTable.filterSpecs"
+        :keyword="{ label: '搜索', placeholder: '代码 / 信号来源 / 策略名' }"
+        :search-text="tradesTable.searchText.value"
+        :filter-state="tradesTable.filterState.value"
+        :displayed-count="tradesTable.displayedCount.value"
+        :total-count="tradesTable.totalCount.value"
+        @update:search-text="(v: string) => (tradesTable.searchText.value = v)"
+        @update:filter-state="(v: any) => (tradesTable.filterState.value = v)"
+        @reset="tradesTable.reset"
+      />
       <table class="trade-table">
         <thead>
           <tr>
-            <th>时间</th><th>策略</th><th>信号来源</th><th>买卖</th><th>代码</th>
-            <th>数量</th><th>价格</th><th>金额</th><th>佣金</th><th>印花税</th>
+            <th v-for="c in tradesTable.columns" :key="c.key"
+                :class="{ sortable: c.sortable }"
+                @click="c.sortable && tradesTable.toggleSort(c.key)">
+              {{ c.label }}
+              <span v-if="tradesTable.sortKey.value === c.key">{{ tradesTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+            </th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="t in paginatedTrades" :key="t.id">
+          <tr v-for="t in tradesTable.pagedRows.value" :key="t.id">
             <td style="font-size:12px;color:var(--ink-faint)">{{ t.bar_time?.replace('T', ' ') }}</td>
             <td><span class="strategy-badge">{{ t.strategy_name || `#${t.strategy_id}` }}</span></td>
             <td>
@@ -3351,12 +3387,13 @@ watch(theme, () => {
           </tr>
         </tbody>
       </table>
-      <div v-if="(detail?.trades || []).length === 0" class="empty-state"><p>无交易记录</p></div>
-      <div v-if="(detail?.trades || []).length > pageSize" class="pagination">
-        <button :disabled="currentPage === 1" @click="currentPage--" class="page-btn">上一页</button>
-        <span class="page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
-        <button :disabled="currentPage === totalPages" @click="currentPage++" class="page-btn">下一页</button>
-      </div>
+      <div v-if="tradesTable.displayedCount.value === 0" class="empty-state"><p>无匹配交易记录</p></div>
+      <TablePager
+        :page="tradesTable.page.value" :page-size="tradesTable.pageSize.value"
+        :total-pages="tradesTable.totalPages.value"
+        :displayed-count="tradesTable.displayedCount.value" :total-count="tradesTable.totalCount.value"
+        @update:page="tradesTable.setPage" @update:page-size="tradesTable.setPageSize"
+      />
     </div>
   </div>
 </template>

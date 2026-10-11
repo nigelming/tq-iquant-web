@@ -330,6 +330,26 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('50.27')
   })
 
+  it('交易明细支持关键词过滤与排序', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      trades: [
+        { id: 1, stock_code: '000001.SZ', trade_type: 'BUY', price: 10, quantity: 100, amount: 1000, commission: 5, stamp_duty: 0, bar_time: '2026-07-02T09:30:00', signal_name: 'a', signal_type: 'OPEN' },
+        { id: 2, stock_code: '600000.SH', trade_type: 'SELL', price: 9, quantity: 200, amount: 900, commission: 5, stamp_duty: 1, bar_time: '2026-07-03T09:30:00', signal_name: 'b', signal_type: 'CLOSE' },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const kw = w.find('input[type="text"].tb-keyword')
+    await kw.setValue('600000')
+    await flushPromises()
+    const rows = w.findAll('table.trade-table tbody tr')
+    expect(rows.length).toBe(1)
+    expect(rows[0].text()).toContain('600000.SH')
+  })
+
   it('详情页含导出 HTML 报告按钮（指向 /api/backtest/records/{id}/export/html）', async () => {
     const w = mount(Backtest)
     await flushPromises()
