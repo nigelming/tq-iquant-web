@@ -2025,6 +2025,153 @@ const decisionDetailTable = useTable(
   },
 )
 
+const parsePct = (v: any) => Number.isFinite(Number(v)) ? Number(v) : parseFloat(String(v).replace(/[%,+'']/g, ''))
+
+// ===== 危机 Alpha 动态表交互 =====
+const caEventTable = useTable(
+  computed(() => caEventRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '结果' },
+    columns: [
+      { key: '回撤起点', label: '回撤起点', sortable: true, searchable: false },
+      { key: '回撤低点', label: '回撤低点', sortable: true, searchable: false },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parsePct(r.基准), searchable: false },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => r.strategy_ret, searchable: false },
+      { key: '超额', label: '超额', sortable: true, sortValue: (r: any) => r.excess, searchable: false },
+      { key: '结果', label: '结果', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: '回撤起点', label: '时间', get: (r: any) => String(r.回撤起点).slice(0, 10) },
+    ],
+  },
+)
+const caBigDownTable = useTable(
+  computed(() => caBigDownRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '月份' },
+    columns: [
+      { key: '月份', label: '月份', sortable: true },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parsePct(r.基准), searchable: false },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => parsePct(r.策略), searchable: false },
+    ],
+    filters: [
+      { kind: 'dateRange', key: '月份', label: '时间', get: (r: any) => String(r.月份) },
+    ],
+  },
+)
+const caAnnualTable = useTable(
+  computed(() => caAnnualRows.value),
+  {
+    pageSize: 20,
+    columns: [
+      { key: '年度', label: '年度', sortable: true, sortValue: (r: any) => parseInt(String(r.年度), 10), searchable: true },
+      { key: '下跌周', label: '下跌周', sortable: true },
+      { key: '危机Alpha', label: '危机Alpha', sortable: true, sortValue: (r: any) => parsePct(r.危机Alpha), searchable: false },
+      { key: '策略收益', label: '策略收益', sortable: true, sortValue: (r: any) => parsePct(r.策略收益), searchable: false },
+      { key: '基准收益', label: '基准收益', sortable: true, sortValue: (r: any) => parsePct(r.基准收益), searchable: false },
+    ],
+  },
+)
+
+// ===== 市场状态动态表交互 =====
+const mrStateTable = useTable(
+  computed(() => mrStateRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '市场状态' },
+    columns: [
+      { key: 'label', label: '市场状态', searchable: true },
+      { key: 'weeks', label: '周数', sortable: true },
+      { key: 'ratio', label: '占比' },
+      { key: 'strategy', label: '策略累计', sortable: true, sortValue: (r: any) => r.strategyRaw },
+      { key: 'benchmark', label: '基准累计', sortable: true, sortValue: (r: any) => parsePct(r.benchmark) },
+      { key: 'excess', label: '超额', sortable: true, sortValue: (r: any) => r.excessRaw },
+      { key: 'win', label: '胜率' },
+      { key: 'dd', label: '态内最大回撤' },
+      { key: 'turnover', label: '年化换手' },
+      { key: 'cost', label: '成本占比' },
+    ],
+  },
+)
+const mrBigUpTable = useTable(
+  computed(() => mrBigUpRows.value),
+  {
+    pageSize: 20,
+    columns: [
+      { key: 'threshold', label: '条件', sortable: true, sortValue: (r: any) => parsePct(r.threshold), searchable: true },
+      { key: 'n', label: '周数', sortable: true },
+      { key: 'strategy', label: '策略平均', sortable: true, sortValue: (r: any) => r.strategyRaw, searchable: false },
+      { key: 'benchmark', label: '基准平均', sortable: true, sortValue: (r: any) => parsePct(r.benchmark), searchable: false },
+      { key: 'win', label: '收涨比例' },
+    ],
+  },
+)
+const mrReboundTable = useTable(
+  computed(() => mrReboundRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '收复情况' },
+    columns: [
+      { key: 'start', label: '起点', sortable: true, searchable: false },
+      { key: 'trough', label: '低点', sortable: true, searchable: false },
+      { key: 'end', label: '终点', sortable: true, searchable: false },
+      { key: 'weeks', label: '周数', sortable: true, searchable: false },
+      { key: 'bRebound', label: '基准反弹', sortable: true, sortValue: (r: any) => parsePct(r.bRebound), searchable: false },
+      { key: 'sRebound', label: '策略反弹', sortable: true, sortValue: (r: any) => r.sReboundRaw, searchable: false },
+      { key: 'elasticity', label: '弹性', sortable: true, searchable: false },
+      { key: 'bRecover', label: '基准收复前高', searchable: true },
+      { key: 'sRecover', label: '策略收复前高', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: 'start', label: '时间', get: (r: any) => String(r.start).slice(0, 10) },
+    ],
+  },
+)
+const mrNeutralTable = useTable(
+  computed(() => mrNeutralRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '指标名' },
+    columns: [
+      { key: 'k', label: '指标', searchable: true },
+      { key: 'v', label: '数值' },
+    ],
+  },
+)
+const iaContribTable = useTable(
+  computed(() => iaContribRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '行业名' },
+    columns: [
+      { key: 'name', label: '行业', searchable: true },
+      { key: 'avg', label: '平均权重' },
+      { key: 'index', label: '行业区间涨跌', sortable: true, sortValue: (r: any) => parsePct(r.index), searchable: false },
+      { key: 'contrib', label: '配置贡献', sortable: true, sortValue: (r: any) => r.contribRaw, searchable: false },
+    ],
+  },
+)
+const rbSensTable = useTable(
+  computed(() => rbSensRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '基准名' },
+    columns: [
+      { key: 'name', label: '基准', searchable: true },
+      { key: 'beta', label: 'β', sortable: true },
+      { key: 'jensen', label: 'Jensen α(年化)', sortable: true, sortValue: (r: any) => (r.available ? r.jensen_alpha : null), searchable: false },
+      { key: 'excess', label: '年化超额', sortable: true, sortValue: (r: any) => (r.available ? r.excess_annual_return : null), searchable: false },
+      { key: 'tracking', label: '跟踪误差' },
+      { key: 'ir', label: '信息比率', sortable: true, sortValue: (r: any) => (r.available ? r.information_ratio : null) },
+      { key: 'up', label: '上行捕获' },
+      { key: 'down', label: '下行捕获' },
+      { key: 'excessDD', label: '超额回撤' },
+    ],
+  },
+)
+
 // ===== echarts 初始化 =====
 function initCharts() {
   initEquityChart()
@@ -2618,10 +2765,28 @@ watch(theme, () => {
         </div>
         <template v-else>
           <div class="table-container">
+            <TableToolbar
+              :filters="caEventTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '结果' }"
+              :search-text="caEventTable.searchText.value"
+              :filter-state="caEventTable.filterState.value"
+              :displayed-count="caEventTable.displayedCount.value"
+              :total-count="caEventTable.totalCount.value"
+              @update:search-text="(v: string) => (caEventTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (caEventTable.filterState.value = v)"
+              @reset="caEventTable.reset"
+            />
             <table class="ca-event-table">
-              <thead><tr><th>回撤起点</th><th>回撤低点</th><th>基准</th><th>策略</th><th>超额</th><th>结果</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in caEventTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && caEventTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="caEventTable.sortKey.value === c.key">{{ caEventTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in caEventRows" :key="r.回撤起点">
+                <tr v-for="r in caEventTable.pagedRows.value" :key="r.回撤起点">
                   <td>{{ r.回撤起点 }}</td>
                   <td>{{ r.回撤低点 }}</td>
                   <td class="text-green">{{ r.基准 }}</td>
@@ -2631,6 +2796,13 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <div v-if="caEventTable.displayedCount.value === 0" class="empty-state"><p>无匹配事件</p></div>
+            <TablePager
+              :page="caEventTable.page.value" :page-size="caEventTable.pageSize.value"
+              :total-pages="caEventTable.totalPages.value"
+              :displayed-count="caEventTable.displayedCount.value" :total-count="caEventTable.totalCount.value"
+              @update:page="caEventTable.setPage" @update:page-size="caEventTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             基准深度回撤（&gt;5%）事件共 {{ caEventStat.n }} 次，{{ ca?.strategy_name }}
@@ -2685,16 +2857,40 @@ watch(theme, () => {
           <div class="empty-state"><p>分析区间内无大跌月。</p></div>
         </div>
         <div v-else class="table-container">
+          <TableToolbar
+            :filters="caBigDownTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '月份' }"
+            :search-text="caBigDownTable.searchText.value"
+            :filter-state="caBigDownTable.filterState.value"
+            :displayed-count="caBigDownTable.displayedCount.value"
+            :total-count="caBigDownTable.totalCount.value"
+            @update:search-text="(v: string) => (caBigDownTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (caBigDownTable.filterState.value = v)"
+            @reset="caBigDownTable.reset"
+          />
           <table class="ca-bigdown-table">
-            <thead><tr><th>月份</th><th>基准</th><th>策略</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in caBigDownTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && caBigDownTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="caBigDownTable.sortKey.value === c.key">{{ caBigDownTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in caBigDownRows" :key="r.月份">
+              <tr v-for="r in caBigDownTable.pagedRows.value" :key="r.月份">
                 <td>{{ r.月份 }}</td>
                 <td class="text-green">{{ r.基准 }}</td>
                 <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="caBigDownTable.page.value" :page-size="caBigDownTable.pageSize.value"
+            :total-pages="caBigDownTable.totalPages.value"
+            :displayed-count="caBigDownTable.displayedCount.value" :total-count="caBigDownTable.totalCount.value"
+            @update:page="caBigDownTable.setPage" @update:page-size="caBigDownTable.setPageSize"
+          />
         </div>
         <p class="ca-note">下跌月份共 {{ pct1(ca?.monthly.hedge_ratio) }} 实现危机对冲（月度口径）。</p>
 
@@ -2715,10 +2911,28 @@ watch(theme, () => {
             <div ref="caAnnualEl" class="ca-chart"></div>
           </div>
           <div class="table-container">
-            <table>
-              <thead><tr><th>年度</th><th>下跌周</th><th>危机Alpha</th><th>策略收益</th><th>基准收益</th></tr></thead>
+            <TableToolbar
+              :filters="caAnnualTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '年度' }"
+              :search-text="caAnnualTable.searchText.value"
+              :filter-state="caAnnualTable.filterState.value"
+              :displayed-count="caAnnualTable.displayedCount.value"
+              :total-count="caAnnualTable.totalCount.value"
+              @update:search-text="(v: string) => (caAnnualTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (caAnnualTable.filterState.value = v)"
+              @reset="caAnnualTable.reset"
+            />
+            <table class="ca-annual-table">
+              <thead><tr>
+                <th v-for="c in caAnnualTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && caAnnualTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="caAnnualTable.sortKey.value === c.key">{{ caAnnualTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in caAnnualRows" :key="r.年度">
+                <tr v-for="r in caAnnualTable.pagedRows.value" :key="r.年度">
                   <td>{{ r.年度 }}</td>
                   <td>{{ r.下跌周 }}</td>
                   <td>{{ r.危机Alpha }}</td>
@@ -2727,6 +2941,12 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="caAnnualTable.page.value" :page-size="caAnnualTable.pageSize.value"
+              :total-pages="caAnnualTable.totalPages.value"
+              :displayed-count="caAnnualTable.displayedCount.value" :total-count="caAnnualTable.totalCount.value"
+              @update:page="caAnnualTable.setPage" @update:page-size="caAnnualTable.setPageSize"
+            />
           </div>
           <p v-if="caAnnualRows.some(r => !r.完整)" class="ca-note">
             注：标 * 的年度为数据区间首尾的非完整年度（有效收益周不足 40 周），指标仅供参考。
@@ -2813,7 +3033,7 @@ watch(theme, () => {
             </tbody>
           </table>
           <div v-if="caDownTable.displayedCount.value === 0" class="empty-state"><p>无匹配下跌周</p></div>
-          <TablePager
+          <TablePager class="dw-pager"
             :page="caDownTable.page.value" :page-size="caDownTable.pageSize.value"
             :total-pages="caDownTable.totalPages.value"
             :displayed-count="caDownTable.displayedCount.value" :total-count="caDownTable.totalCount.value"
@@ -2886,15 +3106,30 @@ watch(theme, () => {
           <div ref="mrStateEl" class="ca-chart mr-chart"></div>
         </div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrStateTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '市场状态' }"
+            :search-text="mrStateTable.searchText.value"
+            :filter-state="mrStateTable.filterState.value"
+            :displayed-count="mrStateTable.displayedCount.value"
+            :total-count="mrStateTable.totalCount.value"
+            @update:search-text="(v: string) => (mrStateTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrStateTable.filterState.value = v)"
+            @reset="mrStateTable.reset"
+          />
           <table>
             <thead>
               <tr>
-                <th>市场状态</th><th>周数</th><th>占比</th><th>策略累计</th><th>基准累计</th>
-                <th>超额</th><th>胜率</th><th>态内最大回撤</th><th>年化换手</th><th>成本占比</th>
+                <th v-for="c in mrStateTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && mrStateTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="mrStateTable.sortKey.value === c.key">{{ mrStateTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="r in mrStateRows" :key="r.key">
+              <tr v-for="r in mrStateTable.pagedRows.value" :key="r.key">
                 <td :style="{ color: MR_STATE_COLORS[r.key], fontWeight: 700 }">{{ r.label }}</td>
                 <td>{{ r.weeks }}</td>
                 <td>{{ r.ratio }}</td>
@@ -2908,15 +3143,39 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrStateTable.page.value" :page-size="mrStateTable.pageSize.value"
+            :total-pages="mrStateTable.totalPages.value"
+            :displayed-count="mrStateTable.displayedCount.value" :total-count="mrStateTable.totalCount.value"
+            @update:page="mrStateTable.setPage" @update:page-size="mrStateTable.setPageSize"
+          />
         </div>
 
         <div class="section-title" style="font-size:14px">二、机遇Alpha（上涨捕获）</div>
         <div class="ca-sub">大涨周检验</div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrBigUpTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '条件' }"
+            :search-text="mrBigUpTable.searchText.value"
+            :filter-state="mrBigUpTable.filterState.value"
+            :displayed-count="mrBigUpTable.displayedCount.value"
+            :total-count="mrBigUpTable.totalCount.value"
+            @update:search-text="(v: string) => (mrBigUpTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrBigUpTable.filterState.value = v)"
+            @reset="mrBigUpTable.reset"
+          />
           <table>
-            <thead><tr><th>条件</th><th>周数</th><th>策略平均</th><th>基准平均</th><th>收涨比例</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in mrBigUpTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && mrBigUpTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="mrBigUpTable.sortKey.value === c.key">{{ mrBigUpTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in mrBigUpRows" :key="r.threshold">
+              <tr v-for="r in mrBigUpTable.pagedRows.value" :key="r.threshold">
                 <td>{{ r.threshold }}</td>
                 <td>{{ r.n }}</td>
                 <td :class="valueClass(r.strategyRaw)">{{ r.strategy }}</td>
@@ -2925,6 +3184,12 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrBigUpTable.page.value" :page-size="mrBigUpTable.pageSize.value"
+            :total-pages="mrBigUpTable.totalPages.value"
+            :displayed-count="mrBigUpTable.displayedCount.value" :total-count="mrBigUpTable.totalCount.value"
+            @update:page="mrBigUpTable.setPage" @update:page-size="mrBigUpTable.setPageSize"
+          />
         </div>
         <div class="ca-sub">上涨周四档分类</div>
         <div class="table-container">
@@ -2954,15 +3219,30 @@ watch(theme, () => {
             <div ref="mrReboundEl" class="ca-chart"></div>
           </div>
           <div class="table-container">
+            <TableToolbar
+              :filters="mrReboundTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '收复情况' }"
+              :search-text="mrReboundTable.searchText.value"
+              :filter-state="mrReboundTable.filterState.value"
+              :displayed-count="mrReboundTable.displayedCount.value"
+              :total-count="mrReboundTable.totalCount.value"
+              @update:search-text="(v: string) => (mrReboundTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (mrReboundTable.filterState.value = v)"
+              @reset="mrReboundTable.reset"
+            />
             <table>
               <thead>
                 <tr>
-                  <th>起点</th><th>低点</th><th>终点</th><th>周数</th><th>基准反弹</th><th>策略反弹</th>
-                  <th>弹性</th><th>基准收复前高</th><th>策略收复前高</th>
+                  <th v-for="c in mrReboundTable.columns" :key="c.key"
+                      :class="{ sortable: c.sortable }"
+                      @click="c.sortable && mrReboundTable.toggleSort(c.key)">
+                    {{ c.label }}
+                    <span v-if="mrReboundTable.sortKey.value === c.key">{{ mrReboundTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="r in mrReboundRows" :key="r.start">
+                <tr v-for="r in mrReboundTable.pagedRows.value" :key="r.start">
                   <td>{{ r.start }}</td>
                   <td>{{ r.trough }}</td>
                   <td>{{ r.end }}</td>
@@ -2975,6 +3255,13 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <div v-if="mrReboundTable.displayedCount.value === 0" class="empty-state"><p>无匹配反弹段</p></div>
+            <TablePager
+              :page="mrReboundTable.page.value" :page-size="mrReboundTable.pageSize.value"
+              :total-pages="mrReboundTable.totalPages.value"
+              :displayed-count="mrReboundTable.displayedCount.value" :total-count="mrReboundTable.totalCount.value"
+              @update:page="mrReboundTable.setPage" @update:page-size="mrReboundTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             反弹平均弹性
@@ -2985,15 +3272,39 @@ watch(theme, () => {
 
         <div class="section-title" style="font-size:14px">四、中性Alpha（震荡磨损）</div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrNeutralTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '指标名' }"
+            :search-text="mrNeutralTable.searchText.value"
+            :filter-state="mrNeutralTable.filterState.value"
+            :displayed-count="mrNeutralTable.displayedCount.value"
+            :total-count="mrNeutralTable.totalCount.value"
+            @update:search-text="(v: string) => (mrNeutralTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrNeutralTable.filterState.value = v)"
+            @reset="mrNeutralTable.reset"
+          />
           <table>
-            <thead><tr><th>指标</th><th>数值</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in mrNeutralTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && mrNeutralTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="mrNeutralTable.sortKey.value === c.key">{{ mrNeutralTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in mrNeutralRows" :key="r.k">
+              <tr v-for="r in mrNeutralTable.pagedRows.value" :key="r.k">
                 <td>{{ r.k }}</td>
                 <td :class="valueClass(r.raw)">{{ r.v }}</td>
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrNeutralTable.page.value" :page-size="mrNeutralTable.pageSize.value"
+            :total-pages="mrNeutralTable.totalPages.value"
+            :displayed-count="mrNeutralTable.displayedCount.value" :total-count="mrNeutralTable.totalCount.value"
+            @update:page="mrNeutralTable.setPage" @update:page-size="mrNeutralTable.setPageSize"
+          />
         </div>
         <p class="ca-note">
           磨损指标按交易日归属平仓日；假突破磨损 = 5 个交易日内同票平仓且毛 PnL ≤ 0（FIFO 配对）。
@@ -3140,10 +3451,28 @@ watch(theme, () => {
             <div class="empty-state"><p>行业指数不可得，仅展示暴露与命中率。</p></div>
           </div>
           <div v-else class="table-container">
+            <TableToolbar
+              :filters="iaContribTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '行业名' }"
+              :search-text="iaContribTable.searchText.value"
+              :filter-state="iaContribTable.filterState.value"
+              :displayed-count="iaContribTable.displayedCount.value"
+              :total-count="iaContribTable.totalCount.value"
+              @update:search-text="(v: string) => (iaContribTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (iaContribTable.filterState.value = v)"
+              @reset="iaContribTable.reset"
+            />
             <table>
-              <thead><tr><th>行业</th><th>平均权重</th><th>行业区间涨跌</th><th>配置贡献</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in iaContribTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && iaContribTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="iaContribTable.sortKey.value === c.key">{{ iaContribTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in iaContribRows" :key="r.name">
+                <tr v-for="r in iaContribTable.pagedRows.value" :key="r.name">
                   <td>{{ r.name }}</td>
                   <td>{{ r.avg }}</td>
                   <td>{{ r.index }}</td>
@@ -3151,6 +3480,12 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="iaContribTable.page.value" :page-size="iaContribTable.pageSize.value"
+              :total-pages="iaContribTable.totalPages.value"
+              :displayed-count="iaContribTable.displayedCount.value" :total-count="iaContribTable.totalCount.value"
+              @update:page="iaContribTable.setPage" @update:page-size="iaContribTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             贡献为行业配置项（Σ 期初行业权重 × 行业日收益），不含行业内个股选择 alpha；合计与策略总收益之差为选股/交易/现金贡献。
@@ -3224,10 +3559,28 @@ watch(theme, () => {
 
           <div class="section-title" style="font-size:13px">基准替换敏感性（FR-1 相对指标逐基独立计算）</div>
           <div class="table-container">
+            <TableToolbar
+              :filters="rbSensTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '基准名' }"
+              :search-text="rbSensTable.searchText.value"
+              :filter-state="rbSensTable.filterState.value"
+              :displayed-count="rbSensTable.displayedCount.value"
+              :total-count="rbSensTable.totalCount.value"
+              @update:search-text="(v: string) => (rbSensTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (rbSensTable.filterState.value = v)"
+              @reset="rbSensTable.reset"
+            />
             <table>
-              <thead><tr><th>基准</th><th>β</th><th>Jensen α(年化)</th><th>年化超额</th><th>跟踪误差</th><th>信息比率</th><th>上行捕获</th><th>下行捕获</th><th>超额回撤</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in rbSensTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && rbSensTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="rbSensTable.sortKey.value === c.key">{{ rbSensTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in rbSensRows" :key="r.code">
+                <tr v-for="r in rbSensTable.pagedRows.value" :key="r.code">
                   <td>{{ r.name }}<span v-if="r.is_primary" class="text-orange">（主）</span></td>
                   <template v-if="r.available">
                     <td>{{ num(r.beta, 2) }}</td>
@@ -3245,6 +3598,12 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="rbSensTable.page.value" :page-size="rbSensTable.pageSize.value"
+              :total-pages="rbSensTable.totalPages.value"
+              :displayed-count="rbSensTable.displayedCount.value" :total-count="rbSensTable.totalCount.value"
+              @update:page="rbSensTable.setPage" @update:page-size="rbSensTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             全部统计仅基于本回测每日净值快照与基准日线：滚动收益按周末净值几何累乘，夏普按周收益年化（×√52）；相对指标口径同评估页 FR-1（日频、对齐日收益 ≥ 20）。

@@ -384,6 +384,25 @@ describe('Backtest.vue — 详情视图', () => {
     expect(link?.attributes('target')).toBe('_blank')
   })
 
+  it('危机Alpha 年度表支持按危机Alpha排序', async () => {
+    const ca: any = JSON.parse(JSON.stringify(crisisAlphaCompleted))
+    ca.data.annual = [
+      { 年份: 2024, 下跌周: 6, 危机Alpha: 0.6, 策略收益: 0.05, 基准收益: -0.08, 完整: false },
+      { 年份: 2025, 下跌周: 3, 危机Alpha: 0.2, 策略收益: 0.03, 基准收益: -0.02, 完整: false },
+    ]
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: ca })
+    const table = w.find('table.ca-annual-table')
+    expect(table.exists()).toBe(true)
+    const firstYearCell = () => table.findAll('tbody tr')[0].findAll('td')[0].text()
+    const alphaCell = (i: number) => table.findAll('tbody tr')[i].findAll('td')[2].text()
+    expect(firstYearCell()).toContain('2024')
+    expect(alphaCell(1)).toContain('20.0%')
+    await w.findAll('table.ca-annual-table th').find((t) => t.text().includes('危机Alpha'))!.trigger('click')
+    await flushPromises()
+    expect(firstYearCell()).toContain('2025')
+    expect(alphaCell(0)).toContain('20.0%')
+  })
+
   it('决策事件下钻明细支持关键词过滤', async () => {
     ;(getBacktestDetail as any).mockResolvedValueOnce({
       ...mockDetail,
@@ -1711,13 +1730,13 @@ describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
     const w = await mountDetail({ ...mockDetail, crisis_alpha: ca25 })
     expect(w.text()).toContain('十二、全部下跌周明细（25 周）')
 
-    const pageInfo = () => w.find('.ca-down-table').element.parentElement?.querySelector('.page-info')?.textContent
-    const pager = () => w.find('.ca-down-table').element.parentElement?.querySelector('.pagination')
-    expect(pager()).toBeTruthy()
+    const pageInfo = () => w.find('.dw-pager .page-info').text()
+    const pager = () => w.find('.dw-pager')
+    expect(pager().exists()).toBe(true)
     expect(w.findAll('.ca-down-table tbody tr').length).toBe(20)
     expect(pageInfo()).toContain('第 1 / 2 页')
 
-    const btns = () => w.findAll('.pagination button')
+    const btns = () => w.findAll('.dw-pager button')
     expect(btns()[0].attributes('disabled')).toBeDefined()
     await btns()[1].trigger('click')
     await flushPromises()
