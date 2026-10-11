@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from ...models import LiveSessionPortfolio
 from ..portfolio import Portfolio
+from ..format import fmt_money, fmt_pct
 from .context import EngineContext
 
 logger = logging.getLogger("core.engine.live.breaker")
@@ -103,8 +104,9 @@ class BreakerService:
             if total_value is not None and rm.peak_value > 0:
                 dd_pct = (rm.peak_value - total_value) / rm.peak_value * 100
                 detail = (
-                    " total=%s peak=%s drawdown=%.2f%% threshold=%s"
-                    % (total_value, rm.peak_value, dd_pct, rm.max_drawdown)
+                    " total=%s peak=%s drawdown=%s threshold=%s"
+                    % (fmt_money(total_value), fmt_money(rm.peak_value),
+                       fmt_pct(dd_pct / 100), fmt_pct(rm.max_drawdown))
                 )
             else:
                 detail = ""
@@ -265,8 +267,9 @@ class BreakerService:
                     pnl = total - prev
                     loss_pct = abs(pnl) / init_cap * 100
                     detail = (
-                        " total=%s prev_close=%s pnl=%s loss=%.2f%% threshold=%s"
-                        % (total, prev, pnl, loss_pct, dpm.daily_loss_limit)
+                        " total=%s prev_close=%s pnl=%s loss=%s threshold=%s"
+                        % (fmt_money(total), fmt_money(prev), fmt_money(pnl),
+                           fmt_pct(loss_pct / 100), fmt_pct(dpm.daily_loss_limit))
                     )
                 else:
                     detail = ""

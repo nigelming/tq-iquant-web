@@ -4,6 +4,7 @@ from typing import Optional
 
 from .position import Position
 from .decision import NULL_RECORDER
+from .format import fmt_money, fmt_pct
 
 
 def _midnight(d: date) -> datetime:
@@ -110,13 +111,22 @@ class PortfolioRiskManager:
         循环结束后由 backtest_engine 调 finalize_last_day 补算最后一日（无后续跨日触发）。
         """
         if self._last_bar_date is not None and self._last_bar_date != current_date:
-            # 跨日：用上一日最后一根 bar 的 total_value 补算上一日 daily_loss
-            # recovery_date 传 current_date（当日），使次日恢复用当前日而非上一日判断
+            self.enter_day(current_date, initial_capital)
+        self.update_peak(total_value, current_date)
+
+    def enter_day(self, current_date: date, initial_capital: Decimal) -> None:
+        """新交易日首根 bar、on_bar 之前调用：跨日时补算上一日 daily_loss。
+
+        回测引擎在每根 bar 的 on_bar 之前调此方法：上一日亏损在"次一交易日"首根
+        即生效（暂停整日剥 BUY），恢复也在 on_bar 之前完成（恢复日首根即解除）。
+        消除旧时序（update 在 on_bar 之后补算）导致的 off-by-one：暂停日在日线
+        回测中整日失效、且恢复日首根误剥。recovery_date 传当日（current_date）。
+        """
+        if self._last_bar_date is not None and self._last_bar_date != current_date:
             self.update_daily(
                 self._last_bar_total_value, self._last_bar_date, initial_capital,
                 recovery_date=current_date,
             )
-        self.update_peak(total_value, current_date)
 
     def finalize_last_day(self, initial_capital: Decimal) -> None:
         """回测循环结束后补算最后一日 daily_loss。
@@ -168,8 +178,8 @@ class PortfolioRiskManager:
                 self._record_halt(
                     "max_drawdown", "max_drawdown", self.max_drawdown, drawdown,
                     current_date,
-                    "峰值 %s 现值 %s 回撤 %.2f%% 触发熔断（第 %d 次%s）" % (
-                        self.peak_value, total_value, float(drawdown) * 100,
+                    "峰值 %s 现值 %s 回撤 %s 触发熔断（第 %d 次%s）" % (
+                        fmt_money(self.peak_value), fmt_money(total_value), fmt_pct(drawdown),
                         self.consecutive_drawdown_triggers,
                         "，累计 3 次转手动" if self.manual_recovery else "",
                     ),
@@ -220,7 +230,7 @@ class PortfolioRiskManager:
                 self._record_halt(
                     "daily_loss", "daily_loss_limit", self.daily_loss_limit, loss,
                     current_date,
-                    "日内盈亏 %s（基准 %s）亏损 %.2f%% 触发当日暂停" % (
-                        daily_pnl, self.prev_close_value, float(loss) * 100,
+                    "日内盈亏 %s（基准 %s）亏损 %s 触发当日暂停" % (
+                        fmt_money(daily_pnl), fmt_money(self.prev_close_value), fmt_pct(loss),
                     ),
                 )
