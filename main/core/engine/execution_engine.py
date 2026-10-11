@@ -7,6 +7,7 @@ from .event import OrderEvent, TradeEvent
 from .account import Account
 from .position import Position
 from .decision import NULL_RECORDER
+from .format import fmt_money, fmt_price
 from tq_iquant_shared.constants import TradeType, SignalType
 
 
@@ -156,8 +157,9 @@ class ExecutionEngine:
                     requested=order.quantity, final=0,
                     param_name="cash", actual_value=float(account.cash),
                     message="资金不足拒单：需 %s 元买 %d 股 @%s，可用现金 %s（缩量后 %d 股<1手）"
-                            % (order.price * order.quantity if order.price else 0,
-                               order.quantity, order.price, account.cash, qty),
+                            % (fmt_money(order.price * order.quantity if order.price else 0),
+                               order.quantity, fmt_price(order.price),
+                               fmt_money(account.cash), qty),
                 )
                 return None
             if qty < order.quantity:
@@ -167,7 +169,7 @@ class ExecutionEngine:
                     requested=order.quantity, final=qty,
                     param_name="cash", actual_value=float(account.cash),
                     message="资金不足缩量：请求 %d 股，按可用现金 %s 缩至 %d 股 @%s"
-                            % (order.quantity, account.cash, qty, order.price),
+                            % (order.quantity, fmt_money(account.cash), qty, fmt_price(order.price)),
                 )
             return qty
         if position is None or order.bar_time is None:
@@ -235,7 +237,7 @@ class ExecutionEngine:
                         requested=order.quantity, final=0,
                         param_name="cash", actual_value=float(account.cash),
                         message="跳空高开资金不足：成交价 %s，需 %s，可用 %s"
-                                % (trade.price, cost, account.cash),
+                                % (fmt_price(trade.price), fmt_money(cost), fmt_money(account.cash)),
                     )
                     return None
                 if qty < order.quantity:
@@ -244,7 +246,7 @@ class ExecutionEngine:
                         requested=order.quantity, final=qty,
                         param_name="cash", actual_value=float(account.cash),
                         message="跳空高开缩量：%d → %d @ %s"
-                                % (order.quantity, qty, trade.price),
+                                % (order.quantity, qty, fmt_price(trade.price)),
                     )
                     order.quantity = qty
                     trade = self._dispatcher.place_order(order)

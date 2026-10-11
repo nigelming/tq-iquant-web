@@ -9,6 +9,7 @@ from .position import Position
 from .risk_manager import PortfolioRiskManager
 from .event import BarEvent, SignalEvent, OrderEvent
 from .decision import NULL_RECORDER
+from .format import fmt_money, fmt_pct, fmt_price
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
@@ -108,24 +109,20 @@ class Portfolio:
             sid: set(codes) for sid, codes in (inflight_opens or {}).items()
         }
         orders: List[OrderEvent] = []
-        # 收集 master/slave 本 bar 卖出的股票集合，供 _follow_master_sells 去重
-        master_sells_this_bar: Dict[int, set] = {}
-        slave_sells_this_bar: Dict[int, set] = {}
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
                 continue
             strat_orders = self._process_strategy(ctx, bar, signal_cache, inflight)
-            for o in strat_orders:
-                if o.trade_type == TradeType.SELL:
-                    if ctx.role == "master":
-                        master_sells_this_bar.setdefault(ctx.strategy_id, set()).add(o.stock_code)
-                    elif ctx.role == "slave":
-                        slave_sells_this_bar.setdefault(ctx.strategy_id, set()).add(o.stock_code)
             orders.extend(strat_orders)
-        # 第二遍：follow_master 联动——master 卖的股票，slave 跟随全平（若持有且本 bar 未卖）
-        orders.extend(self._follow_master_sells(
-            bar, master_sells_this_bar, slave_sells_this_bar, period
-        ))
+            # follow_master 状态镜像：slave 处理完自身信号后，对"master 已不再持有"的
+            # 持仓股全平（本 bar 已自行卖出的股票去重）。以 master 的已成交持仓为准，
+            # 故重启安全、跨周期闭环、REDUCE 不触发（master 仍持仓）。
+            if ctx.role == "slave" and ctx.slave_exit_mode == "follow_master":
+                already_sold = {
+                    o.stock_code for o in strat_orders
+                    if o.trade_type == TradeType.SELL
+                }
+                orders.extend(self._follow_master_state(ctx, bar, already_sold))
         # 熔断/日内亏损暂停期间：剥掉新开仓 BUY，保留 SELL（止损/止盈/CLOSE/REDUCE）。
         # §88：熔断期间不清仓，仅暂停新开仓。DEBUG——熔断期每 bar 每 BUY 都会触发，
         # INFO 会刷屏；DEBUG 供排查"为何 BUY 信号没下单"（被剥的 BUY 不进返回列表，
@@ -207,6 +204,9 @@ class Portfolio:
             if pos.quantity == 0 or stock_code not in bar.stocks:
                 continue
             close = bar.stocks[stock_code]["close"]
+            if close > Decimal("0"):
+                # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
+                pos.update_high(close)
             if risk_manager.check_stop_loss(pos, close):
                 loss = (pos.avg_cost - close) / pos.avg_cost if pos.avg_cost else Decimal("0")
                 risks.append(SignalEvent(
@@ -221,8 +221,8 @@ class Portfolio:
                     param_name="stop_loss_ratio",
                     param_value=float(risk_manager.stop_loss_ratio),
                     actual_value=float(loss),
-                    message="止损：成本 %s 现价 %s 亏 %.2f%%" % (
-                        pos.avg_cost, close, float(loss) * 100),
+                    message="止损：成本 %s 现价 %s 亏 %s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(loss)),
                 )
             elif risk_manager.check_take_profit(pos, close):
                 profit = (close - pos.avg_cost) / pos.avg_cost if pos.avg_cost else Decimal("0")
@@ -238,8 +238,8 @@ class Portfolio:
                     param_name="take_profit_ratio",
                     param_value=float(risk_manager.take_profit_ratio),
                     actual_value=float(profit),
-                    message="止盈：成本 %s 现价 %s 盈 %.2f%%" % (
-                        pos.avg_cost, close, float(profit) * 100),
+                    message="止盈：成本 %s 现价 %s 盈 %s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(profit)),
                 )
             elif risk_manager.check_trailing_stop(pos, close):
                 drawdown = (
@@ -258,8 +258,8 @@ class Portfolio:
                     param_name="trailing_stop_ratio",
                     param_value=float(risk_manager.trailing_stop_ratio),
                     actual_value=float(drawdown),
-                    message="移动止损：最高 %s 现价 %s 回撤 %.2f%%" % (
-                        pos.highest_price, close, float(drawdown) * 100),
+                    message="移动止损：最高 %s 现价 %s 回撤 %s" % (
+                        fmt_price(pos.highest_price), fmt_price(close), fmt_pct(drawdown)),
                 )
         return risks
 
@@ -318,8 +318,8 @@ class Portfolio:
                           param_value=float(ctx.reduce_position_ratio),
                           actual_value=float(quantity),
                           requested_qty=pos.quantity,
-                          message="REDUCE 减仓比例 %s%% × 持仓 %d 向下取整后 %d 股 <100"
-                                  % (ctx.reduce_position_ratio, pos.quantity, quantity))
+                          message="REDUCE 减仓比例 %s × 持仓 %d 向下取整后 %d 股 <100"
+                                  % (fmt_pct(ctx.reduce_position_ratio), pos.quantity, quantity))
                 return None
             trade_type = TradeType.SELL
         elif sig.signal_type == SignalType.OPEN:
@@ -369,7 +369,8 @@ class Portfolio:
                           param_value=float(ctx.single_open_ratio),
                           actual_value=float(quantity),
                           message="OPEN 单笔开仓比例 %s × 策略资金 %s / 价 %s 取整后 %d 股 <100"
-                                  % (ctx.single_open_ratio, strategy_fund, close, quantity))
+                                  % (fmt_pct(ctx.single_open_ratio), fmt_money(strategy_fund),
+                                     fmt_price(close), quantity))
                 return None
             trade_type = TradeType.BUY
         elif sig.signal_type == SignalType.ADD:
@@ -386,9 +387,9 @@ class Portfolio:
                               param_name="add_position_threshold",
                               param_value=float(ctx.add_position_threshold),
                               actual_value=float(drop),
-                              message="ADD 逢跌加仓：现价较成本回撤 %.2f%% < 阈值 %s%%（成本 %s 现价 %s）"
-                                      % (float(drop) * 100, ctx.add_position_threshold * 100,
-                                         pos.avg_cost, close))
+                              message="ADD 逢跌加仓：现价较成本回撤 %s < 阈值 %s（成本 %s 现价 %s）"
+                                      % (fmt_pct(drop), fmt_pct(ctx.add_position_threshold),
+                                         fmt_price(pos.avg_cost), fmt_price(close)))
                     return None
             if pos.add_count >= ctx.max_add_count:
                 self._rec("add_count_exceeded", "signal_gate", "block", ctx, sig, bar,
@@ -410,7 +411,8 @@ class Portfolio:
                           param_value=float(ctx.add_position_ratio),
                           actual_value=float(quantity),
                           message="ADD 加仓比例 %s × 策略资金 %s / 价 %s 取整后 %d 股 <100"
-                                  % (ctx.add_position_ratio, strategy_fund, close, quantity))
+                                  % (fmt_pct(ctx.add_position_ratio), fmt_money(strategy_fund),
+                                     fmt_price(close), quantity))
                 return None
             trade_type = TradeType.BUY
         else:
@@ -428,62 +430,58 @@ class Portfolio:
             signal_bar_date=bar.bar_time.date() if ctx.period in _DAILY_PERIODS else None,
         )
 
-    def _follow_master_sells(
+    def _follow_master_state(
         self,
+        slave: StrategyContext,
         bar: BarEvent,
-        master_sells: Dict[int, set],
-        slave_sells: Dict[int, set],
-        period: Optional[str],
+        already_sold: set,
     ) -> List[OrderEvent]:
-        """follow_master 模式：master 本 bar 卖出某股 → slave 同步全平（若持有且本 bar 未卖）。
+        """follow_master 状态镜像：slave 持有的股票若 master **当前不再持有** → 全平。
 
-        语义：master 触发 CLOSE/REDUCE/STOP_LOSS 等卖出时，slave 跟随全平同股票存量。
-        不影响 slave 自身已触发的卖出（去重保护）；slave 未持仓则跳过。
-        signal_bar_date 按 slave 自身 period 标注（日线 slave 仍走延迟闸门）。
+        以 master 的已成交持仓为准（重启后由 live_trades 重建），而非 master 本 bar 的
+        信号。语义（闭环）：master 清仓某股后，slave 在其**第一个自身周期且该股有价的
+        bar** 全平该股。特性：
+        - 重启安全：无需事件队列，master 持仓重建即自动补上未执行的跟随；
+        - 跨周期闭环：slave 在自身下一 bar 自然检出（无需跨调用状态）；
+        - 幂等：清完即止，不重复触发；
+        - REDUCE 不触发：master 仅减仓时 quantity 仍 > 0 → 不跟随；仅 master 归零才跟随。
+        不影响 slave 本 bar 已自行触发的卖出（already_sold 去重）；无价则留待下一 bar。
         """
-        if not master_sells:
+        if slave.master_strategy_id is None:
+            return []
+        master = self._find_strategy_by_id(slave.master_strategy_id)
+        if master is None:
             return []
         follow_orders: List[OrderEvent] = []
-        for ctx in self.strategies:
-            if ctx.role != "slave" or ctx.slave_exit_mode != "follow_master":
+        for stock_code, pos in slave.positions.items():
+            if pos.quantity == 0 or stock_code in already_sold:
                 continue
-            if ctx.master_strategy_id is None:
+            if self._has_position(master, stock_code):
                 continue
-            if period is not None and ctx.period != period:
+            close = bar.stocks.get(stock_code, {}).get("close")
+            if close is None or close <= Decimal("0"):
                 continue
-            master_sold = master_sells.get(ctx.master_strategy_id, set())
-            if not master_sold:
-                continue
-            already_sold = slave_sells.get(ctx.strategy_id, set())
-            sig_bar_date = bar.bar_time.date() if ctx.period in _DAILY_PERIODS else None
-            for stock_code in master_sold - already_sold:
-                pos = ctx.positions.get(stock_code)
-                if pos is None or pos.quantity == 0:
-                    continue
-                close = bar.stocks.get(stock_code, {}).get("close")
-                if close is None or close <= Decimal("0"):
-                    continue
-                follow_orders.append(OrderEvent(
-                    strategy_id=ctx.strategy_id,
-                    portfolio_id=self.portfolio_id,
-                    stock_code=stock_code,
-                    trade_type=TradeType.SELL,
-                    signal_type=SignalType.CLOSE,
-                    signal_name="follow_master",
-                    quantity=pos.quantity,
-                    price=close,
-                    bar_time=bar.bar_time,
-                    signal_bar_date=sig_bar_date,
-                ))
-                self.recorder.record(
-                    gate="follow_master_sell", layer="signal_gate", action="trigger",
-                    portfolio_id=self.portfolio_id, strategy_id=ctx.strategy_id,
-                    stock_code=stock_code, bar_time=bar.bar_time,
-                    param_name="master_strategy_id",
-                    param_value=ctx.master_strategy_id,
-                    message="follow_master：master 卖出 %s，slave 同步全平 %d 股"
-                            % (stock_code, pos.quantity),
-                )
+            follow_orders.append(OrderEvent(
+                strategy_id=slave.strategy_id,
+                portfolio_id=self.portfolio_id,
+                stock_code=stock_code,
+                trade_type=TradeType.SELL,
+                signal_type=SignalType.CLOSE,
+                signal_name="follow_master",
+                quantity=pos.quantity,
+                price=close,
+                bar_time=bar.bar_time,
+                signal_bar_date=bar.bar_time.date() if slave.period in _DAILY_PERIODS else None,
+            ))
+            self.recorder.record(
+                gate="follow_master_sell", layer="signal_gate", action="trigger",
+                portfolio_id=self.portfolio_id, strategy_id=slave.strategy_id,
+                stock_code=stock_code, bar_time=bar.bar_time,
+                param_name="master_strategy_id",
+                param_value=slave.master_strategy_id,
+                message="follow_master：master 已不再持有 %s，slave 同步全平 %d 股"
+                        % (stock_code, pos.quantity),
+            )
         return follow_orders
 
     def check_circuit_breaker(self) -> bool:
