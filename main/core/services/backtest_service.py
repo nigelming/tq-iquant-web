@@ -54,6 +54,15 @@ from core.tq.formula import TQFormula
 logger = logging.getLogger(__name__)
 
 
+# 回测复权口径：必须用后复权 back。
+# 真机 bug：TDX 前复权为「加性」且锚定查询 end 日期，长区间下高分红股（601225.SH）
+# 2020 年前 Close 被整体减到 ≤0/近零（2020-08-26 前 1296 根 ≤0，最低 -5.44；
+# 2020-07-13 Close=0.01）。0.01 是正数通过 close<=0 闸 → 下单量 0.2×资金/0.01
+# = 2000 万股异常单 → -41% 假回撤 → 熔断永久停机。后复权恒为正且锚定个股首日、
+# 与查询区间无关（前后复权在同区间内仅差常数比例，收益率等价）。
+BACKTEST_DIVIDEND_TYPE = "back"
+
+
 # ---------------------------------------------------------------------------
 # 数据获取层 — TQ 对接
 # 拆为「TQ 调用（依赖通达信进程，不可单测）」+「纯转换（可单测）」两层。
@@ -278,7 +287,7 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
     tq = TQData()
     raw_by_period = tq.get_history_raw(
         stocks=stocks, periods=periods,
-        start=start_str, end=end_str, dividend_type="front", count=-1,
+        start=start_str, end=end_str, dividend_type=BACKTEST_DIVIDEND_TYPE, count=-1,
     )
     warmup_counts = warmup_counts_by_period(ps, db)
     if warmup_counts:
@@ -290,7 +299,7 @@ def build_klines(ps, start: date, end: date, db: Session = None) -> dict:
                 continue
             part = tq.get_history_raw(
                 stocks=stocks, periods=[period],
-                start="", end=warm_end, dividend_type="front", count=cnt,
+                start="", end=warm_end, dividend_type=BACKTEST_DIVIDEND_TYPE, count=cnt,
             )
             if isinstance(part, dict):
                 warm_raw.update(part)
@@ -1783,7 +1792,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
 
     try:
         t0 = datetime.now()
-        portfolio = _assemble_portfolio(ps, strategies, db)
+        portfolio = _assemble_portfolio(ps, strategies, db, enable_manual_recovery=False)
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
         klines_full = build_klines(ps, req.start_date, req.end_date, db)

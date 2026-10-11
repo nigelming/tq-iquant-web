@@ -866,3 +866,37 @@ def test_convert_formula_output_warns_on_length_mismatch(caplog):
     assert (1, "000001.SZ", bar_times[0]) in entries
     assert any("长度" in r.message for r in caplog.records)
 
+
+# ---------------------------------------------------------------------------
+# 复权口径（回测）：真机 bug —— TDX 前复权为「加性」且锚定查询 end 日期，
+# 长区间下高分红股（如 601225.SH 陕西煤业）2020 年真实价 ~7.8 被整体减 ~7.94，
+# 2020-08-26 前 Close 全 ≤0（1296 根，最低 -5.44），2020-07-13 Close=0.01。
+# 0.01 是正数，通过 portfolio 的 close<=0 闸 → 下单量 0.2×资金/0.01 = 2000 万股。
+# 后复权（back）恒为正且与查询区间无关（锚定个股首日），可根除该问题。
+# ---------------------------------------------------------------------------
+def test_build_klines_uses_back_adjust_for_backtest(db_session, monkeypatch):
+    """回测行情（主段 + 预热段）必须用后复权 back，不得用前复权 front。"""
+    import pandas as pd
+    db = db_session
+    ps, strat, formula = _seed_db(db)  # formula_count 默认 >0 → 触发预热段
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.2]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 10.5]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, 9.0]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0]}, index=ts),
+    }
+    seen = []
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        seen.append(dividend_type)
+        return {"1d": raw}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+
+    bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
+
+    assert seen, "应至少调用一次 get_history_raw"
+    assert all(dt == "back" for dt in seen), \
+        "回测行情必须用后复权 back，实际 %r" % seen
+

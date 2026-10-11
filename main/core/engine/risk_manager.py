@@ -44,9 +44,13 @@ class StrategyRiskManager:
 
 
 class PortfolioRiskManager:
-    def __init__(self, max_drawdown: Decimal, daily_loss_limit: Decimal):
+    def __init__(self, max_drawdown: Decimal, daily_loss_limit: Decimal,
+                 enable_manual_recovery: bool = True):
         self.max_drawdown = max_drawdown
         self.daily_loss_limit = daily_loss_limit
+        # 回测模式（False）：累计 3 次不转手动永久锁，始终「触发次日恢复」。
+        # 回测无人工恢复入口，一旦转手动即永久停机（真机 bug 实证 6 年空仓）。
+        self.enable_manual_recovery = enable_manual_recovery
         self.consecutive_drawdown_triggers = 0
         self.circuit_breaker_active = False
         # 熔断接线新增状态（AGENTS.md §88）
@@ -145,7 +149,7 @@ class PortfolioRiskManager:
                 self.circuit_breaker_active = True
                 self.breaker_trigger_date = current_date
                 self.consecutive_drawdown_triggers += 1
-                if self.consecutive_drawdown_triggers >= 3:
+                if self.enable_manual_recovery and self.consecutive_drawdown_triggers >= 3:
                     self.manual_recovery = True
                 self._record_halt(
                     "max_drawdown", "max_drawdown", self.max_drawdown, drawdown,

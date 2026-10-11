@@ -23,16 +23,21 @@ def signal_type_from_str(s: str) -> SignalType:
     raise ValueError("unknown signal_type: %s" % s)
 
 
-def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Session) -> Portfolio:
+def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
+                       enable_manual_recovery: bool = True) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
     cost_params 来自组合表，供 SimulatedDispatcher（回测）透传成本参数；
     实盘 HttpBridgeDispatcher 不用 cost_params（真实成本从 /deals 回报取），
     但 Portfolio 仍持有以备恢复/评估时记账。
+
+    enable_manual_recovery：实盘 True（累计 3 次熔断转手动）；回测传 False
+    （无人工恢复入口，避免永久停机，见 run_backtest 调用点）。
     """
     pm = PortfolioRiskManager(
         max_drawdown=Decimal(str(ps.max_drawdown)),
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
+        enable_manual_recovery=enable_manual_recovery,
     )
     port = Portfolio(
         portfolio_id=ps.id,
