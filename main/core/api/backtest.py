@@ -53,7 +53,7 @@ class BacktestRequest(BaseModel):
     name: str
     start_date: date
     end_date: date
-    # 复权模式：front 前复权（默认，历史行为） / back 后复权
+    # 复权模式：front 前复权（默认，历史行为） / back 后复权 / dual 前复权信号+后复权记账
     dividend_mode: str = "front"
 
 
@@ -171,8 +171,8 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back"):
-        return f"复权模式仅支持 front/back，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in ("front", "back", "dual"):
+        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
     return None
 
 

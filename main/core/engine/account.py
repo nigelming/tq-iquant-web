@@ -42,6 +42,11 @@ class Account:
         可买市值 = min(策略上限可用, 组合现金)
         按可买市值缩减到 100 股整数倍；不足 1 手则拒绝并计数。
         """
+        if price <= 0:
+            # 非正价格（前复权伪影/脏数据）：needed=price*qty<=cap 对负价恒成立，
+            # 直接拒绝，防止负价买入现金倒增 + 巨量股数失真。
+            self.insufficient_count += 1
+            return False, 0
         needed = price * quantity
         # 确认可用资金上限：取策略上限与组合现金的较小值
         cap = self.cash

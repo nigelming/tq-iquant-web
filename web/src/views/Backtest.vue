@@ -98,7 +98,7 @@ const loading = ref(true)
 // ===== 发起弹窗 =====
 const showForm = ref(false)
 const submitting = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '' })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front' })
 
 // ===== 详情视图 =====
 const currentRecord = ref<BacktestRecordItem | null>(null)
@@ -895,6 +895,7 @@ function openForm() {
     name: '',
     start_date: '2021-01-01',
     end_date: fmt(today),
+    dividend_mode: 'front',
   }
   showForm.value = true
 }
@@ -909,7 +910,13 @@ async function submit() {
   }
   submitting.value = true
   try {
-    const res = await runBacktest(form.value)
+    const res = await runBacktest({
+      portfolio_strategy_id: form.value.portfolio_strategy_id,
+      name: form.value.name,
+      start_date: form.value.start_date,
+      end_date: form.value.end_date,
+      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual',
+    })
     showForm.value = false
     await load()
     if (res?.record_id) await openDetail(res.record_id)
@@ -2549,6 +2556,20 @@ watch(theme, () => {
           <div style="flex:1">
             <label>结束日期</label>
             <input v-model="form.end_date" type="date" />
+          </div>
+        </div>
+
+        <div class="signal-row">
+          <div style="flex:1">
+            <label>复权模式</label>
+            <select v-model="form.dividend_mode">
+              <option value="front">前复权（默认，通达信口径）</option>
+              <option value="back">后复权（长区间更真实、可复现）</option>
+              <option value="dual">前复权信号 + 后复权记账（推荐，模拟实盘）</option>
+            </select>
+          </div>
+          <div style="flex:1;align-self:flex-end" class="form-hint">
+            长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
           </div>
         </div>
 

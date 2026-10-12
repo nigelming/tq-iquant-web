@@ -537,11 +537,16 @@ class Evaluator:
                 streak += 1
                 if streak > best_streak:
                     best_streak = streak
-            else:
-                streak = 0
+                win_streak = 0
+            elif r > 0:
                 win_streak += 1
                 if win_streak > best_win_streak:
                     best_win_streak = win_streak
+                streak = 0
+            else:
+                # 0 收益（空仓）日：不计入连盈，且打断连盈/连亏连续段
+                streak = 0
+                win_streak = 0
 
         worst_daily = min(daily_returns) if daily_returns else None
 

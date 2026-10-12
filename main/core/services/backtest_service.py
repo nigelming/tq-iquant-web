@@ -106,6 +106,12 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
                 break
         if not row_ok:
             continue
+        # 伪影过滤：Open/Close ≤0（负价/零价）或 Close 近零（<1分）——前复权加性压缩产物，
+        # 会放大收益/巨量股数，直接丢弃该 bar（不进信号/成交/估值）。
+        o = _to_decimal(raw["Open"].loc[ts, code])
+        c = _to_decimal(raw["Close"].loc[ts, code])
+        if o <= 0 or c <= 0 or c < _MIN_TRADE_PRICE:
+            continue
         has_any = True
         col_data["datetime"].append(ts)
         for field in _OHLCV_FIELDS:
@@ -128,6 +134,11 @@ def _is_nan(val) -> bool:
     if isinstance(val, float) and val != val:  # NaN 唯一不等于自身的特性
         return True
     return False
+
+
+# 最低可交易价：A股无低于 1 分钱的真实成交价，前复权"加性压缩"产物可能逼近 0/转负，
+# 用于在取数层过滤伪影行（防近零价 → 巨量股数 / 负价成交现金倒增）。
+_MIN_TRADE_PRICE = Decimal("0.01")
 
 
 def _to_decimal(val) -> Decimal:
@@ -385,7 +396,8 @@ PARAMS_SNAPSHOT_FIELDS = (
 
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
 # 公式信号传整数（front=1/back=2）。缺省前复权，保持历史行为。
-DIVIDEND_MODES = ("front", "back")
+# "dual" = 信号前复权 + 执行/记账后复权（模拟实盘口径：公式按前复权出信号、真实价成交）。
+DIVIDEND_MODES = ("front", "back", "dual")
 _FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2}
 
 
@@ -1998,6 +2010,11 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     dividend_mode = getattr(req, "dividend_mode", "front") or "front"
     if dividend_mode not in DIVIDEND_MODES:
         dividend_mode = "front"
+    # dual：公式信号走前复权（与通达信口径一致），引擎执行/记账走后复权（真实价、跨除权正确）
+    if dividend_mode == "dual":
+        accounting_mode, signal_mode = "back", "front"
+    else:
+        accounting_mode = signal_mode = dividend_mode
 
     # 写 record（running）
     rec = BacktestRecord(
@@ -2019,7 +2036,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
         klines_full = build_klines(
-            ps, req.start_date, req.end_date, db, dividend_mode=dividend_mode,
+            ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
         )
         t2 = datetime.now()
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
@@ -2029,7 +2046,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         signal_diagnostics: dict = {}
         signal_cache = build_signal_cache(
             ps, klines_full, db, start=req.start_date, diagnostics=signal_diagnostics,
-            dividend_mode=dividend_mode,
+            dividend_mode=signal_mode,
         )
         signal_warnings = build_signal_warnings(
             db, strategies, signal_cache, signal_diagnostics,
@@ -2051,7 +2068,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
         benchmark_data = build_benchmark_data(
-            ps, req.start_date, req.end_date, db, dividend_mode=dividend_mode,
+            ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
         )
         t4 = datetime.now()
 

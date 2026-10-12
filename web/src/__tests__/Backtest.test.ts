@@ -249,6 +249,28 @@ describe('Backtest.vue — 发起回测', () => {
     expect(arg.portfolio_strategy_id).toBe(1)  // 默认选第一个
     expect(arg.start_date).toBe('2026-07-01')
     expect(arg.end_date).toBe('2026-07-31')
+    expect(arg.dividend_mode).toBe('front')  // 默认前复权
+    vi.unstubAllGlobals()
+  })
+
+  it('复权模式选 dual → 提交参数带 dividend_mode=dual', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 100 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('DUAL_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    const modeSelect = w.findAll('select').find((s) => s.text().includes('前复权'))!
+    await modeSelect.setValue('dual')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.dividend_mode).toBe('dual')
     vi.unstubAllGlobals()
   })
 

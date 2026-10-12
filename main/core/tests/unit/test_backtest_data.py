@@ -118,27 +118,27 @@ def test_convert_market_data_volume_as_string():
 
 def test_convert_market_data_nan_values():
     """真机 bug：停牌/无交易的日子 TQ 返回 NaN（float）。
-    _to_int(NaN) 直接 int(NaN) 抛 ValueError；_to_decimal(NaN) 产 Decimal('nan') 毒化计算。
-    NaN 应规整为 0（无成交量）/ 价列也应容忍 NaN 不报错。"""
+    NaN Volume 规整为 0（无成交量）；价列 NaN → Open/Close=0 → 整 bar 作为伪影丢弃（不进引擎）。"""
     import math
     import pandas as pd
-    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
     raw = {
-        "Open": pd.DataFrame({"000001.SZ": [10.0, float("nan")]}, index=ts),
-        "High": pd.DataFrame({"000001.SZ": [10.3, float("nan")]}, index=ts),
-        "Low": pd.DataFrame({"000001.SZ": [9.9, float("nan")]}, index=ts),
-        "Close": pd.DataFrame({"000001.SZ": [10.2, float("nan")]}, index=ts),
-        "Volume": pd.DataFrame({"000001.SZ": [1000, float("nan")]}, index=ts),
-        "Amount": pd.DataFrame({"000001.SZ": [10200.0, float("nan")]}, index=ts),
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.1, float("nan")]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 10.4, float("nan")]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 10.0, float("nan")]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, 10.3, float("nan")]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, float("nan"), float("nan")]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 10403.0, float("nan")]}, index=ts),
     }
     # 不应抛异常
     klines = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
     df = klines["000001.SZ"]["1d"]
+    # 全 NaN bar（Open/Close=0）被丢弃；价合法但 Volume NaN 的 bar 保留
     assert df.height == 2
     # NaN Volume 规整为 0（非 NaN）
     vols = df["Volume"].to_list()
     assert vols[1] == 0, f"NaN Volume 应为 0，实得 {vols[1]!r}"
-    # 价列 NaN 不毒化（Decimal nan 会破坏下游金额计算）— 规整为 0
+    # 保留 bar 的价列不毒化（Decimal nan 会破坏下游金额计算）
     opens = df["Open"].to_list()
     assert not (isinstance(opens[1], Decimal) and opens[1].is_nan()), \
         f"NaN 价应规整为 0，实得 {opens[1]!r}"
@@ -421,6 +421,24 @@ def test_build_klines_orchestration(db_session, monkeypatch):
     assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
     assert "datetime" in klines["000001.SZ"]["1d"].columns
     assert klines["000001.SZ"]["1d"].height == 2
+
+
+def test_convert_market_data_drops_nonpositive_prices():
+    """负价/零价/近零价（<0.01）行属前复权伪影，应被过滤，不进引擎。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 9.0, 8.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 9.5, 8.5]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.8, 7.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, -1.0, 0.005]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 1000, 1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0, 8000.0]}, index=ts),
+    }
+    out = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = out["000001.SZ"]["1d"]
+    assert df.height == 1
+    assert df["datetime"].to_list() == [ts[0]]
 
 
 def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):

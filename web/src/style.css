@@ -130,6 +130,7 @@ tbody tr:last-child td{border-bottom:none}
 .signal-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}
 .signal-row input,.signal-row select{width:auto;margin-bottom:0;flex:1}
 .signal-row select{flex:.8}
+.form-hint{color:var(--ink-soft);font-size:11px;line-height:1.5;margin-bottom:6px}
 .signal-add{margin-bottom:12px}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 .empty-state{text-align:center;padding:40px 20px;color:var(--ink-soft)}

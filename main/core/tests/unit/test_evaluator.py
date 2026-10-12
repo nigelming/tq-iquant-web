@@ -438,12 +438,27 @@ def test_loss_streak_and_worst_returns():
     ]
     result = Evaluator().evaluate(snaps)
     assert result["max_consecutive_loss_days"] == 2
-    assert result["max_consecutive_profit_days"] == 3
+    # 0 收益（空仓）日不计入连盈 → 连盈天数为 0
+    assert result["max_consecutive_profit_days"] == 0
     assert result["worst_daily_return"] == Decimal("-0.0800")
     assert result["worst_weekly_return"] == Decimal("-0.0800")
     # 收益样本 < 20 → 偏度峰度为 None
     assert result["return_skewness"] is None
     assert result["return_kurtosis"] is None
+
+
+def test_profit_streak_excludes_zero_return_days():
+    """连盈天数只累计正收益日；0 收益日打断连盈（不计入）。"""
+    snaps = [
+        _snap(100000, date(2024, 1, 1)),
+        _snap(101000, date(2024, 1, 2)),   # +1%
+        _snap(101000, date(2024, 1, 3)),   # 0%（空仓）
+        _snap(102010, date(2024, 1, 4)),   # +1%
+        _snap(101000, date(2024, 1, 5)),   # -1%
+        _snap(102010, date(2024, 1, 8)),   # +1%
+    ]
+    result = Evaluator().evaluate(snaps)
+    assert result["max_consecutive_profit_days"] == 1
 
 
 def test_skewness_kurtosis_symmetric():

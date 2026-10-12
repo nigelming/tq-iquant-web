@@ -44,7 +44,8 @@ class SimulatedDispatcher(OrderDispatcher):
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         price = self.open_prices.get(order.stock_code)
-        if not price:
+        # 非正成交价（前复权伪影/停牌无价）不成交：负价买入会让现金倒增、股数失真
+        if not price or price <= 0:
             return None
         # 滑点：买入成交价上浮、卖出成交价下浮
         if order.trade_type.value == "BUY":

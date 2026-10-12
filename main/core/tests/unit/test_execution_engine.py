@@ -23,6 +23,21 @@ def _order(trade_type, stock_code, quantity, price, bar_time=None):
     )
 
 
+def test_place_order_negative_open_returns_none():
+    """成交 open 价 ≤0（前复权伪影）→ 不成交，防止负价买入现金倒增。"""
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("-5")})
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10")
+    assert dispatcher.place_order(order) is None
+
+
+def test_approve_order_negative_price_rejected():
+    """负价下单（伪影）→ 资金审批拒绝，needed<=cap 对负价恒成立的漏洞封堵。"""
+    acc = Account(Decimal("100000"), strategy_capital_limit=Decimal("100000"))
+    ok, qty = acc.approve_order(1000, Decimal("-5"), Decimal("0"))
+    assert ok is False
+    assert qty == 0
+
+
 def test_execute_buy_approves_and_updates_account_position():
     acc = Account(Decimal("100000"), strategy_capital_limit=Decimal("60000"))
     pos = Position("000001.SZ")

@@ -1612,6 +1612,36 @@ def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
     assert json.dumps(data, allow_nan=False)
 
 
+def test_run_backtest_dual_mode_resolves_signal_front_accounting_back(db_session, monkeypatch):
+    """dual 模式：引擎 K线/基准走后复权（记账），公式信号走前复权（信号）；
+    且 params_snapshot 记录 dividend_mode=dual。"""
+    ps, _ = _seed(db_session)
+    seen = {}
+
+    def _kl(ps, start, end, db=None, dividend_mode="front"):
+        seen["klines"] = dividend_mode
+        return _mock_klines()
+
+    def _cache(ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
+        seen["cache"] = dividend_mode
+        return {}
+
+    def _bench(ps, start, end, db=None, dividend_mode="front"):
+        seen["bench"] = dividend_mode
+        return {}
+
+    monkeypatch.setattr(svc, "build_klines", _kl)
+    monkeypatch.setattr(svc, "build_signal_cache", _cache)
+    monkeypatch.setattr(svc, "build_benchmark_data", _bench)
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    monkeypatch.setattr(svc.BacktestEngine, "run",
+                        lambda self, portfolio, **kw: _NO_TRADES_RESULT)
+    rid = svc.run_backtest(db_session, ps, _req(dividend_mode="dual"))["record_id"]
+    assert seen == {"klines": "back", "cache": "front", "bench": "back"}
+    snap = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
+    assert snap["dividend_mode"] == "dual"
+
+
 def test_recompute_prefers_snapshot_benchmark(db_session, monkeypatch):
     rec, ps = _seed_record(db_session)
     _seed_ca_daily_snapshots(

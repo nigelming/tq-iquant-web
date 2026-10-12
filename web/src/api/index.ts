@@ -672,6 +672,7 @@ export interface BacktestRequest {
   name: string
   start_date: string  // YYYY-MM-DD
   end_date: string    // YYYY-MM-DD
+  dividend_mode?: 'front' | 'back' | 'dual'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
 }
 
 export async function runBacktest(req: BacktestRequest) {
