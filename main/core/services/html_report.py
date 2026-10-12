@@ -9,6 +9,7 @@
 
 import html as _html
 import json
+import sys
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -1339,7 +1340,30 @@ def _strategy_eval_section(detail: dict) -> str:
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def _echarts_source() -> str:
-    return _ECHARTS_PATH.read_text(encoding="utf-8")
+    return _find_echarts_source().read_text(encoding="utf-8")
+
+
+def _find_echarts_source() -> Path:
+    """定位 echarts.min.js 的完整路径。
+
+    dev 环境用 __file__ 推算 web/node_modules（源码仓库内存在）；打包后
+    (Nuitka standalone) __file__ 指向 _internal，仓库不存在于 exe 目录，
+    因此回退到 argv[0]（启动的 exe）同级目录——build_package.py 会把
+    echarts.min.js 复制到分发根目录（与 config.yaml 同级，定位口径与
+    core/config.py 一致）。
+    """
+    candidates: List[Path] = [_ECHARTS_PATH]
+    if sys.argv:
+        exe_dir = Path(sys.argv[0]).resolve().parent
+        candidates.append(
+            exe_dir / "web" / "node_modules" / "echarts" / "dist" / "echarts.min.js")
+        candidates.append(exe_dir / "echarts.min.js")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "未找到 echarts.min.js（离线报告需内联 ECharts 运行时），已尝试："
+        + ", ".join(str(p) for p in candidates))
 
 
 _CSS = """

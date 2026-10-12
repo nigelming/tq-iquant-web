@@ -25,6 +25,7 @@ def main():
     nuitka_cmd = [
         python_exe, "-m", "nuitka",
         "--standalone",
+        "--low-memory",
         "--include-package=core",
         "--include-package=tq_iquant_shared",
         "--include-package=sqlalchemy",
@@ -66,6 +67,14 @@ def main():
         print(f"  copied web/dist -> {dest_web}")
     else:
         print(f"  WARNING: {WEB_DIST} not found, run 'npm run build' first")
+
+    print("\n=== Step 2b: 复制 echarts.min.js（离线报告内联运行时）===")
+    echarts_src = ROOT.parent / "web" / "node_modules" / "echarts" / "dist" / "echarts.min.js"
+    if echarts_src.exists():
+        shutil.copy2(echarts_src, dist_dir / "echarts.min.js")
+        print(f"  copied echarts.min.js -> {dist_dir.name}/echarts.min.js")
+    else:
+        print(f"  WARNING: {echarts_src} not found, 离线报告导出将失败")
 
     print("\n=== Step 3: 复制 config.yaml ===")
     if CONFIG_YAML.exists():

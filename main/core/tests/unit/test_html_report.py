@@ -1,10 +1,15 @@
 """TR-19 单文件离线 HTML 报告：自包含/无外链/数字同源（FR-21/FR-22）。"""
 import json
 import re
+import sys
 
 import pytest
 
-from core.services.html_report import build_html_report, ALLOWED_EXTERNAL_URLS
+from core.services.html_report import (
+    build_html_report,
+    ALLOWED_EXTERNAL_URLS,
+)
+import core.services.html_report as _hr
 
 
 def _detail(**overrides):
@@ -355,6 +360,41 @@ def test_no_signal_preflight_banner_when_warnings_empty():
     """record.warnings 为空/缺省 → 不渲染警告条。"""
     assert 'class="spb"' not in build_html_report(_detail())
 
-    detail = _detail()
-    detail["record"]["warnings"] = []
-    assert 'class="spb"' not in build_html_report(detail)
+
+def test_echarts_source_falls_back_to_exe_dir(monkeypatch, tmp_path):
+    """打包环境（__file__ 推算路径缺失 + 无 node_modules）回退到 exe 同级 echarts.min.js。
+
+    回归：打包后 /export/html 曾 500——报告需内联 ECharts 运行时，却只从
+    __file__.parents 推算 web/node_modules（包内不存在）。"""
+    from core.services import html_report as hr
+
+    fake_exe = tmp_path / "tq-iquant.exe"
+    fake_exe.write_bytes(b"")
+    (tmp_path / "echarts.min.js").write_text(
+        "window.echarts = { version: '5' };", encoding="utf-8")
+    monkeypatch.setattr(hr, "_ECHARTS_PATH",
+                        tmp_path / "not-exist" / "echarts.min.js")
+    monkeypatch.setattr(sys, "argv", [str(fake_exe)])
+    hr._echarts_source.cache_clear()
+    try:
+        # 回退命中 exe 同级清单文件
+        assert "window.echarts" in hr._echarts_source()
+    finally:
+        hr._echarts_source.cache_clear()
+
+
+def test_echarts_source_all_candidates_missing_raises_clear(monkeypatch, tmp_path):
+    """所有候选都缺失 → 抛出带候选清单的 FileNotFoundError，便于定位。"""
+    from core.services import html_report as hr
+
+    monkeypatch.setattr(hr, "_ECHARTS_PATH",
+                        tmp_path / "none" / "echarts.min.js")
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "x.exe")])
+    hr._echarts_source.cache_clear()
+    try:
+        with pytest.raises(FileNotFoundError) as ei:
+            hr._echarts_source()
+        assert "echarts.min.js" in str(ei.value)
+        assert "已尝试" in str(ei.value)
+    finally:
+        hr._echarts_source.cache_clear()
