@@ -132,6 +132,7 @@ tbody tr:last-child td{border-bottom:none}
 .signal-row select{flex:.8}
 .form-hint{color:var(--ink-soft);font-size:11px;line-height:1.5;margin-bottom:6px}
 .compare-pool-opt{display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer}
+.rec-tag{font-size:10px;color:#fff;background:var(--gold,#b45309);border-radius:4px;padding:1px 5px}
 .signal-add{margin-bottom:12px}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 .empty-state{text-align:center;padding:40px 20px;color:var(--ink-soft)}

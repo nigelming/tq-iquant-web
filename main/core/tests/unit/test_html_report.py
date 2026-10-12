@@ -190,6 +190,41 @@ def test_robustness_ok_renders_tables_and_chart():
     assert "chart-rb" in html
 
 
+def test_robustness_check_section_renders():
+    """离线报告含「稳健性检验」：年度/3年滚动/集中度/样本内外表。"""
+    detail = _detail()
+    detail["robustness"] = {
+        "status": "completed", "computed_at": "2026-10-12T10:00:00",
+        "data": {
+            "total_return": 10.0847, "benchmark_return": 0.8593,
+            "years_positive": "13/13",
+            "annual": [{"year": "2014", "return": 0.814, "max_drawdown": -0.079},
+                       {"year": "2026", "return": 0.048, "max_drawdown": -0.005}],
+            "rolling_3y": [{"start": "2014", "end": "2016", "cagr": 0.532,
+                            "max_drawdown": -0.079}],
+            "concentration": {
+                "total_realized_pnl": 1000000,
+                "top": [{"code": "000408.SZ", "pnl": 338874, "share": 0.036}],
+                "top20_share": 0.42, "profitable_stocks": 195, "total_stocks": 262,
+            },
+            "oos": {
+                "split_year": "2023",
+                "in_sample": {"start": "2014-01-02", "end": "2023-12-29",
+                              "return": 8.145, "cagr": 0.248,
+                              "max_drawdown": -0.079, "benchmark_return": 0.478},
+                "out_of_sample": {"start": "2024-01-02", "end": "2026-10-09",
+                                  "return": 0.212, "cagr": 0.066,
+                                  "max_drawdown": -0.008, "benchmark_return": 0.275},
+            },
+        },
+    }
+    html = build_html_report(detail)
+    for token in ["稳健性检验", "年度收益与年内最大回撤", "3年滚动窗口",
+                  "个股已实现净", "样本内 / 样本外对比", "000408.SZ",
+                  "断点年份", "13/13", "2024 ~ 2026"]:
+        assert token in html, f"报告缺少 {token!r}"
+
+
 def test_market_regime_window_disclosure():
     """五/六/七/七-B 披露实际统计窗口；短于回测区间时写明被指数历史截断。
 

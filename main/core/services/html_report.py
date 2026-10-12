@@ -691,6 +691,89 @@ def _market_regime_section(detail: dict,
                     "".join(body))
 
 
+def _robustness_section(detail: dict) -> str:
+    """三、稳健性检验：年度/3年滚动/个股集中度/样本内外（纯后处理）。"""
+    title = "三、稳健性检验（年度 / 3年滚动 / 集中度 / 样本内外）"
+    rb = detail.get("robustness")
+    if rb is None:
+        return _section(title, _empty("本次回测未计算稳健性检验"))
+    if rb.get("status") != "completed":
+        return _section(title, _empty(
+            f"分析状态：{esc(rb.get('status'))}；{esc(rb.get('error') or '')}"))
+    d = rb.get("data") or {}
+    cards = "".join([
+        _kpi("总收益", pct(d.get("total_return")), value_cls=cls(d.get("total_return"))),
+        _kpi("基准收益", pct(d.get("benchmark_return")),
+             value_cls=cls(d.get("benchmark_return"))),
+        _kpi("正收益年", esc(d.get("years_positive") or "—"),
+             "全部年份中正收益年份占比"),
+    ])
+    body = [f'<div class="kpi-grid">{cards}</div>']
+
+    annual = d.get("annual") or []
+    ann_rows, ann_cls = [], []
+    for a in annual:
+        ann_rows.append([esc(a.get("year")), pct_signed(a.get("return")),
+                         pct(a.get("max_drawdown"))])
+        ann_cls.append([None, cls(a.get("return")), "neg"])
+    body.append("<h3>3.1 年度收益与年内最大回撤</h3>")
+    body.append(_table(["年度", "收益", "年内最大回撤"], ann_rows, ann_cls)
+                if ann_rows else _empty("无年度数据"))
+
+    r3 = d.get("rolling_3y") or []
+    r3_rows, r3_cls = [], []
+    for w in r3:
+        r3_rows.append([f"{esc(w.get('start'))} ~ {esc(w.get('end'))}",
+                        pct_signed(w.get("cagr")), pct(w.get("max_drawdown"))])
+        r3_cls.append([None, cls(w.get("cagr")), "neg"])
+    body.append("<h3>3.2 3年滚动窗口（CAGR / 窗口内最大回撤）</h3>")
+    body.append(_table(["窗口", "CAGR", "窗口内最大回撤"], r3_rows, r3_cls)
+                if r3_rows else _empty("区间不足 3 年，无滚动窗口"))
+
+    conc = d.get("concentration") or {}
+    top = conc.get("top") or []
+    conc_rows, conc_cls = [], []
+    for i, t in enumerate(top, 1):
+        pnl = t.get("pnl")
+        conc_rows.append([str(i), esc(t.get("code")),
+                          f"{pnl:,.2f}" if isinstance(pnl, (int, float)) else "—",
+                          pct(t.get("share"))])
+        conc_cls.append([None, None, cls(pnl), None])
+    conc_summary = (
+        f"盈利个股 {conc.get('profitable_stocks', 0)} / {conc.get('total_stocks', 0)}　"
+        f"前20只占总净利 {pct(conc.get('top20_share'))}　"
+        f"总净利 {conc.get('total_realized_pnl', 0):,.2f}"
+    )
+    body.append("<h3>3.3 个股已实现净 P&L 集中度</h3>")
+    body.append(f'<p class="note">{esc(conc_summary)}</p>')
+    body.append(_table(["#", "代码", "净 P&L", "占比"], conc_rows, conc_cls)
+                if conc_rows else _empty("无成交记录"))
+
+    body.append("<h3>3.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
+    oos = d.get("oos")
+    if not oos:
+        body.append(_empty("区间不足 2 年，无法切分样本内/样本外"))
+    else:
+        def _seg(label: str, seg: dict) -> list:
+            return [
+                f"{label}（{esc(str(seg.get('start'))[:4])} ~ {esc(str(seg.get('end'))[:4])}）",
+                pct_signed(seg.get("return")), pct_signed(seg.get("cagr")),
+                pct(seg.get("max_drawdown")), pct(seg.get("benchmark_return")),
+            ]
+        in_seg = oos.get("in_sample") or {}
+        out_seg = oos.get("out_of_sample") or {}
+        oos_rows = [_seg("样本内", in_seg), _seg("样本外", out_seg)]
+        oos_cls = [
+            [None, cls(in_seg.get("return")), cls(in_seg.get("cagr")), "neg", cls(in_seg.get("benchmark_return"))],
+            [None, cls(out_seg.get("return")), cls(out_seg.get("cagr")), "neg", cls(out_seg.get("benchmark_return"))],
+        ]
+        body.append(f'<p class="note">断点年份：{esc(oos.get("split_year"))}（样本外年化显著低于样本内'
+                    " → alpha 随时间衰减；两者接近 → 较稳健）</p>")
+        body.append(_table(["区间", "累计收益", "年化", "最大回撤", "基准"],
+                           oos_rows, oos_cls))
+    return _section(title, "".join(body))
+
+
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
@@ -751,6 +834,7 @@ def build_html_report(detail: dict) -> str:
         + nav_html
         + _crisis_section(detail)
         + _market_regime_section(detail, charts)
+        + _robustness_section(detail)
         + _appendix(detail)
     )
     options = {cid: opt for cid, opt in charts}

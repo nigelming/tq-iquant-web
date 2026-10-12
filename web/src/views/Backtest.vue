@@ -1434,6 +1434,10 @@ const compareForm = ref({
 const comparing = ref(false)
 const compareResult = ref<{ comparisons: any[] } | null>(null)
 const compareMsg = ref('')
+// 默认推荐池：风格差异较大的备选池（成长/红利/热点），按名称匹配，改名则自动降级不预选
+const RECOMMENDED_POOL_NAMES = ['成长精选', '红利精选', '热点精选']
+const recommendedPoolIds = computed(() =>
+  pools.value.filter((p) => RECOMMENDED_POOL_NAMES.includes(p.name)).map((p) => p.id))
 
 async function openCompare() {
   compareResult.value = null
@@ -1447,7 +1451,12 @@ async function openCompare() {
   try {
     pools.value = await getStockPools()
   } catch { pools.value = [] }
+  compareForm.value.pool_ids = recommendedPoolIds.value  // 默认预选推荐池
   showCompare.value = true
+}
+
+function selectRecommended() {
+  compareForm.value.pool_ids = [...recommendedPoolIds.value]
 }
 
 async function submitCompare() {
@@ -4148,10 +4157,16 @@ watch(theme, () => {
         </p>
 
         <label>备选股票池</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <button type="button" class="btn btn-sm" @click="selectRecommended">⭐ 选推荐池</button>
+          <button type="button" class="btn btn-sm" @click="compareForm.pool_ids = []">清空</button>
+          <span class="form-hint" style="margin-bottom:0">推荐：成长/红利/热点精选（风格差异大，更易检验是否依赖特定池）</span>
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
           <label v-for="p in pools" :key="p.id" class="compare-pool-opt">
             <input type="checkbox" :value="p.id" v-model="compareForm.pool_ids" />
             {{ p.name }}（{{ p.code }}）
+            <span v-if="recommendedPoolIds.includes(p.id)" class="rec-tag">推荐</span>
           </label>
         </div>
 

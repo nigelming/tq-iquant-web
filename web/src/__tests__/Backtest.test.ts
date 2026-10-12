@@ -1380,6 +1380,7 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     ;(getStockPools as any).mockResolvedValue([
       { id: 2, code: 'JYBX', name: '交易备选' },
       { id: 3, code: 'CCJX', name: '成长精选' },
+      { id: 7, code: 'HLJX', name: '红利精选' },
     ])
     ;(compareBacktestPools as any).mockResolvedValue({
       comparisons: [{
@@ -1398,16 +1399,18 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     await w.findAll('button').find((b) => b.text().includes('换池对比复跑'))!.trigger('click')
     await flushPromises()
     expect(w.text()).toContain('换池稳健性对比')
-    const chk = w.findAll('.compare-pool-opt input')[1]
-    ;(chk.element as HTMLInputElement).checked = true
-    await chk.trigger('change')
-    await flushPromises()
+    // 默认预选推荐池（成长精选/红利精选），源风格池（交易备选）不选
+    const boxes = w.findAll('.compare-pool-opt input')
+    expect((boxes[0].element as HTMLInputElement).checked).toBe(false)  // 交易备选
+    expect((boxes[1].element as HTMLInputElement).checked).toBe(true)   // 成长精选
+    expect((boxes[2].element as HTMLInputElement).checked).toBe(true)   // 红利精选
+    expect(w.text()).toContain('推荐')
     await w.findAll('button').find((b) => b.text().includes('开始对比'))!.trigger('click')
     await flushPromises()
     expect(w.text()).not.toContain('请至少选择一个备选股票池')
     expect(compareBacktestPools).toHaveBeenCalledTimes(1)
     const arg = (compareBacktestPools as any).mock.calls[0][0]
-    expect(arg.pool_ids).toEqual([3])
+    expect(arg.pool_ids).toEqual([3, 7])
     expect(arg.dividend_mode).toBe('dual')
     expect(w.text()).toContain('成长精选')
   })
