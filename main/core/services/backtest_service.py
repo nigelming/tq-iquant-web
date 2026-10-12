@@ -27,12 +27,14 @@ from core.models import (
     StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
+    BacktestRobustnessAnalysis,
 )
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
+from core.engine.backtest_robustness import analyze_robustness
 from core.engine.regime import segment_regime
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
@@ -890,6 +892,101 @@ def recompute_market_regime(db: Session, record_id: int) -> Optional[dict]:
             if row.skipped_benchmarks_json else []
         ),
         "benchmark_resolution": resolution,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 回测稳健性检验（年度/3年滚动/个股集中度/样本内外对比，纯后处理不重跑）
+# ---------------------------------------------------------------------------
+def _upsert_robustness(
+    db: Session, record_id: int, status: str,
+    error: Optional[str] = None, payload: Optional[dict] = None,
+) -> BacktestRobustnessAnalysis:
+    row = (
+        db.query(BacktestRobustnessAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    if row is None:
+        row = BacktestRobustnessAnalysis(backtest_record_id=record_id)
+        db.add(row)
+    row.status = status
+    row.error = error
+    row.payload_json = json.dumps(payload, ensure_ascii=False, allow_nan=False) if payload else None
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def compute_and_store_robustness(
+    db: Session, record_id: int, oos_ratio: float = 0.25,
+) -> BacktestRobustnessAnalysis:
+    """读已落库快照+成交 → analyze_robustness → upsert。
+
+    纯后处理：直接消费 DB 数据（与复权模式无关），不重跑回测。
+    """
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    trades = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=record_id)
+        .all()
+    )
+    payload = analyze_robustness(
+        snaps=[
+            {"snap_date": s.snap_date, "total_value": s.total_value,
+             "benchmark_value": s.benchmark_value}
+            for s in snaps
+        ],
+        trades=[
+            {"stock_code": t.stock_code, "trade_type": t.trade_type, "amount": t.amount,
+             "commission": t.commission, "stamp_duty": t.stamp_duty}
+            for t in trades
+        ],
+        oos_ratio=oos_ratio,
+    )
+    return _upsert_robustness(db, record_id, status="completed", payload=payload)
+
+
+def safe_compute_robustness(
+    db: Session, record_id: int, oos_ratio: float = 0.25,
+) -> Optional[BacktestRobustnessAnalysis]:
+    """回测完成后的自动稳健性分析：异常不中断主链路，落 status=failed。"""
+    try:
+        return compute_and_store_robustness(db, record_id, oos_ratio=oos_ratio)
+    except Exception as exc:
+        db.rollback()
+        try:
+            return _upsert_robustness(db, record_id, status="failed", error=str(exc))
+        except Exception:
+            db.rollback()
+            return None
+
+
+def recompute_robustness(db: Session, record_id: int, oos_ratio: float = 0.25) -> Optional[dict]:
+    """离线重算稳健性检验（详情页手动触发）。记录不存在返回 None（路由 404）。"""
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算", "computed_at": None}
+    row = safe_compute_robustness(db, record_id, oos_ratio=oos_ratio)
+    if row is None:
+        return {"status": "failed", "error": "稳健性分析结果落库失败", "computed_at": None}
+    return {
+        "status": row.status,
+        "error": row.error,
+        "computed_at": row.computed_at.isoformat() if row.computed_at else None,
     }
 
 
@@ -1900,6 +1997,20 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
             "data": json.loads(mr.payload_json) if mr.payload_json else None,
         }
 
+    rb = (
+        db.query(BacktestRobustnessAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    robustness = None
+    if rb is not None:
+        robustness = {
+            "status": rb.status,
+            "error": rb.error,
+            "computed_at": rb.computed_at.isoformat() if rb.computed_at else None,
+            "data": json.loads(rb.payload_json) if rb.payload_json else None,
+        }
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -1912,6 +2023,7 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
         "returns_buckets": returns_buckets,
         "crisis_alpha": crisis_alpha,
         "market_regime": market_regime,
+        "robustness": robustness,
     }
 
 
@@ -2128,6 +2240,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     safe_compute_crisis_alpha(
         db, rec.id, ps, result["snapshots"], req.start_date, req.end_date
     )
+    safe_compute_robustness(db, rec.id)
 
     return {
         "record_id": record_id,

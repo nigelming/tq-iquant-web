@@ -741,6 +741,66 @@ def _ca_decimal_frames(points):
     return {d: Decimal(str(v)) for d, v in points.items()}
 
 
+def _seed_robustness_record(db):
+    rec, ps = _seed_record(db)
+    db.add(BacktestDailySnapshot(
+        backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+        snap_date=date(2024, 1, 2), total_value=Decimal("100000"),
+        cash=Decimal("100000"), market_value=Decimal("0"), benchmark_value=Decimal("2000")))
+    db.add(BacktestDailySnapshot(
+        backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+        snap_date=date(2024, 12, 31), total_value=Decimal("120000"),
+        cash=Decimal("0"), market_value=Decimal("120000"), benchmark_value=Decimal("2200")))
+    db.add(BacktestTrade(
+        backtest_record_id=rec.id, strategy_id=1, signal_name="open_sig", signal_type="OPEN",
+        stock_code="000001.SZ", trade_type="BUY", price=Decimal("10"),
+        quantity=1000, amount=Decimal("10000"), commission=Decimal("5"), stamp_duty=Decimal("0"),
+        bar_time=datetime(2024, 1, 3)))
+    db.add(BacktestTrade(
+        backtest_record_id=rec.id, strategy_id=1, signal_name="open_sig", signal_type="OPEN",
+        stock_code="000001.SZ", trade_type="SELL", price=Decimal("12"),
+        quantity=1000, amount=Decimal("12000"), commission=Decimal("5"), stamp_duty=Decimal("6"),
+        bar_time=datetime(2024, 12, 30)))
+    db.commit()
+    return rec, ps
+
+
+def test_compute_and_store_robustness(db_session):
+    rec, _ = _seed_robustness_record(db_session)
+    row = svc.compute_and_store_robustness(db_session, rec.id)
+    assert row.status == "completed"
+    payload = json.loads(row.payload_json)
+    assert round(payload["total_return"], 4) == 0.2
+    assert payload["years_positive"] == "1/1"
+    assert payload["annual"][0]["year"] == "2024"
+    assert round(payload["benchmark_return"], 4) == 0.1
+    assert payload["concentration"]["total_stocks"] == 1
+    # 单笔买卖：净利 = 12000-5-6 - (10000+5) = 1984
+    assert payload["concentration"]["total_realized_pnl"] == 1984.0
+
+
+def test_recompute_robustness_missing_record_returns_none(db_session):
+    assert svc.recompute_robustness(db_session, 99999) is None
+
+
+def test_recompute_robustness_no_snapshots_returns_failed(db_session):
+    rec, _ = _seed_record(db_session)
+    r = svc.recompute_robustness(db_session, rec.id)
+    assert r["status"] == "failed"
+    assert "无组合日快照" in r["error"]
+
+
+def test_run_backtest_auto_computes_robustness(db_session, monkeypatch):
+    """回测完成后自动触发 safe_compute_robustness（记录 id 被调用）。"""
+    ps, _ = _seed(db_session)
+    _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
+    called = []
+    monkeypatch.setattr(svc, "safe_compute_robustness",
+                        lambda db, record_id: called.append(record_id))
+    rid = svc.run_backtest(db_session, ps, _req())["record_id"]
+    assert called == [rid]
+
+
 def test_build_index_close_series_back_dividend_mode(monkeypatch):
     days = [date(2026, 1, 5)]
     fake = _FakeIndexTQ({"000300.SH": {days[0]: 3000.0}})

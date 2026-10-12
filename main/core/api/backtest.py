@@ -81,6 +81,7 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_crisis_alpha as _svc_recompute_crisis_alpha,
     recompute_market_regime as _svc_recompute_market_regime,
     recompute_evaluation as _svc_recompute_evaluation,
+    recompute_robustness as _svc_recompute_robustness,
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
 from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
@@ -138,6 +139,15 @@ def recompute_record_market_regime(record_id: int, db: Session = Depends(get_db)
 def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
     """离线重算组合级评估（不重跑回测），供老记录补算基准相对等新增指标。"""
     result = _svc_recompute_evaluation(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/robustness/recompute")
+def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
+    """离线重算稳健性检验（年度/3年滚动/集中度/样本内外，不重跑回测）。"""
+    result = _svc_recompute_robustness(db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)

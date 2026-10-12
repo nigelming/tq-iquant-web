@@ -216,6 +216,46 @@ def test_post_backtest_invalid_dividend_mode_returns_400(client):
     assert "front/back" in body["message"]
 
 
+def test_post_backtest_robustness_recompute(client, monkeypatch):
+    """回测完成后自动算稳健性检验；POST recompute 返回 completed，详情含 robustness。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.close()
+
+    stock = "000001.SZ"
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    })
+
+    payload = {
+        "portfolio_strategy_id": ps_id, "name": "bt_rb",
+        "start_date": "2026-07-29", "end_date": "2026-07-31",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    record_id = resp.json()["data"]["record_id"]
+
+    # 手动重算稳健性检验
+    resp = c.post(f"/api/backtest/records/{record_id}/robustness/recompute")
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "completed"
+
+    detail = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert detail["robustness"] is not None
+    assert detail["robustness"]["status"] == "completed"
+    assert "annual" in detail["robustness"]["data"]
+
+
+def test_post_backtest_robustness_recompute_missing_404(client):
+    c, _ = client
+    resp = c.post("/api/backtest/records/99999/robustness/recompute")
+    assert resp.json()["code"] == 404
+
+
 def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     c, Session = client
     db = Session()
