@@ -1,6 +1,6 @@
 from datetime import date
 from threading import Lock
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -57,6 +57,15 @@ class BacktestRequest(BaseModel):
     dividend_mode: str = "front"
 
 
+class PoolCompareRequest(BaseModel):
+    portfolio_strategy_id: int
+    pool_ids: List[int]
+    start_date: date
+    end_date: date
+    name_prefix: str = "换池对比"
+    dividend_mode: str = "dual"
+
+
 # ---------------------------------------------------------------------------
 # 业务逻辑已下沉到 core.services.backtest_service（P1 #9）。
 # 下方 re-export 供测试 bt_api.xxx 兼容（test_backtest_data.py / test_backtest_api.py
@@ -82,6 +91,7 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_market_regime as _svc_recompute_market_regime,
     recompute_evaluation as _svc_recompute_evaluation,
     recompute_robustness as _svc_recompute_robustness,
+    run_pool_comparison as _svc_run_pool_comparison,
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
 from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
@@ -151,6 +161,38 @@ def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
+
+
+@router.post("/robustness/compare")
+def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_db)):
+    """换池稳健性对比：同参数仅换池逐个重跑回测并返回对比结果。
+
+    同步内联执行（每池分钟级），需持回测并发锁（与单跑回测互斥）。
+    """
+    ps = db.get(PortfolioStrategy, req.portfolio_strategy_id)
+    if ps is None:
+        return err(404, "组合策略不存在")
+    if not req.pool_ids:
+        return err(400, "请至少选择一个备选股票池")
+    if req.start_date >= req.end_date:
+        return err(400, f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}")
+    if req.dividend_mode not in ("front", "back", "dual"):
+        return err(400, f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}")
+
+    if not _try_acquire_slot():
+        raise HTTPException(
+            status_code=409,
+            detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
+        )
+    try:
+        results = _svc_run_pool_comparison(
+            db, req.portfolio_strategy_id, req.pool_ids,
+            req.start_date, req.end_date,
+            req.name_prefix, req.dividend_mode,
+        )
+        return ok({"comparisons": results})
+    finally:
+        _release_slot()
 
 
 @router.get("/records/{record_id}/export/html")

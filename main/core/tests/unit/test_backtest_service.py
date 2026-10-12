@@ -801,6 +801,46 @@ def test_run_backtest_auto_computes_robustness(db_session, monkeypatch):
     assert called == [rid]
 
 
+def test_ensure_pool_clone_copies_params_and_swaps_pool(db_session):
+    ps, strat_id = _seed(db_session)
+    db_session.add(StockPool(code="T2", name="池2"))
+    db_session.flush()
+    pool2 = db_session.query(StockPool).filter_by(code="T2").one()
+    clone = svc.ensure_pool_clone(db_session, ps.id, pool2.id, "QZQ-池2")
+    assert clone.id != ps.id
+    assert clone.stock_pool_id == pool2.id
+    assert clone.initial_capital == ps.initial_capital
+    assert clone.max_drawdown == ps.max_drawdown
+    strat = db_session.query(Strategy).filter_by(portfolio_id=clone.id).one()
+    assert strat.stock_pool_id == pool2.id
+    assert strat.formula_id is not None
+    # 幂等：同名复用
+    clone2 = svc.ensure_pool_clone(db_session, ps.id, pool2.id, "QZQ-池2")
+    assert clone2.id == clone.id
+
+
+def test_run_pool_comparison_runs_each_pool_and_returns_summary(db_session, monkeypatch):
+    ps, strat_id = _seed(db_session)
+    db_session.add(StockPool(code="T3", name="池3"))
+    db_session.add(StockPool(code="T4", name="池4"))
+    db_session.flush()
+    pools = {r.code: r.id for r in db_session.query(StockPool).all()}
+
+    _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
+    results = svc.run_pool_comparison(
+        db_session, ps.id, [pools["T3"], pools["T4"]],
+        date(2026, 7, 29), date(2026, 7, 31), name_prefix="对比",
+    )
+    assert len(results) == 2
+    for r in results:
+        assert r["status"] == "completed"
+        assert r["record_id"] is not None
+        assert r["metrics"] is not None
+        assert r["robustness"] is not None  # 每次回测自动算稳健性检验
+    assert {r["pool_name"] for r in results} == {"池3", "池4"}
+    assert results[0]["record_id"] != results[1]["record_id"]
+
+
 def test_build_index_close_series_back_dividend_mode(monkeypatch):
     days = [date(2026, 1, 5)]
     fake = _FakeIndexTQ({"000300.SH": {days[0]: 3000.0}})

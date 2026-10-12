@@ -24,7 +24,7 @@ import polars as pl
 from sqlalchemy.orm import Session
 
 from core.models import (
-    StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
+    StockPool, StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
     BacktestRobustnessAnalysis,
@@ -988,6 +988,125 @@ def recompute_robustness(db: Session, record_id: int, oos_ratio: float = 0.25) -
         "error": row.error,
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# 换池稳健性对比（Tier2）：克隆组合（同参数仅换池）逐个重跑回测并对比
+# ---------------------------------------------------------------------------
+def ensure_pool_clone(
+    db: Session, source_ps_id: int, pool_id: int, name: str,
+) -> PortfolioStrategy:
+    """克隆组合：照抄源组合全部字段 + 逐策略克隆（参数一致），仅把组合级/策略级
+    股票池都指向目标池。已存在同名组合则复用（幂等）。"""
+    existing = db.query(PortfolioStrategy).filter_by(name=name).one_or_none()
+    if existing is not None:
+        return existing
+    src = db.get(PortfolioStrategy, source_ps_id)
+    if src is None:
+        raise ValueError(f"源组合策略不存在（id={source_ps_id}）")
+    clone = PortfolioStrategy(
+        name=name, stock_pool_id=pool_id,
+        benchmark_index=src.benchmark_index,
+        initial_capital=src.initial_capital, max_drawdown=src.max_drawdown,
+        daily_loss_limit=src.daily_loss_limit, max_holdings=src.max_holdings,
+        min_commission=src.min_commission, buy_commission_rate=src.buy_commission_rate,
+        sell_commission_rate=src.sell_commission_rate, stamp_duty_rate=src.stamp_duty_rate,
+        slippage=src.slippage, trading_session=src.trading_session,
+    )
+    db.add(clone)
+    db.flush()
+    for s in _portfolio_strategies(src, db):
+        db.add(Strategy(
+            portfolio_id=clone.id, name=s.name, formula_id=s.formula_id,
+            period=s.period, role=s.role, master_strategy_id=s.master_strategy_id,
+            capital_ratio=s.capital_ratio, max_positions=s.max_positions,
+            single_open_ratio=s.single_open_ratio,
+            stop_loss_ratio=s.stop_loss_ratio, take_profit_ratio=s.take_profit_ratio,
+            trailing_stop_ratio=s.trailing_stop_ratio,
+            add_position_threshold=s.add_position_threshold,
+            max_add_count=s.max_add_count, add_position_ratio=s.add_position_ratio,
+            reduce_position_ratio=s.reduce_position_ratio,
+            stock_pool_id=pool_id, slave_exit_mode=s.slave_exit_mode,
+        ))
+    db.commit()
+    db.refresh(clone)
+    return clone
+
+
+class _PoolCompareReq:
+    """run_backtest 请求替身（只读 name/start_date/end_date/dividend_mode）。"""
+
+    def __init__(self, name, start, end, dividend_mode):
+        self.name = name
+        self.start_date = start
+        self.end_date = end
+        self.dividend_mode = dividend_mode
+
+
+def run_pool_comparison(
+    db: Session, source_ps_id: int, pool_ids: List[int],
+    start: date, end: date, name_prefix: str = "换池对比",
+    dividend_mode: str = "dual",
+) -> list:
+    """为每个备选池克隆组合并跑一遍回测（同参数仅换池），返回可并排比较的结果。
+
+    逐个同步执行（路由层应持有回测并发锁）；每次 run_backtest 会自动算
+    稳健性检验，故每个对比记录带 metrics + robustness。"""
+    pools = {
+        p.id: p.name for p in db.query(StockPool).filter(StockPool.id.in_(pool_ids)).all()
+    }
+    results = []
+    for pid in pool_ids:
+        pname = pools.get(pid, f"pool-{pid}")
+        clone = ensure_pool_clone(db, source_ps_id, pid, f"{name_prefix}-{pname}")
+        try:
+            r = run_backtest(
+                db, clone,
+                _PoolCompareReq(
+                    f"{name_prefix}-{pname}-{start.year}-{end.year}",
+                    start, end, dividend_mode,
+                ),
+            )
+            rid = r["record_id"]
+            ev = db.query(BacktestEvaluation).filter_by(
+                backtest_record_id=rid, target_type="portfolio").first()
+            metrics = None
+            if ev is not None:
+                metrics = {
+                    "total_return": _f_val(ev.total_return),
+                    "annual_return": _f_val(ev.annual_return),
+                    "max_drawdown": _f_val(ev.max_drawdown),
+                    "sharpe_ratio": _f_val(ev.sharpe_ratio),
+                    "win_rate": _f_val(ev.win_rate),
+                    "profit_factor": _f_val(ev.profit_factor),
+                    "total_trades": ev.total_trades,
+                    "avg_position_utilization": _f_val(ev.avg_position_utilization),
+                    "benchmark_return": _f_val(ev.benchmark_return),
+                }
+            rb = db.query(BacktestRobustnessAnalysis).filter_by(
+                backtest_record_id=rid).one_or_none()
+            robustness = json.loads(rb.payload_json) if (rb and rb.payload_json) else None
+            results.append({
+                "pool_id": pid, "pool_name": pname,
+                "record_id": rid, "status": "completed",
+                "metrics": metrics, "robustness": robustness,
+            })
+        except Exception as exc:
+            db.rollback()
+            results.append({
+                "pool_id": pid, "pool_name": pname,
+                "record_id": None, "status": "failed", "error": str(exc),
+            })
+    return results
+
+
+def _f_val(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # 评估指标落库字段（运行落库与离线重算共用，避免两处漂移）

@@ -256,6 +256,50 @@ def test_post_backtest_robustness_recompute_missing_404(client):
     assert resp.json()["code"] == 404
 
 
+def test_post_pool_compare_runs_and_returns_comparisons(client, monkeypatch):
+    """换池对比：POST /robustness/compare 逐池跑回测并返回对比结果。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.add(StockPool(code="T9", name="池9"))
+    db.add(StockPool(code="T10", name="池10"))
+    db.commit()
+    pools = {r.code: r.id for r in db.query(StockPool).all()}
+    db.close()
+
+    stock = "000001.SZ"
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "pool_ids": [pools["T9"], pools["T10"]],
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "dual",
+    }
+    resp = c.post("/api/backtest/robustness/compare", json=payload)
+    body = resp.json()
+    assert body["code"] == 0
+    comps = body["data"]["comparisons"]
+    assert len(comps) == 2
+    assert all(c["status"] == "completed" for c in comps)
+    assert all(c["record_id"] is not None for c in comps)
+
+
+def test_post_pool_compare_empty_pools_400(client):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    payload = {
+        "portfolio_strategy_id": ps_id, "pool_ids": [],
+        "start_date": "2026-07-29", "end_date": "2026-07-31",
+    }
+    resp = c.post("/api/backtest/robustness/compare", json=payload)
+    assert resp.json()["code"] == 400
+
+
 def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     c, Session = client
     db = Session()
