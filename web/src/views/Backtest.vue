@@ -4,7 +4,7 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
-  recomputeRobustness,
+  recomputeRobustness, getStockPools, compareBacktestPools,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -1422,6 +1422,62 @@ async function toggleRbSection() {
   rbCollapsed.value = !rbCollapsed.value
 }
 
+// ===== 换池稳健性对比（Tier2）=====
+const showCompare = ref(false)
+const pools = ref<{ id: number; code: string; name: string }[]>([])
+const compareForm = ref({
+  pool_ids: [] as number[],
+  start_date: '',
+  end_date: '',
+  dividend_mode: 'dual',
+})
+const comparing = ref(false)
+const compareResult = ref<{ comparisons: any[] } | null>(null)
+const compareMsg = ref('')
+
+async function openCompare() {
+  compareResult.value = null
+  compareMsg.value = ''
+  compareForm.value = {
+    pool_ids: [],
+    start_date: currentRecord.value?.start_date || '',
+    end_date: currentRecord.value?.end_date || '',
+    dividend_mode: 'dual',
+  }
+  try {
+    pools.value = await getStockPools()
+  } catch { pools.value = [] }
+  showCompare.value = true
+}
+
+async function submitCompare() {
+  const psId = currentRecord.value?.portfolio_strategy_id
+  if (!psId) { compareMsg.value = '缺少源组合'; return }
+  if (!compareForm.value.pool_ids.length) { compareMsg.value = '请至少选择一个备选股票池'; return }
+  if (!compareForm.value.start_date || !compareForm.value.end_date) { compareMsg.value = '请选择起止日期'; return }
+  comparing.value = true
+  compareMsg.value = ''
+  try {
+    const res = await compareBacktestPools({
+      portfolio_strategy_id: psId,
+      pool_ids: compareForm.value.pool_ids,
+      start_date: compareForm.value.start_date,
+      end_date: compareForm.value.end_date,
+      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual',
+    })
+    compareResult.value = res
+  } catch (e) {
+    compareMsg.value = `对比失败：${errMsg(e)}`
+  } finally {
+    comparing.value = false
+  }
+}
+
+function compareOosCagr(c: any): string {
+  const oos = c?.robustness?.oos?.out_of_sample
+  return oos?.cagr === null || oos?.cagr === undefined ? '—' : pct(oos.cagr)
+}
+
 async function toggleMrSection() {
   mrCollapsed.value = !mrCollapsed.value
   if (!mrCollapsed.value) {
@@ -2630,6 +2686,7 @@ watch(theme, () => {
         </div>
       </div>
     </div>
+
   </div>
 
   <!-- ============ 详情报告视图 ============ -->
@@ -3723,6 +3780,7 @@ watch(theme, () => {
             <button class="btn btn-sm" :disabled="rbRecomputing" @click="recomputeRb">
               {{ rbRecomputing ? '计算中…' : '重新计算' }}
             </button>
+            <button class="btn btn-sm" @click="openCompare">换池对比复跑</button>
             <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
           </div>
         </div>
@@ -4080,6 +4138,84 @@ watch(theme, () => {
       />
     </div>
   </div>
+
+    <!-- 换池稳健性对比 Modal -->
+    <div v-if="showCompare" class="modal-overlay modal-lg" @click.self="showCompare = false">
+      <div class="modal">
+        <h3>换池稳健性对比</h3>
+        <p style="color:var(--ink-soft);font-size:12px;margin:0 0 8px">
+          同参数（公式/风控/资金）仅换股票池逐个重跑回测，检验策略是否依赖特定股票池。每次对比分钟级，请耐心等待。
+        </p>
+
+        <label>备选股票池</label>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+          <label v-for="p in pools" :key="p.id" class="compare-pool-opt">
+            <input type="checkbox" :value="p.id" v-model="compareForm.pool_ids" />
+            {{ p.name }}（{{ p.code }}）
+          </label>
+        </div>
+
+        <div class="signal-row">
+          <div style="flex:1">
+            <label>开始日期</label>
+            <input v-model="compareForm.start_date" type="date" />
+          </div>
+          <div style="flex:1">
+            <label>结束日期</label>
+            <input v-model="compareForm.end_date" type="date" />
+          </div>
+        </div>
+
+        <div class="signal-row">
+          <div style="flex:1">
+            <label>复权模式</label>
+            <select v-model="compareForm.dividend_mode">
+              <option value="dual">前复权信号 + 后复权记账（推荐）</option>
+              <option value="front">前复权</option>
+              <option value="back">后复权</option>
+            </select>
+          </div>
+        </div>
+
+        <div v-if="compareMsg" class="form-hint" style="color:var(--red)">{{ compareMsg }}</div>
+
+        <div v-if="comparing" class="empty-state" style="padding:20px">
+          <p>对比运行中（每池分钟级），请勿关闭…</p>
+        </div>
+
+        <div v-else-if="compareResult" class="table-container" style="margin-top:8px">
+          <table>
+            <thead>
+              <tr>
+                <th>股票池</th><th>年化</th><th>最大回撤</th><th>Sharpe</th>
+                <th>胜率</th><th>盈亏比</th><th>交易数</th><th>仓位利用率</th><th>样本外年化</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="c in compareResult.comparisons" :key="c.pool_id">
+                <td>{{ c.pool_name }}<span v-if="c.status !== 'completed'" class="text-red">（失败）</span></td>
+                <td :class="valueClass(c.metrics?.annual_return)">{{ c.metrics ? pct(c.metrics.annual_return) : '—' }}</td>
+                <td class="text-green">{{ c.metrics ? pct(c.metrics.max_drawdown) : '—' }}</td>
+                <td>{{ c.metrics ? c.metrics.sharpe_ratio?.toFixed(2) : '—' }}</td>
+                <td>{{ c.metrics ? pct(c.metrics.win_rate) : '—' }}</td>
+                <td>{{ c.metrics ? c.metrics.profit_factor?.toFixed(2) : '—' }}</td>
+                <td>{{ c.metrics?.total_trades ?? '—' }}</td>
+                <td>{{ c.metrics ? pct(c.metrics.avg_position_utilization) : '—' }}</td>
+                <td :class="valueClass(c.robustness?.oos?.out_of_sample?.cagr)">{{ compareOosCagr(c) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="ca-note">各池年化/回撤接近 → 策略不依赖特定池；差异大 → 结果需谨慎。样本外年化越低说明近期 alpha 衰减越明显。</p>
+        </div>
+
+        <div class="modal-actions">
+          <button @click="submitCompare" class="btn btn-primary" :disabled="comparing || !pools.length">
+            {{ comparing ? '对比中...' : '开始对比' }}
+          </button>
+          <button @click="showCompare = false" class="btn" :disabled="comparing">关闭</button>
+        </div>
+      </div>
+    </div>
 </template>
 
 <style scoped>

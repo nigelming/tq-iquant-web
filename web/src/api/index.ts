@@ -1059,6 +1059,41 @@ export async function recomputeRobustness(id: number) {
   return res.data.data
 }
 
+export interface PoolCompareRequest {
+  portfolio_strategy_id: number
+  pool_ids: number[]
+  start_date: string
+  end_date: string
+  name_prefix?: string
+  dividend_mode?: 'front' | 'back' | 'dual'
+}
+
+export interface PoolCompareItem {
+  pool_id: number
+  pool_name: string
+  record_id: number | null
+  status: string
+  error?: string | null
+  metrics: {
+    total_return: number | null
+    annual_return: number | null
+    max_drawdown: number | null
+    sharpe_ratio: number | null
+    win_rate: number | null
+    profit_factor: number | null
+    total_trades: number | null
+    avg_position_utilization: number | null
+    benchmark_return: number | null
+  } | null
+  robustness: { oos?: { out_of_sample?: { cagr: number | null } | null } | null } | null
+}
+
+export async function compareBacktestPools(req: PoolCompareRequest) {
+  const res = await api.post<ApiResponse<{ comparisons: PoolCompareItem[] }>>(
+    '/backtest/robustness/compare', req)
+  return res.data.data
+}
+
 // ---- B4b: 实盘历史查询（订单/成交/持仓）----
 
 export interface LiveOrderItem {

@@ -52,6 +52,9 @@ vi.mock('../api', () => ({
   deleteBacktestRecord: vi.fn(),
   recomputeCrisisAlpha: vi.fn(),
   recomputeMarketRegime: vi.fn(),
+  recomputeRobustness: vi.fn(),
+  getStockPools: vi.fn(),
+  compareBacktestPools: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -72,6 +75,7 @@ import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
+  getStockPools, compareBacktestPools,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -1357,6 +1361,55 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     await rbHeader.trigger('click')
     await flushPromises()
     expect(w.text()).toContain('尚未计算稳健性检验')
+  })
+
+  it('换池对比：勾选备选池提交 → 调 compareBacktestPools 并渲染对比表', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      record: { ...mockDetail.record, portfolio_strategy_id: 1 },
+      robustness: {
+        status: 'completed',
+        data: {
+          total_return: 1, benchmark_return: 0.5, years_positive: '1/1',
+          annual: [], rolling_3y: [],
+          concentration: { total_realized_pnl: 0, top: [], top20_share: 0, profitable_stocks: 0, total_stocks: 0 },
+          oos: null,
+        },
+      },
+    })
+    ;(getStockPools as any).mockResolvedValue([
+      { id: 2, code: 'JYBX', name: '交易备选' },
+      { id: 3, code: 'CCJX', name: '成长精选' },
+    ])
+    ;(compareBacktestPools as any).mockResolvedValue({
+      comparisons: [{
+        pool_id: 3, pool_name: '成长精选', record_id: 9, status: 'completed',
+        metrics: { annual_return: 0.19, max_drawdown: -0.07, sharpe_ratio: 2.68, win_rate: 0.59, profit_factor: 4.0, total_trades: 2313, avg_position_utilization: 0.17, benchmark_return: 0.86 },
+        robustness: { oos: { out_of_sample: { cagr: 0.066 } } },
+      }],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rbHeader = w.findAll('.ca-header').find((h) => h.text().includes('稳健性检验'))!
+    await rbHeader.trigger('click')
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('换池对比复跑'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('换池稳健性对比')
+    const chk = w.findAll('.compare-pool-opt input')[1]
+    ;(chk.element as HTMLInputElement).checked = true
+    await chk.trigger('change')
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('开始对比'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).not.toContain('请至少选择一个备选股票池')
+    expect(compareBacktestPools).toHaveBeenCalledTimes(1)
+    const arg = (compareBacktestPools as any).mock.calls[0][0]
+    expect(arg.pool_ids).toEqual([3])
+    expect(arg.dividend_mode).toBe('dual')
+    expect(w.text()).toContain('成长精选')
   })
 })
 
