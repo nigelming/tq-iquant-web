@@ -430,6 +430,41 @@ export interface BacktestDetailItem {
   returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
   crisis_alpha: BacktestCrisisAlphaItem | null
   market_regime: BacktestMarketRegimeItem | null
+  robustness: BacktestRobustnessItem | null  // 稳健性检验（年度/3年滚动/集中度/样本内外）
+}
+
+export interface BacktestRobustnessItem {
+  status: string
+  error?: string | null
+  computed_at?: string | null
+  data?: {
+    total_return: number | null
+    benchmark_return: number | null
+    years_positive: string
+    annual: { year: string; return: number | null; max_drawdown: number | null }[]
+    rolling_3y: { start: string; end: string; cagr: number | null; max_drawdown: number | null }[]
+    concentration: {
+      total_realized_pnl: number
+      top: { code: string; pnl: number; share: number }[]
+      top20_share: number
+      profitable_stocks: number
+      total_stocks: number
+    }
+    oos: {
+      split_year: string
+      in_sample: OosSegment
+      out_of_sample: OosSegment
+    } | null
+  } | null
+}
+
+export interface OosSegment {
+  start: string
+  end: string
+  return: number | null
+  cagr: number | null
+  max_drawdown: number | null
+  benchmark_return: number | null
 }
 
 export async function getStockPools() {
@@ -1009,6 +1044,18 @@ export interface BacktestMarketRegimeItem {
 export async function recomputeMarketRegime(id: number) {
   const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
     `/backtest/records/${id}/market-regime/recompute`)
+  return res.data.data
+}
+
+export interface RobustnessRecomputeResult {
+  status: string
+  error?: string | null
+  computed_at?: string | null
+}
+
+export async function recomputeRobustness(id: number) {
+  const res = await api.post<ApiResponse<RobustnessRecomputeResult>>(
+    `/backtest/records/${id}/robustness/recompute`)
   return res.data.data
 }
 

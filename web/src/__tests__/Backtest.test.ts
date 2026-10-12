@@ -1306,6 +1306,60 @@ async function mountDetail(detailPayload: any) {
   return w
 }
 
+describe('Backtest.vue — 稳健性检验 section', () => {
+  it('completed 数据渲染年度/3年滚动/集中度/样本内外', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      robustness: {
+        status: 'completed',
+        computed_at: '2026-10-12T10:00:00',
+        data: {
+          total_return: 10.0847, benchmark_return: 0.8593, years_positive: '13/13',
+          annual: [{ year: '2014', return: 0.814, max_drawdown: -0.079 }],
+          rolling_3y: [{ start: '2014', end: '2016', cagr: 0.532, max_drawdown: -0.079 }],
+          concentration: {
+            total_realized_pnl: 1000000,
+            top: [{ code: '000408.SZ', pnl: 338874, share: 0.036 }],
+            top20_share: 0.42, profitable_stocks: 195, total_stocks: 262,
+          },
+          oos: {
+            split_year: '2023',
+            in_sample: { start: '2014-01-01', end: '2023-12-29', return: 8.145, cagr: 0.248, max_drawdown: -0.079, benchmark_return: 0.478 },
+            out_of_sample: { start: '2024-01-02', end: '2026-10-09', return: 0.212, cagr: 0.066, max_drawdown: -0.008, benchmark_return: 0.275 },
+          },
+        },
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rbHeader = w.findAll('.ca-header').find((h) => h.text().includes('稳健性检验'))!
+    await rbHeader.trigger('click')
+    await flushPromises()
+    const text = w.text()
+    expect(text).toContain('年度收益与年内最大回撤')
+    expect(text).toContain('3年滚动窗口')
+    expect(text).toContain('个股已实现净')
+    expect(text).toContain('样本内 / 样本外对比')
+    expect(text).toContain('000408.SZ')
+    expect(text).toContain('断点年份：2023')
+    expect(text).toContain('13/13')
+  })
+
+  it('robustness 为 null：显示未计算提示', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, robustness: null })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rbHeader = w.findAll('.ca-header').find((h) => h.text().includes('稳健性检验'))!
+    await rbHeader.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('尚未计算稳健性检验')
+  })
+})
+
 describe('Backtest.vue — 危机Alpha 上提到整体表现指标（8 卡）', () => {
   it('crisis_alpha 为 null：共 8 张卡，危机两卡为 —', async () => {
     const w = await mountDetail({ ...mockDetail, crisis_alpha: null })

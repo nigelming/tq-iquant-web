@@ -4,6 +4,7 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
+  recomputeRobustness,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -13,6 +14,7 @@ import type {
   StyleBlock, DispersionBlock, ExposureBlock,
   IndustryAttributionBlock, IndustryHitRatePeriod,
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
+  BacktestRobustnessItem,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
@@ -938,6 +940,7 @@ async function openDetail(id: number) {
   selectedKey.value = null
   caCollapsed.value = true
   mrCollapsed.value = true
+  rbCollapsed.value = true
   // 等 DOM 渲染后初始化图表
   await nextTick()
   initCharts()
@@ -957,6 +960,21 @@ async function toggleCaSection() {
     initCrisisAlphaCharts()
   }
 }
+
+// ===== 稳健性检验（年度/3年滚动/集中度/样本内外对比）=====
+const rbCollapsed = ref(true)
+const robustness = computed<BacktestRobustnessItem | null>(() => detail.value?.robustness ?? null)
+const rbStatus = computed(() => robustness.value?.status ?? null)
+const rbData = computed(() => {
+  const item = robustness.value
+  if (!item || item.status !== 'completed' || !item.data) return null
+  return item.data
+})
+const robustnessSectionEl = ref<HTMLDivElement | null>(null)
+const rbRecomputing = ref(false)
+const rbRecomputeMsg = ref('')
+const rbRecomputeWarn = ref(false)
+const rbRecomputeMsgClass = computed(() => (rbRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
 // ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
 const mrCollapsed = ref(true)
@@ -1375,6 +1393,35 @@ async function expandMrSection() {
   initMrCharts()
 }
 
+async function recomputeRb() {
+  const id = currentRecord.value?.id
+  if (!id) return
+  rbRecomputing.value = true
+  rbRecomputeMsg.value = ''
+  rbRecomputeWarn.value = false
+  try {
+    const res = await recomputeRobustness(id)
+    rbRecomputeMsg.value = res.status === 'completed'
+      ? '重新计算完成'
+      : `重新计算未完成：${res.error || res.status}`
+    rbRecomputeWarn.value = res.status !== 'completed'
+    detail.value = await getBacktestDetail(id)
+  } catch (e) {
+    rbRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
+    rbRecomputeWarn.value = true
+  } finally {
+    rbRecomputing.value = false
+  }
+}
+
+async function expandRbSection() {
+  rbCollapsed.value = false
+}
+
+async function toggleRbSection() {
+  rbCollapsed.value = !rbCollapsed.value
+}
+
 async function toggleMrSection() {
   mrCollapsed.value = !mrCollapsed.value
   if (!mrCollapsed.value) {
@@ -1545,6 +1592,10 @@ function scrollToSection(anchor: string) {
     void expandMrSection().then(() => {
       marketRegimeSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
     })
+  }
+  if (anchor === 'robustness') {
+    expandRbSection()
+    robustnessSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
   }
 }
 
@@ -3630,6 +3681,134 @@ watch(theme, () => {
             全部统计仅基于本回测每日净值快照与基准日线：滚动收益按周末净值几何累乘，夏普按周收益年化（×√52）；相对指标口径同评估页 FR-1（日频、对齐日收益 ≥ 20）。
           </p>
         </template>
+      </template>
+      </template>
+    </div>
+
+    <!-- 稳健性检验（年度/3年滚动/集中度/样本内外对比） -->
+    <div ref="robustnessSectionEl" class="ca-section rb-section">
+      <div class="section-title ca-header" @click="toggleRbSection">
+        <span>🔬 稳健性检验</span>
+        <span class="ca-caret" :class="{ open: !rbCollapsed }">▶</span>
+      </div>
+
+      <template v-if="!rbCollapsed">
+      <div v-if="rbStatus === null" class="card" style="padding:12px">
+        <p style="color:var(--ink-soft);margin:0 0 8px">本次回测尚未计算稳健性检验（年度/3年滚动/个股集中度/样本内外对比）。</p>
+        <button class="btn btn-sm btn-primary" :disabled="rbRecomputing" @click="recomputeRb">
+          {{ rbRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="rbStatus === 'failed'" class="card" style="padding:12px">
+        <p style="color:var(--red);margin:0 0 8px">稳健性检验失败：{{ robustness?.error || '未知原因' }}</p>
+        <button class="btn btn-sm btn-primary" :disabled="rbRecomputing" @click="recomputeRb">
+          {{ rbRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+      </div>
+
+      <template v-else-if="rbData">
+        <div class="ca-banner">
+          <div class="t">回测稳健性检验</div>
+          <div class="d">
+            总收益 {{ pct(rbData.total_return) }} ｜ 基准 {{ pct(rbData.benchmark_return) }} ｜ 正收益年 {{ rbData.years_positive }}
+          </div>
+          <div class="ca-status">
+            <span>口径：纯后处理（读已落库净值/成交），与复权模式无关</span>
+            <span v-if="robustness?.computed_at">
+              计算于 {{ robustness?.computed_at?.replace('T', ' ').slice(0, 19) }}
+            </span>
+            <button class="btn btn-sm" :disabled="rbRecomputing" @click="recomputeRb">
+              {{ rbRecomputing ? '计算中…' : '重新计算' }}
+            </button>
+            <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+          </div>
+        </div>
+
+        <div class="section-title" style="font-size:14px">一、年度收益与年内最大回撤</div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>年度</th><th>收益</th><th>年内最大回撤</th></tr></thead>
+            <tbody>
+              <tr v-for="a in rbData.annual" :key="a.year">
+                <td>{{ a.year }}</td>
+                <td :class="valueClass(a.return)">{{ pct(a.return) }}</td>
+                <td class="text-green">{{ pct(a.max_drawdown) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">二、3年滚动窗口（CAGR / 窗口内最大回撤）</div>
+        <div v-if="rbData.rolling_3y.length === 0" class="table-container">
+          <div class="empty-state"><p>区间不足 3 年，无滚动窗口。</p></div>
+        </div>
+        <div v-else class="table-container">
+          <table>
+            <thead><tr><th>窗口</th><th>CAGR</th><th>窗口内最大回撤</th></tr></thead>
+            <tbody>
+              <tr v-for="w in rbData.rolling_3y" :key="w.start">
+                <td>{{ w.start }} ~ {{ w.end }}</td>
+                <td :class="valueClass(w.cagr)">{{ pct(w.cagr) }}</td>
+                <td class="text-green">{{ pct(w.max_drawdown) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">三、个股已实现净 P&amp;L 集中度</div>
+        <div class="ca-status" style="margin-bottom:6px">
+          盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
+          ｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}
+          ｜ 总净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>#</th><th>代码</th><th>净 P&amp;L</th><th>占比</th></tr></thead>
+            <tbody>
+              <tr v-for="(t, i) in rbData.concentration.top" :key="t.code">
+                <td>{{ i + 1 }}</td>
+                <td>{{ t.code }}</td>
+                <td :class="valueClass(t.pnl)">{{ fmtMoney(t.pnl) }}</td>
+                <td>{{ pct(t.share) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">四、样本内 / 样本外对比（默认 75/25 自动切分）</div>
+        <template v-if="rbData.oos">
+          <div class="ca-status" style="margin-bottom:6px">断点年份：{{ rbData.oos.split_year }}（{{ rbData.oos.in_sample.end.slice(0,4) }} 及以前为样本内）</div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>区间</th><th>累计收益</th><th>年化</th><th>最大回撤</th><th>基准</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>样本内（{{ rbData.oos.in_sample.start.slice(0,4) }} ~ {{ rbData.oos.in_sample.end.slice(0,4) }}）</td>
+                  <td :class="valueClass(rbData.oos.in_sample.return)">{{ pct(rbData.oos.in_sample.return) }}</td>
+                  <td :class="valueClass(rbData.oos.in_sample.cagr)">{{ pct(rbData.oos.in_sample.cagr) }}</td>
+                  <td class="text-green">{{ pct(rbData.oos.in_sample.max_drawdown) }}</td>
+                  <td>{{ pct(rbData.oos.in_sample.benchmark_return) }}</td>
+                </tr>
+                <tr>
+                  <td>样本外（{{ rbData.oos.out_of_sample.start.slice(0,4) }} ~ {{ rbData.oos.out_of_sample.end.slice(0,4) }}）</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.return)">{{ pct(rbData.oos.out_of_sample.return) }}</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.cagr)">{{ pct(rbData.oos.out_of_sample.cagr) }}</td>
+                  <td class="text-green">{{ pct(rbData.oos.out_of_sample.max_drawdown) }}</td>
+                  <td>{{ pct(rbData.oos.out_of_sample.benchmark_return) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            样本外年化显著低于样本内 → 策略 alpha 随时间衰减；两者接近 → 较稳健（结论供参考，非自动判定）。
+          </p>
+        </template>
+        <div v-else class="table-container">
+          <div class="empty-state"><p>区间不足 2 年，无法切分样本内/样本外。</p></div>
+        </div>
       </template>
       </template>
     </div>
