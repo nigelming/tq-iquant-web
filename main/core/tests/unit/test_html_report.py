@@ -225,6 +225,57 @@ def test_robustness_check_section_renders():
         assert token in html, f"报告缺少 {token!r}"
 
 
+def test_new_sections_returns_buckets_decisions_trades_strategy_eval():
+    """收益分布/风控统计/交易明细/策略评估四区块在新版离线报告完整渲染。"""
+    detail = _detail()
+    detail["returns_buckets"] = {
+        "monthly_matrix": {
+            "years": [2024, 2025], "months": ["1月", "2月"],
+            "matrix": [[1.5, -0.8], [2.0, 0.6]],
+            "text": [["+1.50%", "-0.80%"], ["+2.00%", "+0.60%"]],
+        },
+        "yearly": [
+            {"year": 2024, "daily_returns": [0.01, -0.02, 0.03],
+             "monthly_returns": [0.05, -0.03], "annual_return": 0.25},
+            {"year": 2025, "daily_returns": [0.02, 0.01],
+             "monthly_returns": [0.03, 0.04], "annual_return": 0.08},
+        ],
+    }
+    detail["decision_summary"] = [{
+        "gate": "stop_loss", "layer": "strategy_risk", "action": "trigger",
+        "param_name": "stop_loss_ratio", "param_value": 0.05,
+        "count": 3, "stock_count": 2,
+        "first_bar_time": "2024-01-02T09:30:00", "last_bar_time": "2024-01-05T09:30:00",
+    }]
+    detail["decisions"] = [{
+        "gate": "stop_loss", "param_name": "stop_loss_ratio",
+        "bar_time": "2024-01-02T09:30:00", "strategy_id": 1,
+        "stock_code": "000001.SZ", "param_value": 0.05, "actual_value": 0.062,
+        "message": "止损：成本 10.000 现价 9.380 亏 6.20%",
+    }]
+    detail["trades"] = [
+        {"bar_time": "2024-01-02T09:30:00", "strategy_id": 1, "strategy_name": "s1",
+         "stock_code": "000001.SZ", "trade_type": "BUY", "price": 10.0,
+         "quantity": 1000, "amount": 10000.0, "commission": 5.0, "stamp_duty": 0.0},
+        {"bar_time": "2024-01-05T09:30:00", "strategy_id": 1, "strategy_name": "s1",
+         "stock_code": "000001.SZ", "trade_type": "SELL", "price": 11.0,
+         "quantity": 1000, "amount": 11000.0, "commission": 5.0, "stamp_duty": 5.5},
+    ]
+    detail["strategy_evaluations"] = [{
+        "strategy_id": 1, "strategy_name": "s1",
+        "total_return": 0.3, "annual_return": 0.12, "max_drawdown": -0.06,
+        "sharpe_ratio": 1.1,
+    }]
+    html = build_html_report(detail)
+    for token in ["收益分布", "月度收益热力图", "年度日收益箱线图", "各年年收益柱状图",
+                  "风控与拦截统计", "止损", "交易明细", "000001.SZ",
+                  "策略绩效评估", "组合整体指标", "策略 #1：s1", "买入"]:
+        assert token in html, f"报告缺少 {token!r}"
+    assert "chart-return-heat" in html
+    assert "chart-box-daily" in html
+    assert "chart-return-annual" in html
+
+
 def test_market_regime_window_disclosure():
     """五/六/七/七-B 披露实际统计窗口；短于回测区间时写明被指数历史截断。
 
