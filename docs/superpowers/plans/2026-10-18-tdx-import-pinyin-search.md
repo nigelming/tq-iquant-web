@@ -86,7 +86,7 @@ describe('buildPinyinIndex + matchTdx', () => {
   })
 
   it('acName 为空 / 无索引条目 → 不抛错、按子串与 code 规则', () => {
-    expect(matchTdx('nsc', items[1], py.get('逆时钟'))).toBe(true)  // 逆时钟 code=nsc
+    expect(matchTdx('nsz', items[1], py.get('逆时钟'))).toBe(true)  // 逆时钟 code=nsz
     expect(matchTdx('xyzabc', items[1], py.get('逆时钟'))).toBe(false)
     expect(matchTdx('顺', item('顺'), undefined)).toBe(true)         // 无索引 → 子串规则
     expect(matchTdx('shun', item('顺'), undefined)).toBe(false)
@@ -202,7 +202,7 @@ git commit -m "feat(web): 通达信导入拼音首字母搜索纯函数 tdxSearc
     await w.find('input.tdx-search').setValue('zb')
     expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
 
-    await w.find('input.tdx-search').setValue('nsc')
+    await w.find('input.tdx-search').setValue('nsz')
     expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
     expect(w.text()).toContain('逆时钟')
   })
