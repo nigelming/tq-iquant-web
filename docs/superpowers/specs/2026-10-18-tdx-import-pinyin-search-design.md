@@ -32,7 +32,7 @@
 - `code`：`acCode` 的首字母串；`name`：`acName` 的首字母串（空值 → `''`）。
 - 计算方式：`pinyin-pro` 的 `pinyin(text, { pattern: 'first' })`，结果再剔除非 `[a-z0-9]` 字符并小写。
 - 索引是前端派生数据，不污染 API 返回类型 `TdxFormulaListItem`。
-- 数字/标点混合名（如「指标共震6红上车，3红下车」）→ 首字母串保留数字（`zbgz6hsc3hc`）；多音字交给 pinyin-pro 词组判定。
+- 数字/标点混合名（如「指标共震6红上车，3红下车」）→ 首字母串保留数字（`zbgz6hsc3hxc`）；多音字交给 pinyin-pro 词组判定。
 
 ### 匹配逻辑（独立纯函数模块）
 
