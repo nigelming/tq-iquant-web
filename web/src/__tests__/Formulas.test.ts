@@ -315,6 +315,30 @@ describe('Formulas.vue', () => {
     expect(w.text()).toContain('无匹配公式')
   })
 
+  it('通达信弹窗搜索支持拼音首字母（lmsj → 六脉神剑，zb → acName 首字母）', async () => {
+    ;(getTdxFormulas as any).mockResolvedValue([
+      { acCode: '六脉神剑', acName: '指标共震6红上车，3红下车', isSys: 0, imported: false, formula_id: null },
+      { acCode: '逆时钟', acName: '', isSys: 0, imported: false, formula_id: null },
+    ])
+    const w = mount(Formulas)
+    await flushPromises()
+
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+    expect(w.find('input.tdx-search').attributes('placeholder')).toContain('拼音首字母')
+
+    await w.find('input.tdx-search').setValue('lmsj')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+    expect(w.text()).toContain('六脉神剑')
+
+    await w.find('input.tdx-search').setValue('zb')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+
+    await w.find('input.tdx-search').setValue('nsz')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+    expect(w.text()).toContain('逆时钟')
+  })
+
   it('通达信弹窗分页：每页 10 条，可翻页，搜索后回到第 1 页', async () => {
     ;(getTdxFormulas as any).mockResolvedValue(
       Array.from({ length: 25 }, (_, i) => ({
@@ -354,5 +378,21 @@ describe('Formulas.vue', () => {
     expect(rows.length).toBe(10)
     expect(rows[0].text()).toContain('F01')
     expect(w.text()).toContain('第 1 / 3 页')
+  })
+
+  it('后端 400 → 顶部显示错误消息', async () => {
+    ;(createFormula as any).mockRejectedValue({ response: { data: { code: 400, message: '公式含未来函数：ZIG' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[placeholder*="名称"]').setValue('FUTURE_F')
+    await w.find('.signal-row input').setValue('sig1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('ZIG')
+    vi.unstubAllGlobals()
   })
 })
