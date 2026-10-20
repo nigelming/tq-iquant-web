@@ -254,6 +254,8 @@ describe('Backtest.vue — 发起回测', () => {
     expect(arg.start_date).toBe('2026-07-01')
     expect(arg.end_date).toBe('2026-07-31')
     expect(arg.dividend_mode).toBe('front')  // 默认前复权
+    expect(arg.bond_t0_enabled).toBe(false)  // 可转债 T+0 默认关
+    expect(arg.bond_lot_enabled).toBe(false)  // 可转债 10 张取整默认关
     vi.unstubAllGlobals()
   })
 
@@ -276,6 +278,93 @@ describe('Backtest.vue — 发起回测', () => {
     const arg = (runBacktest as any).mock.calls[0][0]
     expect(arg.dividend_mode).toBe('dual')
     vi.unstubAllGlobals()
+  })
+
+  it('高级选项勾选费用预留 + 自适应滑点 → 提交参数带 fee_reserve/adaptive 覆盖', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 101 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('ADV_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    // 展开高级选项
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    await w.find('input[data-field="fee_reserve_enabled"]').setValue(true)
+    await w.find('input[data-field="adaptive_slippage_enabled"]').setValue(true)
+    await w.find('input[data-field="slippage_impact_coef"]').setValue('25')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.fee_reserve_enabled).toBe(true)
+    expect(arg.adaptive_slippage_enabled).toBe(true)
+    expect(arg.slippage_impact_coef).toBeCloseTo(0.25)
+    vi.unstubAllGlobals()
+  })
+
+  it('高级选项勾选可转债 T+0 + 10 张取整 → 提交参数带 bond_t0/bond_lot=true', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 102 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('BOND_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    // 展开高级选项
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    await w.find('input[data-field="bond_t0_enabled"]').setValue(true)
+    await w.find('input[data-field="bond_lot_enabled"]').setValue(true)
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.bond_t0_enabled).toBe(true)
+    expect(arg.bond_lot_enabled).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('高级选项成交量约束 + 容量上限 → 提交带 volume/equity run 级覆盖', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 101 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('VOL_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    // 展开高级选项
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    await w.find('input[data-field="volume_limit_enabled"]').setValue(true)
+    await w.find('input[data-field="volume_limit_ratio"]').setValue('0.2')
+    await w.find('input[data-field="equity_cap"]').setValue('500000')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.volume_limit_enabled).toBe(true)
+    expect(arg.volume_limit_ratio).toBeCloseTo(0.2)
+    expect(arg.equity_cap).toBe(500000)
+    vi.unstubAllGlobals()
+  })
+
+  it('发起回测 → 配置指南按钮打开指南（含复权/IS-OOS 说明）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('[data-field="backtest-guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('发起回测配置指南')
+    expect(w.text()).toContain('IS/OOS 采纳门槛')
+    expect(w.text()).toContain('复权模式')
   })
 
   it('提交失败 → alert 错误且弹窗保持打开', async () => {
@@ -313,6 +402,34 @@ describe('Backtest.vue — 发起回测', () => {
 
     expect(alertMock).toHaveBeenCalled()
     expect(runBacktest).not.toHaveBeenCalled()  // 前端拦截，不发请求
+    vi.unstubAllGlobals()
+  })
+
+  it('发起回测请求包含 evaluation_profile 与 OOS 门字段', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 101, warnings: [], gate: { status: 'rejected', reasons: ['OOS 年化低于门槛'], min_ratio: 0.5 } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开 Modal
+    await w.find('input[placeholder*="回测"]').setValue('PROFILE_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    // 切换评估口径为相对收益
+    const profileSel = w.find('select[data-field="evaluation_profile"]')
+    await profileSel.setValue('relative')
+    // 勾选 IS/OOS 采纳门槛
+    await w.find('input[data-field="is_oos_gate_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('.modal-actions button.btn-primary').trigger('click')  // 确定
+    await flushPromises()
+
+    expect(runBacktest).toHaveBeenCalledTimes(1)
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.evaluation_profile).toBe('relative')
+    expect(arg.is_oos_gate_enabled).toBe(true)
+    expect(arg.oos_gate_min_ratio).toBe(0.5)
     vi.unstubAllGlobals()
   })
 })
@@ -770,6 +887,26 @@ describe('Backtest.vue — 图表数值精度', () => {
 
 // --- 回测报告 — 策略对比/摘要卡红涨绿跌 ---
 describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
+  it('P3 夏普口径 tooltip：夏普比率行 title 标注日频/√252/无风险利率 2%/CAGR', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      strategy_evaluations: [
+        { strategy_id: 1, strategy_name: 'S1', total_return: 0.05, annual_return: 0.08 },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    // 组合整体卡的夏普比率行带口径 title（strategy_evaluations 无 sharpe 字段时策略卡该行值显 —，title 同样存在）
+    const sharpeRow = w.findAll('.portfolio-card .metric-row')
+      .find(r => r.find('.metric-label').text() === '夏普比率')!
+    expect(sharpeRow.attributes('title')).toContain('无风险利率 2%')
+    expect(sharpeRow.attributes('title')).toContain('√252')
+    expect(sharpeRow.attributes('title')).toContain('CAGR')
+  })
+
   it('策略对比收益指标正红负绿（valueClass 反转）', async () => {
     ;(getBacktestDetail as any).mockResolvedValue({
       ...mockDetail,
@@ -2354,5 +2491,41 @@ describe('Backtest.vue — 饼图描边色走 --chart-bg token', () => {
     const root = css.match(/:root\s*\{([\s\S]*?)\n\}/)![1]
     const pick = (n: string) => root.match(new RegExp(`${n}:\\s*([^;]+);`))![1].trim()
     expect(pick('--chart-bg')).toBe(pick('--card-bg'))
+  })
+})
+
+describe('Backtest.vue — 门状态与采纳验收', () => {
+  it('记录列表渲染门状态、详情渲染采纳验收并可切换口径', async () => {
+    ;(getBacktestRecords as any).mockResolvedValue([
+      { ...mockRecords[0], gate_status: 'rejected', gate_reasons: ['OOS 年化低于门槛'], is_oos_gate_enabled: true, evaluation_profile: 'absolute', oos_gate_min_ratio: 0.5 },
+    ])
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      acceptance: {
+        profile: 'absolute', pass: false,
+        checks: [{ metric: 'annual_return', op: '>=', threshold: 0.08, value: 0.05, pass: false, label: '年化收益' }],
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    // 列表门状态徽章
+    expect(w.text()).toContain('未达标')
+
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    // 详情采纳验收块
+    expect(w.text()).toContain('采纳验收')
+    expect(w.text()).toContain('年化收益')
+
+    // 切换口径 → 用 relative 重拉详情
+    const relBtn = w.findAll('button').find((b) => b.text() === '相对收益')
+    expect(relBtn).toBeTruthy()
+    // 展开验收块（v-show 隐藏时按钮仍在 DOM，但为稳妥先展开）
+    await w.findAll('.section-title').find((s) => s.text().includes('采纳验收'))!.trigger('click')
+    await flushPromises()
+    await relBtn!.trigger('click')
+    await flushPromises()
+    const calls = (getBacktestDetail as any).mock.calls
+    expect(calls.some((c: any[]) => c[1] === 'relative')).toBe(true)
   })
 })

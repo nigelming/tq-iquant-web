@@ -14,9 +14,11 @@ import type {
   StyleBlock, DispersionBlock, ExposureBlock,
   IndustryAttributionBlock, IndustryHitRatePeriod,
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
-  BacktestRobustnessItem,
+  BacktestRobustnessItem, BacktestGateResult, AcceptanceResult,
+  ValidationVerdict,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import PageHeader from '../components/PageHeader.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
 import TableToolbar from '../components/TableToolbar.vue'
@@ -68,7 +70,10 @@ function applyBase(option: Record<string, unknown>): Record<string, unknown> {
   }
   for (const key of ['legend', 'xAxis', 'yAxis']) {
     if (out[key] === undefined) continue
-    out[key] = deepMerge(base[key], out[key])
+    // 数组轴（多 yAxis 双轴/多 xAxis 网格）逐项注入主题基色；对象轴整体合并
+    out[key] = Array.isArray(out[key])
+      ? out[key].map((inst: unknown) => deepMerge(base[key], inst))
+      : deepMerge(base[key], out[key])
   }
   return out
 }
@@ -99,13 +104,20 @@ const loading = ref(true)
 
 // ===== 发起弹窗 =====
 const showForm = ref(false)
+const showBacktestGuide = ref(false)
 const submitting = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front' })
+// 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
+const showAdvanced = ref(false)
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined })
+const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
 const currentRecord = ref<BacktestRecordItem | null>(null)
 const detail = ref<BacktestDetailItem | null>(null)
 const errorMsg = ref('')
+const acceptanceProfile = ref<'absolute' | 'relative'>('absolute')
+const acceptance = computed<AcceptanceResult | null>(() => detail.value?.acceptance ?? null)
+const showAcceptance = ref(false)
 
 // echarts 实例（净值 + 回撤）
 const equityChartEl = ref<HTMLDivElement | null>(null)
@@ -149,6 +161,8 @@ const MONTH_STATES = ['大涨', '小涨', '小跌', '大跌']
 const caCollapsed = ref(true)
 const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
+// 验证结论（容量健康 + 危机防御 + 样本外引用），随回测完成冻结在 record.validation
+const validation = computed<ValidationVerdict | null>(() => currentRecord.value?.validation ?? null)
 const caSkipped = computed(() => crisisAlpha.value?.skipped_benchmarks || [])
 const ca = computed<CrisisAlphaData | null>(() => {
   const item = crisisAlpha.value
@@ -518,7 +532,7 @@ async function recomputeCa() {
     recomputeMsg.value = recomputeWarn.value && br
       ? `${base} ｜ ${caBenchmarkWarnText(br)}`
       : base
-    detail.value = await getBacktestDetail(id)
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
     await nextTick()
     initCharts()
   } catch (e) {
@@ -558,13 +572,21 @@ function initCaNavChart() {
   setThemed(caNavChart, {
     tooltip: { trigger: 'axis' },
     legend: { data: [d.strategy_name, d.benchmark_name], bottom: 0 },
-    grid: { left: 56, right: 24, bottom: 34, top: 40, containLabel: true },
+    grid: { left: 56, right: 56, bottom: 34, top: 40, containLabel: true },
     xAxis: { type: 'category', data: nav.dates, boundaryGap: false },
-    yAxis: {
-      type: 'value', name: '累计净值(起点=1.0)', scale: true,
-      axisLabel: { formatter: (v: number) => v.toFixed(2) },
-      splitLine: { lineStyle: { type: 'dashed' } },
-    },
+    // 双轴：策略累计净值左轴；基准独立右轴（策略收益水平高时基准同轴会被压平）
+    yAxis: [
+      {
+        type: 'value', name: '累计净值(起点=1.0)', scale: true,
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        splitLine: { lineStyle: { type: 'dashed' } },
+      },
+      {
+        type: 'value', name: d.benchmark_name, scale: true, position: 'right',
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        splitLine: { show: false },
+      },
+    ],
     series: [
       {
         name: d.strategy_name, type: 'line', data: nav.strategy, smooth: true, symbol: 'none',
@@ -578,6 +600,7 @@ function initCaNavChart() {
       },
       {
         name: d.benchmark_name, type: 'line', data: nav.benchmark, smooth: true, symbol: 'none',
+        yAxisIndex: 1,
         lineStyle: { color: cssVar('--blue'), width: 1.8 }, itemStyle: { color: cssVar('--blue') },
       },
     ],
@@ -898,6 +921,17 @@ function openForm() {
     start_date: '2021-01-01',
     end_date: fmt(today),
     dividend_mode: 'front',
+    evaluation_profile: 'absolute',
+    is_oos_gate_enabled: false,
+    oos_gate_min_ratio: 0.5,
+    fee_reserve_enabled: false,
+    bond_t0_enabled: false,
+    bond_lot_enabled: false,
+    adaptive_slippage_enabled: undefined,
+    slippage_impact_coef: undefined,
+    volume_limit_enabled: undefined,
+    volume_limit_ratio: undefined,
+    equity_cap: undefined,
   }
   showForm.value = true
 }
@@ -910,6 +944,10 @@ async function submit() {
     alert(`开始日期不能晚于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
     return
   }
+  if (form.value.is_oos_gate_enabled && !(form.value.oos_gate_min_ratio >= 0.1 && form.value.oos_gate_min_ratio <= 2)) {
+    alert('IS/OOS 门槛比例须在 [0.1, 2]')
+    return
+  }
   submitting.value = true
   try {
     const res = await runBacktest({
@@ -918,8 +956,34 @@ async function submit() {
       start_date: form.value.start_date,
       end_date: form.value.end_date,
       dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual',
+      evaluation_profile: form.value.evaluation_profile as 'absolute' | 'relative',
+      is_oos_gate_enabled: form.value.is_oos_gate_enabled,
+      oos_gate_min_ratio: Number(form.value.oos_gate_min_ratio) || 0.5,
+      fee_reserve_enabled: form.value.fee_reserve_enabled,
+      bond_t0_enabled: form.value.bond_t0_enabled,
+      bond_lot_enabled: form.value.bond_lot_enabled,
+          ...(form.value.adaptive_slippage_enabled !== undefined
+            ? {
+                adaptive_slippage_enabled: form.value.adaptive_slippage_enabled,
+                ...(form.value.slippage_impact_coef !== undefined && form.value.slippage_impact_coef !== ''
+                  ? { slippage_impact_coef: Number(form.value.slippage_impact_coef) / 100 }
+                  : {}),
+              }
+            : {}),
+          ...(form.value.volume_limit_enabled !== undefined
+            ? {
+                volume_limit_enabled: form.value.volume_limit_enabled,
+                ...(form.value.volume_limit_ratio !== undefined && form.value.volume_limit_ratio !== ''
+                  ? { volume_limit_ratio: Number(form.value.volume_limit_ratio) }
+                  : {}),
+              }
+            : {}),
+          ...(form.value.equity_cap !== undefined && form.value.equity_cap !== ''
+            ? { equity_cap: Number(form.value.equity_cap) }
+            : {}),
     })
     showForm.value = false
+    gateBanner.value = res?.gate ?? null
     await load()
     if (res?.record_id) await openDetail(res.record_id)
   } catch (e) {
@@ -936,6 +1000,10 @@ async function openDetail(id: number) {
     alert(`加载详情失败：${errMsg(e)}`)
     return
   }
+  acceptanceProfile.value = detail.value?.record.evaluation_profile === 'relative' ? 'relative' : 'absolute'
+  if (acceptanceProfile.value === 'relative') {
+    detail.value = await getBacktestDetail(id, 'relative')
+  }
   currentRecord.value = detail.value?.record || null
   selectedKey.value = null
   caCollapsed.value = true
@@ -944,6 +1012,16 @@ async function openDetail(id: number) {
   // 等 DOM 渲染后初始化图表
   await nextTick()
   initCharts()
+}
+
+async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
+  if (!currentRecord.value) return
+  acceptanceProfile.value = p
+  try {
+    detail.value = await getBacktestDetail(currentRecord.value.id, p)
+  } catch (e) {
+    alert(`切换口径失败：${errMsg(e)}`)
+  }
 }
 
 async function expandCaSection() {
@@ -1375,7 +1453,7 @@ async function recomputeMr() {
     mrRecomputeMsg.value = res.status === 'completed'
       ? '重新计算完成'
       : `重新计算未完成：${res.error || res.status}`
-    detail.value = await getBacktestDetail(id)
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
     await nextTick()
     initCharts()
     if (!mrCollapsed.value) initMrCharts()
@@ -1405,7 +1483,7 @@ async function recomputeRb() {
       ? '重新计算完成'
       : `重新计算未完成：${res.error || res.status}`
     rbRecomputeWarn.value = res.status !== 'completed'
-    detail.value = await getBacktestDetail(id)
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
   } catch (e) {
     rbRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
     rbRecomputeWarn.value = true
@@ -1714,8 +1792,11 @@ interface MetricRow {
   label?: string
   value?: string
   cls?: string
+  hint?: string
 }
 function _group(name: string): MetricRow { return { group: name } }
+// 夏普口径标注（P3，与后端 evaluator.py 一致）：日频收益、年化×√252、rf=2%、分子 CAGR
+const SHARPE_HINT = '口径：日收益按日聚合（每日收盘快照），年化波动×√252，无风险利率 2%，分子为年化收益（CAGR）'
 function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[] {
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
@@ -1725,7 +1806,7 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '年化收益', value: pct(m.annual_return), cls: valueClass(m.annual_return) },
     { label: '最大回撤', value: pct(m.max_drawdown), cls: 'text-red' },
     { label: '年化波动率', value: pct(m.volatility), cls: 'text-orange' },
-    { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue' },
+    { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue', hint: SHARPE_HINT },
     { label: '卡玛比率', value: num(m.calmar_ratio, 2), cls: 'text-blue' },
     { label: '索提诺比率', value: num(m.sortino_ratio, 2), cls: 'text-blue' },
     { label: 'VaR (95%)', value: pct(m.var_95), cls: 'text-red' },
@@ -1733,9 +1814,10 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '收益/波动比', value: num(retVolRatio, 2), cls: 'text-blue' },
     { label: '平均修复天数', value: num(m.avg_recovery_days, 0), cls: 'text-orange' },
     { label: '最大修复天数', value: num(m.max_recovery_days, 0), cls: 'text-orange' },
-    { label: '胜率', value: pct(m.win_rate), cls: 'text-blue' },
-    { label: '盈亏比', value: num(m.profit_factor, 2), cls: 'text-blue' },
-    { label: '交易次数', value: String(m.total_trades ?? '—'), cls: '' },
+    { label: '胜率', value: pct(m.win_rate), cls: 'text-blue', hint: '按平仓批次（FIFO 配对）计算：盈利批次 / 总平仓批次；未平仓持仓不计入' },
+    { label: '盈亏比', value: num(m.profit_factor, 2), cls: 'text-blue', hint: '总盈利额 / 总亏损额，按平仓批次（FIFO 配对）汇总' },
+    { label: '成交笔数', value: String(m.total_trades ?? '—'), cls: '', hint: '买卖成交记录条数（含加仓、减仓、分批买卖）' },
+    { label: '平仓批次', value: String(m.closed_trades ?? '—'), cls: '', hint: 'FIFO 配对后的完整平仓批次数量，胜率与盈亏比的分母' },
     { label: '平均持仓天数', value: num(m.avg_holding_days, 1), cls: 'text-blue' },
     { label: 'Ulcer指数', value: num(m.ulcer_index, 2), cls: 'text-orange' },
     { label: '收益稳定性', value: num(m.return_stability, 2), cls: 'text-blue' },
@@ -2340,7 +2422,7 @@ function initEquityChart() {
   if (hasBenchmark.value) {
     series.push({
       name: '基准', type: 'line', data: benchmarkCurve.value, smooth: true,
-      symbol: 'none',
+      symbol: 'none', yAxisIndex: 1,
       lineStyle: { width: 1.5, type: 'dashed', color: cssVar('--ink-faint') },
       itemStyle: { color: cssVar('--ink-faint') },
     })
@@ -2377,9 +2459,16 @@ function initEquityChart() {
     legend: { data: legendData, bottom: 0 },
     grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
     xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
-    yAxis: { type: 'value', name: '收益率(%)', scale: true,
-      axisLabel: { formatter: '{value}%' },
-      splitLine: { lineStyle: { type: 'dashed' } } },
+    // 双轴：组合/策略/超额收益用左轴；基准独立右轴——策略收益水平很高（如 13 号 11200%）
+    // 时，基准（累计 +84%）若同轴会被压成贴底的平线无法比较。
+    yAxis: [
+      { type: 'value', name: '收益率(%)', scale: true,
+        axisLabel: { formatter: '{value}%' },
+        splitLine: { lineStyle: { type: 'dashed' } } },
+      { type: 'value', name: '基准收益率(%)', scale: true, position: 'right',
+        axisLabel: { formatter: '{value}%' },
+        splitLine: { show: false } },
+    ],
     series,
   })
 }
@@ -2621,18 +2710,23 @@ watch(theme, () => {
 <template>
   <!-- ============ 列表视图 ============ -->
   <div v-if="!currentRecord">
-    <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+    <PageHeader title="回测管理">
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
-    </div>
+    </PageHeader>
 
     <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
       {{ errorMsg }}
     </div>
 
+    <div v-if="gateBanner" class="card" :style="{ padding: '12px', marginBottom: '12px', color: gateBanner.status === 'rejected' ? 'var(--red)' : gateBanner.status === 'passed' ? 'var(--green)' : 'var(--ink-soft)' }">
+      IS/OOS 门槛：{{ gateBanner.status === 'passed' ? '通过' : gateBanner.status === 'rejected' ? '未通过' : '数据不足未评估' }}
+      <span v-if="gateBanner.reasons.length">（{{ gateBanner.reasons.join('；') }}）</span>
+    </div>
+
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
@@ -2640,6 +2734,11 @@ watch(theme, () => {
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
             <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
             <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ STATUS_LABEL[r.status] || r.status }}</span></td>
+            <td>
+              <span v-if="r.gate_status === 'passed'" class="badge badge-green">达门槛</span>
+              <span v-else-if="r.gate_status === 'rejected'" class="badge badge-red" :title="(r.gate_reasons || []).join('；')">未达标</span>
+              <span v-else class="badge badge-gray" :title="r.is_oos_gate_enabled ? '数据不足' : '未启用'">{{ r.is_oos_gate_enabled ? '未评估' : '未启用' }}</span>
+            </td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
               <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
@@ -2653,45 +2752,181 @@ watch(theme, () => {
     <!-- 发起回测 Modal -->
     <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
       <div class="modal-content">
-        <h3>发起回测</h3>
-
-        <label>组合</label>
-        <select v-model="form.portfolio_strategy_id">
-          <option :value="0" disabled>请选择组合</option>
-          <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
-        </select>
-
-        <label>回测名称</label>
-        <input v-model="form.name" placeholder="例如：稳健组合-7月回测" />
-
-        <div class="signal-row">
-          <div style="flex:1">
-            <label>开始日期</label>
-            <input v-model="form.start_date" type="date" />
-          </div>
-          <div style="flex:1">
-            <label>结束日期</label>
-            <input v-model="form.end_date" type="date" />
-          </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">发起回测</h3>
+          <button class="btn btn-sm" @click="showBacktestGuide = true" data-field="backtest-guide-toggle">📖 配置指南</button>
         </div>
 
-        <div class="signal-row">
-          <div style="flex:1">
-            <label>复权模式</label>
-            <select v-model="form.dividend_mode">
-              <option value="front">前复权（默认，通达信口径）</option>
-              <option value="back">后复权（长区间更真实、可复现）</option>
-              <option value="dual">前复权信号 + 后复权记账（推荐，模拟实盘）</option>
-            </select>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="group-label">基本信息</label>
+            <div class="field-grid">
+              <div class="field-row field-span-2">
+                <span class="field-label">组合</span>
+                <select v-model="form.portfolio_strategy_id">
+                  <option :value="0" disabled>请选择组合</option>
+                  <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">回测名称</span>
+                <input v-model="form.name" placeholder="例如：稳健组合-7月回测" />
+              </div>
+              <div class="field-row">
+                <span class="field-label">开始日期</span>
+                <input v-model="form.start_date" type="date" />
+              </div>
+              <div class="field-row">
+                <span class="field-label">结束日期</span>
+                <input v-model="form.end_date" type="date" />
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">复权模式</span>
+                <select v-model="form.dividend_mode">
+                  <option value="front">前复权（默认，通达信口径）</option>
+                  <option value="back">后复权（长区间更真实、可复现）</option>
+                  <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                </select>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <span class="form-hint" style="margin:0">
+                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
+                </span>
+              </div>
+            </div>
           </div>
-          <div style="flex:1;align-self:flex-end" class="form-hint">
-            长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
+
+          <!-- 高级选项（默认折叠）：增强前只填上面基础项即可发起 -->
+          <div
+            class="adv-toggle"
+            @click="showAdvanced = !showAdvanced"
+            data-field="advanced-toggle"
+          >
+            {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量）
+          </div>
+
+          <div v-show="showAdvanced" class="form-group" style="margin-top:6px">
+            <div class="field-grid">
+              <div class="field-row">
+                <span class="field-label">评估口径</span>
+                <select v-model="form.evaluation_profile" data-field="evaluation_profile">
+                  <option value="absolute">绝对收益（年化/回撤/卡玛）</option>
+                  <option value="relative">相对收益（信息比率/超额/下行捕获）</option>
+                </select>
+              </div>
+              <div class="field-row" v-if="form.is_oos_gate_enabled">
+                <span class="field-label">门槛比例</span>
+                <input type="number" step="0.05" min="0.1" max="2" v-model.number="form.oos_gate_min_ratio" data-field="oos_gate_min_ratio" />
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.is_oos_gate_enabled" data-field="is_oos_gate_enabled" />
+                  <span class="field-hint">IS/OOS 采纳门槛（OOS 年化 ≥ 比例 × IS 年化，且 OOS 不跑输基准）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.fee_reserve_enabled" data-field="fee_reserve_enabled" />
+                  <span class="field-hint">费用预留（买入审批含佣金，避免现金为负）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.bond_t0_enabled" data-field="bond_t0_enabled" />
+                  <span class="field-hint">可转债 T+0 回转（转债当日买入当日可卖；股票仍 T+1，仅回测生效）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.bond_lot_enabled" data-field="bond_lot_enabled" />
+                  <span class="field-hint">可转债 10 张取整（转债最小交易单位 10 张；股票仍 100 股/手，仅回测生效）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.adaptive_slippage_enabled" data-field="adaptive_slippage_enabled" />
+                  <span class="field-hint">自适应滑点（临时开启市场冲击成本；不勾=用组合默认）</span>
+                </label>
+              </div>
+              <div class="field-row" v-if="form.adaptive_slippage_enabled">
+                <span class="field-label">滑点冲击系数</span>
+                <input type="number" step="1" min="1" max="100" v-model="form.slippage_impact_coef" placeholder="用组合默认" data-field="slippage_impact_coef" />
+                <span class="field-suffix">%（留空=用组合默认）</span>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.volume_limit_enabled" data-field="volume_limit_enabled" />
+                  <span class="field-hint">成交量约束（run 级覆盖；不勾=用组合默认）</span>
+                </label>
+              </div>
+              <div class="field-row" v-if="form.volume_limit_enabled">
+                <span class="field-label">成交量占比</span>
+                <input type="number" step="0.05" min="0.05" max="1" v-model="form.volume_limit_ratio" placeholder="用组合默认" data-field="volume_limit_ratio" />
+                <span class="field-suffix">（0,1]，留空=用组合默认</span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">容量上限</span>
+                <input type="number" step="10000" min="1000" v-model="form.equity_cap" placeholder="用组合默认" data-field="equity_cap" />
+                <span class="field-suffix">元（留空=用组合默认）</span>
+              </div>
+            </div>
           </div>
         </div>
 
         <div class="modal-actions">
           <button @click="submit" class="btn btn-primary" :disabled="submitting">{{ submitting ? '运行中...' : '确定' }}</button>
           <button @click="showForm = false" class="btn" :disabled="submitting">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 发起回测配置指南 Modal ============ -->
+    <div v-if="showBacktestGuide" class="modal-overlay modal-lg" @click.self="showBacktestGuide = false">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">发起回测配置指南</h3>
+          <button class="btn btn-sm" @click="showBacktestGuide = false">关闭</button>
+        </div>
+        <div class="modal-body" style="margin-top:12px">
+          <div class="form-group">
+            <label class="group-label">一、基本参数</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
+                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致。</p>
+              <p class="guide-step"><b>评估口径</b>：absolute=绝对收益（年化/回撤/卡玛）；relative=相对收益
+                （信息比率/超额/下行捕获）。仅影响验收块。</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="group-label">二、高级选项（默认折叠）</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>IS/OOS 采纳门槛（C7）</b>：回测完成时评估样本外年化 ≥ 比例×样本内年化且不跑输基准，
+                否则标记 rejected（记录保留）。防样本内过拟合。</p>
+              <p class="guide-step"><b>费用预留</b>：买入审批含佣金，避免现金为负（run 级，单次回测生效）。</p>
+              <p class="guide-step"><b>自适应滑点（临时）</b>：临时开启市场冲击成本；不勾=用组合默认。
+                冲击系数留空=用组合默认。</p>
+              <p class="guide-step"><b>成交量约束/容量上限（run 级覆盖）</b>：发起回测弹窗的成交量/容量选项可
+                临时覆盖组合配置做 A/B 对比，不改组合。</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="group-label">三、建议</label>
+            <div class="guide-block">
+              <p class="guide-note">· 长区间（5 年以上）建议用 dual 复权 + 开启成交量约束/自适应滑点，结果更贴近实盘。</p>
+              <p class="guide-note">· 动态仓位（组合设为动态净资产）务必设容量上限，否则复利后单仓可能不可成交。</p>
+              <p class="guide-note">· 回测完成后详情页自动给出「🧪 验证结论」，先看容量/危机防御/样本外再判断结果可信度。</p>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button @click="showBacktestGuide = false" class="btn btn-primary">知道了</button>
         </div>
       </div>
     </div>
@@ -2725,6 +2960,84 @@ watch(theme, () => {
       <ul class="spb-list">
         <li v-for="(w, i) in currentRecord.warnings" :key="i">{{ w }}</li>
       </ul>
+    </div>
+
+    <!-- 验证结论：容量健康 + 危机防御 + 样本外引用（自动流程化） -->
+    <div v-if="validation" class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-weight:600;font-size:14px">🧪 验证结论</span>
+        <span style="font-size:12px;color:var(--ink-soft)">容量健康 · 危机防御 · 样本外（回测完成时自动冻结）</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <!-- 容量健康 -->
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">容量健康</div>
+          <ul v-if="validation.capacity.length" class="spb-list">
+            <li v-for="(w, i) in validation.capacity" :key="i">{{ w }}</li>
+          </ul>
+          <span v-else class="badge badge-green">健康（未命中容量/集中度阈值）</span>
+        </div>
+        <!-- 样本外引用 -->
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">样本外验证（Walk-Forward）</div>
+          <template v-if="validation.oos">
+            <span class="badge" :class="validation.oos.overall_pass ? 'badge-green' : 'badge-red'">
+              {{ validation.oos.overall_pass ? '样本外通过' : '样本外未通过' }} {{ validation.oos.windows_passed }}
+            </span>
+            <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">{{ validation.oos.name }}</span>
+          </template>
+          <span v-else style="font-size:12px;color:var(--ink-soft)">未执行（可在「回归验证」面板发起 walk-forward）</span>
+        </div>
+      </div>
+      <!-- 危机防御表 -->
+      <template v-if="validation.crisis.length">
+        <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin:10px 0 6px">危机防御机制（固定窗口，历史锁定）</div>
+        <table>
+          <thead><tr>
+            <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="c in validation.crisis" :key="c.key">
+              <td>{{ c.name }}</td>
+              <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
+              <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
+              <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
+              <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
+              <td>
+                <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
+                      :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </template>
+    </div>
+
+    <!-- 采纳验收 -->
+    <div class="section-title" @click="showAcceptance = !showAcceptance" style="cursor:pointer;display:flex;align-items:center;gap:8px">
+      <span>采纳验收（{{ acceptanceProfile === 'absolute' ? '绝对收益' : '相对收益' }}）</span>
+      <span v-if="acceptance" class="badge" :class="acceptance.pass === true ? 'badge-green' : acceptance.pass === false ? 'badge-red' : 'badge-gray'">
+        {{ acceptance.pass === true ? '通过' : acceptance.pass === false ? '未通过' : '数据不足' }}
+      </span>
+      <span style="font-size:12px;color:var(--ink-faint)">{{ showAcceptance ? '▲' : '▼' }}</span>
+    </div>
+    <div v-show="showAcceptance" class="card" style="padding:12px">
+      <div style="margin-bottom:8px">
+        <button class="btn btn-sm" :class="{ 'btn-primary': acceptanceProfile === 'absolute' }" @click="switchAcceptanceProfile('absolute')">绝对收益</button>
+        <button class="btn btn-sm" :class="{ 'btn-primary': acceptanceProfile === 'relative' }" @click="switchAcceptanceProfile('relative')" style="margin-left:6px">相对收益</button>
+      </div>
+      <table v-if="acceptance">
+        <thead><tr><th>指标</th><th>门槛</th><th>实际</th><th>结论</th></tr></thead>
+        <tbody>
+          <tr v-for="c in acceptance.checks" :key="c.metric">
+            <td>{{ c.label }}</td>
+            <td>{{ c.op }} {{ (c.metric.includes('ratio') || c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
+            <td>{{ c.value === null ? '—' : c.value.toFixed(4) }}</td>
+            <td><span class="badge" :class="c.pass === true ? 'badge-green' : c.pass === false ? 'badge-red' : 'badge-gray'">{{ c.pass === true ? '过' : c.pass === false ? '未过' : '—' }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else>无验收数据</p>
     </div>
 
     <!-- 关键指标摘要 -->
@@ -3856,14 +4169,14 @@ watch(theme, () => {
                   <td>样本内（{{ rbData.oos.in_sample.start.slice(0,4) }} ~ {{ rbData.oos.in_sample.end.slice(0,4) }}）</td>
                   <td :class="valueClass(rbData.oos.in_sample.return)">{{ pct(rbData.oos.in_sample.return) }}</td>
                   <td :class="valueClass(rbData.oos.in_sample.cagr)">{{ pct(rbData.oos.in_sample.cagr) }}</td>
-                  <td class="text-green">{{ pct(rbData.oos.in_sample.max_drawdown) }}</td>
+                  <td :class="valueClass(rbData.oos.in_sample.max_drawdown)">{{ pct(rbData.oos.in_sample.max_drawdown) }}</td>
                   <td>{{ pct(rbData.oos.in_sample.benchmark_return) }}</td>
                 </tr>
                 <tr>
                   <td>样本外（{{ rbData.oos.out_of_sample.start.slice(0,4) }} ~ {{ rbData.oos.out_of_sample.end.slice(0,4) }}）</td>
                   <td :class="valueClass(rbData.oos.out_of_sample.return)">{{ pct(rbData.oos.out_of_sample.return) }}</td>
                   <td :class="valueClass(rbData.oos.out_of_sample.cagr)">{{ pct(rbData.oos.out_of_sample.cagr) }}</td>
-                  <td class="text-green">{{ pct(rbData.oos.out_of_sample.max_drawdown) }}</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.max_drawdown)">{{ pct(rbData.oos.out_of_sample.max_drawdown) }}</td>
                   <td>{{ pct(rbData.oos.out_of_sample.benchmark_return) }}</td>
                 </tr>
               </tbody>
@@ -3871,6 +4184,9 @@ watch(theme, () => {
           </div>
           <p class="ca-note">
             样本外年化显著低于样本内 → 策略 alpha 随时间衰减；两者接近 → 较稳健（结论供参考，非自动判定）。
+          </p>
+          <p class="ca-note" style="color:var(--gold)">
+            {{ rbData.oos.caveat || 'OOS 仅防时段崩塌，不防全样本调参' }}
           </p>
         </template>
         <div v-else class="table-container">
@@ -3914,7 +4230,7 @@ watch(theme, () => {
           <div class="risk-metrics">
             <template v-for="m in sc.metrics" :key="m.group ?? m.label">
               <div v-if="m.group" class="metric-group">{{ m.group }}</div>
-              <div v-else class="metric-row">
+              <div v-else class="metric-row" :title="m.hint">
                 <span class="metric-label">{{ m.label }}</span>
                 <span :class="m.cls">{{ m.value }}</span>
               </div>
@@ -3932,7 +4248,7 @@ watch(theme, () => {
           <div class="risk-metrics">
             <template v-for="m in portfolioMetrics" :key="m.group ?? m.label">
               <div v-if="m.group" class="metric-group">{{ m.group }}</div>
-              <div v-else class="metric-row">
+              <div v-else class="metric-row" :title="m.hint">
                 <span class="metric-label">{{ m.label }}</span>
                 <span :class="m.cls">{{ m.value }}</span>
               </div>
@@ -4150,77 +4466,79 @@ watch(theme, () => {
 
     <!-- 换池稳健性对比 Modal -->
     <div v-if="showCompare" class="modal-overlay modal-lg" @click.self="showCompare = false">
-      <div class="modal">
+      <div class="modal-content">
         <h3>换池稳健性对比</h3>
-        <p style="color:var(--ink-soft);font-size:12px;margin:0 0 8px">
-          同参数（公式/风控/资金）仅换股票池逐个重跑回测，检验策略是否依赖特定股票池。每次对比分钟级，请耐心等待。
-        </p>
+        <div class="modal-body">
+          <p style="color:var(--ink-soft);font-size:12px;margin:0 0 8px">
+            同参数（公式/风控/资金）仅换股票池逐个重跑回测，检验策略是否依赖特定股票池。每次对比分钟级，请耐心等待。
+          </p>
 
-        <label>备选股票池</label>
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-          <button type="button" class="btn btn-sm" @click="selectRecommended">⭐ 选推荐池</button>
-          <button type="button" class="btn btn-sm" @click="compareForm.pool_ids = []">清空</button>
-          <span class="form-hint" style="margin-bottom:0">推荐：成长/红利/热点精选（风格差异大，更易检验是否依赖特定池）</span>
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
-          <label v-for="p in pools" :key="p.id" class="compare-pool-opt">
-            <input type="checkbox" :value="p.id" v-model="compareForm.pool_ids" />
-            {{ p.name }}（{{ p.code }}）
-            <span v-if="recommendedPoolIds.includes(p.id)" class="rec-tag">推荐</span>
-          </label>
-        </div>
-
-        <div class="signal-row">
-          <div style="flex:1">
-            <label>开始日期</label>
-            <input v-model="compareForm.start_date" type="date" />
+          <label>备选股票池</label>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <button type="button" class="btn btn-sm" @click="selectRecommended">⭐ 选推荐池</button>
+            <button type="button" class="btn btn-sm" @click="compareForm.pool_ids = []">清空</button>
+            <span class="form-hint" style="margin-bottom:0">推荐：成长/红利/热点精选（风格差异大，更易检验是否依赖特定池）</span>
           </div>
-          <div style="flex:1">
-            <label>结束日期</label>
-            <input v-model="compareForm.end_date" type="date" />
+          <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+            <label v-for="p in pools" :key="p.id" class="compare-pool-opt">
+              <input type="checkbox" :value="p.id" v-model="compareForm.pool_ids" />
+              {{ p.name }}（{{ p.code }}）
+              <span v-if="recommendedPoolIds.includes(p.id)" class="rec-tag">推荐</span>
+            </label>
           </div>
-        </div>
 
-        <div class="signal-row">
-          <div style="flex:1">
-            <label>复权模式</label>
-            <select v-model="compareForm.dividend_mode">
-              <option value="dual">前复权信号 + 后复权记账（推荐）</option>
-              <option value="front">前复权</option>
-              <option value="back">后复权</option>
-            </select>
+          <div class="signal-row">
+            <div style="flex:1">
+              <label>开始日期</label>
+              <input v-model="compareForm.start_date" type="date" />
+            </div>
+            <div style="flex:1">
+              <label>结束日期</label>
+              <input v-model="compareForm.end_date" type="date" />
+            </div>
           </div>
-        </div>
 
-        <div v-if="compareMsg" class="form-hint" style="color:var(--red)">{{ compareMsg }}</div>
+          <div class="signal-row">
+            <div style="flex:1">
+              <label>复权模式</label>
+              <select v-model="compareForm.dividend_mode">
+                <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="front">前复权（默认）</option>
+                <option value="back">后复权</option>
+              </select>
+            </div>
+          </div>
 
-        <div v-if="comparing" class="empty-state" style="padding:20px">
-          <p>对比运行中（每池分钟级），请勿关闭…</p>
-        </div>
+          <div v-if="compareMsg" class="form-hint" style="color:var(--red)">{{ compareMsg }}</div>
 
-        <div v-else-if="compareResult" class="table-container" style="margin-top:8px">
-          <table>
-            <thead>
-              <tr>
-                <th>股票池</th><th>年化</th><th>最大回撤</th><th>Sharpe</th>
-                <th>胜率</th><th>盈亏比</th><th>交易数</th><th>仓位利用率</th><th>样本外年化</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="c in compareResult.comparisons" :key="c.pool_id">
-                <td>{{ c.pool_name }}<span v-if="c.status !== 'completed'" class="text-red">（失败）</span></td>
-                <td :class="valueClass(c.metrics?.annual_return)">{{ c.metrics ? pct(c.metrics.annual_return) : '—' }}</td>
-                <td class="text-green">{{ c.metrics ? pct(c.metrics.max_drawdown) : '—' }}</td>
-                <td>{{ c.metrics ? c.metrics.sharpe_ratio?.toFixed(2) : '—' }}</td>
-                <td>{{ c.metrics ? pct(c.metrics.win_rate) : '—' }}</td>
-                <td>{{ c.metrics ? c.metrics.profit_factor?.toFixed(2) : '—' }}</td>
-                <td>{{ c.metrics?.total_trades ?? '—' }}</td>
-                <td>{{ c.metrics ? pct(c.metrics.avg_position_utilization) : '—' }}</td>
-                <td :class="valueClass(c.robustness?.oos?.out_of_sample?.cagr)">{{ compareOosCagr(c) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <p class="ca-note">各池年化/回撤接近 → 策略不依赖特定池；差异大 → 结果需谨慎。样本外年化越低说明近期 alpha 衰减越明显。</p>
+          <div v-if="comparing" class="empty-state" style="padding:20px">
+            <p>对比运行中（每池分钟级），请勿关闭…</p>
+          </div>
+
+          <div v-else-if="compareResult" class="table-container" style="margin-top:8px">
+            <table>
+              <thead>
+                <tr>
+                  <th>股票池</th><th>年化</th><th>最大回撤</th><th>Sharpe</th>
+                  <th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>仓位利用率</th><th>样本外年化</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in compareResult.comparisons" :key="c.pool_id">
+                  <td>{{ c.pool_name }}<span v-if="c.status !== 'completed'" class="text-red">（失败）</span></td>
+                  <td :class="valueClass(c.metrics?.annual_return)">{{ c.metrics ? pct(c.metrics.annual_return) : '—' }}</td>
+                  <td class="text-green">{{ c.metrics ? pct(c.metrics.max_drawdown) : '—' }}</td>
+                  <td>{{ c.metrics ? c.metrics.sharpe_ratio?.toFixed(2) : '—' }}</td>
+                  <td>{{ c.metrics ? pct(c.metrics.win_rate) : '—' }}</td>
+                  <td>{{ c.metrics ? c.metrics.profit_factor?.toFixed(2) : '—' }}</td>
+                  <td>{{ c.metrics?.total_trades ?? '—' }}</td>
+                  <td>{{ c.metrics ? pct(c.metrics.avg_position_utilization) : '—' }}</td>
+                  <td :class="valueClass(c.robustness?.oos?.out_of_sample?.cagr)">{{ compareOosCagr(c) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="ca-note">各池年化/回撤接近 → 策略不依赖特定池；差异大 → 结果需谨慎。样本外年化越低说明近期 alpha 衰减越明显。</p>
+          </div>
         </div>
 
         <div class="modal-actions">
@@ -4554,12 +4872,43 @@ watch(theme, () => {
 }
 .ca-caret.open { transform: rotate(90deg); }
 .ca-banner {
-  background: var(--ink);
+  background: #0b0b0b;
   border-radius: 12px;
   padding: 18px 24px;
-  color: var(--card-bg);
+  color: #f2efeb;
   margin-bottom: 6px;
 }
+[data-theme="dark"] .ca-banner {
+  background: #05070a;
+  color: #ece7df;
+}
+/* 反色强调块内的按钮/文字须用固定浅色（--ink/--card-bg 随主题翻转会导致
+   浅色模式下按钮文字与深底同色而不可见） */
+.ca-banner .btn {
+  color: #f2efeb;
+  border-color: rgba(242,239,235,.45);
+  background: transparent;
+}
+.ca-banner .btn:hover {
+  background: #f2efeb;
+  color: #0b0b0b;
+}
+[data-theme="dark"] .ca-banner .btn {
+  color: #ece7df;
+  border-color: rgba(236,231,223,.45);
+}
+[data-theme="dark"] .ca-banner .btn:hover {
+  background: #ece7df;
+  color: #0b0b0b;
+}
+/* .ca-status/.ca-msg 默认用 --ink-soft/--ink（随主题为深色），在深色 banner 上
+   不可见 → banner 作用域内固定浅色 */
+.ca-banner .ca-status { color: rgba(242,239,235,.72); }
+.ca-banner .ca-msg { color: #f2efeb; }
+.ca-banner .ca-warn { color: #e06550; }
+[data-theme="dark"] .ca-banner .ca-status { color: rgba(236,231,223,.72); }
+[data-theme="dark"] .ca-banner .ca-msg { color: #ece7df; }
+[data-theme="dark"] .ca-banner .ca-warn { color: #e06550; }
 .ca-banner .t { font-size: 20px; font-weight: 800; }
 .ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
 .score-card {

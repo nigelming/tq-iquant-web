@@ -15,6 +15,7 @@ import {
   recoverLiveBreaker,
   type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
 } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const sessions = ref<LiveSessionItem[]>([])
 const loading = ref(true)
@@ -208,9 +209,9 @@ onUnmounted(closeEventStream)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+  <PageHeader title="实盘交易">
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
-  </div>
+  </PageHeader>
 
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">

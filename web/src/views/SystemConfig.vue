@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { getSystemConfigs, updateSystemConfigs, type SystemConfig } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
@@ -56,6 +57,7 @@ async function save() {
 </script>
 
 <template>
+  <PageHeader title="系统配置" />
   <div class="card" style="padding:24px;max-width:620px">
     <div v-if="loading" class="empty-state"><p>加载中…</p></div>
 

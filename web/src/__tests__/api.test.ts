@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
-import { api } from '../api'
+import {
+  api, runWalkForward, getWalkForwardRun, runParamPerturb, getParamPerturbRun,
+  type WalkForwardRequest, type ParamPerturbRequest,
+} from '../api'
 
 // #14：响应拦截器测试 — 直接用真实 api 实例，桩掉 adapter 返回可控响应。
 // 拦截器在 api/index.ts 创建实例时已注册，此处验证其行为：
@@ -48,5 +51,54 @@ describe('api 响应拦截器 (#14)', () => {
     // #13 后端未捕获异常 → {code:500,message,data:null} + HTTP 500
     ;(api as any).defaults.adapter = stubAdapter({ code: 500, message: '服务器内部错误', data: null }, 500)
     await expect(api.get('/x')).rejects.toMatchObject({ response: { status: 500 } })
+  })
+})
+
+// C8/P2b 新端点：URL 与入参透传（spy 覆盖方法，避免真实网络）
+describe('walk-forward / param-perturb api', () => {
+  it('runWalkForward POST /backtest/walk-forward 并透传 payload', async () => {
+    const spy = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { code: 0, message: 'ok', data: { run_id: 1, status: 'completed', windows_passed: '2/2', overall_pass: true, error: null } },
+    } as any)
+    const req: WalkForwardRequest = {
+      portfolio_strategy_id: 3, name: 'wf', start_date: '2020-01-01', end_date: '2024-01-01',
+      train_years: 3, test_years: 1, oos_gate_min_ratio: 0.5, dividend_mode: 'front', evaluation_profile: 'absolute',
+    }
+    const r = await runWalkForward(req)
+    expect(spy).toHaveBeenCalledWith('/backtest/walk-forward', req)
+    expect(r.overall_pass).toBe(true)
+    spy.mockRestore()
+  })
+
+  it('getWalkForwardRun GET /backtest/walk-forward/{id}', async () => {
+    const spy = vi.spyOn(api, 'get').mockResolvedValue({
+      data: { code: 0, message: 'ok', data: { id: 7 } },
+    } as any)
+    await getWalkForwardRun(7)
+    expect(spy).toHaveBeenCalledWith('/backtest/walk-forward/7')
+    spy.mockRestore()
+  })
+
+  it('runParamPerturb POST /backtest/param-perturb 并透传 payload', async () => {
+    const spy = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { code: 0, message: 'ok', data: { run_id: 2, status: 'completed', rounds_run: '4/4', most_sensitive: 'stop_loss_ratio', error: null } },
+    } as any)
+    const req: ParamPerturbRequest = {
+      portfolio_strategy_id: 3, name: 'pp', start_date: '2020-01-01', end_date: '2024-01-01',
+      perturb_pct: 0.1, dividend_mode: 'front', evaluation_profile: 'absolute',
+    }
+    const r = await runParamPerturb(req)
+    expect(spy).toHaveBeenCalledWith('/backtest/param-perturb', req)
+    expect(r.most_sensitive).toBe('stop_loss_ratio')
+    spy.mockRestore()
+  })
+
+  it('getParamPerturbRun GET /backtest/param-perturb/{id}', async () => {
+    const spy = vi.spyOn(api, 'get').mockResolvedValue({
+      data: { code: 0, message: 'ok', data: { id: 9 } },
+    } as any)
+    await getParamPerturbRun(9)
+    expect(spy).toHaveBeenCalledWith('/backtest/param-perturb/9')
+    spy.mockRestore()
   })
 })

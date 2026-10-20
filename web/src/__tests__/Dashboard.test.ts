@@ -86,4 +86,16 @@ describe('Dashboard.vue', () => {
     expect(w.text()).toContain('在线')
     w.unmount()
   })
+
+  it('Hero 保留统计与刷新，已移除品牌标题', async () => {
+    const w = mount(Dashboard)
+    await flushPromises()
+    expect(w.find('.dash-hero').exists()).toBe(true)
+    expect(w.find('.dash-hero-stats').exists()).toBe(true)
+    expect(w.find('.dash-hero-stats').text()).toContain('股票池')
+    expect(w.find('.dash-hero-actions').find('button').text()).toContain('刷新')
+    expect(w.find('.dash-brand').exists()).toBe(false)
+    expect(w.find('.dash-brand-sub').exists()).toBe(false)
+    w.unmount()
+  })
 })
