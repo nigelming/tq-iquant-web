@@ -52,6 +52,7 @@ class OrderEvent:
     #   非 None = 日线级信号，须在 t.date() > signal_bar_date 的下一交易日 bar open 成交，
     #   防止当日 00:00 日线 bar 的信号在当日 09:30 分钟 bar 成交（未来函数）。
     signal_bar_date: Optional[date] = None
+    period: Optional[str] = None
 
 
 @dataclass

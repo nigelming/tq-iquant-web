@@ -405,19 +405,15 @@ def test_build_klines_orchestration(db_session, monkeypatch):
 
     klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
 
-    # 主段拉取：区间 [start, end]，count=-1
+    # W-A：单次拉取（主段 start 前推覆盖公式预热窗口），不再单独预热段
+    assert len(calls) == 1
     assert calls[0]["stocks"] == ["000001.SZ", "600519.SH"]
     assert calls[0]["periods"] == ["1d"]
-    assert calls[0]["start"] == "20260729"
+    # formula_count=200（1d）→ 前推 430 天：2026-07-29 - 430 = 2025-05-25
+    assert calls[0]["start"] == "20250525"
     assert calls[0]["end"] == "20260731"
     assert calls[0]["count"] == -1
-    # 预热段拉取：formula_count=200 根，start 空（TDX 从 end 往前数 N 根），end=start 前一天
-    assert len(calls) == 2
-    assert calls[1]["periods"] == ["1d"]
-    assert calls[1]["start"] == ""
-    assert calls[1]["end"] == "20260728"
-    assert calls[1]["count"] == 200
-    # 输出校验：两次拉取同数据 → 去重后仍 2 根 bar
+    # 输出校验：单次拉取同数据 → 仍 2 根 bar（预热 bar 保留在 klines，引擎由调用方切片）
     assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
     assert "datetime" in klines["000001.SZ"]["1d"].columns
     assert klines["000001.SZ"]["1d"].height == 2
@@ -461,7 +457,8 @@ def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):
         return {"1d": raw}
     monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
     bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db, dividend_mode="back")
-    assert calls == ["back", "back"]
+    # W-A：单次拉取，dividend_type 透传
+    assert calls == ["back"]
 
 
 def test_build_signal_cache_back_dividend_passes_2(db_session, monkeypatch):
@@ -779,8 +776,8 @@ def test_warmup_counts_by_period_no_db(db_session):
 
 
 def test_build_klines_warmup_merge(db_session, monkeypatch):
-    """build_klines 预热段按周期 count 直拉（start 空 / end=start 前一天 / count=formula_count），
-    与主段合并，klines 含预热 bar。"""
+    """W-A：预热段并入主段——一次 get_history_raw(start 前推覆盖预热窗口) 取全量，
+    klines 含预热 bar（引擎由调用方切片回主区间）。"""
     import pandas as pd
     db = db_session
     ps = _seed_db_warmup(db)
@@ -797,30 +794,27 @@ def test_build_klines_warmup_merge(db_session, monkeypatch):
 
     ts_warm = [datetime(2026, 7, 28)]
     ts_main = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
-    raw_warm = _raw(ts_warm, [9.9])
-    raw_main = _raw(ts_main, [10.2, 9.0])
+    raw = _raw(ts_warm + ts_main, [9.9, 10.2, 9.0])
 
     calls = []
     def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
         calls.append({"periods": list(periods), "start": start, "end": end, "count": count})
-        if count == -1:
-            # 主段：一次拉全部周期
-            return {"1d": raw_main, "30m": raw_main}
-        # 预热段：每周期一次 count 直拉
-        return {periods[0]: raw_warm}
+        # 单次拉取：返回 [前推 start, end] 全量（含预热 bar）
+        return {p: raw for p in periods}
     monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
 
     klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
 
-    # 调用序列：1 次主段（全周期）+ 每周期 1 次预热段（5m 的 count=0 不拉）
-    assert len(calls) == 3
+    # W-A：单次拉取（所有策略周期一次取全量），count=-1，start 前推早于回测开始日
+    assert len(calls) == 1
+    assert set(calls[0]["periods"]) == {"1d", "30m", "5m"}
     assert calls[0]["count"] == -1
-    warmup_calls = {c["periods"][0]: c for c in calls[1:]}
-    assert set(warmup_calls) == {"1d", "30m"}
-    for c in warmup_calls.values():
-        assert c["start"] == "" and c["end"] == "20260728" and c["count"] == 255
+    assert calls[0]["start"] < "20260729"
+    assert calls[0]["end"] == "20260731"
+    # 预热窗口 = max(formula_count)=255：1d 前推 545 天
+    assert calls[0]["start"] == "20250130"
 
-    # 合并后含预热 bar：1d 有 3 根（07-28 预热 + 07-29/30 主段）
+    # klines 含预热 bar：1d 有 3 根（07-28 预热 + 07-29/30 主段）
     df = klines["000001.SZ"]["1d"]
     assert df.height == 3
     assert df["datetime"].to_list()[0] == datetime(2026, 7, 28)

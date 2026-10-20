@@ -6,8 +6,38 @@ from .event import TradeEvent
 from tq_iquant_shared.constants import TradeType, SignalType
 
 
+# 可转债代码前缀（实证自通达信板块32「可转债」331 只，2026-10）：
+# 沪市 110/111/113/118（11xxxx.SH，含科创板 118）、
+# 深市 123/127/128（12xxxx.SZ）、北交所定向可转债 810（81xxxx.BJ）。
+_BOND_PREFIX_SUFFIX = (("11", "SH"), ("12", "SZ"), ("81", "BJ"))
+
+
+def is_convertible_bond(stock_code: str) -> bool:
+    """是否为可转债代码（按交易所+前缀双重判定，避免 11/12/81 数字段误伤其他品种）。"""
+    if not stock_code:
+        return False
+    code, dot, suffix = stock_code.partition(".")
+    if not dot or len(code) != 6 or not code.isdigit():
+        return False
+    return any(code.startswith(pfx) and suffix == sfx
+               for pfx, sfx in _BOND_PREFIX_SUFFIX)
+
+
+def lot_size_for(stock_code: str, bond_lot_enabled: bool) -> int:
+    """交易手数（取整单位）：转债开关开启且标的为可转债 → 10 张；其余 100 股（原行为）。"""
+    if bond_lot_enabled and is_convertible_bond(stock_code):
+        return 10
+    return 100
+
+
 class Position:
-    def __init__(self, stock_code: str):
+    def __init__(
+        self,
+        stock_code: str,
+        *,
+        same_day_sellable: bool = False,
+        lot_size: int = 100,
+    ):
         self.stock_code = stock_code
         self.quantity = 0
         self.avg_cost = Decimal("0")
@@ -17,6 +47,10 @@ class Position:
         self._lots: Dict[date, int] = {}
         # 已加仓次数（首次建仓清零，全平清零），受 max_add_count 约束
         self.add_count = 0
+        # 可转债 T+0 回转（可选，默认 False=股票 T+1 原行为）：True 时当日买入可卖
+        self.same_day_sellable = same_day_sellable
+        # 交易手数（股票 100 股 / 可转债 10 张），供 REDUCE 等按持仓取整场景使用
+        self.lot_size = lot_size
 
     @property
     def market_value(self) -> Decimal:
@@ -93,11 +127,17 @@ class Position:
             self.quantity += trade.quantity
 
     def can_sell_on(self, query_date: date) -> bool:
-        """T+1：买入当日不可卖，下一交易日及之后可卖。无持仓或当日买入返回 False。"""
+        """T+1：买入当日不可卖，下一交易日及之后可卖。无持仓或当日买入返回 False。
+        可转债 T+0（same_day_sellable=True）：有持仓即可卖，含买入当日。"""
         if self.quantity == 0 or self.buy_time is None:
             return False
+        if self.same_day_sellable:
+            return True
         return query_date > self.buy_time.date()
 
     def available_shares_on(self, query_date: date) -> int:
-        """T+1 可卖股数：query_date 之前（不含当日）买入的份额之和。"""
+        """T+1 可卖股数：query_date 之前（不含当日）买入的份额之和。
+        可转债 T+0（same_day_sellable=True）：全部份额可卖（含当日买入）。"""
+        if self.same_day_sellable:
+            return self.quantity
         return sum(qty for d, qty in self._lots.items() if d < query_date)

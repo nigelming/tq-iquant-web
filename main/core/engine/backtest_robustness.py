@@ -35,13 +35,14 @@ def _return_ratio(first_v, last_v) -> Optional[float]:
 
 
 def _max_drawdown(series) -> float:
+    # W5-L2：返回正号回撤（与 robustness.py 口径统一）；0 表示无回撤。
     peak = None
     mdd = 0.0
     for v in series:
         if peak is None or v > peak:
             peak = v
         if peak:
-            mdd = min(mdd, v / peak - 1)
+            mdd = max(mdd, 1 - v / peak)
     return mdd
 
 
@@ -75,9 +76,13 @@ def _rolling_cagr(snaps, yearly, years, width=3) -> List[dict]:
         w = years[i:i + width]
         start_v = yearly[w[0]]["first_value"]
         end_v = yearly[w[2]]["last_value"]
+        # W5-O3：按窗口实际首末日期跨度年化（自然日/365.25），对齐 _segment。
+        start_d = yearly[w[0]]["first_date"]
+        end_d = yearly[w[2]]["last_date"]
+        span_years = (end_d - start_d).days / 365.25
         cagr = _return_ratio(start_v, end_v)
-        if cagr is not None and cagr > -1:
-            cagr = (1 + cagr) ** (1 / width) - 1
+        if cagr is not None and cagr > -1 and span_years > 0:
+            cagr = (1 + cagr) ** (1 / span_years) - 1
         inw = [s for s in snaps if int(w[0]) <= s["snap_date"].year <= int(w[2])]
         out.append({
             "start": w[0],
@@ -125,11 +130,13 @@ def _segment(snaps, lo, hi):
     vals = [_f(s["total_value"]) for s in sub]
     bench = [_f(s.get("benchmark_value")) for s in sub]
     bench = [b for b in bench if b is not None]
-    n_years = hi - lo + 1
+    # W5-O3：CAGR 年化用实际首末日期跨度（自然日/365.25），而非 hi-lo+1 整年。
+    # 子区间可能不足/超过整年（如 1 月~12 月仅 11 个月），整年计会低估年化。
+    span_years = (sub[-1]["snap_date"] - sub[0]["snap_date"]).days / 365.25
     ret = _return_ratio(vals[0], vals[-1])
     cagr = None
-    if ret is not None and ret > -1:
-        cagr = (1 + ret) ** (1 / n_years) - 1
+    if ret is not None and ret > -1 and span_years > 0:
+        cagr = (1 + ret) ** (1 / span_years) - 1
     return {
         "start": sub[0]["snap_date"].isoformat()[:10],
         "end": sub[-1]["snap_date"].isoformat()[:10],
@@ -156,6 +163,8 @@ def _oos_split(snaps, yearly, years, oos_ratio: float) -> Optional[dict]:
         "split_year": split_year,
         "in_sample": in_seg,
         "out_of_sample": out_seg,
+        # W5-O2：伪 OOS 明示——固定切分防时段崩塌，不防全样本调参
+        "caveat": "OOS 仅防时段崩塌，不防全样本调参",
     }
 
 

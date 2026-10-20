@@ -107,13 +107,6 @@ class Evaluator:
         if len(snapshots) < 2:
             return {}
 
-        n = len(snapshots)
-        values = [Decimal(str(s["total_value"])) for s in snapshots]
-
-        start_val = values[0]
-        end_val = values[-1]
-        total_return = (end_val - start_val) / start_val
-
         # 日频聚合行（每日最后一根 bar）：日收益/仓位/持仓结构/路径指标统一从这里出
         daily_rows = self._daily_rows(snapshots)
         daily_returns = self._returns_from_rows(daily_rows)
@@ -121,6 +114,14 @@ class Evaluator:
         # 避免分钟回测日内多 bar 的中间值污染（与 sharpe/sortino 口径一致）。
         daily_values = [r["total_value"] for r in daily_rows]
         daily_n = len(daily_values)
+
+        # total_return 同走日聚合首尾（与落库日快照口径一致）：分钟级回测首日
+        # 第一根 bar（尚未成交，恒等于初始资金）不作起点，消除引擎值与按落库
+        # 日快照重算值的偏差（审计实测 #4：0.8911 vs 0.8879，差=首日日内盈亏），
+        # annual_return 及其派生 sharpe/sortino/calmar 随之对齐。
+        start_val = daily_values[0]
+        end_val = daily_values[-1]
+        total_return = (end_val - start_val) / start_val
 
         days = (snapshots[-1]["snap_date"] - snapshots[0]["snap_date"]).days
         years = max(days / 365.25, 1 / 365.25)
@@ -147,7 +148,9 @@ class Evaluator:
         downside_dev = math.sqrt(downside_var * 252)
         sortino = (annual_return - rf) / downside_dev if downside_dev > 0 else 0
 
-        calmar = annual_return / float(max_dd) if max_dd > 0 else 0
+        # W5-L1：max_dd==0（区间无回撤）→ calmar_ratio=None（无意义，不填 0，
+        # 避免被误读为"极差"）；acceptance 对 None 视为未知，不误拒。
+        calmar = annual_return / float(max_dd) if max_dd > 0 else None
 
         daily_sorted = sorted(daily_returns)
         idx = max(0, int(len(daily_sorted) * 0.05) - 1)
@@ -211,10 +214,11 @@ class Evaluator:
             "volatility": Decimal(str(volatility)).quantize(Decimal("0.0001")),
             "sharpe_ratio": Decimal(str(sharpe)).quantize(Decimal("0.0001")),
             "sortino_ratio": Decimal(str(sortino)).quantize(Decimal("0.0001")),
-            "calmar_ratio": Decimal(str(calmar)).quantize(Decimal("0.0001")),
+            "calmar_ratio": Decimal(str(calmar)).quantize(Decimal("0.0001")) if calmar is not None else None,
             "win_rate": trade_metrics["win_rate"],
             "profit_factor": trade_metrics["profit_factor"],
             "total_trades": trade_metrics["total_trades"],
+            "closed_trades": trade_metrics["closed_trades"],
             "benchmark_return": benchmark_return,
             "avg_holding_days": trade_metrics["avg_holding_days"],
             "var_95": (
@@ -283,17 +287,23 @@ class Evaluator:
 
         FIFO 队列按 (strategy_id, stock_code) 分组，每笔 SELL 按先进先出消耗 BUY
         仓位，逐笔计算 P&L。部分平仓时按比例拆分。
+
+        P&L 口径（审计修复）：扣除交易成本。买入费用（佣金+印花税）按股分摊
+        随 FIFO 批次消耗，卖出费用按本次卖出量按股分摊：
+        净 P&L = (卖价 − 买价 − 买入费用/股 − 卖出费用/股) × 成交股数。
+        未扣费旧口径会系统性高估胜率与盈亏比（边际盈利单被记为盈利）。
         """
         total_trades = len(trades)
         if not trades:
             return {
                 "total_trades": 0,
+                "closed_trades": 0,
                 "win_rate": None,
                 "profit_factor": None,
                 "avg_holding_days": None,
             }
 
-        # FIFO 队列：{key: deque([(buy_price, qty, buy_time)])}
+        # FIFO 队列：{key: deque([(buy_price, qty, buy_time, buy_cost_per_share)])}
         fifo: dict = {}
         lot_pnls: List[Tuple[Decimal, int]] = []  # [(pnl, holding_days)]
 
@@ -303,23 +313,23 @@ class Evaluator:
                 fifo[key] = deque()
 
             if tr.trade_type.value == "BUY":
-                fifo[key].append((tr.price, tr.quantity, tr.trade_time))
+                buy_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)) / tr.quantity
+                fifo[key].append((tr.price, tr.quantity, tr.trade_time, buy_cost_ps))
             elif tr.trade_type.value == "SELL":
+                sell_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)) / tr.quantity
                 remaining = tr.quantity
-                matched_qty = 0
                 while remaining > 0 and fifo[key]:
-                    buy_price, buy_qty, buy_time = fifo[key][0]
+                    buy_price, buy_qty, buy_time, buy_cost_ps = fifo[key][0]
                     taken = min(remaining, buy_qty)
-                    # P&L = (sell_price - buy_price) * taken
-                    pnl = (tr.price - buy_price) * taken
+                    # 净 P&L = 价差 − 双边费用（均按股分摊 × taken）
+                    pnl = (tr.price - buy_price - buy_cost_ps - sell_cost_ps) * taken
                     holding_days = (tr.trade_time - buy_time).days
                     lot_pnls.append((pnl, holding_days))
                     remaining -= taken
-                    matched_qty += taken
                     if taken >= buy_qty:
                         fifo[key].popleft()
                     else:
-                        fifo[key][0] = (buy_price, buy_qty - taken, buy_time)
+                        fifo[key][0] = (buy_price, buy_qty - taken, buy_time, buy_cost_ps)
                 # 剩余 unmatched（卖超了）忽略
 
         # win_rate
@@ -351,6 +361,7 @@ class Evaluator:
 
         return {
             "total_trades": total_trades,
+            "closed_trades": len(lot_pnls),
             "win_rate": win_rate,
             "profit_factor": profit_factor,
             "avg_holding_days": avg_hold,

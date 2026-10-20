@@ -244,14 +244,10 @@ class BreakerService:
         （无最新 bar 时以当前持仓成本近似；有 bar 由 on_bar_update(update_peak) 已覆盖）。
         """
         try:
-            # 日终总市值：用组合最新现金 + 持仓市值（无最新 bar 时以当前持仓市值近似）
-            total = portfolio.account.cash
-            for ctx in portfolio.strategies:
-                for stock_code, pos in ctx.positions.items():
-                    if pos.quantity == 0:
-                        continue
-                    # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
-                    total += pos.avg_cost * pos.quantity
+            # R1：日终总市值改用市值口径（现金 + 持仓按最近已知价市值），与
+            # prev_close_value（市值）一致，避免"成本市值 vs 昨收市值"口径错配
+            # 造成 daily_loss 误触（浮盈/浮亏持仓按成本算会漏算/虚高当日盈亏）。
+            total = portfolio.account.cash + portfolio._holdings_value()
             was_paused = portfolio.risk_manager.daily_pause_active
             portfolio.risk_manager.update_daily(
                 total, today, portfolio.account.initial_capital

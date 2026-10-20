@@ -1,7 +1,8 @@
 from datetime import date, timedelta
 from decimal import Decimal
 
-from core.engine.risk_manager import PortfolioRiskManager
+from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
+from core.engine.position import Position
 
 
 def _pm(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05")):
@@ -249,3 +250,37 @@ def test_daily_pause_recovers_next_day_via_cross_day_update():
     # D3: update 跨日补算 D2(已触发) + update_peak 恢复 daily_pause
     pm.update(Decimal("93000"), date(2026, 7, 3), initial)
     assert pm.daily_pause_active is False  # update_peak 已恢复
+
+
+# ===========================================================================
+# B5：check_trailing_stop ratio 覆盖（None 回落实例阈值，行为不变）
+# ===========================================================================
+def _pos_with_high(qty=1000, high="10"):
+    pos = Position("000001.SZ")
+    pos.quantity = qty
+    pos.highest_price = Decimal(high)
+    return pos
+
+
+def test_trailing_stop_ratio_override_relaxes_threshold():
+    """回撤 5%：实例阈值 3% 触发；覆盖 8%（趋势态放宽）不触发。"""
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = _pos_with_high()
+    assert rm.check_trailing_stop(pos, Decimal("9.5")) is True
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.08")) is False
+
+
+def test_trailing_stop_ratio_none_falls_back_to_instance():
+    """ratio=None 与显式传实例阈值等价（默认行为不变）。"""
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = _pos_with_high()
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=None) is True
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.03")) is True
+    # 覆盖 0 同样视为禁用（与实例阈值 0 语义一致）
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0")) is False

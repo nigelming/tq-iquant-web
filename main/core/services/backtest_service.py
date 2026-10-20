@@ -27,7 +27,7 @@ from core.models import (
     StockPool, StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
-    BacktestRobustnessAnalysis,
+    BacktestRobustnessAnalysis, WalkForwardRun,
 )
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.evaluator import Evaluator
@@ -35,7 +35,8 @@ from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
 from core.engine.backtest_robustness import analyze_robustness
-from core.engine.regime import segment_regime
+from core.engine.regime import segment_regime, CausalRegimeTracker
+from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
     RegimeAlphaAnalyzer,
@@ -44,7 +45,8 @@ from core.engine.industry_attribution import (
     compute_industry_attribution, needs_rerun_block, TAXONOMY as INDUSTRY_TAXONOMY,
 )
 from core.engine.robustness import compute_robustness
-from core.engine.decision import summarize_decisions
+from core.engine.decision import summarize_decisions, summarize_decisions_yearly
+from core.services.oos_gate import evaluate_oos_gate
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
 )
@@ -215,6 +217,22 @@ def warmup_counts_by_period(ps, db: Session = None) -> Dict[str, int]:
     return counts
 
 
+# W-A：预热窗口周期→自然日换算（bar/交易日近似，含缓冲）。取保守上限，
+# 宁多拉勿少（覆盖停牌/节假日导致 bar 数不足），start 前推只多取几根预热 bar。
+_PERIOD_BARS_PER_TRADING_DAY = {
+    "1m": 240, "5m": 48, "15m": 16, "30m": 8, "1h": 4, "1d": 1,
+    "1w": 1 / 5, "1mon": 1 / 22,
+}
+
+
+def _warmup_span_days(period: str, count: int) -> int:
+    """估算覆盖 count 根该周期 bar 所需自然日（交易日→自然日 ×7/5，加缓冲）。"""
+    per_day = _PERIOD_BARS_PER_TRADING_DAY.get(period, 1)
+    trading_days = count / per_day if per_day else count
+    calendar_days = trading_days * 7 / 5
+    return int(calendar_days * 1.5) + 10
+
+
 def _merge_raw_by_period(main_raw: dict, warm_raw: dict) -> dict:
     """预热段 + 主段原始行情合并：{period: {field: pandas.DataFrame}}。
 
@@ -272,40 +290,36 @@ def build_klines(ps, start: date, end: date, db: Session = None,
 
     股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
     需要 db 查股票池；若未传 db，返回空（无法定位股票）。
-    流程：主段 get_history_raw（start~end，count=-1）→ 每周期预热段 count 直拉
-    （start 空 + end=start 前一天 + count=formula_count，TDX 消化交易日/停牌差异）→
-    _merge_raw_by_period 合并 → _convert_market_data_multi（转引擎 polars）。
+    流程：主段 start 前推覆盖公式预热窗口 → 一次 get_history_raw(count=-1) 取全量
+    （含预热 bar）→ _convert_market_data_multi（转引擎 polars）。
 
-    返回值含预热 bar（早于 start）；引擎视野由调用方 _slice_klines_from 切回主区间，
-    预热段只喂 build_signal_cache。
+    W-A：预热段不再单独逐周期拉取（原 1+N 次往返），改为把主段 start 前推一个
+    覆盖 max(formula_count) 的自然日窗口，一次取全量后由调用方 _slice_klines_from
+    切回主区间（预热 bar 只喂 build_signal_cache，不进引擎时间轴）。
     dividend_mode：复权模式（"front" 前复权 / "back" 后复权），K线取数透传给 TQ。
     """
     stocks = _pool_stocks(ps, db)
     if not stocks:
         return {}
     periods = _strategy_periods(ps, db)
-    start_str = start.strftime("%Y%m%d")
+    warmup_counts = warmup_counts_by_period(ps, db)
+    # W-A：start 前推覆盖预热窗口（按周期估算自然日，保守上限）
+    fetch_start = start
+    if warmup_counts:
+        span = max(
+            (_warmup_span_days(p, cnt) for p, cnt in warmup_counts.items()
+             if p in periods),
+            default=0,
+        )
+        if span > 0:
+            fetch_start = start - timedelta(days=span)
+    start_str = fetch_start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
     tq = TQData()
     raw_by_period = tq.get_history_raw(
         stocks=stocks, periods=periods,
         start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
     )
-    warmup_counts = warmup_counts_by_period(ps, db)
-    if warmup_counts:
-        # 预热段：每周期一次 count 直拉，end=start 前一天（重叠 bar 合并时去重）
-        warm_end = (start - timedelta(days=1)).strftime("%Y%m%d")
-        warm_raw: dict = {}
-        for period, cnt in warmup_counts.items():
-            if period not in periods:
-                continue
-            part = tq.get_history_raw(
-                stocks=stocks, periods=[period],
-                start="", end=warm_end, dividend_type=dividend_mode, count=cnt,
-            )
-            if isinstance(part, dict):
-                warm_raw.update(part)
-        raw_by_period = _merge_raw_by_period(raw_by_period, warm_raw)
     return _convert_market_data_multi(raw_by_period, stocks)
 
 
@@ -394,6 +408,18 @@ PARAMS_SNAPSHOT_FIELDS = (
     "slippage",
     "trading_session",
     "stock_pool_id",
+    "position_sizing",
+    # #1/#2/W2 新执行约束：影响回测成交/资金行为，冻结以保证结果可复现。
+    # （此前缺失——11-fair 的成交量约束仅存于组合表、未进快照，无法仅凭记录复现）
+    "price_limit_check_enabled",
+    "volume_limit_enabled",
+    "volume_limit_ratio",
+    "adaptive_slippage_enabled",
+    "slippage_impact_coef",
+    "cash_enhance_enabled",
+    "cash_enhance_equity_threshold",
+    "cash_enhance_position_ratio_threshold",
+    "equity_cap",
 )
 
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
@@ -401,6 +427,35 @@ PARAMS_SNAPSHOT_FIELDS = (
 # "dual" = 信号前复权 + 执行/记账后复权（模拟实盘口径：公式按前复权出信号、真实价成交）。
 DIVIDEND_MODES = ("front", "back", "dual")
 _FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2}
+
+# W5-O1b(M4) 扰动值域：策略数值参数的有效区间，越界钳制（装配入口统一生效）。
+# capital_ratio 为持仓上限占比 ≤1；比率类 (0,1]；整型 ≥1 在装配处 max(1,·) 已保。
+PERTURB_BOUNDS: dict = {
+    "capital_ratio": (None, 1.0),
+    "single_open_ratio": (0.0, 1.0),
+    "add_position_ratio": (0.0, 1.0),
+    "reduce_position_ratio": (0.0, 1.0),
+    "stop_loss_ratio": (0.0, 1.0),
+    "take_profit_ratio": (0.0, 1.0),
+    "trailing_stop_ratio": (0.0, 1.0),
+}
+
+
+def clamp_perturbed_value(field: str, value):
+    """按 PERTURB_BOUNDS 钳制扰动后的参数值；越界取边界值（丢弃越界方向由
+    微扰层 build_perturb_rounds 判定）。无界字段原样返回。"""
+    if value is None:
+        return value
+    lo, hi = PERTURB_BOUNDS.get(field, (None, None))
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return value
+    if lo is not None and v < lo:
+        return lo
+    if hi is not None and v > hi:
+        return hi
+    return value
 
 
 def _snapshot_value(value):
@@ -427,12 +482,34 @@ def _json_safe(obj):
     return obj
 
 
-def build_params_snapshot(ps, dividend_mode: str = "front") -> str:
+def build_params_snapshot(ps, dividend_mode: str = "front",
+                          fee_reserve_enabled: bool = False,
+                          bond_t0_enabled: bool = False,
+                          bond_lot_enabled: bool = False,
+                          adaptive_slippage_enabled: bool | None = None,
+                          slippage_impact_coef=None,
+                          volume_limit_enabled: bool | None = None,
+                          volume_limit_ratio=None,
+                          equity_cap=None) -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
     }
     payload["dividend_mode"] = dividend_mode
+    # run 级可选开关/覆盖冻结入快照，保证结果可复现：
+    # 费用预留/可转债 T+0/转债 10 张（均默认关）；自适应滑点/成交量/容量 run 级覆盖（None=用组合默认）
+    payload["fee_reserve_enabled"] = bool(fee_reserve_enabled)
+    payload["bond_t0_enabled"] = bool(bond_t0_enabled)
+    payload["bond_lot_enabled"] = bool(bond_lot_enabled)
+    for name, val in (
+        ("adaptive_slippage_enabled", adaptive_slippage_enabled),
+        ("slippage_impact_coef", slippage_impact_coef),
+        ("volume_limit_enabled", volume_limit_enabled),
+        ("volume_limit_ratio", volume_limit_ratio),
+        ("equity_cap", equity_cap),
+    ):
+        if val is not None:
+            payload[name] = _snapshot_value(val)
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -1113,7 +1190,7 @@ def _f_val(v):
 _EVALUATION_FIELDS = (
     "total_return", "annual_return", "max_drawdown", "volatility",
     "sharpe_ratio", "sortino_ratio", "calmar_ratio", "win_rate",
-    "profit_factor", "total_trades", "benchmark_return", "avg_holding_days",
+    "profit_factor", "total_trades", "closed_trades", "benchmark_return", "avg_holding_days",
     "var_95", "cvar_95", "avg_recovery_days", "max_recovery_days",
     "ulcer_index", "return_stability",
     "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
@@ -1455,6 +1532,12 @@ def build_signal_cache(
         # 两键始终初始化，消费方可直接索引（成功时 errors 为空 dict）
         diagnostics.setdefault("errors", {})
         diagnostics.setdefault("output_lines", {})
+
+    # W-C 按 (formula_id, period) 分组：同组一次 compute（stocks=并集），
+    # 转换/诊断按策略拆分——多策略共享公式+周期时把 N 次 TQ 往返降为 1 次
+    # （formula_process_mul_zb 的 stock_list 批量与逐策略调用等价）。
+    start_str, end_str = _kline_time_range(klines)
+    groups: Dict[tuple, List[tuple]] = {}
     for strat in strategies:
         formula = db.get(Formula, strat.formula_id)
         if formula is None:
@@ -1467,27 +1550,44 @@ def build_signal_cache(
                 if code in _pool_stock_set(db, strat.stock_pool_id)
             ]
         else:
-            strat_stocks = stocks
+            strat_stocks = list(stocks)
         if not strat_stocks:
             continue
-        start_str, end_str = _kline_time_range(klines)
+        groups.setdefault((strat.formula_id, period), []).append(
+            (strat, strat_stocks)
+        )
+    for (formula_id, period), members in groups.items():
+        formula = db.get(Formula, formula_id)
+        if formula is None:
+            continue
+        # 并集股票（保序去重）
+        union: List[str] = []
+        seen: set = set()
+        for _, ss in members:
+            for code in ss:
+                if code not in seen:
+                    seen.add(code)
+                    union.append(code)
         raw = tq_formula.compute(
             formula_name=formula.name, formula_arg="",
-            stocks=strat_stocks, period=period,
+            stocks=union, period=period,
             count=-1, dividend_type=_FORMULA_DIVIDEND_TYPE.get(dividend_mode, 1),
             start_time=start_str, end_time=end_str,
         )
-        if diagnostics is not None:
-            err_msg, lines = _formula_diagnostics(raw, strat_stocks)
-            if err_msg:
-                diagnostics.setdefault("errors", {})[strat.id] = err_msg
-            else:
-                diagnostics.setdefault("output_lines", {})[strat.id] = lines
         # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
         # 按策略周期过滤时间轴，避免多周期并集导致索引串位
         bt = _bar_times_by_period(klines, period) if period in _MINUTE_PERIODS else None
-        entries = _convert_formula_output(raw, strat.id, strat_stocks, bar_times_by_code=bt)
-        cache.update(entries)
+        for strat, strat_stocks in members:
+            if diagnostics is not None:
+                err_msg, lines = _formula_diagnostics(raw, strat_stocks)
+                if err_msg:
+                    diagnostics.setdefault("errors", {})[strat.id] = err_msg
+                else:
+                    diagnostics.setdefault("output_lines", {})[strat.id] = lines
+            entries = _convert_formula_output(
+                raw, strat.id, strat_stocks, bar_times_by_code=bt
+            )
+            cache.update(entries)
     if start is not None:
         start_ts = datetime(start.year, start.month, start.day)
         cache = {k: v for k, v in cache.items() if k[2] >= start_ts}
@@ -1618,7 +1718,9 @@ def _strategy_periods(ps, db: Session) -> list:
 def _portfolio_strategies(ps, db: Session) -> list:
     if db is None:
         return []
-    return db.query(Strategy).filter_by(portfolio_id=ps.id).all()
+    # ORDER BY id：策略处理顺序确定化（master/slave 同 bar 现金审批与 follow_master
+    # 镜像依赖遍历顺序，未排序会被 SQLite 物理顺序抖动导致非确定性）。
+    return db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
 
 
 def _kline_time_range(klines: dict):
@@ -1758,6 +1860,18 @@ def _serialize_record(r: BacktestRecord) -> dict:
         "status": r.status,
         "error_message": r.error_message,
         "warnings": json.loads(r.warnings_json) if r.warnings_json else [],
+        # B6 考核口径（历史记录无该列值时回落 absolute）
+        "evaluation_profile": getattr(r, "evaluation_profile", None) or "absolute",
+        # C7 IS/OOS 门槛（默认关；gate_status None=未启用/未评估）
+        "is_oos_gate_enabled": bool(getattr(r, "is_oos_gate_enabled", False)),
+        "oos_gate_min_ratio": _f(getattr(r, "oos_gate_min_ratio", None)),
+        "gate_status": getattr(r, "gate_status", None),
+        "gate_reasons": (
+            json.loads(r.gate_reasons) if getattr(r, "gate_reasons", None) else []
+        ),
+        "validation": (
+            json.loads(r.validation_json) if getattr(r, "validation_json", None) else None
+        ),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
     }
@@ -1854,6 +1968,7 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "win_rate": _f(e.win_rate),
         "profit_factor": _f(e.profit_factor),
         "total_trades": e.total_trades,
+        "closed_trades": e.closed_trades,
         "benchmark_return": _f(e.benchmark_return),
         "avg_holding_days": _f(e.avg_holding_days),
         "var_95": _f(e.var_95),
@@ -1996,14 +2111,27 @@ def build_return_buckets(snaps: list) -> dict:
 # 查询（路由层调，返回纯 dict；不存在返回 None / False 由路由转 err(404)）
 # ---------------------------------------------------------------------------
 def list_records(db: Session) -> list:
-    """列出全部回测记录（按创建时间倒序），序列化为 dict 列表。"""
-    recs = db.query(BacktestRecord).order_by(BacktestRecord.created_at.desc()).all()
+    """列出全部回测记录（按创建时间倒序），序列化为 dict 列表。
+    C8：过滤 walk-forward 窗口子回测（walk_forward_run_id 非空），
+    P2b：过滤参数微扰子回测（param_perturb_run_id 非空），
+    子记录仅在各自 run 详情内可见；普通回测（NULL）行为不变。"""
+    recs = (
+        db.query(BacktestRecord)
+        .filter(BacktestRecord.walk_forward_run_id.is_(None))
+        .filter(BacktestRecord.param_perturb_run_id.is_(None))
+        .order_by(BacktestRecord.created_at.desc())
+        .all()
+    )
     return [_serialize_record(r) for r in recs]
 
 
-def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
+def get_record_detail(
+    db: Session, record_id: int, profile_override: Optional[str] = None,
+) -> Optional[dict]:
     """回测记录详情：record + snapshots + trades + evaluations + 策略层。
-    不存在返回 None（路由层据此 err(404)）。"""
+    不存在返回 None（路由层据此 err(404)）。
+    profile_override：B6 验收口径临时切换（?profile=relative），仅影响
+    acceptance 块，不改记录存储的 evaluation_profile。"""
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
         return None
@@ -2072,6 +2200,8 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
     decision_summary = [
         _serialize_decision_summary(s) for s in summarize_decisions(decision_rows)
     ]
+    # C9 年度归因：按年聚合风控触发率与槽位拦截量（纯展示块，不改任何行为）
+    decision_yearly = summarize_decisions_yearly(decision_rows)
 
     # ---- 收益分布桶（月度热力图 / 年度箱线图）----
     returns_buckets = build_return_buckets(snaps)
@@ -2130,19 +2260,28 @@ def get_record_detail(db: Session, record_id: int) -> Optional[dict]:
             "data": json.loads(rb.payload_json) if rb.payload_json else None,
         }
 
+    # ---- B6 考核口径验收（默认 absolute；?profile= 可临时切换查看另一口径）----
+    evals_dict = _serialize_evaluation(evals) if evals else None
+    profile = profile_override or rec.evaluation_profile or "absolute"
+    if profile not in ACCEPTANCE_PROFILES:
+        profile = "absolute"
+    acceptance = compute_acceptance(evals_dict, profile)
+
     return {
         "record": _serialize_record(rec),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
         "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
-        "evaluations": _serialize_evaluation(evals) if evals else None,
+        "evaluations": evals_dict,
         "strategy_evaluations": strategy_evaluations,
         "strategy_snapshots": strategy_snapshots,
         "decision_summary": decision_summary,
+        "decision_yearly": decision_yearly,
         "decisions": [_serialize_decision(d) for d in decision_rows],
         "returns_buckets": returns_buckets,
         "crisis_alpha": crisis_alpha,
         "market_regime": market_regime,
         "robustness": robustness,
+        "acceptance": acceptance,
     }
 
 
@@ -2218,7 +2357,244 @@ def _log_kline_summary(record_id: int, klines: dict) -> None:
     )
 
 
-def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
+# 容量预警阈值：单笔成交 ≥ 该股日均成交额的 30% → 提示不可成交风险（默认无限
+# 流动性假设下，实盘按回测价成交不现实）；最大单票权重 > 25% → 集中度/权重膨胀。
+_CAP_PARTICIPATION_WARN = 0.30
+_CAP_MAX_WEIGHT_WARN = 0.25
+
+
+def _fmt_yuan(v: float) -> str:
+    """金额人读格式化：按量级选单位（亿/万/元），避免小金额被 /1e8 显示成
+    '0.00亿' 无法分辨来源（如单笔 20 万 + 日均成交额 1.4 万 → 1420%）。"""
+    if v >= 1e8:
+        return f"{v / 1e8:.2f} 亿"
+    if v >= 1e4:
+        return f"{v / 1e4:.1f} 万"
+    return f"{v:,.0f} 元"
+
+# 危机期窗口（历史锁定、未来定义标准）：固定常量，非按策略表现回填，
+# 保证"危机防御判定"的标准先于结果确定（无前视）。key 用于稳定标识。
+CRISIS_WINDOWS: tuple = (
+    {"key": "2015_crash", "name": "2015 股灾", "start": "2015-06-01", "end": "2015-09-30"},
+    {"key": "2016_circuit_breaker", "name": "2016 熔断", "start": "2016-01-01", "end": "2016-02-29"},
+    {"key": "2018_tradewar", "name": "2018 贸易战/去杠杆", "start": "2018-01-01", "end": "2018-12-31"},
+    {"key": "2020_covid", "name": "2020 疫情", "start": "2020-01-01", "end": "2020-04-30"},
+    {"key": "2024_liquidity", "name": "2023底-24初流动性危机", "start": "2023-11-01", "end": "2024-02-29"},
+    {"key": "2025_tradewar", "name": "2025 贸易战", "start": "2025-04-01", "end": "2025-07-31"},
+    {"key": "2026_techcrash", "name": "2026-07 科技崩盘", "start": "2026-07-01", "end": "2026-07-31"},
+)
+
+# 危机防御判定：危机期正收益/持平 → 防御；负收益但最低现金占比 ≥70%（高现金避险）→ 防御。
+_CRISIS_DEFENSIVE_CASH = 0.70
+
+
+def build_crisis_verification(snapshots: list) -> list:
+    """危机防御机制自动验证：对固定危机窗口逐窗计算
+    策略收益/基准收益/窗口最大回撤/最低现金占比 → 防御✓ / 暴露✗ 判定。
+
+    snapshots：回测组合日快照（snap_date/total_value/cash/benchmark_value）。
+    窗口未覆盖（回测区间未触及）→ 跳过；数据不足 → verdict=n/a。
+    """
+    if not snapshots:
+        return []
+    by_date = {}
+    for s in snapshots:
+        d = s.get("snap_date")
+        if d is not None:
+            by_date[d] = s
+    sorted_dates = sorted(by_date)
+    if not sorted_dates:
+        return []
+    result: list = []
+    for w in CRISIS_WINDOWS:
+        try:
+            w_start = date.fromisoformat(w["start"])
+            w_end = date.fromisoformat(w["end"])
+        except ValueError:
+            continue
+        in_window = [d for d in sorted_dates if w_start <= d <= w_end]
+        if not in_window:
+            continue
+        # 基准：窗口前一日 last value，否则窗口首日
+        prior = [d for d in sorted_dates if d < w_start]
+        base_day = prior[-1] if prior else in_window[0]
+        base_total = float(by_date[base_day]["total_value"])
+        end_total = float(by_date[in_window[-1]]["total_value"])
+        strategy_return = (end_total / base_total - 1.0) if base_total else None
+        # 基准收益
+        bench_vals = []
+        for d in in_window:
+            bv = by_date[d].get("benchmark_value")
+            if bv is not None:
+                bench_vals.append(float(bv))
+        if len(bench_vals) >= 2:
+            benchmark_return = bench_vals[-1] / bench_vals[0] - 1.0
+        else:
+            benchmark_return = None
+        # 窗口内最大回撤（total_value 峰谷）
+        peak = None
+        max_dd = None
+        for d in in_window:
+            v = float(by_date[d]["total_value"])
+            if peak is None or v > peak:
+                peak = v
+            if peak:
+                dd = (peak - v) / peak
+                if max_dd is None or dd > max_dd:
+                    max_dd = dd
+        # 最低现金占比
+        cash_ratios = []
+        for d in in_window:
+            cash = by_date[d].get("cash")
+            tv = by_date[d].get("total_value")
+            if cash is not None and tv and float(tv) > 0:
+                cash_ratios.append(float(cash) / float(tv))
+        min_cash_ratio = min(cash_ratios) if cash_ratios else None
+        # 判定
+        if strategy_return is None:
+            verdict, reason = "n/a", "窗口内净值数据不足"
+        elif strategy_return >= 0:
+            verdict, reason = "defensive", "危机期仍取得正收益/持平"
+        elif min_cash_ratio is not None and min_cash_ratio >= _CRISIS_DEFENSIVE_CASH:
+            verdict, reason = "defensive", f"高现金避险（最低现金占比 {min_cash_ratio:.0%}）"
+        else:
+            verdict, reason = "exposed", f"危机期受损且现金占比低（最低 {min_cash_ratio:.0%}）"
+        result.append({
+            "key": w["key"], "name": w["name"],
+            "start": w["start"], "end": w["end"],
+            "strategy_return": strategy_return,
+            "benchmark_return": benchmark_return,
+            "max_drawdown": max_dd,
+            "min_cash_ratio": min_cash_ratio,
+            "verdict": verdict, "reason": reason,
+        })
+    return result
+
+
+def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dict:
+    """回测"验证结论"聚合：容量健康 + 危机防御 + 样本外引用，随结果冻结落库。
+
+    - capacity：build_capacity_warnings 的告警列表（空=健康）；
+    - crisis：固定窗口危机防御验证（build_crisis_verification）；
+    - oos：该组合最近的 walk-forward 运行摘要（None=未做过样本外验证）。
+    """
+    snapshots = result.get("snapshots") or []
+    trades = result.get("trades") or []
+    warnings = build_capacity_warnings(
+        trades, klines,
+        result.get("evaluations") or {},
+        getattr(ps, "position_sizing", "dynamic"),
+        getattr(ps, "equity_cap", None),
+    )
+    crisis = build_crisis_verification(snapshots)
+    oos: Optional[dict] = None
+    if db is not None:
+        wf = (
+            db.query(WalkForwardRun)
+            .filter(WalkForwardRun.portfolio_strategy_id == ps.id)
+            .order_by(WalkForwardRun.id.desc())
+            .first()
+        )
+        if wf is not None:
+            oos = {
+                "run_id": wf.id, "name": wf.name,
+                "completed_at": wf.completed_at,
+                "windows_passed": (json.loads(wf.summary_json or "{}")
+                                   .get("windows_passed")),
+                "overall_pass": (json.loads(wf.summary_json or "{}")
+                                 .get("overall_pass")),
+            }
+    return {
+        "capacity": warnings,
+        "crisis": crisis,
+        "oos": oos,
+    }
+
+
+def build_capacity_warnings(
+    trades: list,
+    klines: dict,
+    evaluations: Optional[dict] = None,
+    position_sizing: str = "dynamic",
+    equity_cap=None,
+) -> list:
+    """容量健康度告警（自动）：即使未设 equity_cap，也在结果里明确提示
+    "该结果是否含不可实现仓位"。
+
+    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_手×100×Close)，从 klines 估算）：
+      最大占比 ≥ 30% → 该笔实盘按回测价成交不现实；
+    - 最大单票权重 max_single_weight > 25% → 集中度/权重随涨幅过度膨胀；
+    - dynamic 且未设 equity_cap 时命中任一 → 附设置容量上限/成交量约束的建议。
+
+    仅在有成交且可估算 ADV 时生效；无数据静默跳过（不误报）。
+    """
+    if not trades:
+        return []
+    warns: list = []
+    # 1. 每股日均成交额（元）。TQ 单位已实测确认：Volume=股、Amount=万元。
+    #    故优先用 量(股)×价(元) 直接得元口径；Amount(万元)×10000 兜底。
+    adv_by_code: Dict[str, float] = {}
+    for code, periods in (klines or {}).items():
+        df = periods.get("1d") if isinstance(periods, dict) else None
+        if df is None:
+            continue
+        try:
+            cols = df.columns
+            amounts = df["Amount"].to_list() if "Amount" in cols else None
+            vols = df["Volume"].to_list() if "Volume" in cols else None
+            closes = df["Close"].to_list() if "Close" in cols else None
+        except Exception:
+            continue
+        day_amts = []
+        if vols is not None and closes is not None:
+            day_amts = [
+                float(v) * float(c)
+                for v, c in zip(vols, closes)
+                if v is not None and c is not None and float(v) > 0 and float(c) > 0
+            ]
+        if not day_amts and amounts is not None:
+            day_amts = [float(a) * 10000.0 for a in amounts
+                        if a is not None and float(a) > 0]
+        if day_amts:
+            adv_by_code[code] = sum(day_amts) / len(day_amts)
+    # 2. 最大单笔成交 vs ADV 占比
+    worst = None  # (amount, code, adv, ratio)
+    for t in trades:
+        code = getattr(t, "stock_code", None)
+        adv = adv_by_code.get(code)
+        if not adv or adv <= 0:
+            continue
+        amt = float(getattr(t, "amount", 0) or 0)
+        if amt <= 0:
+            continue
+        ratio = amt / adv
+        if worst is None or ratio > worst[3]:
+            worst = (amt, code, adv, ratio)
+    if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
+        amt, code, adv, ratio = worst
+        warns.append(
+            f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
+            f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
+            f"实盘按此价成交不现实，该结果可能含不可实现仓位"
+        )
+    # 3. 最大单票权重
+    msw = (evaluations or {}).get("max_single_weight")
+    if msw is not None and float(msw) > _CAP_MAX_WEIGHT_WARN:
+        warns.append(
+            f"集中度预警：最大单票权重 {float(msw):.1%} 超过 {_CAP_MAX_WEIGHT_WARN:.0%}，"
+            f"组合过度集中于单只股票（仓位随涨幅膨胀）"
+        )
+    # 4. 修复建议
+    if warns and position_sizing == "dynamic" and not equity_cap:
+        warns.append(
+            "容量建议：为组合设置 equity_cap（容量上限，仓位封顶）或开启 "
+            "volume_limit 成交量约束，让仓位落在真实可成交规模；否则本结果仅作上界参考"
+        )
+    return warns
+
+
+def run_backtest(db: Session, ps: PortfolioStrategy, req,
+                 param_overrides: Optional[dict] = None) -> dict:
     """回测主链路（从路由 _run_backtest_locked 迁入）。
 
     前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
@@ -2229,13 +2605,36 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     异常：标 record(failed) + re-raise（路由层全局异常处理器兜底转 {code:500}，
           与现状一致——原 _run_backtest_locked 也是 raise 出去）。
 
+    param_overrides（P2b 参数微扰，可选，默认 None 行为不变）：
+    {子策略数值字段: 乘性因子}，各子策略按自身基准值缩放（int 字段按因子
+    方向 floor/ceil 且 ≥1）。先 expunge 脱管再改值——db.commit() 不会把
+    扰动值 flush 回 strategies 表，扰动仅作用于本轮内存装配。
+
     返回纯 dict（不经 ok() 包装，由路由层统一 ok()）。
     """
     strategies = (
         db.query(Strategy)
         .filter_by(portfolio_id=ps.id)
+        .order_by(Strategy.id)
         .all()
     )
+    if param_overrides:
+        for s in strategies:
+            db.expunge(s)
+            for field, factor in param_overrides.items():
+                base = getattr(s, field, None)
+                if base is None:
+                    continue
+                if isinstance(base, bool):
+                    continue
+                if isinstance(base, int):
+                    scaled = base * factor
+                    v = math.floor(scaled) if factor < 1 else math.ceil(scaled)
+                    setattr(s, field, max(1, int(v)))
+                elif isinstance(base, Decimal):
+                    setattr(s, field, clamp_perturbed_value(field, base * Decimal(str(factor))))
+                else:
+                    setattr(s, field, clamp_perturbed_value(field, base * factor))
 
     # 复权模式：读请求参数，非法值回退前复权（保持历史行为 + 防脏数据）
     dividend_mode = getattr(req, "dividend_mode", "front") or "front"
@@ -2247,6 +2646,42 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     else:
         accounting_mode = signal_mode = dividend_mode
 
+    # B6 考核口径：读请求参数，非法值回退 absolute（保持默认行为 + 防脏数据）
+    evaluation_profile = getattr(req, "evaluation_profile", "absolute") or "absolute"
+    if evaluation_profile not in ACCEPTANCE_PROFILES:
+        evaluation_profile = "absolute"
+
+    # C7 IS/OOS 采纳门槛（默认关）：读请求参数，非法 ratio 回退 0.5
+    is_oos_gate_enabled = bool(getattr(req, "is_oos_gate_enabled", False))
+    try:
+        oos_gate_min_ratio = float(getattr(req, "oos_gate_min_ratio", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        oos_gate_min_ratio = 0.5
+    # 费用预留（run 级可选，默认关）：买入审批含佣金防现金为负
+    fee_reserve_enabled = bool(getattr(req, "fee_reserve_enabled", False))
+    # 可转债 run 级开关（默认关，仅回测生效）：T+0 回转 / 10 张取整
+    bond_t0_enabled = bool(getattr(req, "bond_t0_enabled", False))
+    bond_lot_enabled = bool(getattr(req, "bond_lot_enabled", False))
+    # 自适应滑点 run 级覆盖（None=用组合默认；显式 bool/coef 临时覆盖不改组合）
+    adaptive_slippage_enabled = getattr(req, "adaptive_slippage_enabled", None)
+    slippage_impact_coef = getattr(req, "slippage_impact_coef", None)
+    # 成交量约束 run 级覆盖（None=用组合默认）
+    volume_limit_enabled = getattr(req, "volume_limit_enabled", None)
+    volume_limit_ratio = getattr(req, "volume_limit_ratio", None)
+    # 容量上限 run 级覆盖（None=用组合默认）
+    equity_cap = getattr(req, "equity_cap", None)
+    # 快照用的生效值：组合默认 or run 级覆盖（fee_reserve 仅 run 级）
+    eff_adaptive = (
+        bool(adaptive_slippage_enabled)
+        if adaptive_slippage_enabled is not None
+        else bool(getattr(ps, "adaptive_slippage_enabled", False))
+    )
+    eff_impact_coef = (
+        slippage_impact_coef
+        if slippage_impact_coef is not None
+        else getattr(ps, "slippage_impact_coef", None)
+    )
+
     # 写 record（running）
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id,
@@ -2254,7 +2689,20 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         start_date=req.start_date,
         end_date=req.end_date,
         status="running",
-        params_snapshot=build_params_snapshot(ps, dividend_mode=dividend_mode),
+        params_snapshot=build_params_snapshot(
+            ps, dividend_mode=dividend_mode,
+            fee_reserve_enabled=fee_reserve_enabled,
+            bond_t0_enabled=bond_t0_enabled,
+            bond_lot_enabled=bond_lot_enabled,
+            adaptive_slippage_enabled=eff_adaptive,
+            slippage_impact_coef=eff_impact_coef,
+            volume_limit_enabled=volume_limit_enabled,
+            volume_limit_ratio=volume_limit_ratio,
+            equity_cap=equity_cap,
+        ),
+        evaluation_profile=evaluation_profile,
+        is_oos_gate_enabled=is_oos_gate_enabled,
+        oos_gate_min_ratio=oos_gate_min_ratio,
     )
     db.add(rec)
     db.commit()
@@ -2264,6 +2712,20 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     try:
         t0 = datetime.now()
         portfolio = _assemble_portfolio(ps, strategies, db)
+        # run 级覆盖装配：费用预留 + 可转债开关 + 自适应滑点 + 成交量约束 + 容量上限（不改组合表，仅本轮内存生效）
+        portfolio.fee_reserve_enabled = fee_reserve_enabled
+        portfolio.bond_t0_enabled = bond_t0_enabled
+        portfolio.bond_lot_enabled = bond_lot_enabled
+        if adaptive_slippage_enabled is not None:
+            portfolio.adaptive_slippage_enabled = bool(adaptive_slippage_enabled)
+        if slippage_impact_coef is not None:
+            portfolio.slippage_impact_coef = Decimal(str(slippage_impact_coef))
+        if volume_limit_enabled is not None:
+            portfolio.volume_limit_enabled = bool(volume_limit_enabled)
+        if volume_limit_ratio is not None:
+            portfolio.volume_limit_ratio = Decimal(str(volume_limit_ratio))
+        if equity_cap is not None:
+            portfolio.equity_cap = Decimal(str(equity_cap))
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
         klines_full = build_klines(
@@ -2298,9 +2760,30 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
-        benchmark_data = build_benchmark_data(
-            ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
+        # W-B 基准取数去重：任一策略启用 regime_filter_enabled 时，本就会拉取
+        # [start-620d, end] 全区间基准收盘（regime_closes）；benchmark_data 直接
+        # 从其中切片主区间，不再单独调 build_benchmark_data（同一指数、区间重叠，
+        # 避免二次 TQ 往返）。未启用 regime 维持原 build_benchmark_data。
+        regime_enabled = any(
+            getattr(s, "regime_filter_enabled", False) for s in strategies
         )
+        benchmark_code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
+        regime_closes: Dict[date, Decimal] = {}
+        if regime_enabled:
+            regime_closes = build_index_close_series(
+                [benchmark_code],
+                req.start_date - timedelta(days=620),
+                req.end_date,
+                dividend_mode=accounting_mode,
+            ).get(benchmark_code, {})
+            benchmark_data = {
+                d: c for d, c in regime_closes.items()
+                if req.start_date <= d <= req.end_date
+            }
+        else:
+            benchmark_data = build_benchmark_data(
+                ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
+            )
         t4 = datetime.now()
 
         # 各阶段耗时日志（定位回测慢的根因）
@@ -2323,15 +2806,44 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
                     "snapshots_count": 0, "evaluations": {}}
 
         t6 = datetime.now()
+        # B5 市场状态闸（默认关）：任一策略开启 regime_filter_enabled 时构建因果
+        # 状态跟踪器。regime_closes 已在上面（W-B 基准去重处）一次拉取 [start-620d, end]
+        # 全区间基准收盘；这里只用 start 前的历史预喂（区间内由引擎逐 bar 喂入，
+        # 纯因果，禁未来函数）。未开启传 None。
+        regime_tracker = None
+        if regime_enabled:
+            regime_tracker = CausalRegimeTracker()
+            regime_tracker.feed_history(
+                {d: c for d, c in regime_closes.items() if d < req.start_date}
+            )
         engine = BacktestEngine()
         result = engine.run(
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
             benchmark_data=benchmark_data,
+            regime_tracker=regime_tracker,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
+
+        # W5-O5：样本不足一年（< 252 交易日）→ 告警年化收益仅供参考
+        n_trading_days = len(_dedup_daily_by_date(result.get("snapshots") or []))
+        if n_trading_days < 252:
+            warnings.append(
+                f"回测区间仅 {n_trading_days} 个交易日（< 252），"
+                f"年化收益基于不足一年样本，仅供参考"
+            )
+
+        # 容量健康度自动预警：即使未设 equity_cap，命中"单笔>30%日均成交额 /
+        # 单票权重>25%"时，在结果里明确提示"该结果含不可实现仓位"并附修复建议。
+        warnings.extend(build_capacity_warnings(
+            result.get("trades") or [],
+            klines,
+            result.get("evaluations") or {},
+            getattr(ps, "position_sizing", "dynamic"),
+            getattr(ps, "equity_cap", None),
+        ))
 
         _persist_result(db, record_id, ps.id, result, strategies)
         t8 = datetime.now()
@@ -2342,6 +2854,11 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         # 告警：行情跳过 + 信号预检（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
         rec.warnings_json = (
             json.dumps(warnings, ensure_ascii=False) if warnings else None
+        )
+        # 验证结论冻结：容量健康 + 危机防御 + 样本外引用（随记录审计）
+        rec.validation_json = json.dumps(
+            build_validation_verdict(result, klines, ps, db),
+            ensure_ascii=False, default=str,
         )
         rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
         db.commit()
@@ -2359,7 +2876,41 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
     safe_compute_crisis_alpha(
         db, rec.id, ps, result["snapshots"], req.start_date, req.end_date
     )
-    safe_compute_robustness(db, rec.id)
+    rb_row = safe_compute_robustness(db, rec.id)
+
+    # 机遇/中性Alpha（市场状态×绩效）随回测同时计算（与危机Alpha 同点，非手动重算）：
+    # 用已落库成交（_persist_result 已写入 backtest_trades）走与「离线重算」完全一致的
+    # 路径；失败由 safe_ 包装标 failed，不阻断回测主链路。
+    trades_orm = (
+        db.query(BacktestTrade)
+        .filter_by(backtest_record_id=rec.id)
+        .order_by(BacktestTrade.bar_time, BacktestTrade.id)
+        .all()
+    )
+    safe_compute_market_regime(
+        db, rec.id, ps, result["snapshots"], trades_orm,
+        req.start_date, req.end_date,
+    )
+
+    # C7 IS/OOS 采纳门槛（默认关）：仅启用时按稳健性 oos 块评估并落库；
+    # rejected 只标记不删记录（审计友好）；数据不足 gate_status=None。
+    gate = None
+    if rec.is_oos_gate_enabled:
+        payload = json.loads(rb_row.payload_json) if rb_row and rb_row.payload_json else None
+        verdict = evaluate_oos_gate(
+            (payload or {}).get("oos"), float(rec.oos_gate_min_ratio or 0.5),
+        )
+        rec.gate_status = verdict["status"]
+        rec.gate_reasons = (
+            json.dumps(verdict["reasons"], ensure_ascii=False)
+            if verdict["reasons"] else None
+        )
+        db.commit()
+        gate = {
+            "status": verdict["status"],
+            "reasons": verdict["reasons"],
+            "min_ratio": float(rec.oos_gate_min_ratio),
+        }
 
     return {
         "record_id": record_id,
@@ -2367,4 +2918,5 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req) -> dict:
         "snapshots_count": len(_dedup_daily_by_date(result["snapshots"])),
         "evaluations": result.get("evaluations") or {},
         "warnings": warnings,
+        "gate": gate,
     }

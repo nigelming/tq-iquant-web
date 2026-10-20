@@ -349,6 +349,7 @@ def _mock_data(monkeypatch):
     })
     monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    monkeypatch.setattr(svc, "safe_compute_market_regime", lambda *a, **kw: None)
 
 
 def _post_backtest(c, ps_id):
@@ -868,4 +869,487 @@ def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     assert ca["error"] == "probe error text"
     assert ca["computed_at"] == "2026-09-25T10:00:00"
     assert ca["data"] == {"total_score": 3}
+
+
+# ===========================================================================
+# B6：evaluation_profile 落库 + 详情 acceptance 块 + ?profile= 临时切换口径
+# ===========================================================================
+def test_evaluation_profile_persisted_and_acceptance_block(client, monkeypatch):
+    """POST 带 evaluation_profile='relative' → 落库；详情 acceptance 按 relative 口径。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    resp = c.post("/api/backtest", json={
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_profile_relative",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "evaluation_profile": "relative",
+    })
+    assert resp.status_code == 200
+    record_id = resp.json()["data"]["record_id"]
+
+    db = Session()
+    assert db.get(BacktestRecord, record_id).evaluation_profile == "relative"
+    db.close()
+
+    data = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert data["record"]["evaluation_profile"] == "relative"
+    acc = data["acceptance"]
+    assert acc["profile"] == "relative"
+    assert {chk["metric"] for chk in acc["checks"]} == {
+        "information_ratio", "excess_annual_return", "down_capture_ratio"}
+    assert "pass" in acc
+
+
+def test_acceptance_default_absolute_and_profile_override(client, monkeypatch):
+    """默认 absolute；?profile=relative 仅临时切换 acceptance 口径，不改记录存储值。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    # 默认：absolute 口径
+    data = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert data["record"]["evaluation_profile"] == "absolute"
+    acc = data["acceptance"]
+    assert acc["profile"] == "absolute"
+    assert {chk["metric"] for chk in acc["checks"]} == {
+        "annual_return", "max_drawdown", "calmar_ratio"}
+
+    # ?profile=relative：acceptance 切换，record 序列化与落库值不变
+    data2 = c.get(f"/api/backtest/records/{record_id}?profile=relative").json()["data"]
+    assert data2["acceptance"]["profile"] == "relative"
+    assert data2["record"]["evaluation_profile"] == "absolute"
+    db = Session()
+    assert db.get(BacktestRecord, record_id).evaluation_profile == "absolute"
+    db.close()
+
+
+def test_evaluation_profile_invalid_falls_back_to_absolute(client, monkeypatch):
+    """非法 evaluation_profile → 回落 absolute 落库（防御性，不 422）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    resp = c.post("/api/backtest", json={
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_profile_bogus",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "evaluation_profile": "bogus",
+    })
+    assert resp.status_code == 200
+    record_id = resp.json()["data"]["record_id"]
+    db = Session()
+    assert db.get(BacktestRecord, record_id).evaluation_profile == "absolute"
+    db.close()
+
+
+# ===========================================================================
+# C7：IS/OOS 采纳门槛（默认关）——OOS CAGR ≥ ratio × IS CAGR 且 OOS 不跑输基准
+# ===========================================================================
+class _FakeRobustnessRow:
+    """safe_compute_robustness 的替身：只带 payload_json。"""
+
+    def __init__(self, payload):
+        self.payload_json = json.dumps(payload) if payload is not None else None
+
+
+def _oos_payload(in_cagr, out_cagr, out_return=0.30, bench=0.10):
+    return {"oos": {
+        "split_year": "2024",
+        "in_sample": {"cagr": in_cagr, "return": 0.80, "benchmark_return": 0.20},
+        "out_of_sample": {"cagr": out_cagr, "return": out_return, "benchmark_return": bench},
+    }}
+
+
+def _post_gate(c, ps_id, **extra):
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_gate",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "is_oos_gate_enabled": True,
+    }
+    payload.update(extra)
+    return c.post("/api/backtest", json=payload)
+
+
+def test_oos_gate_default_disabled(client, monkeypatch):
+    """默认不启用：不评估，gate_status=None，POST 响应 gate=None。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    assert _post_backtest(c, ps_id).json()["data"].get("gate") is None
+
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    assert rec.is_oos_gate_enabled is False
+    assert rec.gate_status is None
+    db.close()
+
+    data = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert data["record"]["is_oos_gate_enabled"] is False
+    assert data["record"]["gate_status"] is None
+    assert data["record"]["gate_reasons"] == []
+
+
+def test_oos_gate_rejected_when_oos_collapses(client, monkeypatch):
+    """启用且 OOS 崩塌（IS 24.8% → OOS 6.6% < 50%×IS）→ rejected + 人读原因，记录保留。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    monkeypatch.setattr(svc, "safe_compute_robustness",
+                        lambda db, rid, **kw: _FakeRobustnessRow(_oos_payload(0.248, 0.066)))
+    resp = _post_gate(c, ps_id)
+    assert resp.status_code == 200
+    gate = resp.json()["data"]["gate"]
+    assert gate["status"] == "rejected"
+    assert any("6.6%" in r and "24.8%" in r for r in gate["reasons"])
+    record_id = resp.json()["data"]["record_id"]
+
+    # 落库 + 记录保留（rejected 仅标记，不删除）
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    assert rec is not None
+    assert rec.status == "completed"
+    assert rec.gate_status == "rejected"
+    assert json.loads(rec.gate_reasons)
+    db.close()
+
+    data = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert data["record"]["gate_status"] == "rejected"
+    assert data["record"]["oos_gate_min_ratio"] == 0.5
+    assert len(data["record"]["gate_reasons"]) == 1
+
+
+def test_oos_gate_passed_when_healthy(client, monkeypatch):
+    """启用且 OOS 健康（16.6% ≥ 12.4%，OOS 收益跑赢基准）→ passed。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    monkeypatch.setattr(svc, "safe_compute_robustness",
+                        lambda db, rid, **kw: _FakeRobustnessRow(_oos_payload(0.248, 0.166)))
+    resp = _post_gate(c, ps_id)
+    gate = resp.json()["data"]["gate"]
+    assert gate["status"] == "passed"
+    assert gate["reasons"] == []
+
+    db = Session()
+    assert db.get(BacktestRecord, resp.json()["data"]["record_id"]).gate_status == "passed"
+    db.close()
+
+
+def test_oos_gate_not_evaluated_when_data_insufficient(client, monkeypatch):
+    """启用但数据不足（真实稳健性：3 天快照仅 1 个日历年 → oos=None）→ gate_status=None。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)  # 不 mock robustness：真实计算，oos 必然 None
+    resp = _post_gate(c, ps_id)
+    gate = resp.json()["data"]["gate"]
+    assert gate["status"] is None
+    assert gate["reasons"]  # 人读原因：数据不足未评估
+
+    db = Session()
+    rec = db.get(BacktestRecord, resp.json()["data"]["record_id"])
+    assert rec.gate_status is None
+    assert rec.gate_reasons  # 原因仍落库
+    db.close()
+
+
+def test_oos_gate_invalid_ratio_400(client):
+    """门槛比例越界（>2、<0.1 或 0）→ 400。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    resp = _post_gate(c, ps_id, oos_gate_min_ratio=3.0)
+    assert resp.json()["code"] == 400
+    resp = _post_gate(c, ps_id, oos_gate_min_ratio=0)
+    assert resp.json()["code"] == 400
+    resp = _post_gate(c, ps_id, oos_gate_min_ratio=0.05)
+    assert resp.json()["code"] == 400
+
+
+# ===========================================================================
+# C8：walk-forward 滚动验证（滚动 3 年训练 + 1 年验证逐段前移）
+# ===========================================================================
+import core.services.walk_forward_service as wf_svc
+from core.models import WalkForwardRun
+
+
+def _wf_payload(ps_id, **extra):
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "wf_test",
+        "start_date": "2020-01-01",
+        "end_date": "2023-01-01",
+        "train_years": 1,
+        "test_years": 1,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_walk_forward_happy_path(client, monkeypatch):
+    """2 窗滚动（2020~2022 / 2021~2023）：子回测落库并关联 run、列表过滤子记录、
+    run summary 聚合各窗门槛，全窗 passed → overall_pass=True。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    monkeypatch.setattr(
+        wf_svc, "safe_compute_robustness",
+        lambda db, rid, **kw: _FakeRobustnessRow(_oos_payload(0.248, 0.166)),
+    )
+    resp = c.post("/api/backtest/walk-forward", json=_wf_payload(ps_id))
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["status"] == "completed"
+    assert data["windows_passed"] == "2/2"
+    assert data["overall_pass"] is True
+    run_id = data["run_id"]
+
+    # 子回测落库并关联 run；命名 名称#wN
+    db = Session()
+    children = db.query(BacktestRecord).filter_by(walk_forward_run_id=run_id).all()
+    assert len(children) == 2
+    assert {ch.name for ch in children} == {"wf_test#w1", "wf_test#w2"}
+    assert all(ch.status == "completed" for ch in children)
+    child_ids = {ch.id for ch in children}
+    db.close()
+
+    # 列表接口默认过滤子记录
+    recs = c.get("/api/backtest/records").json()["data"]
+    assert all(r["id"] not in child_ids for r in recs)
+
+    # run 详情：summary 各窗带 IS/OOS 与门槛结果
+    run = c.get(f"/api/backtest/walk-forward/{run_id}").json()["data"]
+    assert run["status"] == "completed"
+    assert run["train_years"] == 1 and run["test_years"] == 1
+    summary = run["summary"]
+    assert summary["overall_pass"] is True
+    assert summary["windows_passed"] == "2/2"
+    assert len(summary["windows"]) == 2
+    w1 = summary["windows"][0]
+    assert w1["train"] == {"start": "2020-01-01", "end": "2021-01-01"}
+    assert w1["test"] == {"start": "2021-01-01", "end": "2022-01-01"}
+    assert w1["is_cagr"] == 0.248 and w1["oos_cagr"] == 0.166
+    assert w1["gate"]["status"] == "passed"
+    assert w1["record_id"] in child_ids
+
+    # 列表端点含该 run
+    runs = c.get("/api/backtest/walk-forward").json()["data"]
+    assert any(r["id"] == run_id for r in runs)
+
+
+def test_walk_forward_delete_removes_run_and_children(client, monkeypatch):
+    """删除 walk-forward：run 与子回测记录（含其快照/成交）一并删除。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    monkeypatch.setattr(
+        wf_svc, "safe_compute_robustness",
+        lambda db, rid, **kw: _FakeRobustnessRow(_oos_payload(0.248, 0.166)),
+    )
+    run_id = c.post("/api/backtest/walk-forward", json=_wf_payload(ps_id)).json()["data"]["run_id"]
+
+    db = Session()
+    children = db.query(BacktestRecord).filter_by(walk_forward_run_id=run_id).all()
+    child_ids = [ch.id for ch in children]
+    assert len(child_ids) == 2
+    db.close()
+
+    resp = c.delete(f"/api/backtest/walk-forward/{run_id}")
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+
+    db = Session()
+    assert db.query(BacktestRecord).filter(BacktestRecord.id.in_(child_ids)).count() == 0
+    assert db.query(WalkForwardRun).filter_by(id=run_id).first() is None
+    db.close()
+    # 再次删除 → body code=404（envelope 模式：HTTP 保持 200，code 与 HTTP 对齐）
+    assert c.delete(f"/api/backtest/walk-forward/{run_id}").json()["code"] == 404
+
+
+def test_walk_forward_overall_fail_when_window_rejected(client, monkeypatch):
+    """任一窗 OOS 崩塌 → overall_pass=False，windows_passed 计数正确。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    monkeypatch.setattr(
+        wf_svc, "safe_compute_robustness",
+        lambda db, rid, **kw: _FakeRobustnessRow(_oos_payload(0.248, 0.066)),
+    )
+    data = c.post("/api/backtest/walk-forward", json=_wf_payload(ps_id)).json()["data"]
+    assert data["status"] == "completed"
+    assert data["windows_passed"] == "0/2"
+    assert data["overall_pass"] is False
+
+    run = c.get(f"/api/backtest/walk-forward/{data['run_id']}").json()["data"]
+    assert run["summary"]["windows"][0]["gate"]["status"] == "rejected"
+    assert run["summary"]["windows"][0]["gate"]["reasons"]
+
+
+def test_walk_forward_insufficient_range_marks_failed(client, monkeypatch):
+    """区间不足一个完整窗口 → run failed + 人读错误，无子回测。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    payload = _wf_payload(ps_id, start_date="2022-01-01", end_date="2023-06-01",
+                          train_years=3, test_years=1)
+    data = c.post("/api/backtest/walk-forward", json=payload).json()["data"]
+    assert data["status"] == "failed"
+    assert "不足一个完整窗口" in data["error"]
+
+    db = Session()
+    assert db.query(BacktestRecord).filter_by(
+        walk_forward_run_id=data["run_id"]).count() == 0
+    run = db.get(WalkForwardRun, data["run_id"])
+    assert run.status == "failed" and run.error_message
+    db.close()
+
+
+def test_walk_forward_validation_errors(client):
+    """ps 不存在 404；train_years<1 / 门槛越界 400；run 不存在 404。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    assert c.post("/api/backtest/walk-forward",
+                  json=_wf_payload(99999)).json()["code"] == 404
+    assert c.post("/api/backtest/walk-forward",
+                  json=_wf_payload(ps_id, train_years=0)).json()["code"] == 400
+    assert c.post("/api/backtest/walk-forward",
+                  json=_wf_payload(ps_id, test_years=0)).json()["code"] == 400
+    assert c.post("/api/backtest/walk-forward",
+                  json=_wf_payload(ps_id, oos_gate_min_ratio=3.0)).json()["code"] == 400
+    assert c.get("/api/backtest/walk-forward/99999").json()["code"] == 404
+
+
+# ===========================================================================
+# P2b：参数微扰敏感性分析（单参数逐一 ±pct，新表落库 + 独立端点）
+# ===========================================================================
+from core.models import Strategy
+
+
+def _pp_payload(ps_id, **extra):
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "pp_test",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "perturb_pct": 0.10,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_param_perturb_happy_path(client, monkeypatch):
+    """基准 1 轮 + 9 参数 × 2 方向 18 轮（trailing_stop_ratio=0 跳过）：
+    子回测落库并关联 run、列表过滤子记录、summary 聚合敏感度，
+    且扰动不回写 strategies 表（expunge 保护）。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, _ = _seed(db)
+    db.close()
+
+    _mock_data(monkeypatch)
+    resp = c.post("/api/backtest/param-perturb", json=_pp_payload(ps_id))
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["status"] == "completed"
+    assert data["rounds_run"] == "18/18"
+    assert data["most_sensitive"] is not None
+    run_id = data["run_id"]
+
+    # 子回测落库并关联 run：1 基准 + 18 扰动 = 19 条
+    db = Session()
+    children = db.query(BacktestRecord).filter_by(param_perturb_run_id=run_id).all()
+    assert len(children) == 19
+    assert {ch.name for ch in children} >= {"pp_test#base"}
+    child_ids = {ch.id for ch in children}
+
+    # 扰动不回写 strategies 表：原参数保持种子值
+    strat = db.get(Strategy, strat_id)
+    assert strat.stop_loss_ratio == Decimal("0.05")
+    assert strat.max_positions == 5
+    assert strat.capital_ratio == Decimal("0.6")
+    db.close()
+
+    # 列表接口默认过滤子记录
+    recs = c.get("/api/backtest/records").json()["data"]
+    assert all(r["id"] not in child_ids for r in recs)
+
+    # run 详情：summary 含基准/轮次/参数聚合
+    run = c.get(f"/api/backtest/param-perturb/{run_id}").json()["data"]
+    assert run["status"] == "completed"
+    assert run["perturb_pct"] == pytest.approx(0.10)
+    summary = run["summary"]
+    assert summary["baseline"]["record_id"] in child_ids
+    assert summary["baseline"]["status"] == "completed"
+    assert len(summary["rounds"]) == 18
+    r0 = summary["rounds"][0]
+    assert r0["param"] and r0["direction"] in ("low", "high")
+    assert r0["record_id"] in child_ids
+    params = {p["param"]: p for p in summary["params"]}
+    assert "trailing_stop_ratio" not in params  # 基准 0 不可扰动
+    assert "stop_loss_ratio" in params
+    assert params["stop_loss_ratio"]["delta_cagr"] is not None
+    assert summary["most_sensitive"] in params
+
+    # 列表端点含该 run
+    runs = c.get("/api/backtest/param-perturb").json()["data"]
+    assert any(r["id"] == run_id for r in runs)
+
+
+def test_param_perturb_validation_errors(client):
+    """ps 不存在 404；扰动幅度越界 400；run 不存在 404。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    assert c.post("/api/backtest/param-perturb",
+                  json=_pp_payload(99999)).json()["code"] == 404
+    assert c.post("/api/backtest/param-perturb",
+                  json=_pp_payload(ps_id, perturb_pct=0)).json()["code"] == 400
+    assert c.post("/api/backtest/param-perturb",
+                  json=_pp_payload(ps_id, perturb_pct=0.6)).json()["code"] == 400
+    assert c.get("/api/backtest/param-perturb/99999").json()["code"] == 404
 

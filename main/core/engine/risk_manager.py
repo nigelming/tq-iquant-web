@@ -35,13 +35,16 @@ class StrategyRiskManager:
         profit = (current_price - position.avg_cost) / position.avg_cost
         return profit >= self.take_profit_ratio
 
-    def check_trailing_stop(self, position: Position, current_price: Decimal) -> bool:
-        if position.quantity == 0 or self.trailing_stop_ratio == 0:
+    def check_trailing_stop(self, position: Position, current_price: Decimal,
+                            ratio: Optional[Decimal] = None) -> bool:
+        """移动止损。ratio 可覆盖实例阈值（B5 市场状态闸：趋势态放宽止损）。"""
+        threshold = ratio if ratio is not None else self.trailing_stop_ratio
+        if position.quantity == 0 or threshold == 0:
             return False
         if current_price > position.highest_price:
             return False
         drawdown = (position.highest_price - current_price) / position.highest_price
-        return drawdown >= self.trailing_stop_ratio
+        return drawdown >= threshold
 
 
 class PortfolioRiskManager:

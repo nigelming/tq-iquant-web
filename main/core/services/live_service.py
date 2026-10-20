@@ -19,7 +19,7 @@ start_session 只返回构造好、heartbeat 通过、recover 已执行但尚未
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
@@ -36,6 +36,7 @@ from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
 from core.engine.decision import summarize_decisions
+from core.engine.crisis_alpha import DEFAULT_BENCHMARK_CODE
 from core.engine.event import TradeEvent
 from core.engine.position import Position
 from core.tq.formula import TQFormula
@@ -107,6 +108,8 @@ def build_engine(
     )
     portfolios = []
     stock_codes: set = set()
+    # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
+    benchmark_codes: Dict[int, str] = {}
     formula_ids: set = set()
     strategy_formula: Dict[int, int] = {}  # strategy_id -> formula_id
     # 预热/分发按 (code, period) 取该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
@@ -121,9 +124,10 @@ def build_engine(
         ps = db.query(PortfolioStrategy).filter_by(id=link.portfolio_strategy_id).first()
         if ps is None:
             continue
-        strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).all()
+        strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
         port = assemble_portfolio(ps, strategies, db)
         portfolios.append(port)
+        benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
         pool_codes = resolve_stock_codes(db, ps.id)
         stock_codes.update(pool_codes)
         for strat in strategies:
@@ -160,6 +164,15 @@ def build_engine(
         # 无任何带公式的策略 → 兜底；有则取 max
         code_period_count[(code, period)] = max(counts) if counts else DEFAULT_COUNT
 
+    def _regime_provider(code: str, end_date):
+        """B5：拉基准收盘历史（end_date 前 ~620 天 ~ end_date），供因果 regime 跟踪。
+        局部 import 避免 live_service ↔ backtest_service 模块级耦合；仅在有策略
+        开启 regime_filter_enabled 时被 LiveEngine 调用（默认完全不触发）。"""
+        from core.services.backtest_service import build_index_close_series
+        return build_index_close_series(
+            [code], end_date - timedelta(days=620), end_date,
+        ).get(code, {})
+
     br = bridge_config()
     # 按 session.mode 选桥：simulation→仿真桥(8790/虚拟资金)，live→实盘桥(8791/真实资金)。
     # 未知 mode 兜底仿真桥（防误传走到真实资金桥）。
@@ -181,6 +194,8 @@ def build_engine(
         formula_count=200,
         formula_count_by_name=formula_count_by_name,
         code_period_count=code_period_count,
+        regime_provider=_regime_provider,
+        benchmark_codes=benchmark_codes,
     )
 
 

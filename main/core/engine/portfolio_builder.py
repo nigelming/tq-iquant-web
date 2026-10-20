@@ -42,6 +42,7 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
         portfolio_id=ps.id,
         initial_capital=Decimal(str(ps.initial_capital)),
         risk_manager=pm,
+        position_sizing=getattr(ps, "position_sizing", None) or "dynamic",
         cost_params={
             "min_commission": Decimal(str(ps.min_commission)),
             "buy_commission_rate": Decimal(str(ps.buy_commission_rate)),
@@ -50,6 +51,29 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             "slippage": Decimal(str(ps.slippage)),
         },
     )
+    # #1 涨跌停约束（默认开；仅回测成交步生效）
+    port.price_limit_check_enabled = bool(getattr(ps, "price_limit_check_enabled", True))
+    # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
+    port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
+    _vol_ratio = getattr(ps, "volume_limit_ratio", None)
+    if _vol_ratio is not None:
+        port.volume_limit_ratio = Decimal(str(_vol_ratio))
+    # #4 自适应滑点（可选，默认关；仅回测成交步生效）：市场冲击随订单量占比上浮
+    port.adaptive_slippage_enabled = bool(getattr(ps, "adaptive_slippage_enabled", False))
+    _impact_coef = getattr(ps, "slippage_impact_coef", None)
+    if _impact_coef is not None:
+        port.slippage_impact_coef = Decimal(str(_impact_coef))
+    # W2 现金管理增强（预留触发点，默认关）：仅记决策事件，不产生订单
+    port.cash_enhance_enabled = bool(getattr(ps, "cash_enhance_enabled", False))
+    _ce_eq = getattr(ps, "cash_enhance_equity_threshold", None)
+    port.cash_enhance_equity_threshold = Decimal(str(_ce_eq)) if _ce_eq is not None else None
+    _ce_ratio = getattr(ps, "cash_enhance_position_ratio_threshold", None)
+    port.cash_enhance_position_ratio_threshold = (
+        Decimal(str(_ce_ratio)) if _ce_ratio is not None else None
+    )
+    # W3 容量上限（可选，默认 None）：dynamic 仓位封顶，防长周期复利开出天文仓位
+    _cap = getattr(ps, "equity_cap", None)
+    port.equity_cap = Decimal(str(_cap)) if _cap is not None else None
     # 组合级股票池成分（继承用）：策略 stock_pool_id 为空时回退到此
     portfolio_pool_codes = {
         row.stock_code
@@ -78,6 +102,19 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             master_strategy_id=strat.master_strategy_id,
             stock_pool=strategy_pool_codes,
             slave_exit_mode=strat.slave_exit_mode,
+            # B4/B5 可选增强（默认关，关闭时行为与原逻辑一致）
+            rotation_enabled=bool(getattr(strat, "rotation_enabled", False)),
+            rotation_momentum_bars=getattr(strat, "rotation_momentum_bars", None) or 20,
+            rotation_hysteresis=Decimal(str(getattr(strat, "rotation_hysteresis", None) or "0.05")),
+            regime_filter_enabled=bool(getattr(strat, "regime_filter_enabled", False)),
+            trend_trailing_stop_ratio=(
+                Decimal(str(strat.trend_trailing_stop_ratio))
+                if getattr(strat, "trend_trailing_stop_ratio", None) is not None
+                else None
+            ),
+            trend_max_positions=getattr(strat, "trend_max_positions", None),
+            # #3 策略级敞口上限（可选，默认关；仅回测成交步生效）
+            exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()

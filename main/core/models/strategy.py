@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Numeric, DateTime
-from sqlalchemy.sql import func
+from sqlalchemy import Boolean, Column, Integer, String, ForeignKey, Numeric, DateTime
+from sqlalchemy.sql import func, text
 
 from .base import Base
 
@@ -33,5 +33,16 @@ class Strategy(Base):
     max_add_count = Column(Integer, default=2, server_default="2", nullable=False)
     add_position_ratio = Column(Numeric(5, 4), default=0.1000, server_default="0.1000", nullable=False)
     reduce_position_ratio = Column(Numeric(5, 4), default=0.3000, server_default="0.3000", nullable=False)
+    # B4 OPEN 择优轮动（默认关）：满槽时强信号可轮出最弱持仓换入新信号股
+    rotation_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    rotation_momentum_bars = Column(Integer, default=20, server_default="20", nullable=False)
+    rotation_hysteresis = Column(Numeric(5, 4), default=0.0500, server_default="0.0500", nullable=False)
+    # B5 市场状态闸（默认关）：基准周线趋势态(bull)时用 trend_* 覆盖参数，其余态用原参数
+    regime_filter_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    trend_trailing_stop_ratio = Column(Numeric(5, 4), nullable=True)
+    trend_max_positions = Column(Integer, nullable=True)
+    # #3 策略级敞口上限（默认关）：回测 BUY 审批加卡策略总持仓市值
+    # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
+    exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

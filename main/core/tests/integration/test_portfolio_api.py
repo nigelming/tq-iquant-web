@@ -900,6 +900,170 @@ def test_update_strategy(client):
     assert body["data"]["capital_ratio"] == 0.8
 
 
+# ===========================================================================
+# #1 涨跌停约束开关：新组合默认开、显式设置按值、编辑未携带不动
+# ===========================================================================
+def test_create_portfolio_price_limit_default_on(client):
+    """创建请求未携带 price_limit_check_enabled → 新组合默认开启。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is True
+
+
+def test_create_portfolio_price_limit_explicit_off(client):
+    """创建请求显式 price_limit_check_enabled=false → 按值关闭。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        price_limit_check_enabled=False,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is False
+
+
+def test_update_portfolio_price_limit_untouched_when_omitted(client):
+    """PUT 未携带该字段 → 不动已存值（关闭的旧组合编辑后不偷改）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+    pid = c.post("/api/portfolios", json=_create_payload(
+        price_limit_check_enabled=False,
+    )).json()["data"]["id"]
+
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(name="RENAMED")).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is False
+    # 显式开启 → 按值更新
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        price_limit_check_enabled=True,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is True
+
+
+# ===========================================================================
+# #2 成交量约束开关：默认关 + 显式设置按值 + 比例校验
+# ===========================================================================
+def test_portfolio_volume_limit_default_off(client):
+    """创建未携带 volume_limit_* → 默认关、ratio 0.10。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["volume_limit_enabled"] is False
+    assert body["data"]["volume_limit_ratio"] == 0.10
+
+
+def test_portfolio_volume_limit_explicit_on_roundtrip(client):
+    """显式开启 + 自定义比例 → 按值落库并回显；非法比例 → 400。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        volume_limit_enabled=True, volume_limit_ratio=0.2,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["volume_limit_enabled"] is True
+    assert body["data"]["volume_limit_ratio"] == 0.2
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        volume_limit_ratio=1.5,
+    )).json()
+    assert body["code"] == 400
+    assert "volume_limit_ratio" in body["message"]
+
+
+# ===========================================================================
+# W2 仓位模型 / 现金管理增强字段
+# ===========================================================================
+def test_portfolio_position_sizing_default_dynamic(client):
+    """新建组合未携带 → position_sizing='dynamic'，现金管理默认关/阈值 None。"""
+    c, Session = client
+    db = Session(); _seed_pool(db); _seed_formula(db); db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    d = body["data"]
+    assert d["position_sizing"] == "dynamic"
+    assert d["cash_enhance_enabled"] is False
+    assert d["cash_enhance_equity_threshold"] is None
+    assert d["cash_enhance_position_ratio_threshold"] is None
+
+
+def test_portfolio_position_sizing_fixed_roundtrip(client):
+    """显式 fixed + 现金管理字段 → 回显；非法 position_sizing → 400。"""
+    c, Session = client
+    db = Session(); _seed_pool(db); _seed_formula(db); db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        position_sizing="fixed",
+        cash_enhance_enabled=True,
+        cash_enhance_equity_threshold=1000000,
+        cash_enhance_position_ratio_threshold=0.3,
+    )).json()
+    assert body["code"] == 0
+    d = body["data"]
+    assert d["position_sizing"] == "fixed"
+    assert d["cash_enhance_enabled"] is True
+    assert d["cash_enhance_equity_threshold"] == 1000000
+    assert d["cash_enhance_position_ratio_threshold"] == 0.3
+
+    bad = c.post("/api/portfolios", json=_create_payload(position_sizing="bogus")).json()
+    assert bad["code"] == 400
+    assert "position_sizing" in bad["message"]
+
+
+# ===========================================================================
+# #3 策略级敞口上限开关：默认关 + 显式开启回显
+# ===========================================================================
+def test_strategy_exposure_cap_default_off(client):
+    """子策略未携带 exposure_cap_enabled → 默认关。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["strategies"][0]["exposure_cap_enabled"] is False
+
+
+def test_strategy_exposure_cap_explicit_on_roundtrip(client):
+    """显式 exposure_cap_enabled=true → 按值落库并回显；PUT 子策略可编辑。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload(strategies=[
+        {"name": "S1", "formula_id": 1, "period": "1d", "role": "independent",
+         "capital_ratio": 0.6, "max_positions": 5, "exposure_cap_enabled": True},
+    ])
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+    s = body["data"]["strategies"][0]
+    assert s["exposure_cap_enabled"] is True
+
+    body = c.put(f"/api/portfolios/{body['data']['id']}/strategies/{s['id']}",
+                 json=_strategy_payload(name="S1", exposure_cap_enabled=False)).json()
+    assert body["code"] == 0
+    assert body["data"]["exposure_cap_enabled"] is False
+
+
 def test_update_strategy_not_found(client):
     c, Session = client
     db = Session()

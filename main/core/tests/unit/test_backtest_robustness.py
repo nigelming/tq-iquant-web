@@ -26,7 +26,7 @@ def test_annual_returns_and_mdd():
     r = analyze_robustness(snaps, [], oos_ratio=0.5)
     annual = {a["year"]: a for a in r["annual"]}
     assert round(annual["2024"]["return"], 4) == 0.21   # 100 -> 121
-    assert round(annual["2024"]["max_drawdown"], 4) == -0.1
+    assert round(annual["2024"]["max_drawdown"], 4) == 0.1   # W5-L2：正号回撤
     assert round(annual["2025"]["return"], 4) == 0.1    # 121 -> 133.1
     assert r["total_return"] == round(133.1 / 100 - 1, 4)
     assert r["years_positive"] == "2/2"
@@ -45,9 +45,10 @@ def test_rolling_3y_cagr():
     # 4 个年份 → 2 个 3 年窗口
     assert len(r3) == 2
     assert r3[0]["start"] == "2014" and r3[0]["end"] == "2016"
-    assert round(r3[0]["cagr"], 4) == round((1.21 ** (1 / 3)) - 1, 4)   # 100->121
+    # W5-O3：CAGR 按窗口实际首末日期跨度年化（2014-01-02→2016-12-31 ≈ 2.995 年）
+    assert round(r3[0]["cagr"], 4) == round(0.06571055110497115, 4)
     assert r3[1]["start"] == "2015" and r3[1]["end"] == "2017"
-    assert round(r3[1]["cagr"], 4) == 0.1                              # 100->133.1
+    assert round(r3[1]["cagr"], 4) == 0.1002                          # 100->133.1
 
 
 def test_oos_split_75_25():
@@ -65,8 +66,8 @@ def test_oos_split_75_25():
     assert oos["in_sample"]["end"][:4] == "2022"
     assert oos["out_of_sample"]["start"][:4] == "2023"
     assert oos["out_of_sample"]["end"][:4] == "2023"
-    # 样本内 100->133.1 = +33.1%，CAGR=(1.331)^(1/3)-1=0.1
-    assert round(oos["in_sample"]["cagr"], 4) == 0.1
+    # 样本内 100->133.1 = +33.1%，CAGR 按实际跨度年化（2020-01-02→2022-12-30）
+    assert round(oos["in_sample"]["cagr"], 4) == 0.1003
     # 样本外 133.1->146.41 = +10%
     assert round(oos["out_of_sample"]["return"], 4) == 0.1
 

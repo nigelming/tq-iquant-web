@@ -289,6 +289,24 @@ def test_update_formula_not_found(client):
 
 
 # ---------------------------------------------------------------------------
+# W4：已移除未来函数关键字预检（strict_future_check）。公式内容原样入库，
+# 是否使用未来函数由用户自行判断。
+# ---------------------------------------------------------------------------
+def test_create_formula_no_future_check(client):
+    """含 ZIG 的内容原样入库，不再做未来函数拦截（含旧 strict_future_check 键也忽略）。"""
+    c, Session = client
+    payload = {
+        "name": "FUT_OK", "content": "A:ZIG(3,5);", "signals": [],
+        "strict_future_check": True,
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["content"] == "A:ZIG(3,5);"
+
+
+# ---------------------------------------------------------------------------
 # formula_count 字段（任务 #27：注入历史根数，按公式配）
 # ---------------------------------------------------------------------------
 def test_create_formula_with_formula_count(client):

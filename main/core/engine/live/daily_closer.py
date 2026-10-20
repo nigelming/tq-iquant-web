@@ -60,16 +60,17 @@ class DailyCloser:
         self._emit = emit
         self._set_bridge_offline = set_bridge_offline
         self._clock = ctx.clock
-
-    @property
-    def _calendar(self):
-        return self._get_calendar()
+        # R4：幂等日期标记移入 __init__（原在 _calendar property 的 return 之后，死代码）。
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
         self.last_daily_date = None
         # C6(B/C)：14:30 日终 1d 快照 bar + 1w/1mon 注入已驱动的日期标记（每日一次）
         self.last_daily_bar_date = None
         # 15:05 收盘清扫已执行的日期标记（每日一次，确定性兜底未成交单）
         self.last_close_sweep_date = None
+
+    @property
+    def _calendar(self):
+        return self._get_calendar()
 
     # ---------------- 日终估值（E5/E6）----------------
     def maybe_daily_close(self, now: Optional[datetime] = None) -> None:
@@ -95,6 +96,16 @@ class DailyCloser:
             # per-portfolio 日终估值 + update_daily + daily_loss 触发/恢复 + risk 事件
             # 归 BreakerService.on_daily_update（0010 步骤 4）；时点判断/幂等留本方法。
             self._breaker.on_daily_update(portfolio, today)
+            # W2 现金管理增强（预留触发点，默认关）：命中阈值仅记决策事件，不产生订单。
+            # 设计定案：实盘在 14:30 日终（与 daily_loss 同点）触发。估值口径与
+            # on_daily_update 一致（现金 + 持仓按最近已知价市值），bar_time 取日终时点
+            # 供决策事件时间戳与日内去重（_cash_enhance_last_date）。
+            total = portfolio.account.cash + portfolio._holdings_value()
+            portfolio.maybe_cash_enhancement(
+                BarEvent(stocks={}, bar_time=datetime.combine(today, datetime.min.time()),
+                         period="1d"),
+                total,
+            )
         logger.info(
             "daily close done (session %s, %s): %d portfolio(s) valuated",
             self._ctx.session_id, today, len(self._ctx.portfolios),
