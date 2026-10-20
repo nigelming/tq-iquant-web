@@ -105,6 +105,12 @@ export const TRADE_TYPE_LABEL: Record<string, string> = {
   SELL: '卖出',
 }
 
+/** trade_type → 中文标签（大小写不敏感；未知值回退原值）。 */
+export function tradeTypeLabel(v: unknown): string {
+  const raw = fmt(v)
+  return TRADE_TYPE_LABEL[raw.toUpperCase()] || raw
+}
+
 export const ORDER_STATUS_LABEL: Record<string, string> = {
   submitted: '已提交',
   filled: '成交',
@@ -129,7 +135,7 @@ function formatOrder(data: Record<string, unknown>): string {
     return `${label} ${stock} ${fmt(data.error_message)}`
   }
   if (status === 'submitted') {
-    const t = TRADE_TYPE_LABEL[String(data.trade_type)] || fmt(data.trade_type)
+    const t = tradeTypeLabel(data.trade_type)
     const price = data.price ? ` @ ${data.price}` : ''
     return `${t} ${stock} ${fmt(data.quantity)}股${price}`
   }
@@ -192,7 +198,7 @@ export function formatEvent(type: string, data: Record<string, unknown>): string
     case 'order':
       return formatOrder(data)
     case 'trade': {
-      const t = TRADE_TYPE_LABEL[String(data.trade_type)] || fmt(data.trade_type)
+      const t = tradeTypeLabel(data.trade_type)
       const amount = data.amount ? ` 金额${data.amount}` : ''
       return `${t} ${fmt(data.stock_code)} ${fmt(data.quantity)}股 @ ${fmt(data.price)}${amount}`
     }

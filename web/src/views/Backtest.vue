@@ -4,6 +4,7 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
+  recomputeRobustness, getStockPools, compareBacktestPools,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -13,8 +14,15 @@ import type {
   StyleBlock, DispersionBlock, ExposureBlock,
   IndustryAttributionBlock, IndustryHitRatePeriod,
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
+  BacktestRobustnessItem, BacktestGateResult, AcceptanceResult,
+  ValidationVerdict,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import PageHeader from '../components/PageHeader.vue'
+import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
+import { useTable } from '../composables/useTable'
+import TableToolbar from '../components/TableToolbar.vue'
+import TablePager from '../components/TablePager.vue'
 import { useTheme } from '../composables/useTheme'
 
 function cssVar(name: string): string {
@@ -62,7 +70,10 @@ function applyBase(option: Record<string, unknown>): Record<string, unknown> {
   }
   for (const key of ['legend', 'xAxis', 'yAxis']) {
     if (out[key] === undefined) continue
-    out[key] = deepMerge(base[key], out[key])
+    // 数组轴（多 yAxis 双轴/多 xAxis 网格）逐项注入主题基色；对象轴整体合并
+    out[key] = Array.isArray(out[key])
+      ? out[key].map((inst: unknown) => deepMerge(base[key], inst))
+      : deepMerge(base[key], out[key])
   }
   return out
 }
@@ -93,13 +104,20 @@ const loading = ref(true)
 
 // ===== 发起弹窗 =====
 const showForm = ref(false)
+const showBacktestGuide = ref(false)
 const submitting = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '' })
+// 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
+const showAdvanced = ref(false)
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined })
+const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
 const currentRecord = ref<BacktestRecordItem | null>(null)
 const detail = ref<BacktestDetailItem | null>(null)
 const errorMsg = ref('')
+const acceptanceProfile = ref<'absolute' | 'relative'>('absolute')
+const acceptance = computed<AcceptanceResult | null>(() => detail.value?.acceptance ?? null)
+const showAcceptance = ref(false)
 
 // echarts 实例（净值 + 回撤）
 const equityChartEl = ref<HTMLDivElement | null>(null)
@@ -143,6 +161,8 @@ const MONTH_STATES = ['大涨', '小涨', '小跌', '大跌']
 const caCollapsed = ref(true)
 const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
+// 验证结论（容量健康 + 危机防御 + 样本外引用），随回测完成冻结在 record.validation
+const validation = computed<ValidationVerdict | null>(() => currentRecord.value?.validation ?? null)
 const caSkipped = computed(() => crisisAlpha.value?.skipped_benchmarks || [])
 const ca = computed<CrisisAlphaData | null>(() => {
   const item = crisisAlpha.value
@@ -462,15 +482,28 @@ const caDownRows = computed(() => (ca.value?.down_weeks ?? []).map((r) => ({
   color: CRISIS_COLORS[r.分类] || cssVar('--ink'),
 })))
 
-// ===== 模块十二：下跌周明细分页（与交易明细同款）=====
-const caDownPage = ref(1)
-const caDownPageSize = 20
-const caDownTotalPages = computed(() => Math.max(1, Math.ceil(caDownRows.value.length / caDownPageSize)))
-const pagedCaDownRows = computed(() => {
-  const page = Math.min(caDownPage.value, caDownTotalPages.value)
-  const start = (page - 1) * caDownPageSize
-  return caDownRows.value.slice(start, start + caDownPageSize)
-})
+// ===== 模块十二：下跌周明细交互 =====
+const caDownTable = useTable(
+  computed(() => caDownRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '分类' },
+    columns: [
+      { key: '日期', label: '日期', sortable: true },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parseFloat(String(r.基准).replace('%', '')) },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => parseFloat(String(r.策略).replace('%', '')) },
+      { key: '超额', label: '超额', sortable: true, sortValue: (r: any) => parseFloat(String(r.超额).replace('%', '')) },
+      { key: '分类', label: '分类', searchable: true },
+    ],
+    filters: [
+      { kind: 'select', key: '分类', label: '分类', get: (r: any) => r.分类,
+        options: () => Array.from(new Set(caDownRows.value.map((r: any) => r.分类).filter(Boolean)))
+          .map((v: any) => ({ value: v, label: v })) },
+      { kind: 'dateRange', key: '日期', label: '时间', get: (r: any) => String(r.日期).slice(0, 10) },
+      { kind: 'numRange', key: '超额', label: '超额%', get: (r: any) => parseFloat(String(r.超额).replace('%', '')) },
+    ],
+  },
+)
 
 function caBenchmarkWarnText(br: CrisisAlphaBenchmarkResolution): string {
   const used = br.benchmark_name
@@ -499,7 +532,7 @@ async function recomputeCa() {
     recomputeMsg.value = recomputeWarn.value && br
       ? `${base} ｜ ${caBenchmarkWarnText(br)}`
       : base
-    detail.value = await getBacktestDetail(id)
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
     await nextTick()
     initCharts()
   } catch (e) {
@@ -539,13 +572,21 @@ function initCaNavChart() {
   setThemed(caNavChart, {
     tooltip: { trigger: 'axis' },
     legend: { data: [d.strategy_name, d.benchmark_name], bottom: 0 },
-    grid: { left: 56, right: 24, bottom: 34, top: 40, containLabel: true },
+    grid: { left: 56, right: 56, bottom: 34, top: 40, containLabel: true },
     xAxis: { type: 'category', data: nav.dates, boundaryGap: false },
-    yAxis: {
-      type: 'value', name: '累计净值(起点=1.0)', scale: true,
-      axisLabel: { formatter: (v: number) => v.toFixed(2) },
-      splitLine: { lineStyle: { type: 'dashed' } },
-    },
+    // 双轴：策略累计净值左轴；基准独立右轴（策略收益水平高时基准同轴会被压平）
+    yAxis: [
+      {
+        type: 'value', name: '累计净值(起点=1.0)', scale: true,
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        splitLine: { lineStyle: { type: 'dashed' } },
+      },
+      {
+        type: 'value', name: d.benchmark_name, scale: true, position: 'right',
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        splitLine: { show: false },
+      },
+    ],
     series: [
       {
         name: d.strategy_name, type: 'line', data: nav.strategy, smooth: true, symbol: 'none',
@@ -559,6 +600,7 @@ function initCaNavChart() {
       },
       {
         name: d.benchmark_name, type: 'line', data: nav.benchmark, smooth: true, symbol: 'none',
+        yAxisIndex: 1,
         lineStyle: { color: cssVar('--blue'), width: 1.8 }, itemStyle: { color: cssVar('--blue') },
       },
     ],
@@ -824,10 +866,7 @@ function initCaDimChart() {
   })
 }
 
-// 交易明细分页
-const currentPage = ref(1)
-const pageSize = 20
-
+// 信号状态标签
 const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
 }
@@ -881,6 +920,18 @@ function openForm() {
     name: '',
     start_date: '2021-01-01',
     end_date: fmt(today),
+    dividend_mode: 'front',
+    evaluation_profile: 'absolute',
+    is_oos_gate_enabled: false,
+    oos_gate_min_ratio: 0.5,
+    fee_reserve_enabled: false,
+    bond_t0_enabled: false,
+    bond_lot_enabled: false,
+    adaptive_slippage_enabled: undefined,
+    slippage_impact_coef: undefined,
+    volume_limit_enabled: undefined,
+    volume_limit_ratio: undefined,
+    equity_cap: undefined,
   }
   showForm.value = true
 }
@@ -893,10 +944,46 @@ async function submit() {
     alert(`开始日期不能晚于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
     return
   }
+  if (form.value.is_oos_gate_enabled && !(form.value.oos_gate_min_ratio >= 0.1 && form.value.oos_gate_min_ratio <= 2)) {
+    alert('IS/OOS 门槛比例须在 [0.1, 2]')
+    return
+  }
   submitting.value = true
   try {
-    const res = await runBacktest(form.value)
+    const res = await runBacktest({
+      portfolio_strategy_id: form.value.portfolio_strategy_id,
+      name: form.value.name,
+      start_date: form.value.start_date,
+      end_date: form.value.end_date,
+      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual',
+      evaluation_profile: form.value.evaluation_profile as 'absolute' | 'relative',
+      is_oos_gate_enabled: form.value.is_oos_gate_enabled,
+      oos_gate_min_ratio: Number(form.value.oos_gate_min_ratio) || 0.5,
+      fee_reserve_enabled: form.value.fee_reserve_enabled,
+      bond_t0_enabled: form.value.bond_t0_enabled,
+      bond_lot_enabled: form.value.bond_lot_enabled,
+          ...(form.value.adaptive_slippage_enabled !== undefined
+            ? {
+                adaptive_slippage_enabled: form.value.adaptive_slippage_enabled,
+                ...(form.value.slippage_impact_coef !== undefined && form.value.slippage_impact_coef !== ''
+                  ? { slippage_impact_coef: Number(form.value.slippage_impact_coef) / 100 }
+                  : {}),
+              }
+            : {}),
+          ...(form.value.volume_limit_enabled !== undefined
+            ? {
+                volume_limit_enabled: form.value.volume_limit_enabled,
+                ...(form.value.volume_limit_ratio !== undefined && form.value.volume_limit_ratio !== ''
+                  ? { volume_limit_ratio: Number(form.value.volume_limit_ratio) }
+                  : {}),
+              }
+            : {}),
+          ...(form.value.equity_cap !== undefined && form.value.equity_cap !== ''
+            ? { equity_cap: Number(form.value.equity_cap) }
+            : {}),
+    })
     showForm.value = false
+    gateBanner.value = res?.gate ?? null
     await load()
     if (res?.record_id) await openDetail(res.record_id)
   } catch (e) {
@@ -913,15 +1000,28 @@ async function openDetail(id: number) {
     alert(`加载详情失败：${errMsg(e)}`)
     return
   }
+  acceptanceProfile.value = detail.value?.record.evaluation_profile === 'relative' ? 'relative' : 'absolute'
+  if (acceptanceProfile.value === 'relative') {
+    detail.value = await getBacktestDetail(id, 'relative')
+  }
   currentRecord.value = detail.value?.record || null
-  currentPage.value = 1
-  caDownPage.value = 1
   selectedKey.value = null
   caCollapsed.value = true
   mrCollapsed.value = true
+  rbCollapsed.value = true
   // 等 DOM 渲染后初始化图表
   await nextTick()
   initCharts()
+}
+
+async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
+  if (!currentRecord.value) return
+  acceptanceProfile.value = p
+  try {
+    detail.value = await getBacktestDetail(currentRecord.value.id, p)
+  } catch (e) {
+    alert(`切换口径失败：${errMsg(e)}`)
+  }
 }
 
 async function expandCaSection() {
@@ -938,6 +1038,21 @@ async function toggleCaSection() {
     initCrisisAlphaCharts()
   }
 }
+
+// ===== 稳健性检验（年度/3年滚动/集中度/样本内外对比）=====
+const rbCollapsed = ref(true)
+const robustness = computed<BacktestRobustnessItem | null>(() => detail.value?.robustness ?? null)
+const rbStatus = computed(() => robustness.value?.status ?? null)
+const rbData = computed(() => {
+  const item = robustness.value
+  if (!item || item.status !== 'completed' || !item.data) return null
+  return item.data
+})
+const robustnessSectionEl = ref<HTMLDivElement | null>(null)
+const rbRecomputing = ref(false)
+const rbRecomputeMsg = ref('')
+const rbRecomputeWarn = ref(false)
+const rbRecomputeMsgClass = computed(() => (rbRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
 
 // ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
 const mrCollapsed = ref(true)
@@ -1338,7 +1453,7 @@ async function recomputeMr() {
     mrRecomputeMsg.value = res.status === 'completed'
       ? '重新计算完成'
       : `重新计算未完成：${res.error || res.status}`
-    detail.value = await getBacktestDetail(id)
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
     await nextTick()
     initCharts()
     if (!mrCollapsed.value) initMrCharts()
@@ -1354,6 +1469,100 @@ async function expandMrSection() {
   mrCollapsed.value = false
   await nextTick()
   initMrCharts()
+}
+
+async function recomputeRb() {
+  const id = currentRecord.value?.id
+  if (!id) return
+  rbRecomputing.value = true
+  rbRecomputeMsg.value = ''
+  rbRecomputeWarn.value = false
+  try {
+    const res = await recomputeRobustness(id)
+    rbRecomputeMsg.value = res.status === 'completed'
+      ? '重新计算完成'
+      : `重新计算未完成：${res.error || res.status}`
+    rbRecomputeWarn.value = res.status !== 'completed'
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
+  } catch (e) {
+    rbRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
+    rbRecomputeWarn.value = true
+  } finally {
+    rbRecomputing.value = false
+  }
+}
+
+async function expandRbSection() {
+  rbCollapsed.value = false
+}
+
+async function toggleRbSection() {
+  rbCollapsed.value = !rbCollapsed.value
+}
+
+// ===== 换池稳健性对比（Tier2）=====
+const showCompare = ref(false)
+const pools = ref<{ id: number; code: string; name: string }[]>([])
+const compareForm = ref({
+  pool_ids: [] as number[],
+  start_date: '',
+  end_date: '',
+  dividend_mode: 'dual',
+})
+const comparing = ref(false)
+const compareResult = ref<{ comparisons: any[] } | null>(null)
+const compareMsg = ref('')
+// 默认推荐池：风格差异较大的备选池（成长/红利/热点），按名称匹配，改名则自动降级不预选
+const RECOMMENDED_POOL_NAMES = ['成长精选', '红利精选', '热点精选']
+const recommendedPoolIds = computed(() =>
+  pools.value.filter((p) => RECOMMENDED_POOL_NAMES.includes(p.name)).map((p) => p.id))
+
+async function openCompare() {
+  compareResult.value = null
+  compareMsg.value = ''
+  compareForm.value = {
+    pool_ids: [],
+    start_date: currentRecord.value?.start_date || '',
+    end_date: currentRecord.value?.end_date || '',
+    dividend_mode: 'dual',
+  }
+  try {
+    pools.value = await getStockPools()
+  } catch { pools.value = [] }
+  compareForm.value.pool_ids = recommendedPoolIds.value  // 默认预选推荐池
+  showCompare.value = true
+}
+
+function selectRecommended() {
+  compareForm.value.pool_ids = [...recommendedPoolIds.value]
+}
+
+async function submitCompare() {
+  const psId = currentRecord.value?.portfolio_strategy_id
+  if (!psId) { compareMsg.value = '缺少源组合'; return }
+  if (!compareForm.value.pool_ids.length) { compareMsg.value = '请至少选择一个备选股票池'; return }
+  if (!compareForm.value.start_date || !compareForm.value.end_date) { compareMsg.value = '请选择起止日期'; return }
+  comparing.value = true
+  compareMsg.value = ''
+  try {
+    const res = await compareBacktestPools({
+      portfolio_strategy_id: psId,
+      pool_ids: compareForm.value.pool_ids,
+      start_date: compareForm.value.start_date,
+      end_date: compareForm.value.end_date,
+      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual',
+    })
+    compareResult.value = res
+  } catch (e) {
+    compareMsg.value = `对比失败：${errMsg(e)}`
+  } finally {
+    comparing.value = false
+  }
+}
+
+function compareOosCagr(c: any): string {
+  const oos = c?.robustness?.oos?.out_of_sample
+  return oos?.cagr === null || oos?.cagr === undefined ? '—' : pct(oos.cagr)
 }
 
 async function toggleMrSection() {
@@ -1527,6 +1736,10 @@ function scrollToSection(anchor: string) {
       marketRegimeSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
     })
   }
+  if (anchor === 'robustness') {
+    expandRbSection()
+    robustnessSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
+  }
 }
 
 async function onDelete(id: number) {
@@ -1548,15 +1761,10 @@ function backToList() {
 }
 
 // ===== 格式化 =====
-function pct(v: number | null | undefined): string {
-  if (v === null || v === undefined) return '—'
-  return `${(Number(v) * 100).toFixed(2)}%`
-}
-function num(v: number | null | undefined, digits = 4): string {
-  if (v === null || v === undefined) return '—'
-  if (!Number.isFinite(Number(v))) return '—'
-  return Number(v).toFixed(digits)
-}
+function pct(v: number | null | undefined): string { return fmtPct(v, 2) }
+function num(v: number | null | undefined, digits = 4): string { return fmtRatio(v, digits) }
+function pct1(v: number | null | undefined): string { return fmtPct(v, 1) }
+function pctSigned(v: number | null | undefined, digits = 2): string { return fmtSignedPct(v, digits) }
 
 function lastVal(arr: (number | null)[] | undefined): number | null {
   if (!arr || !arr.length) return null
@@ -1577,16 +1785,6 @@ function valueClass(v: number | null | undefined): string {
   return Number(v) >= 0 ? 'text-red' : 'text-green'
 }
 
-function pct1(v: number | null | undefined): string {
-  if (v === null || v === undefined) return '—'
-  return `${(Number(v) * 100).toFixed(1)}%`
-}
-
-function pctSigned(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined) return '—'
-  return `${Number(v) >= 0 ? '+' : ''}${(Number(v) * 100).toFixed(digits)}%`
-}
-
 // ===== 指标构建（18 项，参考 quant-cy buildMetricsList）=====
 // 指标行；group 非空时为分组标题（跨两列渲染），label/value/cls 为空
 interface MetricRow {
@@ -1594,8 +1792,11 @@ interface MetricRow {
   label?: string
   value?: string
   cls?: string
+  hint?: string
 }
 function _group(name: string): MetricRow { return { group: name } }
+// 夏普口径标注（P3，与后端 evaluator.py 一致）：日频收益、年化×√252、rf=2%、分子 CAGR
+const SHARPE_HINT = '口径：日收益按日聚合（每日收盘快照），年化波动×√252，无风险利率 2%，分子为年化收益（CAGR）'
 function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[] {
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
@@ -1605,7 +1806,7 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '年化收益', value: pct(m.annual_return), cls: valueClass(m.annual_return) },
     { label: '最大回撤', value: pct(m.max_drawdown), cls: 'text-red' },
     { label: '年化波动率', value: pct(m.volatility), cls: 'text-orange' },
-    { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue' },
+    { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue', hint: SHARPE_HINT },
     { label: '卡玛比率', value: num(m.calmar_ratio, 2), cls: 'text-blue' },
     { label: '索提诺比率', value: num(m.sortino_ratio, 2), cls: 'text-blue' },
     { label: 'VaR (95%)', value: pct(m.var_95), cls: 'text-red' },
@@ -1613,9 +1814,10 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '收益/波动比', value: num(retVolRatio, 2), cls: 'text-blue' },
     { label: '平均修复天数', value: num(m.avg_recovery_days, 0), cls: 'text-orange' },
     { label: '最大修复天数', value: num(m.max_recovery_days, 0), cls: 'text-orange' },
-    { label: '胜率', value: pct(m.win_rate), cls: 'text-blue' },
-    { label: '盈亏比', value: num(m.profit_factor, 2), cls: 'text-blue' },
-    { label: '交易次数', value: String(m.total_trades ?? '—'), cls: '' },
+    { label: '胜率', value: pct(m.win_rate), cls: 'text-blue', hint: '按平仓批次（FIFO 配对）计算：盈利批次 / 总平仓批次；未平仓持仓不计入' },
+    { label: '盈亏比', value: num(m.profit_factor, 2), cls: 'text-blue', hint: '总盈利额 / 总亏损额，按平仓批次（FIFO 配对）汇总' },
+    { label: '成交笔数', value: String(m.total_trades ?? '—'), cls: '', hint: '买卖成交记录条数（含加仓、减仓、分批买卖）' },
+    { label: '平仓批次', value: String(m.closed_trades ?? '—'), cls: '', hint: 'FIFO 配对后的完整平仓批次数量，胜率与盈亏比的分母' },
     { label: '平均持仓天数', value: num(m.avg_holding_days, 1), cls: 'text-blue' },
     { label: 'Ulcer指数', value: num(m.ulcer_index, 2), cls: 'text-orange' },
     { label: '收益稳定性', value: num(m.return_stability, 2), cls: 'text-blue' },
@@ -1657,11 +1859,15 @@ const portfolioMetrics = computed(() => buildMetrics(detail.value?.evaluations))
 // ===== 综合评分卡 =====
 interface ScoreDimension { label: string; score: number; max: number; comment: string }
 interface StrategyScore {
-  total: number; grade: 'A' | 'B' | 'C' | 'D'; gradeLabel: string
+  total: number; rawTotal: number; timeFactor: number; confidencePct: number; sampleYears: number
+  grade: 'A' | 'B' | 'C' | 'D'; gradeLabel: string
   dimensions: ScoreDimension[]; summary: string[]
 }
 
-function scoreStrategy(m: BacktestEvaluationItem | null | undefined, years?: number): StrategyScore | null {
+// 综合评分时间因子：样本时长置信度，短周期按比例折扣（满该年数记 100%）
+const SCORE_REFERENCE_YEARS = 3
+
+function scoreStrategy(m: BacktestEvaluationItem | null | undefined, sampleYears = 0): StrategyScore | null {
   if (!m) return null
   const sharpe = m.sharpe_ratio ?? 0
   const calmar = m.calmar_ratio ?? 0
@@ -1673,18 +1879,17 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined, years?: num
   const winRate = m.win_rate ?? 0
   const util = m.avg_position_utilization ?? 0
   const emptyDays = m.empty_days_ratio ?? 0
-  const y = Math.max(years ?? 0, 0.5)
 
   const riskAdj = Math.min(sharpe / 3, 1) * 15 + Math.min(calmar / 3, 1) * 10 + Math.min(sortino / 3, 1) * 5
   const ddCtrl = Math.max(0, 15 - maxDd * 50) + Math.max(0, 5 - ulcer * 100)
   const stabScore = stability * 15
   const costScore = Math.max(0, 10 - costRatio * 20) + winRate * 5
-  const sampleBonus = Math.min(y / 5, 1) * 5 // 时长加分（0-5分），5年满分
-  const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10) + sampleBonus - (y < 1 ? 2 : 0) // 短期样本扣分
+  const utilScore = Math.min(util * 20, 20) + Math.max(0, 10 - emptyDays * 10)
 
-
-  let total = Math.round(riskAdj + ddCtrl + stabScore + costScore + utilScore)
-  total = Math.max(0, Math.min(100, total))
+  // 时间因子：样本时长置信度，短于参考年数按比例折扣；总分 = 原始分 × 时间因子
+  const timeFactor = Math.min(sampleYears / SCORE_REFERENCE_YEARS, 1)
+  const rawTotal = riskAdj + ddCtrl + stabScore + costScore + utilScore
+  const total = Math.round(rawTotal * timeFactor)
   const grade = total >= 80 ? 'A' : total >= 60 ? 'B' : total >= 40 ? 'C' : 'D'
   const gradeLabel = { A: '优秀', B: '良好', C: '一般', D: '较差' }[grade]
 
@@ -1703,8 +1908,7 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined, years?: num
   if (costRatio > 0.08) issues.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，年化换手 ${(m.annual_turnover ?? 0).toFixed(1)} 次，成本侵蚀明显`)
   if (util < 0.3) issues.push(`仓位利用率 ${(util * 100).toFixed(1)}%，空仓日 ${(emptyDays * 100).toFixed(1)}%，资金闲置较多`)
   if ((m.return_kurtosis ?? 0) > 10) issues.push(`收益峰度 ${(m.return_kurtosis ?? 0).toFixed(1)}，尾部风险大（最差日 ${((m.worst_daily_return ?? 0) * 100).toFixed(2)}%）`)
-  if (y < 2) issues.push(`回测时长 ${(y).toFixed(1)} 年（小于2年），样本偏少，统计稳健性一般`)
-  if (y >= 5) highlights.push(`回测时长 ${(y).toFixed(1)} 年，样本较充分，结论更具参考价值`)
+  if ((m.max_consecutive_profit_days ?? 0) > 500) issues.push(`最长连盈 ${m.max_consecutive_profit_days} 天，交易信号触发频率低`)
 
   // 超额回撤说明
   const beta = m.beta ?? 0
@@ -1721,31 +1925,28 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined, years?: num
   if (suggestions.length) summary.push(`优化方向：${suggestions.join(' + ')}`)
 
   return {
-    total, grade, gradeLabel,
+    total, rawTotal: Math.round(rawTotal), timeFactor,
+    confidencePct: Math.round(timeFactor * 100), sampleYears,
+    grade, gradeLabel,
     dimensions: [
       { label: '风险调整收益', score: Math.round(riskAdj), max: 30, comment: `夏普${sharpe.toFixed(2)} / 卡玛${calmar.toFixed(2)}` },
       { label: '回撤控制', score: Math.round(ddCtrl), max: 20, comment: `最大回撤${(maxDd * 100).toFixed(2)}%` },
       { label: '收益稳定性', score: Math.round(stabScore), max: 15, comment: `R²=${stability.toFixed(2)}` },
       { label: '交易效率', score: Math.round(costScore), max: 15, comment: `成本${(costRatio * 100).toFixed(1)}%` },
       { label: '仓位利用', score: Math.round(utilScore), max: 20, comment: `利用率${(util * 100).toFixed(1)}%` },
-      { label: '样本充分性', score: Math.round(sampleBonus + (y < 2 ? -2 : 0)), max: 10, comment: `时长 ${y.toFixed(1)} 年` },
     ],
     summary,
   }
 }
 
-const portfolioScore = computed(() => {
-  const e = detail.value?.evaluations
+// 回测样本年数（按交易日估算，252 日/年），用于综合评分的时间因子
+const backtestYears = computed(() => {
   const snaps = detail.value?.snapshots || []
-  let years = 0
-  if (snaps.length >= 2) {
-    const days = snaps.length - 1
-    years = days / 252
-  } else if (e?.annual_return && e?.total_return) {
-    years = Math.abs(e.total_return) > 0 ? Math.abs(e.total_return / (e.annual_return || 1)) : 0
-  }
-  return scoreStrategy(e, years)
+  if (snaps.length < 2) return 0
+  return (snaps.length - 1) / 252
 })
+
+const portfolioScore = computed(() => scoreStrategy(detail.value?.evaluations, backtestYears.value))
 
 // 策略对比卡片
 const strategyCards = computed(() => {
@@ -1907,13 +2108,35 @@ function boxplotData(arr: number[]): [number, number, number, number, number] | 
   return [sorted[0], q(0.25), q(0.5), q(0.75), sorted[sorted.length - 1]]
 }
 
-// ===== 交易明细分页 =====
-const totalPages = computed(() => Math.max(1, Math.ceil((detail.value?.trades || []).length / pageSize)))
-const paginatedTrades = computed(() => {
-  const trades = detail.value?.trades || []
-  const start = (currentPage.value - 1) * pageSize
-  return trades.slice(start, start + pageSize)
-})
+// ===== 交易明细交互（排序/筛选/分页）=====
+const tradesTable = useTable(
+  computed(() => detail.value?.trades ?? []),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '代码 / 信号来源 / 策略名' },
+    columns: [
+      { key: 'bar_time', label: '时间', sortable: true },
+      { key: 'strategy_name', label: '策略' },
+      { key: 'signal_name', label: '信号来源', searchable: true },
+      { key: 'trade_type', label: '买卖' },
+      { key: 'stock_code', label: '代码', searchable: true },
+      { key: 'quantity', label: '数量', sortable: true, sortValue: (t: any) => Number(t.quantity) },
+      { key: 'price', label: '价格', sortable: true, sortValue: (t: any) => Number(t.price) },
+      { key: 'amount', label: '金额', sortable: true, sortValue: (t: any) => Number(t.amount) },
+      { key: 'commission', label: '佣金', sortable: true, sortValue: (t: any) => Number(t.commission) },
+      { key: 'stamp_duty', label: '印花税', sortable: true, sortValue: (t: any) => Number(t.stamp_duty) },
+    ],
+    filters: [
+      { kind: 'select', key: 'trade_type', label: '买卖', get: (t: any) => t.trade_type,
+        options: [{ value: 'BUY', label: '买入' }, { value: 'SELL', label: '卖出' }] },
+      { kind: 'select', key: 'signal_type', label: '信号', get: (t: any) => t.signal_type,
+        options: () => Array.from(new Set((detail.value?.trades ?? []).map((t: any) => t.signal_type).filter(Boolean)))
+          .map((v: any) => ({ value: v, label: signalTypeLabel(v) })) },
+      { kind: 'dateRange', key: 'bar_time', label: '时间', get: (t: any) => (t.bar_time || '').slice(0, 10) },
+      { kind: 'numRange', key: 'amount', label: '金额', unit: '元', get: (t: any) => Number(t.amount) },
+    ],
+  },
+)
 
 // ===== 风控与拦截统计（决策闸门，调参可观测性）=====
 // 闸门阈值/实际值：比率类（0<|v|<1）转百分比，数量类（max_positions 等）原样显示。
@@ -1957,6 +2180,202 @@ const selectedEvents = computed<DecisionEventItem[]>(() => {
   return (detail.value?.decisions || []).filter(
     (e) => e.gate === sel.gate && (e.param_name || '') === (sel.param_name || ''))
 })
+
+// ===== 风控与拦截：聚合摘要 + 下钻明细交互 =====
+const decisionTable = useTable(
+  computed(() => decisionSummary.value),
+  {
+    pageSize: 20,
+    initialSort: { key: 'count', dir: 'desc' },
+    keyword: { label: '搜索', placeholder: '闸门 / 参数名' },
+    columns: [
+      { key: 'gate', label: '闸门', searchable: true },
+      { key: 'layer', label: '层' },
+      { key: 'action', label: '动作' },
+      { key: 'param_name', label: '参数', searchable: true },
+      { key: 'param_value', label: '阈值' },
+      { key: 'count', label: '触发次数', sortable: true },
+      { key: 'first_bar_time', label: '首次', sortable: true },
+      { key: 'last_bar_time', label: '末次', sortable: true },
+      { key: 'stock_count', label: '涉及股票', sortable: true },
+      { key: 'qty', label: '请求/实发' },
+    ],
+    filters: [
+      { kind: 'select', key: 'layer', label: '层', get: (s: any) => s.layer,
+        options: () => Array.from(new Set(decisionSummary.value.map((s: any) => s.layer).filter(Boolean)))
+          .map((l: any) => ({ value: l, label: layerLabel(l) })) },
+      { kind: 'select', key: 'action', label: '动作', get: (s: any) => s.action,
+        options: () => Array.from(new Set(decisionSummary.value.map((s: any) => s.action).filter(Boolean)))
+          .map((a: any) => ({ value: a, label: actionLabel(a) })) },
+    ],
+  },
+)
+const decisionDetailTable = useTable(
+  computed(() => selectedEvents.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '代码 / 原因' },
+    columns: [
+      { key: 'bar_time', label: '时间', sortable: true, searchable: false },
+      { key: 'strategy_id', label: '策略', searchable: false },
+      { key: 'stock_code', label: '代码', searchable: true },
+      { key: 'param_value', label: '阈值', searchable: false },
+      { key: 'actual_value', label: '实际', searchable: false },
+      { key: 'final_qty', label: '请求/实发', searchable: false },
+      { key: 'message', label: '原因', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: 'bar_time', label: '时间', get: (e: any) => (e.bar_time || '').slice(0, 10) },
+    ],
+  },
+)
+
+const parsePct = (v: any) => Number.isFinite(Number(v)) ? Number(v) : parseFloat(String(v).replace(/[%,+'']/g, ''))
+
+// ===== 危机 Alpha 动态表交互 =====
+const caEventTable = useTable(
+  computed(() => caEventRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '结果' },
+    columns: [
+      { key: '回撤起点', label: '回撤起点', sortable: true, searchable: false },
+      { key: '回撤低点', label: '回撤低点', sortable: true, searchable: false },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parsePct(r.基准), searchable: false },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => r.strategy_ret, searchable: false },
+      { key: '超额', label: '超额', sortable: true, sortValue: (r: any) => r.excess, searchable: false },
+      { key: '结果', label: '结果', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: '回撤起点', label: '时间', get: (r: any) => String(r.回撤起点).slice(0, 10) },
+    ],
+  },
+)
+const caBigDownTable = useTable(
+  computed(() => caBigDownRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '月份' },
+    columns: [
+      { key: '月份', label: '月份', sortable: true },
+      { key: '基准', label: '基准', sortable: true, sortValue: (r: any) => parsePct(r.基准), searchable: false },
+      { key: '策略', label: '策略', sortable: true, sortValue: (r: any) => parsePct(r.策略), searchable: false },
+    ],
+    filters: [
+      { kind: 'dateRange', key: '月份', label: '时间', get: (r: any) => String(r.月份) },
+    ],
+  },
+)
+const caAnnualTable = useTable(
+  computed(() => caAnnualRows.value),
+  {
+    pageSize: 20,
+    columns: [
+      { key: '年度', label: '年度', sortable: true, sortValue: (r: any) => parseInt(String(r.年度), 10), searchable: true },
+      { key: '下跌周', label: '下跌周', sortable: true },
+      { key: '危机Alpha', label: '危机Alpha', sortable: true, sortValue: (r: any) => parsePct(r.危机Alpha), searchable: false },
+      { key: '策略收益', label: '策略收益', sortable: true, sortValue: (r: any) => parsePct(r.策略收益), searchable: false },
+      { key: '基准收益', label: '基准收益', sortable: true, sortValue: (r: any) => parsePct(r.基准收益), searchable: false },
+    ],
+  },
+)
+
+// ===== 市场状态动态表交互 =====
+const mrStateTable = useTable(
+  computed(() => mrStateRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '市场状态' },
+    columns: [
+      { key: 'label', label: '市场状态', searchable: true },
+      { key: 'weeks', label: '周数', sortable: true },
+      { key: 'ratio', label: '占比' },
+      { key: 'strategy', label: '策略累计', sortable: true, sortValue: (r: any) => r.strategyRaw },
+      { key: 'benchmark', label: '基准累计', sortable: true, sortValue: (r: any) => parsePct(r.benchmark) },
+      { key: 'excess', label: '超额', sortable: true, sortValue: (r: any) => r.excessRaw },
+      { key: 'win', label: '胜率' },
+      { key: 'dd', label: '态内最大回撤' },
+      { key: 'turnover', label: '年化换手' },
+      { key: 'cost', label: '成本占比' },
+    ],
+  },
+)
+const mrBigUpTable = useTable(
+  computed(() => mrBigUpRows.value),
+  {
+    pageSize: 20,
+    columns: [
+      { key: 'threshold', label: '条件', sortable: true, sortValue: (r: any) => parsePct(r.threshold), searchable: true },
+      { key: 'n', label: '周数', sortable: true },
+      { key: 'strategy', label: '策略平均', sortable: true, sortValue: (r: any) => r.strategyRaw, searchable: false },
+      { key: 'benchmark', label: '基准平均', sortable: true, sortValue: (r: any) => parsePct(r.benchmark), searchable: false },
+      { key: 'win', label: '收涨比例' },
+    ],
+  },
+)
+const mrReboundTable = useTable(
+  computed(() => mrReboundRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '收复情况' },
+    columns: [
+      { key: 'start', label: '起点', sortable: true, searchable: false },
+      { key: 'trough', label: '低点', sortable: true, searchable: false },
+      { key: 'end', label: '终点', sortable: true, searchable: false },
+      { key: 'weeks', label: '周数', sortable: true, searchable: false },
+      { key: 'bRebound', label: '基准反弹', sortable: true, sortValue: (r: any) => parsePct(r.bRebound), searchable: false },
+      { key: 'sRebound', label: '策略反弹', sortable: true, sortValue: (r: any) => r.sReboundRaw, searchable: false },
+      { key: 'elasticity', label: '弹性', sortable: true, searchable: false },
+      { key: 'bRecover', label: '基准收复前高', searchable: true },
+      { key: 'sRecover', label: '策略收复前高', searchable: true },
+    ],
+    filters: [
+      { kind: 'dateRange', key: 'start', label: '时间', get: (r: any) => String(r.start).slice(0, 10) },
+    ],
+  },
+)
+const mrNeutralTable = useTable(
+  computed(() => mrNeutralRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '指标名' },
+    columns: [
+      { key: 'k', label: '指标', searchable: true },
+      { key: 'v', label: '数值' },
+    ],
+  },
+)
+const iaContribTable = useTable(
+  computed(() => iaContribRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '行业名' },
+    columns: [
+      { key: 'name', label: '行业', searchable: true },
+      { key: 'avg', label: '平均权重' },
+      { key: 'index', label: '行业区间涨跌', sortable: true, sortValue: (r: any) => parsePct(r.index), searchable: false },
+      { key: 'contrib', label: '配置贡献', sortable: true, sortValue: (r: any) => r.contribRaw, searchable: false },
+    ],
+  },
+)
+const rbSensTable = useTable(
+  computed(() => rbSensRows.value),
+  {
+    pageSize: 20,
+    keyword: { label: '搜索', placeholder: '基准名' },
+    columns: [
+      { key: 'name', label: '基准', searchable: true },
+      { key: 'beta', label: 'β', sortable: true },
+      { key: 'jensen', label: 'Jensen α(年化)', sortable: true, sortValue: (r: any) => (r.available ? r.jensen_alpha : null), searchable: false },
+      { key: 'excess', label: '年化超额', sortable: true, sortValue: (r: any) => (r.available ? r.excess_annual_return : null), searchable: false },
+      { key: 'tracking', label: '跟踪误差' },
+      { key: 'ir', label: '信息比率', sortable: true, sortValue: (r: any) => (r.available ? r.information_ratio : null) },
+      { key: 'up', label: '上行捕获' },
+      { key: 'down', label: '下行捕获' },
+      { key: 'excessDD', label: '超额回撤' },
+    ],
+  },
+)
 
 // ===== echarts 初始化 =====
 function initCharts() {
@@ -2003,7 +2422,7 @@ function initEquityChart() {
   if (hasBenchmark.value) {
     series.push({
       name: '基准', type: 'line', data: benchmarkCurve.value, smooth: true,
-      symbol: 'none',
+      symbol: 'none', yAxisIndex: 1,
       lineStyle: { width: 1.5, type: 'dashed', color: cssVar('--ink-faint') },
       itemStyle: { color: cssVar('--ink-faint') },
     })
@@ -2040,9 +2459,16 @@ function initEquityChart() {
     legend: { data: legendData, bottom: 0 },
     grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
     xAxis: { type: 'category', data: equityDates.value, boundaryGap: false },
-    yAxis: { type: 'value', name: '收益率(%)', scale: true,
-      axisLabel: { formatter: '{value}%' },
-      splitLine: { lineStyle: { type: 'dashed' } } },
+    // 双轴：组合/策略/超额收益用左轴；基准独立右轴——策略收益水平很高（如 13 号 11200%）
+    // 时，基准（累计 +84%）若同轴会被压成贴底的平线无法比较。
+    yAxis: [
+      { type: 'value', name: '收益率(%)', scale: true,
+        axisLabel: { formatter: '{value}%' },
+        splitLine: { lineStyle: { type: 'dashed' } } },
+      { type: 'value', name: '基准收益率(%)', scale: true, position: 'right',
+        axisLabel: { formatter: '{value}%' },
+        splitLine: { show: false } },
+    ],
     series,
   })
 }
@@ -2284,18 +2710,23 @@ watch(theme, () => {
 <template>
   <!-- ============ 列表视图 ============ -->
   <div v-if="!currentRecord">
-    <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+    <PageHeader title="回测管理">
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
-    </div>
+    </PageHeader>
 
     <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
       {{ errorMsg }}
     </div>
 
+    <div v-if="gateBanner" class="card" :style="{ padding: '12px', marginBottom: '12px', color: gateBanner.status === 'rejected' ? 'var(--red)' : gateBanner.status === 'passed' ? 'var(--green)' : 'var(--ink-soft)' }">
+      IS/OOS 门槛：{{ gateBanner.status === 'passed' ? '通过' : gateBanner.status === 'rejected' ? '未通过' : '数据不足未评估' }}
+      <span v-if="gateBanner.reasons.length">（{{ gateBanner.reasons.join('；') }}）</span>
+    </div>
+
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
@@ -2303,7 +2734,11 @@ watch(theme, () => {
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
             <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
             <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ STATUS_LABEL[r.status] || r.status }}</span></td>
-            <td><span v-if="r.progress != null">{{ r.progress }}%</span><span v-else style="color:var(--ink-faint)">-</span></td>
+            <td>
+              <span v-if="r.gate_status === 'passed'" class="badge badge-green">达门槛</span>
+              <span v-else-if="r.gate_status === 'rejected'" class="badge badge-red" :title="(r.gate_reasons || []).join('；')">未达标</span>
+              <span v-else class="badge badge-gray" :title="r.is_oos_gate_enabled ? '数据不足' : '未启用'">{{ r.is_oos_gate_enabled ? '未评估' : '未启用' }}</span>
+            </td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
               <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
@@ -2317,25 +2752,131 @@ watch(theme, () => {
     <!-- 发起回测 Modal -->
     <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
       <div class="modal-content">
-        <h3>发起回测</h3>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">发起回测</h3>
+          <button class="btn btn-sm" @click="showBacktestGuide = true" data-field="backtest-guide-toggle">📖 配置指南</button>
+        </div>
 
-        <label>组合</label>
-        <select v-model="form.portfolio_strategy_id">
-          <option :value="0" disabled>请选择组合</option>
-          <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
-        </select>
-
-        <label>回测名称</label>
-        <input v-model="form.name" placeholder="例如：稳健组合-7月回测" />
-
-        <div class="signal-row">
-          <div style="flex:1">
-            <label>开始日期</label>
-            <input v-model="form.start_date" type="date" />
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="group-label">基本信息</label>
+            <div class="field-grid">
+              <div class="field-row field-span-2">
+                <span class="field-label">组合</span>
+                <select v-model="form.portfolio_strategy_id">
+                  <option :value="0" disabled>请选择组合</option>
+                  <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">回测名称</span>
+                <input v-model="form.name" placeholder="例如：稳健组合-7月回测" />
+              </div>
+              <div class="field-row">
+                <span class="field-label">开始日期</span>
+                <input v-model="form.start_date" type="date" />
+              </div>
+              <div class="field-row">
+                <span class="field-label">结束日期</span>
+                <input v-model="form.end_date" type="date" />
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">复权模式</span>
+                <select v-model="form.dividend_mode">
+                  <option value="front">前复权（默认，通达信口径）</option>
+                  <option value="back">后复权（长区间更真实、可复现）</option>
+                  <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                </select>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <span class="form-hint" style="margin:0">
+                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
+                </span>
+              </div>
+            </div>
           </div>
-          <div style="flex:1">
-            <label>结束日期</label>
-            <input v-model="form.end_date" type="date" />
+
+          <!-- 高级选项（默认折叠）：增强前只填上面基础项即可发起 -->
+          <div
+            class="adv-toggle"
+            @click="showAdvanced = !showAdvanced"
+            data-field="advanced-toggle"
+          >
+            {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量）
+          </div>
+
+          <div v-show="showAdvanced" class="form-group" style="margin-top:6px">
+            <div class="field-grid">
+              <div class="field-row">
+                <span class="field-label">评估口径</span>
+                <select v-model="form.evaluation_profile" data-field="evaluation_profile">
+                  <option value="absolute">绝对收益（年化/回撤/卡玛）</option>
+                  <option value="relative">相对收益（信息比率/超额/下行捕获）</option>
+                </select>
+              </div>
+              <div class="field-row" v-if="form.is_oos_gate_enabled">
+                <span class="field-label">门槛比例</span>
+                <input type="number" step="0.05" min="0.1" max="2" v-model.number="form.oos_gate_min_ratio" data-field="oos_gate_min_ratio" />
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.is_oos_gate_enabled" data-field="is_oos_gate_enabled" />
+                  <span class="field-hint">IS/OOS 采纳门槛（OOS 年化 ≥ 比例 × IS 年化，且 OOS 不跑输基准）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.fee_reserve_enabled" data-field="fee_reserve_enabled" />
+                  <span class="field-hint">费用预留（买入审批含佣金，避免现金为负）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.bond_t0_enabled" data-field="bond_t0_enabled" />
+                  <span class="field-hint">可转债 T+0 回转（转债当日买入当日可卖；股票仍 T+1，仅回测生效）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.bond_lot_enabled" data-field="bond_lot_enabled" />
+                  <span class="field-hint">可转债 10 张取整（转债最小交易单位 10 张；股票仍 100 股/手，仅回测生效）</span>
+                </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.adaptive_slippage_enabled" data-field="adaptive_slippage_enabled" />
+                  <span class="field-hint">自适应滑点（临时开启市场冲击成本；不勾=用组合默认）</span>
+                </label>
+              </div>
+              <div class="field-row" v-if="form.adaptive_slippage_enabled">
+                <span class="field-label">滑点冲击系数</span>
+                <input type="number" step="1" min="1" max="100" v-model="form.slippage_impact_coef" placeholder="用组合默认" data-field="slippage_impact_coef" />
+                <span class="field-suffix">%（留空=用组合默认）</span>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.volume_limit_enabled" data-field="volume_limit_enabled" />
+                  <span class="field-hint">成交量约束（run 级覆盖；不勾=用组合默认）</span>
+                </label>
+              </div>
+              <div class="field-row" v-if="form.volume_limit_enabled">
+                <span class="field-label">成交量占比</span>
+                <input type="number" step="0.05" min="0.05" max="1" v-model="form.volume_limit_ratio" placeholder="用组合默认" data-field="volume_limit_ratio" />
+                <span class="field-suffix">（0,1]，留空=用组合默认</span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">容量上限</span>
+                <input type="number" step="10000" min="1000" v-model="form.equity_cap" placeholder="用组合默认" data-field="equity_cap" />
+                <span class="field-suffix">元（留空=用组合默认）</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -2345,6 +2886,51 @@ watch(theme, () => {
         </div>
       </div>
     </div>
+
+    <!-- ============ 发起回测配置指南 Modal ============ -->
+    <div v-if="showBacktestGuide" class="modal-overlay modal-lg" @click.self="showBacktestGuide = false">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">发起回测配置指南</h3>
+          <button class="btn btn-sm" @click="showBacktestGuide = false">关闭</button>
+        </div>
+        <div class="modal-body" style="margin-top:12px">
+          <div class="form-group">
+            <label class="group-label">一、基本参数</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
+                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致。</p>
+              <p class="guide-step"><b>评估口径</b>：absolute=绝对收益（年化/回撤/卡玛）；relative=相对收益
+                （信息比率/超额/下行捕获）。仅影响验收块。</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="group-label">二、高级选项（默认折叠）</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>IS/OOS 采纳门槛（C7）</b>：回测完成时评估样本外年化 ≥ 比例×样本内年化且不跑输基准，
+                否则标记 rejected（记录保留）。防样本内过拟合。</p>
+              <p class="guide-step"><b>费用预留</b>：买入审批含佣金，避免现金为负（run 级，单次回测生效）。</p>
+              <p class="guide-step"><b>自适应滑点（临时）</b>：临时开启市场冲击成本；不勾=用组合默认。
+                冲击系数留空=用组合默认。</p>
+              <p class="guide-step"><b>成交量约束/容量上限（run 级覆盖）</b>：发起回测弹窗的成交量/容量选项可
+                临时覆盖组合配置做 A/B 对比，不改组合。</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="group-label">三、建议</label>
+            <div class="guide-block">
+              <p class="guide-note">· 长区间（5 年以上）建议用 dual 复权 + 开启成交量约束/自适应滑点，结果更贴近实盘。</p>
+              <p class="guide-note">· 动态仓位（组合设为动态净资产）务必设容量上限，否则复利后单仓可能不可成交。</p>
+              <p class="guide-note">· 回测完成后详情页自动给出「🧪 验证结论」，先看容量/危机防御/样本外再判断结果可信度。</p>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button @click="showBacktestGuide = false" class="btn btn-primary">知道了</button>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <!-- ============ 详情报告视图 ============ -->
@@ -2362,6 +2948,96 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+    </div>
+
+    <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->
+    <div v-if="currentRecord.warnings && currentRecord.warnings.length"
+         class="card signal-preflight-banner">
+      <div class="spb-title">
+        ⚠️ 回测告警 {{ currentRecord.warnings.length }} 项
+        <span>（回测已完成，但可能存在行情数据或信号问题）</span>
+      </div>
+      <ul class="spb-list">
+        <li v-for="(w, i) in currentRecord.warnings" :key="i">{{ w }}</li>
+      </ul>
+    </div>
+
+    <!-- 验证结论：容量健康 + 危机防御 + 样本外引用（自动流程化） -->
+    <div v-if="validation" class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-weight:600;font-size:14px">🧪 验证结论</span>
+        <span style="font-size:12px;color:var(--ink-soft)">容量健康 · 危机防御 · 样本外（回测完成时自动冻结）</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <!-- 容量健康 -->
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">容量健康</div>
+          <ul v-if="validation.capacity.length" class="spb-list">
+            <li v-for="(w, i) in validation.capacity" :key="i">{{ w }}</li>
+          </ul>
+          <span v-else class="badge badge-green">健康（未命中容量/集中度阈值）</span>
+        </div>
+        <!-- 样本外引用 -->
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">样本外验证（Walk-Forward）</div>
+          <template v-if="validation.oos">
+            <span class="badge" :class="validation.oos.overall_pass ? 'badge-green' : 'badge-red'">
+              {{ validation.oos.overall_pass ? '样本外通过' : '样本外未通过' }} {{ validation.oos.windows_passed }}
+            </span>
+            <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">{{ validation.oos.name }}</span>
+          </template>
+          <span v-else style="font-size:12px;color:var(--ink-soft)">未执行（可在「回归验证」面板发起 walk-forward）</span>
+        </div>
+      </div>
+      <!-- 危机防御表 -->
+      <template v-if="validation.crisis.length">
+        <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin:10px 0 6px">危机防御机制（固定窗口，历史锁定）</div>
+        <table>
+          <thead><tr>
+            <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="c in validation.crisis" :key="c.key">
+              <td>{{ c.name }}</td>
+              <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
+              <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
+              <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
+              <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
+              <td>
+                <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
+                      :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </template>
+    </div>
+
+    <!-- 采纳验收 -->
+    <div class="section-title" @click="showAcceptance = !showAcceptance" style="cursor:pointer;display:flex;align-items:center;gap:8px">
+      <span>采纳验收（{{ acceptanceProfile === 'absolute' ? '绝对收益' : '相对收益' }}）</span>
+      <span v-if="acceptance" class="badge" :class="acceptance.pass === true ? 'badge-green' : acceptance.pass === false ? 'badge-red' : 'badge-gray'">
+        {{ acceptance.pass === true ? '通过' : acceptance.pass === false ? '未通过' : '数据不足' }}
+      </span>
+      <span style="font-size:12px;color:var(--ink-faint)">{{ showAcceptance ? '▲' : '▼' }}</span>
+    </div>
+    <div v-show="showAcceptance" class="card" style="padding:12px">
+      <div style="margin-bottom:8px">
+        <button class="btn btn-sm" :class="{ 'btn-primary': acceptanceProfile === 'absolute' }" @click="switchAcceptanceProfile('absolute')">绝对收益</button>
+        <button class="btn btn-sm" :class="{ 'btn-primary': acceptanceProfile === 'relative' }" @click="switchAcceptanceProfile('relative')" style="margin-left:6px">相对收益</button>
+      </div>
+      <table v-if="acceptance">
+        <thead><tr><th>指标</th><th>门槛</th><th>实际</th><th>结论</th></tr></thead>
+        <tbody>
+          <tr v-for="c in acceptance.checks" :key="c.metric">
+            <td>{{ c.label }}</td>
+            <td>{{ c.op }} {{ (c.metric.includes('ratio') || c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
+            <td>{{ c.value === null ? '—' : c.value.toFixed(4) }}</td>
+            <td><span class="badge" :class="c.pass === true ? 'badge-green' : c.pass === false ? 'badge-red' : 'badge-gray'">{{ c.pass === true ? '过' : c.pass === false ? '未过' : '—' }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else>无验收数据</p>
     </div>
 
     <!-- 关键指标摘要 -->
@@ -2540,10 +3216,28 @@ watch(theme, () => {
         </div>
         <template v-else>
           <div class="table-container">
+            <TableToolbar
+              :filters="caEventTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '结果' }"
+              :search-text="caEventTable.searchText.value"
+              :filter-state="caEventTable.filterState.value"
+              :displayed-count="caEventTable.displayedCount.value"
+              :total-count="caEventTable.totalCount.value"
+              @update:search-text="(v: string) => (caEventTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (caEventTable.filterState.value = v)"
+              @reset="caEventTable.reset"
+            />
             <table class="ca-event-table">
-              <thead><tr><th>回撤起点</th><th>回撤低点</th><th>基准</th><th>策略</th><th>超额</th><th>结果</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in caEventTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && caEventTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="caEventTable.sortKey.value === c.key">{{ caEventTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in caEventRows" :key="r.回撤起点">
+                <tr v-for="r in caEventTable.pagedRows.value" :key="r.回撤起点">
                   <td>{{ r.回撤起点 }}</td>
                   <td>{{ r.回撤低点 }}</td>
                   <td class="text-green">{{ r.基准 }}</td>
@@ -2553,6 +3247,13 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <div v-if="caEventTable.displayedCount.value === 0" class="empty-state"><p>无匹配事件</p></div>
+            <TablePager
+              :page="caEventTable.page.value" :page-size="caEventTable.pageSize.value"
+              :total-pages="caEventTable.totalPages.value"
+              :displayed-count="caEventTable.displayedCount.value" :total-count="caEventTable.totalCount.value"
+              @update:page="caEventTable.setPage" @update:page-size="caEventTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             基准深度回撤（&gt;5%）事件共 {{ caEventStat.n }} 次，{{ ca?.strategy_name }}
@@ -2607,16 +3308,40 @@ watch(theme, () => {
           <div class="empty-state"><p>分析区间内无大跌月。</p></div>
         </div>
         <div v-else class="table-container">
+          <TableToolbar
+            :filters="caBigDownTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '月份' }"
+            :search-text="caBigDownTable.searchText.value"
+            :filter-state="caBigDownTable.filterState.value"
+            :displayed-count="caBigDownTable.displayedCount.value"
+            :total-count="caBigDownTable.totalCount.value"
+            @update:search-text="(v: string) => (caBigDownTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (caBigDownTable.filterState.value = v)"
+            @reset="caBigDownTable.reset"
+          />
           <table class="ca-bigdown-table">
-            <thead><tr><th>月份</th><th>基准</th><th>策略</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in caBigDownTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && caBigDownTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="caBigDownTable.sortKey.value === c.key">{{ caBigDownTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in caBigDownRows" :key="r.月份">
+              <tr v-for="r in caBigDownTable.pagedRows.value" :key="r.月份">
                 <td>{{ r.月份 }}</td>
                 <td class="text-green">{{ r.基准 }}</td>
                 <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="caBigDownTable.page.value" :page-size="caBigDownTable.pageSize.value"
+            :total-pages="caBigDownTable.totalPages.value"
+            :displayed-count="caBigDownTable.displayedCount.value" :total-count="caBigDownTable.totalCount.value"
+            @update:page="caBigDownTable.setPage" @update:page-size="caBigDownTable.setPageSize"
+          />
         </div>
         <p class="ca-note">下跌月份共 {{ pct1(ca?.monthly.hedge_ratio) }} 实现危机对冲（月度口径）。</p>
 
@@ -2637,10 +3362,28 @@ watch(theme, () => {
             <div ref="caAnnualEl" class="ca-chart"></div>
           </div>
           <div class="table-container">
-            <table>
-              <thead><tr><th>年度</th><th>下跌周</th><th>危机Alpha</th><th>策略收益</th><th>基准收益</th></tr></thead>
+            <TableToolbar
+              :filters="caAnnualTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '年度' }"
+              :search-text="caAnnualTable.searchText.value"
+              :filter-state="caAnnualTable.filterState.value"
+              :displayed-count="caAnnualTable.displayedCount.value"
+              :total-count="caAnnualTable.totalCount.value"
+              @update:search-text="(v: string) => (caAnnualTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (caAnnualTable.filterState.value = v)"
+              @reset="caAnnualTable.reset"
+            />
+            <table class="ca-annual-table">
+              <thead><tr>
+                <th v-for="c in caAnnualTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && caAnnualTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="caAnnualTable.sortKey.value === c.key">{{ caAnnualTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in caAnnualRows" :key="r.年度">
+                <tr v-for="r in caAnnualTable.pagedRows.value" :key="r.年度">
                   <td>{{ r.年度 }}</td>
                   <td>{{ r.下跌周 }}</td>
                   <td>{{ r.危机Alpha }}</td>
@@ -2649,6 +3392,12 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="caAnnualTable.page.value" :page-size="caAnnualTable.pageSize.value"
+              :total-pages="caAnnualTable.totalPages.value"
+              :displayed-count="caAnnualTable.displayedCount.value" :total-count="caAnnualTable.totalCount.value"
+              @update:page="caAnnualTable.setPage" @update:page-size="caAnnualTable.setPageSize"
+            />
           </div>
           <p v-if="caAnnualRows.some(r => !r.完整)" class="ca-note">
             注：标 * 的年度为数据区间首尾的非完整年度（有效收益周不足 40 周），指标仅供参考。
@@ -2704,10 +3453,28 @@ watch(theme, () => {
           <div class="empty-state"><p>分析区间内无基准下跌周。</p></div>
         </div>
         <div v-else class="table-container">
+          <TableToolbar
+            :filters="caDownTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '分类' }"
+            :search-text="caDownTable.searchText.value"
+            :filter-state="caDownTable.filterState.value"
+            :displayed-count="caDownTable.displayedCount.value"
+            :total-count="caDownTable.totalCount.value"
+            @update:search-text="(v: string) => (caDownTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (caDownTable.filterState.value = v)"
+            @reset="caDownTable.reset"
+          />
           <table class="ca-down-table">
-            <thead><tr><th>日期</th><th>基准</th><th>策略</th><th>超额</th><th>分类</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in caDownTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && caDownTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="caDownTable.sortKey.value === c.key">{{ caDownTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in pagedCaDownRows" :key="r.日期">
+              <tr v-for="r in caDownTable.pagedRows.value" :key="r.日期">
                 <td>{{ r.日期 }}</td>
                 <td class="text-green">{{ r.基准 }}</td>
                 <td :class="valueClass(Number(r.策略))">{{ r.策略 }}</td>
@@ -2716,11 +3483,13 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
-          <div v-if="caDownRows.length > caDownPageSize" class="pagination">
-            <button :disabled="caDownPage === 1" @click="caDownPage--" class="page-btn">上一页</button>
-            <span class="page-info">第 {{ Math.min(caDownPage, caDownTotalPages) }} / {{ caDownTotalPages }} 页</span>
-            <button :disabled="caDownPage >= caDownTotalPages" @click="caDownPage++" class="page-btn">下一页</button>
-          </div>
+          <div v-if="caDownTable.displayedCount.value === 0" class="empty-state"><p>无匹配下跌周</p></div>
+          <TablePager class="dw-pager"
+            :page="caDownTable.page.value" :page-size="caDownTable.pageSize.value"
+            :total-pages="caDownTable.totalPages.value"
+            :displayed-count="caDownTable.displayedCount.value" :total-count="caDownTable.totalCount.value"
+            @update:page="caDownTable.setPage" @update:page-size="caDownTable.setPageSize"
+          />
         </div>
       </template>
       </template>
@@ -2788,15 +3557,30 @@ watch(theme, () => {
           <div ref="mrStateEl" class="ca-chart mr-chart"></div>
         </div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrStateTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '市场状态' }"
+            :search-text="mrStateTable.searchText.value"
+            :filter-state="mrStateTable.filterState.value"
+            :displayed-count="mrStateTable.displayedCount.value"
+            :total-count="mrStateTable.totalCount.value"
+            @update:search-text="(v: string) => (mrStateTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrStateTable.filterState.value = v)"
+            @reset="mrStateTable.reset"
+          />
           <table>
             <thead>
               <tr>
-                <th>市场状态</th><th>周数</th><th>占比</th><th>策略累计</th><th>基准累计</th>
-                <th>超额</th><th>胜率</th><th>态内最大回撤</th><th>年化换手</th><th>成本占比</th>
+                <th v-for="c in mrStateTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && mrStateTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="mrStateTable.sortKey.value === c.key">{{ mrStateTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="r in mrStateRows" :key="r.key">
+              <tr v-for="r in mrStateTable.pagedRows.value" :key="r.key">
                 <td :style="{ color: MR_STATE_COLORS[r.key], fontWeight: 700 }">{{ r.label }}</td>
                 <td>{{ r.weeks }}</td>
                 <td>{{ r.ratio }}</td>
@@ -2810,15 +3594,39 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrStateTable.page.value" :page-size="mrStateTable.pageSize.value"
+            :total-pages="mrStateTable.totalPages.value"
+            :displayed-count="mrStateTable.displayedCount.value" :total-count="mrStateTable.totalCount.value"
+            @update:page="mrStateTable.setPage" @update:page-size="mrStateTable.setPageSize"
+          />
         </div>
 
         <div class="section-title" style="font-size:14px">二、机遇Alpha（上涨捕获）</div>
         <div class="ca-sub">大涨周检验</div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrBigUpTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '条件' }"
+            :search-text="mrBigUpTable.searchText.value"
+            :filter-state="mrBigUpTable.filterState.value"
+            :displayed-count="mrBigUpTable.displayedCount.value"
+            :total-count="mrBigUpTable.totalCount.value"
+            @update:search-text="(v: string) => (mrBigUpTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrBigUpTable.filterState.value = v)"
+            @reset="mrBigUpTable.reset"
+          />
           <table>
-            <thead><tr><th>条件</th><th>周数</th><th>策略平均</th><th>基准平均</th><th>收涨比例</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in mrBigUpTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && mrBigUpTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="mrBigUpTable.sortKey.value === c.key">{{ mrBigUpTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in mrBigUpRows" :key="r.threshold">
+              <tr v-for="r in mrBigUpTable.pagedRows.value" :key="r.threshold">
                 <td>{{ r.threshold }}</td>
                 <td>{{ r.n }}</td>
                 <td :class="valueClass(r.strategyRaw)">{{ r.strategy }}</td>
@@ -2827,6 +3635,12 @@ watch(theme, () => {
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrBigUpTable.page.value" :page-size="mrBigUpTable.pageSize.value"
+            :total-pages="mrBigUpTable.totalPages.value"
+            :displayed-count="mrBigUpTable.displayedCount.value" :total-count="mrBigUpTable.totalCount.value"
+            @update:page="mrBigUpTable.setPage" @update:page-size="mrBigUpTable.setPageSize"
+          />
         </div>
         <div class="ca-sub">上涨周四档分类</div>
         <div class="table-container">
@@ -2856,15 +3670,30 @@ watch(theme, () => {
             <div ref="mrReboundEl" class="ca-chart"></div>
           </div>
           <div class="table-container">
+            <TableToolbar
+              :filters="mrReboundTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '收复情况' }"
+              :search-text="mrReboundTable.searchText.value"
+              :filter-state="mrReboundTable.filterState.value"
+              :displayed-count="mrReboundTable.displayedCount.value"
+              :total-count="mrReboundTable.totalCount.value"
+              @update:search-text="(v: string) => (mrReboundTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (mrReboundTable.filterState.value = v)"
+              @reset="mrReboundTable.reset"
+            />
             <table>
               <thead>
                 <tr>
-                  <th>起点</th><th>低点</th><th>终点</th><th>周数</th><th>基准反弹</th><th>策略反弹</th>
-                  <th>弹性</th><th>基准收复前高</th><th>策略收复前高</th>
+                  <th v-for="c in mrReboundTable.columns" :key="c.key"
+                      :class="{ sortable: c.sortable }"
+                      @click="c.sortable && mrReboundTable.toggleSort(c.key)">
+                    {{ c.label }}
+                    <span v-if="mrReboundTable.sortKey.value === c.key">{{ mrReboundTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="r in mrReboundRows" :key="r.start">
+                <tr v-for="r in mrReboundTable.pagedRows.value" :key="r.start">
                   <td>{{ r.start }}</td>
                   <td>{{ r.trough }}</td>
                   <td>{{ r.end }}</td>
@@ -2877,6 +3706,13 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <div v-if="mrReboundTable.displayedCount.value === 0" class="empty-state"><p>无匹配反弹段</p></div>
+            <TablePager
+              :page="mrReboundTable.page.value" :page-size="mrReboundTable.pageSize.value"
+              :total-pages="mrReboundTable.totalPages.value"
+              :displayed-count="mrReboundTable.displayedCount.value" :total-count="mrReboundTable.totalCount.value"
+              @update:page="mrReboundTable.setPage" @update:page-size="mrReboundTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             反弹平均弹性
@@ -2887,15 +3723,39 @@ watch(theme, () => {
 
         <div class="section-title" style="font-size:14px">四、中性Alpha（震荡磨损）</div>
         <div class="table-container">
+          <TableToolbar
+            :filters="mrNeutralTable.filterSpecs"
+            :keyword="{ label: '搜索', placeholder: '指标名' }"
+            :search-text="mrNeutralTable.searchText.value"
+            :filter-state="mrNeutralTable.filterState.value"
+            :displayed-count="mrNeutralTable.displayedCount.value"
+            :total-count="mrNeutralTable.totalCount.value"
+            @update:search-text="(v: string) => (mrNeutralTable.searchText.value = v)"
+            @update:filter-state="(v: any) => (mrNeutralTable.filterState.value = v)"
+            @reset="mrNeutralTable.reset"
+          />
           <table>
-            <thead><tr><th>指标</th><th>数值</th></tr></thead>
+            <thead><tr>
+              <th v-for="c in mrNeutralTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && mrNeutralTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="mrNeutralTable.sortKey.value === c.key">{{ mrNeutralTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
+            </tr></thead>
             <tbody>
-              <tr v-for="r in mrNeutralRows" :key="r.k">
+              <tr v-for="r in mrNeutralTable.pagedRows.value" :key="r.k">
                 <td>{{ r.k }}</td>
                 <td :class="valueClass(r.raw)">{{ r.v }}</td>
               </tr>
             </tbody>
           </table>
+          <TablePager
+            :page="mrNeutralTable.page.value" :page-size="mrNeutralTable.pageSize.value"
+            :total-pages="mrNeutralTable.totalPages.value"
+            :displayed-count="mrNeutralTable.displayedCount.value" :total-count="mrNeutralTable.totalCount.value"
+            @update:page="mrNeutralTable.setPage" @update:page-size="mrNeutralTable.setPageSize"
+          />
         </div>
         <p class="ca-note">
           磨损指标按交易日归属平仓日；假突破磨损 = 5 个交易日内同票平仓且毛 PnL ≤ 0（FIFO 配对）。
@@ -3042,10 +3902,28 @@ watch(theme, () => {
             <div class="empty-state"><p>行业指数不可得，仅展示暴露与命中率。</p></div>
           </div>
           <div v-else class="table-container">
+            <TableToolbar
+              :filters="iaContribTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '行业名' }"
+              :search-text="iaContribTable.searchText.value"
+              :filter-state="iaContribTable.filterState.value"
+              :displayed-count="iaContribTable.displayedCount.value"
+              :total-count="iaContribTable.totalCount.value"
+              @update:search-text="(v: string) => (iaContribTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (iaContribTable.filterState.value = v)"
+              @reset="iaContribTable.reset"
+            />
             <table>
-              <thead><tr><th>行业</th><th>平均权重</th><th>行业区间涨跌</th><th>配置贡献</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in iaContribTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && iaContribTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="iaContribTable.sortKey.value === c.key">{{ iaContribTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in iaContribRows" :key="r.name">
+                <tr v-for="r in iaContribTable.pagedRows.value" :key="r.name">
                   <td>{{ r.name }}</td>
                   <td>{{ r.avg }}</td>
                   <td>{{ r.index }}</td>
@@ -3053,6 +3931,12 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="iaContribTable.page.value" :page-size="iaContribTable.pageSize.value"
+              :total-pages="iaContribTable.totalPages.value"
+              :displayed-count="iaContribTable.displayedCount.value" :total-count="iaContribTable.totalCount.value"
+              @update:page="iaContribTable.setPage" @update:page-size="iaContribTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             贡献为行业配置项（Σ 期初行业权重 × 行业日收益），不含行业内个股选择 alpha；合计与策略总收益之差为选股/交易/现金贡献。
@@ -3126,10 +4010,28 @@ watch(theme, () => {
 
           <div class="section-title" style="font-size:13px">基准替换敏感性（FR-1 相对指标逐基独立计算）</div>
           <div class="table-container">
+            <TableToolbar
+              :filters="rbSensTable.filterSpecs"
+              :keyword="{ label: '搜索', placeholder: '基准名' }"
+              :search-text="rbSensTable.searchText.value"
+              :filter-state="rbSensTable.filterState.value"
+              :displayed-count="rbSensTable.displayedCount.value"
+              :total-count="rbSensTable.totalCount.value"
+              @update:search-text="(v: string) => (rbSensTable.searchText.value = v)"
+              @update:filter-state="(v: any) => (rbSensTable.filterState.value = v)"
+              @reset="rbSensTable.reset"
+            />
             <table>
-              <thead><tr><th>基准</th><th>β</th><th>Jensen α(年化)</th><th>年化超额</th><th>跟踪误差</th><th>信息比率</th><th>上行捕获</th><th>下行捕获</th><th>超额回撤</th></tr></thead>
+              <thead><tr>
+                <th v-for="c in rbSensTable.columns" :key="c.key"
+                    :class="{ sortable: c.sortable }"
+                    @click="c.sortable && rbSensTable.toggleSort(c.key)">
+                  {{ c.label }}
+                  <span v-if="rbSensTable.sortKey.value === c.key">{{ rbSensTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+                </th>
+              </tr></thead>
               <tbody>
-                <tr v-for="r in rbSensRows" :key="r.code">
+                <tr v-for="r in rbSensTable.pagedRows.value" :key="r.code">
                   <td>{{ r.name }}<span v-if="r.is_primary" class="text-orange">（主）</span></td>
                   <template v-if="r.available">
                     <td>{{ num(r.beta, 2) }}</td>
@@ -3147,11 +4049,149 @@ watch(theme, () => {
                 </tr>
               </tbody>
             </table>
+            <TablePager
+              :page="rbSensTable.page.value" :page-size="rbSensTable.pageSize.value"
+              :total-pages="rbSensTable.totalPages.value"
+              :displayed-count="rbSensTable.displayedCount.value" :total-count="rbSensTable.totalCount.value"
+              @update:page="rbSensTable.setPage" @update:page-size="rbSensTable.setPageSize"
+            />
           </div>
           <p class="ca-note">
             全部统计仅基于本回测每日净值快照与基准日线：滚动收益按周末净值几何累乘，夏普按周收益年化（×√52）；相对指标口径同评估页 FR-1（日频、对齐日收益 ≥ 20）。
           </p>
         </template>
+      </template>
+      </template>
+    </div>
+
+    <!-- 稳健性检验（年度/3年滚动/集中度/样本内外对比） -->
+    <div ref="robustnessSectionEl" class="ca-section rb-section">
+      <div class="section-title ca-header" @click="toggleRbSection">
+        <span>🔬 稳健性检验</span>
+        <span class="ca-caret" :class="{ open: !rbCollapsed }">▶</span>
+      </div>
+
+      <template v-if="!rbCollapsed">
+      <div v-if="rbStatus === null" class="card" style="padding:12px">
+        <p style="color:var(--ink-soft);margin:0 0 8px">本次回测尚未计算稳健性检验（年度/3年滚动/个股集中度/样本内外对比）。</p>
+        <button class="btn btn-sm btn-primary" :disabled="rbRecomputing" @click="recomputeRb">
+          {{ rbRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+      </div>
+
+      <div v-else-if="rbStatus === 'failed'" class="card" style="padding:12px">
+        <p style="color:var(--red);margin:0 0 8px">稳健性检验失败：{{ robustness?.error || '未知原因' }}</p>
+        <button class="btn btn-sm btn-primary" :disabled="rbRecomputing" @click="recomputeRb">
+          {{ rbRecomputing ? '计算中…' : '重新计算' }}
+        </button>
+        <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+      </div>
+
+      <template v-else-if="rbData">
+        <div class="ca-banner">
+          <div class="t">回测稳健性检验</div>
+          <div class="d">
+            总收益 {{ pct(rbData.total_return) }} ｜ 基准 {{ pct(rbData.benchmark_return) }} ｜ 正收益年 {{ rbData.years_positive }}
+          </div>
+          <div class="ca-status">
+            <span>口径：纯后处理（读已落库净值/成交），与复权模式无关</span>
+            <span v-if="robustness?.computed_at">
+              计算于 {{ robustness?.computed_at?.replace('T', ' ').slice(0, 19) }}
+            </span>
+            <button class="btn btn-sm" :disabled="rbRecomputing" @click="recomputeRb">
+              {{ rbRecomputing ? '计算中…' : '重新计算' }}
+            </button>
+            <button class="btn btn-sm" @click="openCompare">换池对比复跑</button>
+            <span v-if="rbRecomputeMsg" :class="rbRecomputeMsgClass">{{ rbRecomputeMsg }}</span>
+          </div>
+        </div>
+
+        <div class="section-title" style="font-size:14px">一、年度收益与年内最大回撤</div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>年度</th><th>收益</th><th>年内最大回撤</th></tr></thead>
+            <tbody>
+              <tr v-for="a in rbData.annual" :key="a.year">
+                <td>{{ a.year }}</td>
+                <td :class="valueClass(a.return)">{{ pct(a.return) }}</td>
+                <td class="text-green">{{ pct(a.max_drawdown) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">二、3年滚动窗口（CAGR / 窗口内最大回撤）</div>
+        <div v-if="rbData.rolling_3y.length === 0" class="table-container">
+          <div class="empty-state"><p>区间不足 3 年，无滚动窗口。</p></div>
+        </div>
+        <div v-else class="table-container">
+          <table>
+            <thead><tr><th>窗口</th><th>CAGR</th><th>窗口内最大回撤</th></tr></thead>
+            <tbody>
+              <tr v-for="w in rbData.rolling_3y" :key="w.start">
+                <td>{{ w.start }} ~ {{ w.end }}</td>
+                <td :class="valueClass(w.cagr)">{{ pct(w.cagr) }}</td>
+                <td class="text-green">{{ pct(w.max_drawdown) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">三、个股已实现净 P&amp;L 集中度</div>
+        <div class="ca-status" style="margin-bottom:6px">
+          盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
+          ｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}
+          ｜ 总净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>#</th><th>代码</th><th>净 P&amp;L</th><th>占比</th></tr></thead>
+            <tbody>
+              <tr v-for="(t, i) in rbData.concentration.top" :key="t.code">
+                <td>{{ i + 1 }}</td>
+                <td>{{ t.code }}</td>
+                <td :class="valueClass(t.pnl)">{{ fmtMoney(t.pnl) }}</td>
+                <td>{{ pct(t.share) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="font-size:14px">四、样本内 / 样本外对比（默认 75/25 自动切分）</div>
+        <template v-if="rbData.oos">
+          <div class="ca-status" style="margin-bottom:6px">断点年份：{{ rbData.oos.split_year }}（{{ rbData.oos.in_sample.end.slice(0,4) }} 及以前为样本内）</div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>区间</th><th>累计收益</th><th>年化</th><th>最大回撤</th><th>基准</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>样本内（{{ rbData.oos.in_sample.start.slice(0,4) }} ~ {{ rbData.oos.in_sample.end.slice(0,4) }}）</td>
+                  <td :class="valueClass(rbData.oos.in_sample.return)">{{ pct(rbData.oos.in_sample.return) }}</td>
+                  <td :class="valueClass(rbData.oos.in_sample.cagr)">{{ pct(rbData.oos.in_sample.cagr) }}</td>
+                  <td :class="valueClass(rbData.oos.in_sample.max_drawdown)">{{ pct(rbData.oos.in_sample.max_drawdown) }}</td>
+                  <td>{{ pct(rbData.oos.in_sample.benchmark_return) }}</td>
+                </tr>
+                <tr>
+                  <td>样本外（{{ rbData.oos.out_of_sample.start.slice(0,4) }} ~ {{ rbData.oos.out_of_sample.end.slice(0,4) }}）</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.return)">{{ pct(rbData.oos.out_of_sample.return) }}</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.cagr)">{{ pct(rbData.oos.out_of_sample.cagr) }}</td>
+                  <td :class="valueClass(rbData.oos.out_of_sample.max_drawdown)">{{ pct(rbData.oos.out_of_sample.max_drawdown) }}</td>
+                  <td>{{ pct(rbData.oos.out_of_sample.benchmark_return) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note">
+            样本外年化显著低于样本内 → 策略 alpha 随时间衰减；两者接近 → 较稳健（结论供参考，非自动判定）。
+          </p>
+          <p class="ca-note" style="color:var(--gold)">
+            {{ rbData.oos.caveat || 'OOS 仅防时段崩塌，不防全样本调参' }}
+          </p>
+        </template>
+        <div v-else class="table-container">
+          <div class="empty-state"><p>区间不足 2 年，无法切分样本内/样本外。</p></div>
+        </div>
       </template>
       </template>
     </div>
@@ -3166,6 +4206,10 @@ watch(theme, () => {
           <div class="score-grade" :class="'grade-' + portfolioScore.grade.toLowerCase()">{{ portfolioScore.grade }}</div>
           <div class="score-info">
             <div class="score-title">综合评分 <span class="score-total">{{ portfolioScore.total }}</span> / 100 — {{ portfolioScore.gradeLabel }}</div>
+            <div class="score-confidence">
+              样本时长 {{ portfolioScore.sampleYears.toFixed(2) }} 年 · 置信度 {{ portfolioScore.confidencePct }}%
+              <span v-if="portfolioScore.timeFactor < 1" class="score-confidence-note">（不足 {{ SCORE_REFERENCE_YEARS }} 年，评分按置信度折扣；原始分 {{ portfolioScore.rawTotal }}）</span>
+            </div>
             <div class="score-dims">
               <div v-for="d in portfolioScore.dimensions" :key="d.label" class="score-dim">
                 <span class="dim-label">{{ d.label }}</span>
@@ -3186,7 +4230,7 @@ watch(theme, () => {
           <div class="risk-metrics">
             <template v-for="m in sc.metrics" :key="m.group ?? m.label">
               <div v-if="m.group" class="metric-group">{{ m.group }}</div>
-              <div v-else class="metric-row">
+              <div v-else class="metric-row" :title="m.hint">
                 <span class="metric-label">{{ m.label }}</span>
                 <span :class="m.cls">{{ m.value }}</span>
               </div>
@@ -3204,7 +4248,7 @@ watch(theme, () => {
           <div class="risk-metrics">
             <template v-for="m in portfolioMetrics" :key="m.group ?? m.label">
               <div v-if="m.group" class="metric-group">{{ m.group }}</div>
-              <div v-else class="metric-row">
+              <div v-else class="metric-row" :title="m.hint">
                 <span class="metric-label">{{ m.label }}</span>
                 <span :class="m.cls">{{ m.value }}</span>
               </div>
@@ -3266,15 +4310,30 @@ watch(theme, () => {
     </div>
     <template v-else>
       <div class="table-container">
+        <TableToolbar
+          :filters="decisionTable.filterSpecs"
+          :keyword="{ label: '搜索', placeholder: '闸门 / 参数名' }"
+          :search-text="decisionTable.searchText.value"
+          :filter-state="decisionTable.filterState.value"
+          :displayed-count="decisionTable.displayedCount.value"
+          :total-count="decisionTable.totalCount.value"
+          @update:search-text="(v: string) => (decisionTable.searchText.value = v)"
+          @update:filter-state="(v: any) => (decisionTable.filterState.value = v)"
+          @reset="decisionTable.reset"
+        />
         <table class="decision-table">
           <thead>
             <tr>
-              <th>闸门</th><th>层</th><th>动作</th><th>参数</th><th>阈值</th>
-              <th>触发次数</th><th>首次</th><th>末次</th><th>涉及股票</th><th>请求/实发(股)</th>
+              <th v-for="c in decisionTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && decisionTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="decisionTable.sortKey.value === c.key">{{ decisionTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="s in decisionSummary" :key="gateKey(s)"
+            <tr v-for="s in decisionTable.pagedRows.value" :key="gateKey(s)"
                 class="decision-row" :class="{ active: gateKey(s) === selectedKey }"
                 @click="toggleGate(s)">
               <td>
@@ -3293,6 +4352,13 @@ watch(theme, () => {
             </tr>
           </tbody>
         </table>
+        <div v-if="decisionTable.displayedCount.value === 0" class="empty-state"><p>无匹配记录</p></div>
+        <TablePager
+          :page="decisionTable.page.value" :page-size="decisionTable.pageSize.value"
+          :total-pages="decisionTable.totalPages.value"
+          :displayed-count="decisionTable.displayedCount.value" :total-count="decisionTable.totalCount.value"
+          @update:page="decisionTable.setPage" @update:page-size="decisionTable.setPageSize"
+        />
       </div>
 
       <!-- 下钻：选中闸门的逐笔事件 -->
@@ -3301,15 +4367,30 @@ watch(theme, () => {
           「{{ gateLabel(selectedSummary.gate) }}」明细 · 共 {{ selectedEvents.length }} 条
           <span class="drill-close" @click="selectedKey = null">收起 ✕</span>
         </div>
+        <TableToolbar
+          :filters="decisionDetailTable.filterSpecs"
+          :keyword="{ label: '搜索', placeholder: '代码 / 原因' }"
+          :search-text="decisionDetailTable.searchText.value"
+          :filter-state="decisionDetailTable.filterState.value"
+          :displayed-count="decisionDetailTable.displayedCount.value"
+          :total-count="decisionDetailTable.totalCount.value"
+          @update:search-text="(v: string) => (decisionDetailTable.searchText.value = v)"
+          @update:filter-state="(v: any) => (decisionDetailTable.filterState.value = v)"
+          @reset="decisionDetailTable.reset"
+        />
         <table class="trade-table">
           <thead>
             <tr>
-              <th>时间</th><th>策略</th><th>代码</th><th>阈值</th><th>实际</th>
-              <th>请求/实发</th><th>原因</th>
+              <th v-for="c in decisionDetailTable.columns" :key="c.key"
+                  :class="{ sortable: c.sortable }"
+                  @click="c.sortable && decisionDetailTable.toggleSort(c.key)">
+                {{ c.label }}
+                <span v-if="decisionDetailTable.sortKey.value === c.key">{{ decisionDetailTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+              </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="e in selectedEvents" :key="e.id">
+            <tr v-for="e in decisionDetailTable.pagedRows.value" :key="e.id">
               <td class="time">{{ fmtBarTime(e.bar_time) }}</td>
               <td>{{ e.strategy_id ? `#${e.strategy_id}` : '组合' }}</td>
               <td>{{ e.stock_code || '—' }}</td>
@@ -3320,21 +4401,43 @@ watch(theme, () => {
             </tr>
           </tbody>
         </table>
+        <div v-if="decisionDetailTable.displayedCount.value === 0" class="empty-state"><p>无匹配事件</p></div>
+        <TablePager
+          :page="decisionDetailTable.page.value" :page-size="decisionDetailTable.pageSize.value"
+          :total-pages="decisionDetailTable.totalPages.value"
+          :displayed-count="decisionDetailTable.displayedCount.value" :total-count="decisionDetailTable.totalCount.value"
+          @update:page="decisionDetailTable.setPage" @update:page-size="decisionDetailTable.setPageSize"
+        />
       </div>
     </template>
 
     <!-- 交易明细 -->
     <div class="section-title">交易明细</div>
     <div class="table-container">
+      <TableToolbar
+        :filters="tradesTable.filterSpecs"
+        :keyword="{ label: '搜索', placeholder: '代码 / 信号来源 / 策略名' }"
+        :search-text="tradesTable.searchText.value"
+        :filter-state="tradesTable.filterState.value"
+        :displayed-count="tradesTable.displayedCount.value"
+        :total-count="tradesTable.totalCount.value"
+        @update:search-text="(v: string) => (tradesTable.searchText.value = v)"
+        @update:filter-state="(v: any) => (tradesTable.filterState.value = v)"
+        @reset="tradesTable.reset"
+      />
       <table class="trade-table">
         <thead>
           <tr>
-            <th>时间</th><th>策略</th><th>信号来源</th><th>买卖</th><th>代码</th>
-            <th>数量</th><th>价格</th><th>金额</th><th>佣金</th><th>印花税</th>
+            <th v-for="c in tradesTable.columns" :key="c.key"
+                :class="{ sortable: c.sortable }"
+                @click="c.sortable && tradesTable.toggleSort(c.key)">
+              {{ c.label }}
+              <span v-if="tradesTable.sortKey.value === c.key">{{ tradesTable.sortDir.value === 'asc' ? '▲' : '▼' }}</span>
+            </th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="t in paginatedTrades" :key="t.id">
+          <tr v-for="t in tradesTable.pagedRows.value" :key="t.id">
             <td style="font-size:12px;color:var(--ink-faint)">{{ t.bar_time?.replace('T', ' ') }}</td>
             <td><span class="strategy-badge">{{ t.strategy_name || `#${t.strategy_id}` }}</span></td>
             <td>
@@ -3343,22 +4446,109 @@ watch(theme, () => {
             </td>
             <td :class="t.trade_type === 'BUY' ? 'text-green' : 'text-red'">{{ t.trade_type === 'BUY' ? '买入' : '卖出' }}</td>
             <td>{{ t.stock_code }}</td>
-            <td>{{ t.quantity }}</td>
-            <td>{{ Number(t.price).toFixed(3) }}</td>
-            <td>{{ Number(t.amount).toLocaleString() }}</td>
-            <td>{{ Number(t.commission).toFixed(2) }}</td>
-            <td>{{ Number(t.stamp_duty).toFixed(2) }}</td>
+            <td>{{ fmtQty(t.quantity) }}</td>
+            <td>{{ fmtPrice(t.price) }}</td>
+            <td>{{ fmtMoney(t.amount) }}</td>
+            <td>{{ fmtMoney(t.commission) }}</td>
+            <td>{{ fmtMoney(t.stamp_duty) }}</td>
           </tr>
         </tbody>
       </table>
-      <div v-if="(detail?.trades || []).length === 0" class="empty-state"><p>无交易记录</p></div>
-      <div v-if="(detail?.trades || []).length > pageSize" class="pagination">
-        <button :disabled="currentPage === 1" @click="currentPage--" class="page-btn">上一页</button>
-        <span class="page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
-        <button :disabled="currentPage === totalPages" @click="currentPage++" class="page-btn">下一页</button>
-      </div>
+      <div v-if="tradesTable.displayedCount.value === 0" class="empty-state"><p>无匹配交易记录</p></div>
+      <TablePager
+        :page="tradesTable.page.value" :page-size="tradesTable.pageSize.value"
+        :total-pages="tradesTable.totalPages.value"
+        :displayed-count="tradesTable.displayedCount.value" :total-count="tradesTable.totalCount.value"
+        @update:page="tradesTable.setPage" @update:page-size="tradesTable.setPageSize"
+      />
     </div>
   </div>
+
+    <!-- 换池稳健性对比 Modal -->
+    <div v-if="showCompare" class="modal-overlay modal-lg" @click.self="showCompare = false">
+      <div class="modal-content">
+        <h3>换池稳健性对比</h3>
+        <div class="modal-body">
+          <p style="color:var(--ink-soft);font-size:12px;margin:0 0 8px">
+            同参数（公式/风控/资金）仅换股票池逐个重跑回测，检验策略是否依赖特定股票池。每次对比分钟级，请耐心等待。
+          </p>
+
+          <label>备选股票池</label>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <button type="button" class="btn btn-sm" @click="selectRecommended">⭐ 选推荐池</button>
+            <button type="button" class="btn btn-sm" @click="compareForm.pool_ids = []">清空</button>
+            <span class="form-hint" style="margin-bottom:0">推荐：成长/红利/热点精选（风格差异大，更易检验是否依赖特定池）</span>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+            <label v-for="p in pools" :key="p.id" class="compare-pool-opt">
+              <input type="checkbox" :value="p.id" v-model="compareForm.pool_ids" />
+              {{ p.name }}（{{ p.code }}）
+              <span v-if="recommendedPoolIds.includes(p.id)" class="rec-tag">推荐</span>
+            </label>
+          </div>
+
+          <div class="signal-row">
+            <div style="flex:1">
+              <label>开始日期</label>
+              <input v-model="compareForm.start_date" type="date" />
+            </div>
+            <div style="flex:1">
+              <label>结束日期</label>
+              <input v-model="compareForm.end_date" type="date" />
+            </div>
+          </div>
+
+          <div class="signal-row">
+            <div style="flex:1">
+              <label>复权模式</label>
+              <select v-model="compareForm.dividend_mode">
+                <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="front">前复权（默认）</option>
+                <option value="back">后复权</option>
+              </select>
+            </div>
+          </div>
+
+          <div v-if="compareMsg" class="form-hint" style="color:var(--red)">{{ compareMsg }}</div>
+
+          <div v-if="comparing" class="empty-state" style="padding:20px">
+            <p>对比运行中（每池分钟级），请勿关闭…</p>
+          </div>
+
+          <div v-else-if="compareResult" class="table-container" style="margin-top:8px">
+            <table>
+              <thead>
+                <tr>
+                  <th>股票池</th><th>年化</th><th>最大回撤</th><th>Sharpe</th>
+                  <th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>仓位利用率</th><th>样本外年化</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in compareResult.comparisons" :key="c.pool_id">
+                  <td>{{ c.pool_name }}<span v-if="c.status !== 'completed'" class="text-red">（失败）</span></td>
+                  <td :class="valueClass(c.metrics?.annual_return)">{{ c.metrics ? pct(c.metrics.annual_return) : '—' }}</td>
+                  <td class="text-green">{{ c.metrics ? pct(c.metrics.max_drawdown) : '—' }}</td>
+                  <td>{{ c.metrics ? c.metrics.sharpe_ratio?.toFixed(2) : '—' }}</td>
+                  <td>{{ c.metrics ? pct(c.metrics.win_rate) : '—' }}</td>
+                  <td>{{ c.metrics ? c.metrics.profit_factor?.toFixed(2) : '—' }}</td>
+                  <td>{{ c.metrics?.total_trades ?? '—' }}</td>
+                  <td>{{ c.metrics ? pct(c.metrics.avg_position_utilization) : '—' }}</td>
+                  <td :class="valueClass(c.robustness?.oos?.out_of_sample?.cagr)">{{ compareOosCagr(c) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="ca-note">各池年化/回撤接近 → 策略不依赖特定池；差异大 → 结果需谨慎。样本外年化越低说明近期 alpha 衰减越明显。</p>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button @click="submitCompare" class="btn btn-primary" :disabled="comparing || !pools.length">
+            {{ comparing ? '对比中...' : '开始对比' }}
+          </button>
+          <button @click="showCompare = false" class="btn" :disabled="comparing">关闭</button>
+        </div>
+      </div>
+    </div>
 </template>
 
 <style scoped>
@@ -3376,6 +4566,30 @@ watch(theme, () => {
   left: 0;
   top: 0;
   text-decoration: none;
+}
+.signal-preflight-banner {
+  margin: 0 0 20px;
+  padding: 12px 16px;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-wash);
+}
+.signal-preflight-banner .spb-title {
+  color: var(--warn);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.signal-preflight-banner .spb-title span {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-left: 6px;
+}
+.signal-preflight-banner .spb-list {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.7;
 }
 .report-header h1 {
   margin: 0;
@@ -3658,12 +4872,43 @@ watch(theme, () => {
 }
 .ca-caret.open { transform: rotate(90deg); }
 .ca-banner {
-  background: var(--ink);
+  background: #0b0b0b;
   border-radius: 12px;
   padding: 18px 24px;
-  color: var(--card-bg);
+  color: #f2efeb;
   margin-bottom: 6px;
 }
+[data-theme="dark"] .ca-banner {
+  background: #05070a;
+  color: #ece7df;
+}
+/* 反色强调块内的按钮/文字须用固定浅色（--ink/--card-bg 随主题翻转会导致
+   浅色模式下按钮文字与深底同色而不可见） */
+.ca-banner .btn {
+  color: #f2efeb;
+  border-color: rgba(242,239,235,.45);
+  background: transparent;
+}
+.ca-banner .btn:hover {
+  background: #f2efeb;
+  color: #0b0b0b;
+}
+[data-theme="dark"] .ca-banner .btn {
+  color: #ece7df;
+  border-color: rgba(236,231,223,.45);
+}
+[data-theme="dark"] .ca-banner .btn:hover {
+  background: #ece7df;
+  color: #0b0b0b;
+}
+/* .ca-status/.ca-msg 默认用 --ink-soft/--ink（随主题为深色），在深色 banner 上
+   不可见 → banner 作用域内固定浅色 */
+.ca-banner .ca-status { color: rgba(242,239,235,.72); }
+.ca-banner .ca-msg { color: #f2efeb; }
+.ca-banner .ca-warn { color: #e06550; }
+[data-theme="dark"] .ca-banner .ca-status { color: rgba(236,231,223,.72); }
+[data-theme="dark"] .ca-banner .ca-msg { color: #ece7df; }
+[data-theme="dark"] .ca-banner .ca-warn { color: #e06550; }
 .ca-banner .t { font-size: 20px; font-weight: 800; }
 .ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
 .score-card {
@@ -3686,6 +4931,8 @@ watch(theme, () => {
 .score-info { flex: 1; }
 .score-title { font-size: 14px; font-weight: 600; color: var(--ink); }
 .score-total { font-size: 20px; font-weight: 800; color: var(--accent); }
+.score-confidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
+.score-confidence-note { color: var(--gold); }
 .score-dims { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; margin-top: 8px; }
 .score-dim { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-shrink: 0; }
 .dim-label { width: 70px; color: var(--ink-soft); flex-shrink: 0; white-space: nowrap; }

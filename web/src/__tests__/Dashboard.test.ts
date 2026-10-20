@@ -45,7 +45,7 @@ beforeEach(() => {
   ;(getPortfolios as any).mockResolvedValue([])
   ;(getBacktestRecords as any).mockResolvedValue([{
     id: 1, portfolio_strategy_id: 1, name: '回测A', start_date: '2026-01-01', end_date: '2026-01-31',
-    status: 'completed', progress: 1, error_message: null, created_at: null, completed_at: null,
+    status: 'completed', error_message: null, created_at: null, completed_at: null,
   }])
   ;(getLiveSessions as any).mockResolvedValue([])
   ;(getSystemConfigs as any).mockResolvedValue(mockCfg)
@@ -84,6 +84,18 @@ describe('Dashboard.vue', () => {
     expect(w.text()).toContain('部分数据加载失败')
     expect(w.text()).toContain('回测记录')  // 其余卡片不受影响
     expect(w.text()).toContain('在线')
+    w.unmount()
+  })
+
+  it('Hero 保留统计与刷新，已移除品牌标题', async () => {
+    const w = mount(Dashboard)
+    await flushPromises()
+    expect(w.find('.dash-hero').exists()).toBe(true)
+    expect(w.find('.dash-hero-stats').exists()).toBe(true)
+    expect(w.find('.dash-hero-stats').text()).toContain('股票池')
+    expect(w.find('.dash-hero-actions').find('button').text()).toContain('刷新')
+    expect(w.find('.dash-brand').exists()).toBe(false)
+    expect(w.find('.dash-brand-sub').exists()).toBe(false)
     w.unmount()
   })
 })

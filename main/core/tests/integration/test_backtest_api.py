@@ -106,8 +106,8 @@ def test_post_backtest_end_to_end(client, monkeypatch):
 
     stock = "000001.SZ"
     # monkeypatch 数据获取层：返回 mock klines / signal_cache
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -131,7 +131,6 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     rec = db.get(BacktestRecord, record_id)
     assert rec is not None
     assert rec.status == "completed"
-    assert rec.progress == 100
     assert rec.portfolio_strategy_id == ps_id
 
     trades = db.query(BacktestTrade).filter_by(backtest_record_id=record_id).all()
@@ -152,6 +151,155 @@ def test_post_backtest_end_to_end(client, monkeypatch):
     db.close()
 
 
+def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
+    """dividend_mode='back' 穿透到 build_klines/build_signal_cache/build_benchmark_data，
+    且写入 params_snapshot。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.close()
+
+    seen = {}
+
+    def _fake_klines(ps, start, end, db=None, dividend_mode="front"):
+        seen["klines"] = dividend_mode
+        return _mock_klines()
+
+    def _fake_cache(ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
+        seen["cache"] = dividend_mode
+        return {}
+
+    def _fake_bench(ps, start, end, db=None, dividend_mode="front"):
+        seen["bench"] = dividend_mode
+        return {}
+
+    monkeypatch.setattr(svc, "build_klines", _fake_klines)
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc, "build_benchmark_data", _fake_bench)
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_back",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "back",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert seen == {"klines": "back", "cache": "back", "bench": "back"}
+
+    record_id = resp.json()["data"]["record_id"]
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    snap = json.loads(rec.params_snapshot)
+    assert snap["dividend_mode"] == "back"
+    db.close()
+
+
+def test_post_backtest_invalid_dividend_mode_returns_400(client):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_bad",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "hfq",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    body = resp.json()
+    assert body["code"] == 400
+    assert "front/back" in body["message"]
+
+
+def test_post_backtest_robustness_recompute(client, monkeypatch):
+    """回测完成后自动算稳健性检验；POST recompute 返回 completed，详情含 robustness。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.close()
+
+    stock = "000001.SZ"
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    })
+
+    payload = {
+        "portfolio_strategy_id": ps_id, "name": "bt_rb",
+        "start_date": "2026-07-29", "end_date": "2026-07-31",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    record_id = resp.json()["data"]["record_id"]
+
+    # 手动重算稳健性检验
+    resp = c.post(f"/api/backtest/records/{record_id}/robustness/recompute")
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "completed"
+
+    detail = c.get(f"/api/backtest/records/{record_id}").json()["data"]
+    assert detail["robustness"] is not None
+    assert detail["robustness"]["status"] == "completed"
+    assert "annual" in detail["robustness"]["data"]
+
+
+def test_post_backtest_robustness_recompute_missing_404(client):
+    c, _ = client
+    resp = c.post("/api/backtest/records/99999/robustness/recompute")
+    assert resp.json()["code"] == 404
+
+
+def test_post_pool_compare_runs_and_returns_comparisons(client, monkeypatch):
+    """换池对比：POST /robustness/compare 逐池跑回测并返回对比结果。"""
+    c, Session = client
+    db = Session()
+    ps_id, strat_id, formula_id = _seed(db)
+    db.add(StockPool(code="T9", name="池9"))
+    db.add(StockPool(code="T10", name="池10"))
+    db.commit()
+    pools = {r.code: r.id for r in db.query(StockPool).all()}
+    db.close()
+
+    stock = "000001.SZ"
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "pool_ids": [pools["T9"], pools["T10"]],
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "dual",
+    }
+    resp = c.post("/api/backtest/robustness/compare", json=payload)
+    body = resp.json()
+    assert body["code"] == 0
+    comps = body["data"]["comparisons"]
+    assert len(comps) == 2
+    assert all(c["status"] == "completed" for c in comps)
+    assert all(c["record_id"] is not None for c in comps)
+
+
+def test_post_pool_compare_empty_pools_400(client):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    payload = {
+        "portfolio_strategy_id": ps_id, "pool_ids": [],
+        "start_date": "2026-07-29", "end_date": "2026-07-31",
+    }
+    resp = c.post("/api/backtest/robustness/compare", json=payload)
+    assert resp.json()["code"] == 400
+
+
 def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     c, Session = client
     db = Session()
@@ -159,8 +307,8 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
@@ -193,14 +341,15 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 # ===========================================================================
 def _mock_data(monkeypatch):
     """统一 mock 数据获取层，供多测试复用。"""
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     })
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    monkeypatch.setattr(svc, "safe_compute_market_regime", lambda *a, **kw: None)
 
 
 def _post_backtest(c, ps_id):
@@ -231,7 +380,6 @@ def test_list_records_returns_persisted(client, monkeypatch):
     rec = next(r for r in body["data"] if r["id"] == record_id)
     assert rec["name"] == "bt_list_test"
     assert rec["status"] == "completed"
-    assert rec["progress"] == 100
     assert rec["portfolio_strategy_id"] == ps_id
     assert "created_at" in rec
 
@@ -327,6 +475,85 @@ def test_delete_record_not_found(client):
     assert body["code"] == 404
 
 
+def test_delete_record_running_returns_409(client):
+    """#4: 删除 status=running 的回测记录 → 409（运行中拒绝删除）。
+
+    防止并发删除运行中的回测引发 FK 500 / 数据竞争。回测同步内联执行，
+    运行中即代表有另一请求正在跑回测，删除会破坏其写入。
+    """
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps_id, name="running_one",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="running",
+    )
+    db.add(rec)
+    db.commit()
+    rid = rec.id
+    db.close()
+
+    resp = c.delete(f"/api/backtest/records/{rid}")
+    body = resp.json()
+    assert body["code"] == 409
+    assert "运行中" in body["message"]
+
+    # 记录仍在，状态不变
+    db = Session()
+    still = db.get(BacktestRecord, rid)
+    assert still is not None
+    assert still.status == "running"
+    db.close()
+
+
+def test_lifespan_recovers_stale_running_backtests_on_startup(monkeypatch):
+    """#5: 应用启动 lifespan 会调用 recover_stale_running_backtests 清理僵尸 running
+    记录（进程崩溃/重启残留），防止前端永久显示"运行中"。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from core.main import app
+
+    called = {"n": 0, "db_ok": False}
+
+    def fake_recover(db):
+        called["n"] += 1
+        # 校验传入的是可用 Session（表已建好）
+        from core.models import BacktestRecord
+        assert db.query(BacktestRecord).count() == 0  # 启动时本应空
+        called["db_ok"] = True
+        return 0
+
+    # 避免 lifespan 跑 Alembic 真实迁移 + 连真实 dev.db（只测 recover 接线）
+    monkeypatch.setattr("core.main.init_db", lambda: None)
+    monkeypatch.setattr("core.main.recover_stale_running_backtests", fake_recover)
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine)
+    monkeypatch.setattr("core.main.SessionLocal", TestSession)
+
+    def override_get_db():
+        db = TestSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app, raise_server_exceptions=False):
+            assert called["n"] == 1
+            assert called["db_ok"] is True
+    finally:
+        app.dependency_overrides.clear()
+
+
 # ===========================================================================
 # 日期区间校验 — start 必须 < end；起止不可在未来。
 # 防止 TQ 拉到空行情后静默"成功"标 completed（真机 bug 根因）。
@@ -379,9 +606,9 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
     ps_id, _, _ = _seed(db)
     db.close()
 
-    # mock 数据层全返回空 — 模拟 TQ 拉不到行情
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: {})
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    # mock 三层全返回空 — 模拟 TQ 拉不到行情
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
 
     payload = {
         "portfolio_strategy_id": ps_id,
@@ -409,7 +636,7 @@ def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
     db.close()
 
     # build_klines 抛异常 — 模拟 polars PanicException 等真机错误
-    def _boom(ps, start, end, db=None):
+    def _boom(ps, start, end, db=None, dividend_mode="front"):
         raise RuntimeError("polars panic: str cannot be int")
     monkeypatch.setattr(svc, "build_klines", _boom)
 
@@ -447,22 +674,23 @@ def _post_payload(ps_id, name):
 
 
 def test_post_backtest_409_when_already_running(client, monkeypatch):
-    """并发保护：已有回测在跑（模块锁被持有）→ 新 POST 返回 HTTP 409，不被放行。
+    """并发保护：已达并发上限（占满 slot）→ 新 POST 返回 HTTP 409，不被放行。
 
     回测是同步内联执行（一个请求阻塞到跑完），两并发请求不会真的重叠，故用
-    「直接持有 _BACKTEST_LOCK」模拟"回测进行中"：持锁时 acquire(blocking=False)
-    失败 → 409。释放后正常放行。"""
+    「直接占满并发 slot」模拟"回测进行中"：占满后 _try_acquire_slot 失败 → 409。
+    释放 slot 后正常放行。"""
     c, Session = client
     db = Session()
     ps_id, _, _ = _seed(db)
     db.close()
 
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     payload = _post_payload(ps_id, "conflict_test")
 
-    # 持锁模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
-    bt_api._BACKTEST_LOCK.acquire()
+    # 占满并发 slot 模拟"已有回测在跑" → 新 POST 应 409（HTTP 状态码，非 body code）
+    monkeypatch.setattr(bt_api, "_max_concurrent_backtest", lambda: 1)
+    bt_api._running_backtests = 1
     try:
         resp = c.post("/api/backtest", json=payload)
         assert resp.status_code == 409
@@ -472,9 +700,9 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
         assert db.query(BacktestRecord).filter_by(name="conflict_test").count() == 0
         db.close()
     finally:
-        bt_api._BACKTEST_LOCK.release()
+        bt_api._running_backtests = 0
 
-    # 锁释放后 → 正常放行
+    # slot 释放后 → 正常放行
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0
@@ -498,8 +726,8 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     assert resp.json()["code"] == 500
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None: _mock_klines())
-    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None: {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
     assert resp2.json()["code"] == 0
@@ -604,36 +832,6 @@ def test_export_html_not_found(client):
     assert resp.json()["code"] == 404
 
 
-def test_delete_running_record_returns_409(client):
-    """#4：删除 running 记录返回 HTTP 409，且保留该行（FK=ON 下删 running 会与子表插入
-    竞争 → IntegrityError → 500）。
-
-    brief 原用 conftest 的 test_client/db_session，但该 fixture 把同一个 Session 跨线程
-    交给请求处理（TestClient 在工作线程跑端点），SQLite 默认 check_same_thread=True 抛
-    ProgrammingError。改用本文件既有的 client fixture（StaticPool + check_same_thread=False，
-    见 client:21-47），与同文件其它集成测试的 seed+调用模式一致。
-    """
-    from datetime import date
-    from core.models.backtest_record import BacktestRecord
-
-    c, Session = client
-    db = Session()
-    rec = BacktestRecord(
-        portfolio_strategy_id=1, name="run", status="running", progress=30,
-        start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
-    )
-    db.add(rec)
-    db.commit()
-    rec_id = rec.id
-    db.close()
-
-    resp = c.delete(f"/api/backtest/records/{rec_id}")
-    assert resp.status_code == 409
-
-    db = Session()
-    assert db.get(BacktestRecord, rec_id) is not None
-    db.close()
-
 
 def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     c, Session = client
@@ -674,31 +872,26 @@ def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     assert ca["data"] == {"total_score": 3}
 
 
-def test_delete_running_record_returns_409(test_client, db_session):
+def test_recompute_running_record_returns_409(client):
+    """running 记录重算评估 → 409（离线重算不碰 running 行，防写入竞争）。"""
     from datetime import date
     from core.models.backtest_record import BacktestRecord
 
-    def _rec(status, progress):
-        return BacktestRecord(
-            portfolio_strategy_id=1, name="run", status=status, progress=progress,
-            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
-        )
-
-    rec = _rec("running", 30)
-    db_session.add(rec); db_session.commit()
-    resp = test_client.delete(f"/api/backtest/records/{rec.id}")
-    assert resp.status_code == 409
-    assert db_session.get(BacktestRecord, rec.id) is not None
-
-
-def test_recompute_running_record_returns_409(test_client, db_session):
-    from datetime import date
-    from core.models.backtest_record import BacktestRecord
+    c, Session = client
+    db = Session()
     rec = BacktestRecord(
-        portfolio_strategy_id=1, name="run", status="running", progress=50,
+        portfolio_strategy_id=1, name="run", status="running",
         start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
     )
-    db_session.add(rec); db_session.commit()
-    resp = test_client.post(f"/api/backtest/records/{rec.id}/evaluations/recompute")
-    assert resp.status_code == 409
+    db.add(rec); db.commit()
+    rid = rec.id
+    db.close()
+
+    body = c.post(f"/api/backtest/records/{rid}/evaluations/recompute").json()
+    assert body["code"] == 409
+    db = Session()
+    assert db.get(BacktestRecord, rid) is not None
+    db.close()
+
+
 

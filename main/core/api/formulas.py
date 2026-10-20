@@ -17,13 +17,14 @@ from core.services.formula_service import (
 router = APIRouter(prefix="/api/formulas", tags=["formulas"])
 
 VALID_SIGNAL_TYPES = {"OPEN", "ADD", "REDUCE", "CLOSE"}
+# 0 故意排除：0 是通达信信号输出线的"无信号"常态值，配成触发值会导致每根 bar 都匹配。
 VALID_TRIGGER_VALUES = {-2, -1, 1, 2}
 
 
 class SignalItem(BaseModel):
     signal_name: str
     signal_type: str  # OPEN|ADD|REDUCE|CLOSE
-    trigger_value: int  # -2/-1/1/2（通达信 buy=2, sell=-2/0）
+    trigger_value: int  # ±1/±2（0 为无信号常态值，禁止配置）
 
 
 class FormulaCreate(BaseModel):
@@ -41,10 +42,17 @@ class FormulaImport(BaseModel):
 def _validate_signals(signals: list[SignalItem]) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
     for sig in signals:
+        if not sig.signal_name.strip():
+            return "signal_name 不能为空"
         if sig.signal_type not in VALID_SIGNAL_TYPES:
             return f"signal_type 必须为 OPEN/ADD/REDUCE/CLOSE，收到 {sig.signal_type}"
+        if sig.trigger_value == 0:
+            return (
+                "trigger_value 不能为 0：0 是公式输出线的无信号常态值，"
+                "配置后会在每根 bar 都匹配，请改用实际信号值（±1/±2）"
+            )
         if sig.trigger_value not in VALID_TRIGGER_VALUES:
-            return f"trigger_value 必须为 -2/-1/1/2，收到 {sig.trigger_value}"
+            return f"trigger_value 必须为 -2,-1,1,2，收到 {sig.trigger_value}"
     return None
 
 
@@ -95,6 +103,8 @@ def get_formula(formula_id: int, db: Session = Depends(get_db)):
 
 @router.post("")
 def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
+    if not req.name.strip():
+        return err(400, "公式名称不能为空")
     err_msg = _validate_signals(req.signals)
     if err_msg:
         return err(400, err_msg)
@@ -108,6 +118,8 @@ def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(ge
     # 校验参数（400）→ 再调 service（内部判 404 + 应用 + 提交）。
     # 原实现顺序是 404→400，但 service 把「判存在 + 应用 + 提交」合并后，须先校验
     # 避免把非法字段写库；「不存在 id + 非法信号」无测试覆盖且语义上 400 更合理。
+    if not req.name.strip():
+        return err(400, "公式名称不能为空")
     err_msg = _validate_signals(req.signals)
     if err_msg:
         return err(400, err_msg)

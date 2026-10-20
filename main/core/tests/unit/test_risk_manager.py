@@ -1,7 +1,8 @@
 from datetime import date, timedelta
 from decimal import Decimal
 
-from core.engine.risk_manager import PortfolioRiskManager
+from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
+from core.engine.position import Position
 
 
 def _pm(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05")):
@@ -69,8 +70,14 @@ def test_backtest_mode_breaker_never_permanent_manual_lock():
         pm.update(Decimal("79000"), td, initial)                       # 触发
     assert pm.consecutive_drawdown_triggers == 4
     assert pm.manual_recovery is False
-    # 触发次日回升 → 自动恢复，未永久停机
+    # 7/9：熔断次日自动恢复（circuit_breaker_active=False）；7/8 的 -21% 日内亏损
+    # 按新时序（跨日补算）在 7/9 触发 daily_loss 当日暂停——属预期，非永久锁。
     pm.update(Decimal("99000"), date(2026, 7, 9), initial)
+    assert pm.circuit_breaker_active is False
+    assert pm.manual_recovery is False
+    assert pm.is_trading_halted() is True   # daily_loss 暂停生效日
+    # 7/10：daily_loss 暂停次日恢复 → 完全解除，未永久停机
+    pm.update(Decimal("100000"), date(2026, 7, 10), initial)
     assert pm.circuit_breaker_active is False
     assert pm.is_trading_halted() is False
 
@@ -89,16 +96,19 @@ def test_live_mode_breaker_still_permanent_manual_lock():
 
 def test_daily_loss_triggers_pause_next_day_recovery():
     """日内亏损 ≥ daily_loss_limit → daily_pause_active=True，次日恢复。
-    initial=100000, limit=5% → 日内亏 6000(6%) 触发。"""
+    initial=100000, limit=5% → 日内亏 6000(6%) 触发。
+    新语义（#8）：update 跨日补算上一日 daily_loss，最后一日由 finalize_last_day 收尾。"""
     pm = _pm(daily_loss_limit=Decimal("0.05"))
     initial = Decimal("100000")
 
     pm.update(Decimal("100000"), date(2026, 7, 1), initial)  # 首日基线
-    pm.update(Decimal("94000"), date(2026, 7, 2), initial)   # 日内亏 6000=6% ≥ 5%
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)   # 跨日补算 D1(pnl=0)，建立 D2 基准
+    # 循环结束补算最后一日（D2 日内亏 6000=6% ≥ 5%）
+    pm.finalize_last_day(initial)
     assert pm.daily_pause_active is True
     assert pm.daily_loss_trigger_date == date(2026, 7, 2)
 
-    # 次日 update → date(7/3) > trigger(7/2) → 恢复
+    # 次日 update → update_peak 跨日恢复 daily_pause（7/3 > 7/2）
     pm.update(Decimal("93000"), date(2026, 7, 3), initial)
     assert pm.daily_pause_active is False
 
@@ -199,10 +209,10 @@ def test_update_peak_breaker_minute_scale():
     assert pm.circuit_breaker_active is False
 
 
-def test_update_is_combined_peak_and_daily_backward_compat():
-    """原 update 保留 = update_peak + update_daily 合并，回测语义不变。
+def test_update_daily_line_cross_day_compat():
+    """日线回测每 bar 跨日：update 跨日补算上一日 daily_loss + update_peak 维护峰值/熔断。
 
-    日线回测每 bar 跨日：prev_close 每次刷新为上一 bar total，daily_pnl = 今日-昨日。"""
+    日线语义与旧 update = update_peak + update_daily 等价（每 bar 跨日 → 补算上一日 = 逐日检查）。"""
     pm = _pm()
     initial = Decimal("100000")
     # 与现有 test_max_drawdown_triggers_breaker_next_day_recovery 相同序列
@@ -212,3 +222,109 @@ def test_update_is_combined_peak_and_daily_backward_compat():
     assert pm.breaker_trigger_date == date(2026, 7, 2)
     pm.update(Decimal("99000"), date(2026, 7, 3), initial)   # 回升 → 恢复
     assert pm.circuit_breaker_active is False
+
+
+# ===========================================================================
+# #8 修复：分钟回测 daily_loss 时点对齐实盘
+# update() 跨日补算上一日，同日仅 update_peak；循环结束 finalize_last_day 收尾。
+# daily_pause 次日恢复移至 update_peak（每 bar 检测，不依赖 update_daily 调用时点）。
+# ===========================================================================
+def test_update_minute_same_day_no_daily_loss_jitter():
+    """分钟回测同日多 bar：update 只调 update_peak，不误触 daily_loss。
+
+    盘中下跌 6%（超 5% 阈值）不触发 daily_pause —— 日内亏损只在日终（跨日补算或收尾）算。
+    """
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    initial = Decimal("100000")
+    # Day1 收盘 100000（建立基准）
+    pm.update(Decimal("100000"), date(2026, 7, 1), initial)
+    # Day2 盘中多 bar：09:30 跌到 94000（-6%）→ 不触发（同日仅 update_peak）
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)  # 跨日补算 D1(pnl=0) + peak
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)  # 同日：仅 peak
+    assert pm.daily_pause_active is False  # 日内亏损未在盘中触发
+
+
+def test_update_cross_day_finalizes_previous_daily_loss():
+    """跨日时补算上一日 daily_loss：Day2 收盘 94000 → Day3 首根 update 触发 D2 日内亏损。
+
+    D1=100000, D2 收盘=94000（-6%）→ D3 跨日补算 update_daily(94000, D2) → 触发。
+    """
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    initial = Decimal("100000")
+    pm.update(Decimal("100000"), date(2026, 7, 1), initial)  # D1
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)   # D2: 跨日补算 D1(pnl=0)
+    assert pm.daily_pause_active is False  # D2 尚未补算
+    pm.update(Decimal("93000"), date(2026, 7, 3), initial)   # D3: 跨日补算 D2 → 触发!
+    assert pm.daily_pause_active is True
+    assert pm.daily_loss_trigger_date == date(2026, 7, 2)
+
+
+def test_finalize_last_day_checks_closing_day():
+    """循环结束补算最后一日：无后续跨日时由 finalize_last_day 收尾。
+
+    D1=100000, D2=94000 → update 跨日补算 D1, finalize_last_day 补算 D2（-6%）→ 触发。
+    """
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    initial = Decimal("100000")
+    pm.update(Decimal("100000"), date(2026, 7, 1), initial)
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)
+    assert pm.daily_pause_active is False  # D2 尚未补算
+    pm.finalize_last_day(initial)
+    assert pm.daily_pause_active is True
+    assert pm.daily_loss_trigger_date == date(2026, 7, 2)
+
+
+def test_finalize_last_day_skips_empty():
+    """无 bar（空回测）时 finalize_last_day 不报错。"""
+    pm = _pm()
+    pm.finalize_last_day(Decimal("100000"))  # _last_bar_date=None → 空操作
+
+
+def test_daily_pause_recovers_next_day_via_cross_day_update():
+    """daily_pause 次日恢复由 update_daily 跨日补算时处理（recovery_date = 当日）。
+
+    D2 触发 daily_loss → D3 跨日 update_daily(prev=D2, recovery_date=D3) → D3 > D2 → 恢复。
+    """
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    initial = Decimal("100000")
+    pm.update(Decimal("100000"), date(2026, 7, 1), initial)
+    pm.update(Decimal("94000"), date(2026, 7, 2), initial)
+    pm.finalize_last_day(initial)  # D2 触发
+    assert pm.daily_pause_active is True
+    # D3: update 跨日补算 D2(已触发) + update_peak 恢复 daily_pause
+    pm.update(Decimal("93000"), date(2026, 7, 3), initial)
+    assert pm.daily_pause_active is False  # update_peak 已恢复
+
+
+# ===========================================================================
+# B5：check_trailing_stop ratio 覆盖（None 回落实例阈值，行为不变）
+# ===========================================================================
+def _pos_with_high(qty=1000, high="10"):
+    pos = Position("000001.SZ")
+    pos.quantity = qty
+    pos.highest_price = Decimal(high)
+    return pos
+
+
+def test_trailing_stop_ratio_override_relaxes_threshold():
+    """回撤 5%：实例阈值 3% 触发；覆盖 8%（趋势态放宽）不触发。"""
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = _pos_with_high()
+    assert rm.check_trailing_stop(pos, Decimal("9.5")) is True
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.08")) is False
+
+
+def test_trailing_stop_ratio_none_falls_back_to_instance():
+    """ratio=None 与显式传实例阈值等价（默认行为不变）。"""
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = _pos_with_high()
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=None) is True
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.03")) is True
+    # 覆盖 0 同样视为禁用（与实例阈值 0 语义一致）
+    assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0")) is False

@@ -9,6 +9,7 @@ const router = createRouter({
     { path: '/formulas', name: 'formulas', component: () => import('../views/Formulas.vue') },
     { path: '/portfolios', name: 'portfolios', component: () => import('../views/Portfolios.vue') },
     { path: '/backtest', name: 'backtest', component: () => import('../views/Backtest.vue') },
+    { path: '/backtest/analysis', name: 'backtest-analysis', component: () => import('../views/BacktestAnalysis.vue') },
     { path: '/live', name: 'live', component: () => import('../views/LiveSessions.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemConfig.vue') },
   ],

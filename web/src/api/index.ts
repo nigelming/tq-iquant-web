@@ -48,7 +48,7 @@ export interface TdxPoolItem {
 // 通达信板块实时成分股（GET /stock-pools/tdx/{code}/stocks）— 对齐 tq.data.get_pool_stocks
 export interface TdxPoolStockItem {
   stock_code: string
-  stock_name: string
+  stock_name: string | null
 }
 
 // 公式信号（响应侧，含 id）— 对齐 formulas._serialize_formula signals 子项
@@ -56,7 +56,7 @@ export interface FormulaSignalItem {
   id: number
   signal_name: string
   signal_type: string  // OPEN|ADD|REDUCE|CLOSE
-  trigger_value: number  // 1 | -1
+  trigger_value: number  // -2|-1|0|1|2
 }
 
 // 公式（GET/POST/PUT /formulas）— 对齐 formulas._serialize_formula
@@ -86,6 +86,16 @@ export interface PortfolioItem {
   stamp_duty_rate: number | null
   slippage: number | null
   trading_session: string  // full|am|pm
+  price_limit_check_enabled: boolean  // #1 涨跌停约束（回测）
+  volume_limit_enabled: boolean       // #2 成交量/流动性约束（回测，默认关）
+  volume_limit_ratio: number          // 单 bar 成交量占比上限（默认 0.10）
+  adaptive_slippage_enabled: boolean  // #4 自适应滑点（回测，默认关）：冲击随订单量占成交量比例上浮
+  slippage_impact_coef: number        // 滑点冲击系数（默认 0.10，封顶滑点 10%）
+  position_sizing: string             // W2 仓位模型：dynamic（默认）|fixed
+  cash_enhance_enabled: boolean       // W2 现金管理增强（预留，默认关）
+  cash_enhance_equity_threshold: number | null
+  cash_enhance_position_ratio_threshold: number | null
+  equity_cap: number | null            // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -100,10 +110,28 @@ export interface BacktestRecordItem {
   start_date: string | null
   end_date: string | null
   status: string  // running|completed|failed
-  progress: number | null
   error_message: string | null
+  warnings: string[]  // 回测非致命告警（行情跳过/零信号/输出线缺失/公式报错）
+  evaluation_profile: string  // absolute|relative（历史记录回落 absolute）
+  is_oos_gate_enabled: boolean
+  oos_gate_min_ratio: number | null
+  gate_status: 'passed' | 'rejected' | null  // null=未启用或数据不足
+  gate_reasons: string[]
   created_at: string | null
   completed_at: string | null
+  // 验证结论（容量健康 + 危机防御 + 样本外引用），回测完成时冻结；老记录为 null
+  validation: ValidationVerdict | null
+}
+
+// 回测"验证结论"（对齐 backtest_service.build_validation_verdict）
+export interface ValidationVerdict {
+  capacity: string[]
+  crisis: { key: string; name: string; start: string; end: string;
+    strategy_return: number | null; benchmark_return: number | null;
+    max_drawdown: number | null; min_cash_ratio: number | null;
+    verdict: string; reason: string }[]
+  oos: { run_id: number; name: string; completed_at: string | null;
+    windows_passed: string | null; overall_pass: boolean | null } | null
 }
 
 // 组合日快照 — 对齐 backtest._serialize_snapshot
@@ -146,6 +174,7 @@ export interface BacktestEvaluationItem {
   win_rate: number | null
   profit_factor: number | null
   total_trades: number | null
+  closed_trades: number | null
   benchmark_return: number | null
   avg_holding_days: number | null
   var_95: number | null
@@ -430,6 +459,58 @@ export interface BacktestDetailItem {
   returns_buckets: BacktestReturnsBucket | null  // 收益分布（无快照时 null）
   crisis_alpha: BacktestCrisisAlphaItem | null
   market_regime: BacktestMarketRegimeItem | null
+  robustness: BacktestRobustnessItem | null  // 稳健性检验（年度/3年滚动/集中度/样本内外）
+  acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
+}
+
+// B6 考核口径验收（对齐 acceptance.compute_acceptance）
+export interface AcceptanceCheck {
+  metric: string
+  op: string
+  threshold: number
+  value: number | null
+  pass: boolean | null
+  label: string
+}
+export interface AcceptanceResult {
+  profile: string  // absolute|relative
+  pass: boolean | null  // true 全过 / false 有不过 / null 数据不足
+  checks: AcceptanceCheck[]
+}
+
+export interface BacktestRobustnessItem {
+  status: string
+  error?: string | null
+  computed_at?: string | null
+  data?: {
+    total_return: number | null
+    benchmark_return: number | null
+    years_positive: string
+    annual: { year: string; return: number | null; max_drawdown: number | null }[]
+    rolling_3y: { start: string; end: string; cagr: number | null; max_drawdown: number | null }[]
+    concentration: {
+      total_realized_pnl: number
+      top: { code: string; pnl: number; share: number }[]
+      top20_share: number
+      profitable_stocks: number
+      total_stocks: number
+    }
+    oos: {
+      split_year: string
+      in_sample: OosSegment
+      out_of_sample: OosSegment
+      caveat?: string  // W5-O2 伪 OOS 明示（固定切分防时段崩塌，不防全样本调参）
+    } | null
+  } | null
+}
+
+export interface OosSegment {
+  start: string
+  end: string
+  return: number | null
+  cagr: number | null
+  max_drawdown: number | null
+  benchmark_return: number | null
 }
 
 export async function getStockPools() {
@@ -509,11 +590,11 @@ export interface TdxFormulaListItem {
 
 export interface TdxFormulaInfo {
   acCode: string
-  acName: string
-  isSys: number
-  ParaNum: number
+  acName?: string
+  isSys?: number
+  ParaNum?: number
   Para?: { ParaName: string; Min: string; Max: string; Default: string }[]
-  LineNum: number
+  LineNum?: number
   Line?: { LineName: string }[]
 }
 
@@ -547,6 +628,8 @@ export interface StrategyItem {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 0=本批第N个；null=无
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number
@@ -557,6 +640,13 @@ export interface StrategyItem {
   max_add_count: number
   add_position_ratio: number
   reduce_position_ratio: number
+  rotation_enabled: boolean
+  rotation_momentum_bars: number
+  rotation_hysteresis: number
+  regime_filter_enabled: boolean
+  trend_trailing_stop_ratio: number | null
+  trend_max_positions: number | null
+  exposure_cap_enabled: boolean
 }
 
 export interface PortfolioRequest {
@@ -573,8 +663,18 @@ export interface PortfolioRequest {
   stamp_duty_rate: number
   slippage: number
   trading_session: string  // full|am|pm
+  price_limit_check_enabled?: boolean  // None=新建默认开启/编辑不动
+  volume_limit_enabled?: boolean
+  volume_limit_ratio?: number  // (0,1]
+  adaptive_slippage_enabled?: boolean  // #4 自适应滑点（默认关）
+  slippage_impact_coef?: number  // (0,1]，冲击系数，默认 0.10
+  position_sizing?: string  // W2: dynamic（默认）|fixed
+  cash_enhance_enabled?: boolean
+  cash_enhance_equity_threshold?: number | null
+  cash_enhance_position_ratio_threshold?: number | null
+  equity_cap?: number | null  // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
   status: string  // active|archived
-  strategies: StrategyItem[]
+  strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
 
 export async function getPortfolioDetail(id: number) {
@@ -605,6 +705,8 @@ export interface StrategyDetail {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number
@@ -615,6 +717,13 @@ export interface StrategyDetail {
   max_add_count: number
   add_position_ratio: number
   reduce_position_ratio: number
+  rotation_enabled: boolean
+  rotation_momentum_bars: number
+  rotation_hysteresis: number
+  regime_filter_enabled: boolean
+  trend_trailing_stop_ratio: number | null
+  trend_max_positions: number | null
+  exposure_cap_enabled: boolean
 }
 
 export interface StrategyRequest {
@@ -623,6 +732,8 @@ export interface StrategyRequest {
   period: string  // 1m|5m|15m|30m|1h|1d|1w|1mon
   role: string  // independent|master|slave
   master_strategy_id: number | null  // 已存在的同组合 master id
+  stock_pool_id?: number | null  // null=继承组合级
+  slave_exit_mode?: string  // independent|follow_master（仅 slave 有意义）
   capital_ratio: number
   max_positions: number
   single_open_ratio: number
@@ -633,6 +744,13 @@ export interface StrategyRequest {
   max_add_count: number
   add_position_ratio: number
   reduce_position_ratio: number
+  rotation_enabled?: boolean
+  rotation_momentum_bars?: number
+  rotation_hysteresis?: number
+  regime_filter_enabled?: boolean
+  trend_trailing_stop_ratio?: number | null
+  trend_max_positions?: number | null
+  exposure_cap_enabled?: boolean
 }
 
 // 独立子策略 CRUD（两层设计：组合下单独管理子策略）
@@ -666,20 +784,191 @@ export interface BacktestRequest {
   name: string
   start_date: string  // YYYY-MM-DD
   end_date: string    // YYYY-MM-DD
+  dividend_mode?: 'front' | 'back' | 'dual'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
+  evaluation_profile?: 'absolute' | 'relative'  // B6 考核口径（默认 absolute）
+  is_oos_gate_enabled?: boolean                 // C7 IS/OOS 采纳门槛（默认关）
+  oos_gate_min_ratio?: number                   // (0,2]，默认 0.5
+  fee_reserve_enabled?: boolean                 // 费用预留（默认关）：买入审批含佣金防负现金
+  bond_t0_enabled?: boolean                     // 可转债 T+0 回转（默认关，仅回测）：转债当日买入当日可卖
+  bond_lot_enabled?: boolean                    // 可转债 10 张取整（默认关，仅回测）：转债最小交易单位 10 张
+  adaptive_slippage_enabled?: boolean           // 自适应滑点 run 级覆盖（undefined=用组合默认）
+  slippage_impact_coef?: number                 // (0,1]，run 级覆盖冲击系数（undefined=用组合默认）
+  volume_limit_enabled?: boolean                // 成交量约束 run 级覆盖（undefined=用组合默认）
+  volume_limit_ratio?: number                   // (0,1]，run 级覆盖占比（undefined=用组合默认）
+  equity_cap?: number                           // 容量上限 run 级覆盖，>0（undefined=用组合默认）
+}
+
+// C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）
+export interface BacktestGateResult {
+  status: 'passed' | 'rejected' | null
+  reasons: string[]
+  min_ratio: number
+}
+export interface BacktestRunResult {
+  record_id: number
+  warnings: string[]
+  gate: BacktestGateResult | null
 }
 
 export async function runBacktest(req: BacktestRequest) {
-  const res = await api.post<ApiResponse<{ record_id: number }>>('/backtest', req)
+  const res = await api.post<ApiResponse<BacktestRunResult>>('/backtest', req)
   return res.data.data
 }
 
-export async function getBacktestDetail(id: number) {
-  const res = await api.get<ApiResponse<BacktestDetailItem>>(`/backtest/records/${id}`)
+// B6：详情可按 profile 临时切换验收口径（不改记录存储值）
+export async function getBacktestDetail(id: number, profile?: 'absolute' | 'relative') {
+  const res = await api.get<ApiResponse<BacktestDetailItem>>(`/backtest/records/${id}`, {
+    params: profile ? { profile } : undefined,
+  })
   return res.data.data
 }
 
 export async function deleteBacktestRecord(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/backtest/records/${id}`)
+  return res.data.data
+}
+
+// ===== C8 walk-forward 滚动验证 =====
+export interface WalkForwardRequest {
+  portfolio_strategy_id: number
+  name: string
+  start_date: string
+  end_date: string
+  train_years: number
+  test_years: number
+  oos_gate_min_ratio: number
+  dividend_mode: 'front' | 'back' | 'dual'
+  evaluation_profile: 'absolute' | 'relative'
+}
+export interface WalkForwardWindow {
+  index: number
+  train: { start: string | null; end: string | null }
+  test: { start: string | null; end: string | null }
+  record_id: number | null
+  is_cagr: number | null
+  oos_cagr: number | null
+  oos_return: number | null
+  oos_benchmark_return: number | null
+  gate: { status: 'passed' | 'rejected' | null; reasons: string[] }
+  error?: string
+}
+export interface WalkForwardSummary {
+  windows: WalkForwardWindow[]
+  windows_passed: string  // "k/n"
+  windows_failed: number   // W5-L5 失败窗口数
+  windows_errored: number  // W5-L5 出错窗口数
+  overall_pass: boolean
+}
+export interface WalkForwardRunItem {
+  id: number
+  portfolio_strategy_id: number
+  name: string
+  start_date: string | null
+  end_date: string | null
+  train_years: number
+  test_years: number
+  oos_gate_min_ratio: number | null
+  status: string
+  error_message: string | null
+  summary: WalkForwardSummary | null
+  created_at: string | null
+  completed_at: string | null
+}
+export async function runWalkForward(req: WalkForwardRequest) {
+  const res = await api.post<ApiResponse<{
+    run_id: number
+    status: string
+    windows_passed: string
+    overall_pass: boolean
+    error: string | null
+  }>>('/backtest/walk-forward', req)
+  return res.data.data
+}
+export async function getWalkForwardRuns() {
+  const res = await api.get<ApiResponse<WalkForwardRunItem[]>>('/backtest/walk-forward')
+  return res.data.data
+}
+export async function getWalkForwardRun(id: number) {
+  const res = await api.get<ApiResponse<WalkForwardRunItem>>(`/backtest/walk-forward/${id}`)
+  return res.data.data
+}
+export async function deleteWalkForwardRun(id: number) {
+  const res = await api.delete<ApiResponse<null>>(`/backtest/walk-forward/${id}`)
+  return res.data.data
+}
+
+// ===== P2b 参数微扰敏感性分析 =====
+export interface ParamPerturbRequest {
+  portfolio_strategy_id: number
+  name: string
+  start_date: string
+  end_date: string
+  perturb_pct: number  // (0,0.5]
+  dividend_mode: 'front' | 'back' | 'dual'
+  evaluation_profile: 'absolute' | 'relative'
+}
+export interface PerturbRoundMetrics {
+  record_id: number | null
+  status: string | null
+  annual_return: number | null
+  total_return: number | null
+  max_drawdown: number | null
+  win_rate: number | null
+  profit_factor: number | null
+  sharpe_ratio: number | null
+  total_trades: number | null
+  error: string | null
+}
+export interface PerturbRound extends PerturbRoundMetrics {
+  param: string
+  direction: 'low' | 'high'
+  factor: number
+}
+export interface PerturbParamBlock {
+  param: string
+  low: PerturbRound | null
+  high: PerturbRound | null
+  delta_cagr: number | null  // 实为年化收益差值（high − low）
+}
+export interface ParamPerturbSummary {
+  baseline: PerturbRoundMetrics
+  rounds: PerturbRound[]
+  params: PerturbParamBlock[]
+  most_sensitive: string | null
+}
+export interface ParamPerturbRunItem {
+  id: number
+  portfolio_strategy_id: number
+  name: string
+  start_date: string | null
+  end_date: string | null
+  perturb_pct: number | null
+  status: string
+  error_message: string | null
+  summary: ParamPerturbSummary | null
+  created_at: string | null
+  completed_at: string | null
+}
+export async function runParamPerturb(req: ParamPerturbRequest) {
+  const res = await api.post<ApiResponse<{
+    run_id: number
+    status: string
+    rounds_run: string
+    most_sensitive: string | null
+    error: string | null
+  }>>('/backtest/param-perturb', req)
+  return res.data.data
+}
+export async function getParamPerturbRuns() {
+  const res = await api.get<ApiResponse<ParamPerturbRunItem[]>>('/backtest/param-perturb')
+  return res.data.data
+}
+export async function getParamPerturbRun(id: number) {
+  const res = await api.get<ApiResponse<ParamPerturbRunItem>>(`/backtest/param-perturb/${id}`)
+  return res.data.data
+}
+export async function deleteParamPerturbRun(id: number) {
+  const res = await api.delete<ApiResponse<null>>(`/backtest/param-perturb/${id}`)
   return res.data.data
 }
 
@@ -698,6 +987,7 @@ export interface CrisisAlphaRecomputeResult {
   status: string
   error: string | null
   computed_at: string | null
+  skipped_benchmarks?: string[]
   benchmark_resolution?: CrisisAlphaBenchmarkResolution
 }
 
@@ -992,6 +1282,7 @@ export interface BacktestMarketRegimeItem {
   status: 'completed' | 'insufficient' | 'failed'
   error: string | null
   computed_at: string | null
+  skipped_benchmarks: string[]
   benchmark_code: string
   benchmark_name: string
   data: MarketRegimeData | null
@@ -1000,6 +1291,53 @@ export interface BacktestMarketRegimeItem {
 export async function recomputeMarketRegime(id: number) {
   const res = await api.post<ApiResponse<CrisisAlphaRecomputeResult>>(
     `/backtest/records/${id}/market-regime/recompute`)
+  return res.data.data
+}
+
+export interface RobustnessRecomputeResult {
+  status: string
+  error?: string | null
+  computed_at?: string | null
+}
+
+export async function recomputeRobustness(id: number) {
+  const res = await api.post<ApiResponse<RobustnessRecomputeResult>>(
+    `/backtest/records/${id}/robustness/recompute`)
+  return res.data.data
+}
+
+export interface PoolCompareRequest {
+  portfolio_strategy_id: number
+  pool_ids: number[]
+  start_date: string
+  end_date: string
+  name_prefix?: string
+  dividend_mode?: 'front' | 'back' | 'dual'
+}
+
+export interface PoolCompareItem {
+  pool_id: number
+  pool_name: string
+  record_id: number | null
+  status: string
+  error?: string | null
+  metrics: {
+    total_return: number | null
+    annual_return: number | null
+    max_drawdown: number | null
+    sharpe_ratio: number | null
+    win_rate: number | null
+    profit_factor: number | null
+    total_trades: number | null
+    avg_position_utilization: number | null
+    benchmark_return: number | null
+  } | null
+  robustness: { oos?: { out_of_sample?: { cagr: number | null } | null } | null } | null
+}
+
+export async function compareBacktestPools(req: PoolCompareRequest) {
+  const res = await api.post<ApiResponse<{ comparisons: PoolCompareItem[] }>>(
+    '/backtest/robustness/compare', req)
   return res.data.data
 }
 

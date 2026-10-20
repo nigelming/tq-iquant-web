@@ -195,6 +195,54 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const arg = (createPortfolio as any).mock.calls[0][0]
     expect(arg.name).toBe('NEW_PS')
     expect(arg.strategies).toEqual([])
+    // #4 自适应滑点默认关；系数带 showIf 隐藏 → 不随默认提交（undefined）
+    expect(arg.adaptive_slippage_enabled).toBe(false)
+    expect(arg.slippage_impact_coef).toBeUndefined()
+  })
+
+  it('勾选自适应滑点并改冲击系数 25% → 提交 enabled=true / coef=0.25', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('input[data-field="adaptive_slippage_enabled"]').setValue(true)
+    await w.find('input[data-field="slippage_impact_coef"]').setValue('25')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.adaptive_slippage_enabled).toBe(true)
+    expect(arg.slippage_impact_coef).toBeCloseTo(0.25)
+  })
+
+  it('配置指南按钮 → 打开指南弹窗（含动态仓位/容量上限说明）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开新建组合
+    await w.find('[data-field="guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('配置指南')
+    expect(w.text()).toContain('容量上限')
+    expect(w.text()).toContain('成交量约束')
+  })
+
+  it('新建子策略弹窗 → 配置指南按钮打开子策略指南（含轮动/主从说明）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    // 展开第一个组合行
+    await w.find('button.toggle-expand').trigger('click')
+    await flushPromises()
+    // 打开新建子策略
+    const addBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await addBtn.trigger('click')
+    await flushPromises()
+    await w.find('[data-field="strategy-guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('子策略配置指南')
+    expect(w.text()).toContain('OPEN 择优轮动')
+    expect(w.text()).toContain('主从策略')
   })
 
   it('提交失败（422）→ alert 错误且弹窗保持打开，不静默卡死', async () => {
@@ -410,5 +458,77 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     expect(alertMock).toHaveBeenCalled()
     expect(alertMock.mock.calls[0][0]).toContain('被回测或实盘交易记录引用')
     vi.unstubAllGlobals()
+  })
+})
+
+describe('Portfolios.vue — 执行真实感与策略增强', () => {
+  it('组合表单含执行真实感开关并随 payload 提交', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // +新建组合
+
+    expect(w.text()).toContain('执行真实感')
+    expect(w.text()).toContain('涨跌停')
+    // 默认 price_limit_check_enabled=true
+    const plInput = w.find('input[data-field="price_limit_check_enabled"]')
+    expect((plInput.element as HTMLInputElement).checked).toBe(true)
+
+    // 勾选成交量约束 → ratio 字段显示，默认 10%
+    await w.find('input[data-field="volume_limit_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.price_limit_check_enabled).toBe(true)
+    expect(arg.volume_limit_enabled).toBe(true)
+    expect(arg.volume_limit_ratio).toBeCloseTo(0.1)
+  })
+
+  it('子策略表单含策略增强组字段', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+
+    expect(w.text()).toContain('策略增强')
+    expect(w.find('input[data-field="rotation_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="exposure_cap_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="regime_filter_enabled"]').exists()).toBe(true)
+  })
+
+  it('组合表单含仓位模型与现金管理组，默认 dynamic，字段随 payload 提交', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // +新建组合
+
+    expect(w.text()).toContain('仓位与现金管理')
+    const psSel = w.find('select[data-field="position_sizing"]')
+    expect(psSel.exists()).toBe(true)
+    expect((psSel.element as HTMLSelectElement).value).toBe('dynamic')
+
+    // 默认关闭现金管理增强 → 阈值字段隐藏（v-show 置 display:none）
+    const eqRow = w.find('input[data-field="cash_enhance_equity_threshold"]').element.closest('.field-row') as HTMLElement
+    expect(eqRow.style.display).toBe('none')
+    await w.find('input[data-field="cash_enhance_enabled"]').setValue(true)
+    await flushPromises()
+    expect(eqRow.style.display).not.toBe('none')
+
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('input[data-field="cash_enhance_equity_threshold"]').setValue('2000000')
+    await w.find('input[data-field="cash_enhance_position_ratio_threshold"]').setValue('30')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.position_sizing).toBe('dynamic')
+    expect(arg.cash_enhance_enabled).toBe(true)
+    expect(arg.cash_enhance_equity_threshold).toBe(2000000)
+    expect(arg.cash_enhance_position_ratio_threshold).toBeCloseTo(0.3)
   })
 })

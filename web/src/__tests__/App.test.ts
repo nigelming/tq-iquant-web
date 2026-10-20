@@ -48,11 +48,11 @@ describe('App.vue — 图标渲染', () => {
     localStorage.clear()
   })
 
-  it('侧边栏 7 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
+  it('侧边栏 8 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
     const w = mount(App)
     await flushPromises()
     const items = w.findAll('.sidebar-nav .nav-item')
-    expect(items).toHaveLength(7)
+    expect(items).toHaveLength(8)
     items.forEach((it) => {
       const svg = it.find('svg.icon')
       expect(svg.exists()).toBe(true)
@@ -77,10 +77,12 @@ describe('App.vue — 外壳结构', () => {
     expect(w.findAll('.nav-group-label')).toHaveLength(3)
   })
 
-  it('主题切换按钮在顶栏（不在侧边栏底部）', async () => {
+  it('主题切换按钮在侧边栏底部（与 Core 状态同区）', async () => {
     const w = mount(App)
     await flushPromises()
-    expect(w.find('.topbar-right').find('.theme-toggle').exists()).toBe(true)
+    const foot = w.find('.sidebar-footbar')
+    expect(foot.exists()).toBe(true)
+    expect(foot.find('.theme-toggle').exists()).toBe(true)
     expect(w.find('.sidebar-footer').exists()).toBe(false)
   })
 
@@ -95,9 +97,12 @@ describe('App.vue — 外壳结构', () => {
     expect(w.find('.status-chip').text()).toContain('0h53m')
   })
 
-  it('顶栏显示当前路由路径（等宽字体）', async () => {
+  it('顶栏横幅显示平台大标题（居中双色）', async () => {
     const w = mount(App)
     await flushPromises()
-    expect(w.find('.topbar-path').text()).toBe('/dashboard')
+    const banner = w.find('.topbar .app-banner')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('创懿私募基金量化回测平台')
   })
 })
+

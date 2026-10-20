@@ -20,7 +20,8 @@ def _snap(total_value, snap_date=date(2024, 1, 2)):
     }
 
 
-def _trade(stock_code, trade_type, price, quantity, trade_time):
+def _trade(stock_code, trade_type, price, quantity, trade_time,
+           commission=Decimal("5"), stamp_duty=Decimal("0")):
     amount = Decimal(str(price)) * quantity
     return TradeEvent(
         strategy_id=1, portfolio_id=1,
@@ -29,8 +30,8 @@ def _trade(stock_code, trade_type, price, quantity, trade_time):
         price=Decimal(str(price)),
         quantity=quantity,
         amount=amount,
-        commission=Decimal("5"),
-        stamp_duty=Decimal("0"),
+        commission=commission,
+        stamp_duty=stamp_duty,
         trade_time=trade_time,
     )
 
@@ -42,6 +43,20 @@ def test_total_return():
         _snap(110000, date(2024, 1, 3)),
     ])
     assert result["total_return"] == Decimal("0.1")
+
+
+def test_total_return_intraday_first_day_uses_daily_close():
+    """分钟级同日多 bar：total_return 以首日收盘（每日最后一根 bar）为起点，
+    与落库日快照口径一致——首日第一根 bar 恒等于初始资金（尚未成交），不作起点。"""
+    ev = Evaluator()
+    result = ev.evaluate([
+        _snap(100000, date(2024, 1, 2)),   # 首日第一根 bar：初始资金（同日多 bar 的第一根）
+        _snap(100200, date(2024, 1, 2)),   # 首日收盘（同日后者覆盖前者）
+        _snap(110110, date(2024, 1, 3)),
+    ])
+    # 新口径：(110110 - 100200) / 100200；旧口径为 (110110 - 100000) / 100000 = 0.1011
+    assert abs(float(result["total_return"]) - 9910 / 100200) < 1e-9
+    assert abs(float(result["total_return"]) - 0.1011) > 1e-6
 
 
 def test_max_drawdown():
@@ -75,10 +90,11 @@ def test_insufficient_data():
 # 交易指标（win_rate / profit_factor / total_trades / avg_holding_days）
 # ===========================================================================
 def test_trade_metrics_basic():
-    """两次完整 round-trip：1 赢 + 1 输 → total_trades=4, win_rate=0.5, profit_factor>1。
-    交易序列：
-      BUY A @10×1000=10000, SELL A @12×1000=12000 (赢 +2000)
-      BUY B @10×1000=10000, SELL B @8×1000=8000  (输 -2000)
+    """两次完整 round-trip：1 赢 + 1 输 → total_trades=4, win_rate=0.5。
+    P&L 口径：扣交易成本（双边佣金按股分摊）。
+    交易序列（每笔 commission=5, stamp_duty=0）：
+      BUY A @10×1000=10000, SELL A @12×1000=12000 → 净 +2000−10=+1990 (赢)
+      BUY B @10×1000=10000, SELL B @8×1000=8000  → 净 −2000−10=−2010 (输)
     """
     snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(3)]
     trades = [
@@ -93,10 +109,27 @@ def test_trade_metrics_basic():
     assert result["total_trades"] == 4
     # win_rate 基于已平仓 round-trip：2 次卖出 → 1 赢 1 输 → 50%
     assert result["win_rate"] == Decimal("0.5")
-    # profit_factor: 赢 2000 / 输 2000 = 1
-    assert result["profit_factor"] == Decimal("1")
+    # profit_factor（扣费口径）: 赢 1990 / 输 2010 ≈ 0.9900（未扣费旧口径为 1）
+    assert result["profit_factor"] == Decimal("0.99")
     # avg_holding_days: 1 天 → 1.0
     assert result["avg_holding_days"] == Decimal("1")
+
+
+def test_trade_metrics_cost_turns_marginal_win_into_loss():
+    """边际盈利被交易成本转亏：价差 +5，双边费用 10 → 净 −5 判负。
+    未扣费旧口径会记为 1 赢（win_rate=1），修复后 win_rate=0、profit_factor=0。
+    """
+    snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(3)]
+    trades = [
+        _trade("A", TradeType.BUY, 10, 100, datetime(2024, 1, 2, 10, 0)),
+        _trade("A", TradeType.SELL, 10.05, 100, datetime(2024, 1, 3, 10, 0),
+               commission=Decimal("5"), stamp_duty=Decimal("1")),
+    ]
+    ev = Evaluator()
+    result = ev.evaluate(snaps, trades=trades)
+    # 价差 +5 − 买佣金 5 − 卖佣金 5 − 印花税 1 = −6 → 亏损
+    assert result["win_rate"] == Decimal("0")
+    assert result["profit_factor"] == Decimal("0")
 
 
 def test_trade_metrics_no_trades():
@@ -112,7 +145,8 @@ def test_trade_metrics_no_trades():
 
 def test_trade_metrics_partial_close():
     """部分平仓：BUY 1000 股 → SELL 500 股（赢）+ SELL 500 股（输）。
-    两次卖出 P&L：500*(12-10)=+1000，500*(8-10)=-1000。
+    扣费口径 P&L：500×(12−10)−500×(0.005+0.01)=+992.5，
+    500×(8−10)−500×(0.005+0.01)=−1007.5。
     """
     snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(3)]
     trades = [
@@ -126,6 +160,40 @@ def test_trade_metrics_partial_close():
     # 2 次卖出：1 赢 1 输 → 50%
     assert result["win_rate"] == Decimal("0.5")
     assert result["avg_holding_days"] is not None
+
+
+def test_closed_trades_counts_fifo_lots():
+    """closed_trades = FIFO 平仓批次数（与 total_trades 成交笔数口径区分）。"""
+    snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(3)]
+    trades = [
+        _trade("A", TradeType.BUY, 10, 1000, datetime(2024, 1, 2, 10, 0)),
+        _trade("A", TradeType.SELL, 12, 1000, datetime(2024, 1, 3, 10, 0)),
+        _trade("B", TradeType.BUY, 10, 1000, datetime(2024, 1, 2, 11, 0)),
+        _trade("B", TradeType.SELL, 8, 1000, datetime(2024, 1, 3, 11, 0)),
+    ]
+    result = Evaluator().evaluate(snaps, trades=trades)
+    assert result["total_trades"] == 4
+    assert result["closed_trades"] == 2
+
+
+def test_closed_trades_partial_close_counts_lots():
+    """部分平仓：1 BUY + 2 SELL → total_trades=3，closed_trades=2。"""
+    snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(4)]
+    trades = [
+        _trade("A", TradeType.BUY, 10, 1000, datetime(2024, 1, 2, 10, 0)),
+        _trade("A", TradeType.SELL, 12, 500, datetime(2024, 1, 3, 10, 0)),
+        _trade("A", TradeType.SELL, 8, 500, datetime(2024, 1, 4, 10, 0)),
+    ]
+    result = Evaluator().evaluate(snaps, trades=trades)
+    assert result["total_trades"] == 3
+    assert result["closed_trades"] == 2
+
+
+def test_closed_trades_zero_when_no_trades():
+    snaps = [_snap(100000, date(2024, 1, i + 2)) for i in range(3)]
+    result = Evaluator().evaluate(snaps, trades=[])
+    assert result["total_trades"] == 0
+    assert result["closed_trades"] == 0
 
 
 def test_benchmark_return():
@@ -196,7 +264,8 @@ def test_intraday_bars_volatility_uses_daily_returns():
     assert ev["volatility"] == Decimal(str(expected_vol)).quantize(Decimal("0.0001"))
 
     # Sharpe 用同一日频口径：sharpe = (annual - rf) / vol
-    total = 109000 / 100000 - 1
+    # total_return 起点为首日收盘（日聚合口径，与落库日快照一致）
+    total = 109000 / 100100 - 1
     years = 3 / 365.25
     annual = (1 + total) ** (1 / years) - 1
     expected_sharpe = (annual - 0.02) / expected_vol
@@ -214,6 +283,37 @@ def test_intraday_bars_daily_returns_not_per_bar():
         snapshots.append(_snap(120000, d))
     ev = Evaluator().evaluate(snapshots)
     assert ev["volatility"] == Decimal("0.0000")  # 每日收盘相等 → 日收益 0
+
+
+# ===========================================================================
+# #6: 分钟回测一天多 bar 的口径一致性 — 路径指标按日聚合序列算。
+# max_drawdown/ulcer/return_stability/recovery_days 旧实现直接用原始快照序列
+# （含日内多条），与 sharpe/sortino（已按日聚合）口径不一致：日内假回撤会被
+# 当真实回撤计入，恢复天数会被同日"假恢复"算成 0 天。
+# ===========================================================================
+def test_intraday_bars_max_drawdown_uses_daily_close():
+    """#6: max_drawdown/ulcer/return_stability 按日聚合序列（每日最后一根 bar）
+    算，不被日内中间 bar 的假回撤拉高。
+
+    场景：day1 日内跌到 80000 又收回 100000（日内假回撤 20%），日收盘 100000；
+          day2/day3 收盘 110000/120000。日聚合序列 [100000, 110000, 120000]
+          线性上涨 → 无回撤、r2=1。
+    原始快照序列含 80000 → max_drawdown=20%、r2<1（错）。
+    """
+    snaps = [
+        _snap(100000, date(2024, 1, 2)),
+        _snap(80000, date(2024, 1, 2)),   # 日内假回撤
+        _snap(100000, date(2024, 1, 2)),  # day1 收盘
+        _snap(110000, date(2024, 1, 3)),  # day2 收盘
+        _snap(120000, date(2024, 1, 4)),  # day3 收盘
+    ]
+    ev = Evaluator().evaluate(snaps)
+    # 日聚合序列 [100000, 110000, 120000] → 线性上涨无回撤
+    assert ev["max_drawdown"] == Decimal("0")
+    # ulcer = sqrt(Σ dd² / n)，日聚合无回撤 → 0
+    assert ev["ulcer_index"] == Decimal("0.0000")
+    # r2：日聚合 3 点完全线性 → 1
+    assert ev["return_stability"] == Decimal("1.0000")
 
 
 # ===========================================================================
@@ -407,12 +507,27 @@ def test_loss_streak_and_worst_returns():
     ]
     result = Evaluator().evaluate(snaps)
     assert result["max_consecutive_loss_days"] == 2
-    assert result["max_consecutive_profit_days"] == 3
+    # 0 收益（空仓）日不计入连盈 → 连盈天数为 0
+    assert result["max_consecutive_profit_days"] == 0
     assert result["worst_daily_return"] == Decimal("-0.0800")
     assert result["worst_weekly_return"] == Decimal("-0.0800")
     # 收益样本 < 20 → 偏度峰度为 None
     assert result["return_skewness"] is None
     assert result["return_kurtosis"] is None
+
+
+def test_profit_streak_excludes_zero_return_days():
+    """连盈天数只累计正收益日；0 收益日打断连盈（不计入）。"""
+    snaps = [
+        _snap(100000, date(2024, 1, 1)),
+        _snap(101000, date(2024, 1, 2)),   # +1%
+        _snap(101000, date(2024, 1, 3)),   # 0%（空仓）
+        _snap(102010, date(2024, 1, 4)),   # +1%
+        _snap(101000, date(2024, 1, 5)),   # -1%
+        _snap(102010, date(2024, 1, 8)),   # +1%
+    ]
+    result = Evaluator().evaluate(snaps)
+    assert result["max_consecutive_profit_days"] == 1
 
 
 def test_skewness_kurtosis_symmetric():

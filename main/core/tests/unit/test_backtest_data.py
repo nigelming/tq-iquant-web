@@ -118,27 +118,27 @@ def test_convert_market_data_volume_as_string():
 
 def test_convert_market_data_nan_values():
     """真机 bug：停牌/无交易的日子 TQ 返回 NaN（float）。
-    _to_int(NaN) 直接 int(NaN) 抛 ValueError；_to_decimal(NaN) 产 Decimal('nan') 毒化计算。
-    NaN 应规整为 0（无成交量）/ 价列也应容忍 NaN 不报错。"""
+    NaN Volume 规整为 0（无成交量）；价列 NaN → Open/Close=0 → 整 bar 作为伪影丢弃（不进引擎）。"""
     import math
     import pandas as pd
-    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
     raw = {
-        "Open": pd.DataFrame({"000001.SZ": [10.0, float("nan")]}, index=ts),
-        "High": pd.DataFrame({"000001.SZ": [10.3, float("nan")]}, index=ts),
-        "Low": pd.DataFrame({"000001.SZ": [9.9, float("nan")]}, index=ts),
-        "Close": pd.DataFrame({"000001.SZ": [10.2, float("nan")]}, index=ts),
-        "Volume": pd.DataFrame({"000001.SZ": [1000, float("nan")]}, index=ts),
-        "Amount": pd.DataFrame({"000001.SZ": [10200.0, float("nan")]}, index=ts),
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.1, float("nan")]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 10.4, float("nan")]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 10.0, float("nan")]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, 10.3, float("nan")]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, float("nan"), float("nan")]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 10403.0, float("nan")]}, index=ts),
     }
     # 不应抛异常
     klines = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
     df = klines["000001.SZ"]["1d"]
+    # 全 NaN bar（Open/Close=0）被丢弃；价合法但 Volume NaN 的 bar 保留
     assert df.height == 2
     # NaN Volume 规整为 0（非 NaN）
     vols = df["Volume"].to_list()
     assert vols[1] == 0, f"NaN Volume 应为 0，实得 {vols[1]!r}"
-    # 价列 NaN 不毒化（Decimal nan 会破坏下游金额计算）— 规整为 0
+    # 保留 bar 的价列不毒化（Decimal nan 会破坏下游金额计算）
     opens = df["Open"].to_list()
     assert not (isinstance(opens[1], Decimal) and opens[1].is_nan()), \
         f"NaN 价应规整为 0，实得 {opens[1]!r}"
@@ -405,22 +405,80 @@ def test_build_klines_orchestration(db_session, monkeypatch):
 
     klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
 
-    # 主段拉取：区间 [start, end]，count=-1
+    # W-A：单次拉取（主段 start 前推覆盖公式预热窗口），不再单独预热段
+    assert len(calls) == 1
     assert calls[0]["stocks"] == ["000001.SZ", "600519.SH"]
     assert calls[0]["periods"] == ["1d"]
-    assert calls[0]["start"] == "20260729"
+    # formula_count=200（1d）→ 前推 430 天：2026-07-29 - 430 = 2025-05-25
+    assert calls[0]["start"] == "20250525"
     assert calls[0]["end"] == "20260731"
     assert calls[0]["count"] == -1
-    # 预热段拉取：formula_count=200 根，start 空（TDX 从 end 往前数 N 根），end=start 前一天
-    assert len(calls) == 2
-    assert calls[1]["periods"] == ["1d"]
-    assert calls[1]["start"] == ""
-    assert calls[1]["end"] == "20260728"
-    assert calls[1]["count"] == 200
-    # 输出校验：两次拉取同数据 → 去重后仍 2 根 bar
+    # 输出校验：单次拉取同数据 → 仍 2 根 bar（预热 bar 保留在 klines，引擎由调用方切片）
     assert set(klines.keys()) == {"000001.SZ", "600519.SH"}
     assert "datetime" in klines["000001.SZ"]["1d"].columns
     assert klines["000001.SZ"]["1d"].height == 2
+
+
+def test_convert_market_data_drops_nonpositive_prices():
+    """负价/零价/近零价（<0.01）行属前复权伪影，应被过滤，不进引擎。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 9.0, 8.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3, 9.5, 8.5]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.8, 7.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2, -1.0, 0.005]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 1000, 1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0, 8000.0]}, index=ts),
+    }
+    out = bt_api._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = out["000001.SZ"]["1d"]
+    assert df.height == 1
+    assert df["datetime"].to_list() == [ts[0]]
+
+
+def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):
+    """dividend_mode='back' → get_history_raw 主段/预热段均传 dividend_type='back'。"""
+    import pandas as pd
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    ts = [datetime(2026, 7, 29)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0]}, index=ts),
+    }
+    calls = []
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        calls.append(dividend_type)
+        return {"1d": raw}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+    bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db, dividend_mode="back")
+    # W-A：单次拉取，dividend_type 透传
+    assert calls == ["back"]
+
+
+def test_build_signal_cache_back_dividend_passes_2(db_session, monkeypatch):
+    """dividend_mode='back' → TQFormula.compute dividend_type=2（后复权）。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    klines = {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29)],
+        "Open": [Decimal("10")], "High": [Decimal("10.3")],
+        "Low": [Decimal("9.9")], "Close": [Decimal("10.2")],
+        "Volume": [1000],
+    })}}
+    captured = {}
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                      start_time="", end_time="", return_count=-1, return_date=True):
+        captured["dividend_type"] = dividend_type
+        return {}
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+    bt_api.build_signal_cache(ps, klines, db, dividend_mode="back")
+    assert captured["dividend_type"] == 2
 
 
 def test_build_signal_cache_orchestration(db_session, monkeypatch):
@@ -537,6 +595,90 @@ def test_minute_periods_aligned_with_valid_periods():
     assert non_minute == {"1d", "1w", "1mon"}
 
 
+def test_convert_formula_output_minute_alignment_phantom_drift():
+    """午休幽灵 bar 回归：批量取数 fill_data=True 注入 13:00 bar（9 根/日 vs 公式 8 根/日）。
+
+    公式输出按索引对齐到含幽灵的时间轴会整体前移一根——15:00 触发的信号被钉到
+    14:30（隐性未来函数，30m 回测换手/胜率异常的根因）。剔除幽灵后的标准 8 根/日
+    时间轴才映射到正确 bar。此测试固定两端行为，防止数据层修复后回退。
+    """
+    raw = {"000001.SZ": {"buy": [{"Date": "20260107", "Value": 0} for _ in range(7)]
+                         + [{"Date": "20260107", "Value": 1}]}}
+    phantom_axis = [
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),
+        datetime(2026, 1, 7, 11, 0), datetime(2026, 1, 7, 11, 30),
+        datetime(2026, 1, 7, 13, 0), datetime(2026, 1, 7, 13, 30),
+        datetime(2026, 1, 7, 14, 0), datetime(2026, 1, 7, 14, 30),
+        datetime(2026, 1, 7, 15, 0),
+    ]
+    # 现状（BUG）：输出第 8 条（15:00 信号）落到含幽灵轴的 index[7]=14:30
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": phantom_axis})
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 14, 30)) in entries
+
+    # 修复后：数据层剔除 13:00，时间轴恢复 8 根/日 → 信号正确落在 15:00
+    import core.tq.data as tq_data
+    import pandas as pd
+    phantom_raw = {f: pd.DataFrame({"000001.SZ": list(range(9))}, index=pd.to_datetime(phantom_axis))
+                   for f in ("Open", "High", "Low", "Close", "Volume", "Amount")}
+    stripped = tq_data.strip_lunch_phantom(phantom_raw, "30m")
+    # 真机 klines 的 bar_times 来自 polars datetime 列 → Python datetime，
+    # 与 pandas Timestamp 不相等（dict key 比对），故转 pydatetime 对齐
+    clean_axis = [t.to_pydatetime() for t in stripped["Close"].index]
+    assert len(clean_axis) == 8
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": clean_axis})
+    # 信号线（Value=1）应在 15:00，绝不应提前到 14:30（其他条目的 0 值无信号意义）
+    assert ("buy", 1) in [(e["name"], e["value"]) for e in entries.get(
+        (12, "000001.SZ", datetime(2026, 1, 7, 15, 0)), [])]
+    assert ("buy", 1) not in [(e["name"], e["value"]) for e in entries.get(
+        (12, "000001.SZ", datetime(2026, 1, 7, 14, 30)), [])]
+
+
+def test_convert_formula_output_minute_perday_new_listing_no_drift():
+    """新股对齐回归：批量取数 fill_data=True 会给上市前也补 carry-forward bar，
+    klines 轴比公式输出多一段「上市前假 bar」。全局索引对齐会把上市后的信号
+    错贴到上市前（漂移 N 根=上市前 bar 数，实测 688808.SH 漂 784 根）。
+    必须按 Date 逐日对齐：公式某日的第 j 条 → 该日 klines 第 j 根。
+    """
+    axis = [
+        datetime(2026, 1, 5, 10, 0), datetime(2026, 1, 5, 10, 30),  # 上市前（假）
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),  # 上市后（真）
+    ]
+    raw = {"000001.SZ": {"buy": [
+        {"Date": "20260107", "Value": 0},
+        {"Date": "20260107", "Value": 1},   # 上市后 10:30 出信号
+    ]}}
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": axis})
+    # 信号必须落在上市后 2026-01-07 10:30
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 10, 30)) in entries
+    # 全局索引会把 entry[1] 贴到 axis[1]=2026-01-05 10:30（漂移到上市前）→ 禁止
+    assert (12, "000001.SZ", datetime(2026, 1, 5, 10, 30)) not in entries
+    assert all(k[2].date() == datetime(2026, 1, 7).date() for k in entries)
+
+
+def test_convert_formula_output_minute_perday_suspension_skip():
+    """停牌日对齐回归：klines 停牌日有 carry-forward bar（fill_data），公式输出当天
+    为 0 条。恢复日后信号必须落到正确的当天 bar，不被停牌日的多余 bar 前移，
+    停牌日本身也不应产生任何 signal key。"""
+    axis = [
+        datetime(2026, 1, 5, 10, 0), datetime(2026, 1, 5, 10, 30),  # 正常日
+        datetime(2026, 1, 6, 10, 0), datetime(2026, 1, 6, 10, 30),  # 停牌日（klines 有，公式无）
+        datetime(2026, 1, 7, 10, 0), datetime(2026, 1, 7, 10, 30),  # 恢复日
+    ]
+    raw = {"000001.SZ": {"buy": [
+        {"Date": "20260105", "Value": 0}, {"Date": "20260105", "Value": 0},
+        {"Date": "20260107", "Value": 0}, {"Date": "20260107", "Value": 1},  # 恢复日 10:30 出信号
+    ]}}
+    entries = bt_api._convert_formula_output(raw, 12, ["000001.SZ"],
+                                             {"000001.SZ": axis})
+    assert (12, "000001.SZ", datetime(2026, 1, 7, 10, 30)) in entries
+    # 全局索引会把恢复日 entry 贴到停牌日（01-06）→ 禁止
+    assert (12, "000001.SZ", datetime(2026, 1, 6, 10, 30)) not in entries
+    assert all(k[2].date() != datetime(2026, 1, 6).date() for k in entries)
+
+
 def test_build_signal_cache_1h_uses_index_align(db_session, monkeypatch):
     """1h bar 时间带时分（10:00/11:00），TQ 输出 Date 只标到日，
     须按 bar_times 索引对齐（同 5m），否则 cache key 落午夜 → 引擎逐 bar 查不到信号。"""
@@ -634,8 +776,8 @@ def test_warmup_counts_by_period_no_db(db_session):
 
 
 def test_build_klines_warmup_merge(db_session, monkeypatch):
-    """build_klines 预热段按周期 count 直拉（start 空 / end=start 前一天 / count=formula_count），
-    与主段合并，klines 含预热 bar。"""
+    """W-A：预热段并入主段——一次 get_history_raw(start 前推覆盖预热窗口) 取全量，
+    klines 含预热 bar（引擎由调用方切片回主区间）。"""
     import pandas as pd
     db = db_session
     ps = _seed_db_warmup(db)
@@ -652,30 +794,27 @@ def test_build_klines_warmup_merge(db_session, monkeypatch):
 
     ts_warm = [datetime(2026, 7, 28)]
     ts_main = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
-    raw_warm = _raw(ts_warm, [9.9])
-    raw_main = _raw(ts_main, [10.2, 9.0])
+    raw = _raw(ts_warm + ts_main, [9.9, 10.2, 9.0])
 
     calls = []
     def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
         calls.append({"periods": list(periods), "start": start, "end": end, "count": count})
-        if count == -1:
-            # 主段：一次拉全部周期
-            return {"1d": raw_main, "30m": raw_main}
-        # 预热段：每周期一次 count 直拉
-        return {periods[0]: raw_warm}
+        # 单次拉取：返回 [前推 start, end] 全量（含预热 bar）
+        return {p: raw for p in periods}
     monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
 
     klines = bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
 
-    # 调用序列：1 次主段（全周期）+ 每周期 1 次预热段（5m 的 count=0 不拉）
-    assert len(calls) == 3
+    # W-A：单次拉取（所有策略周期一次取全量），count=-1，start 前推早于回测开始日
+    assert len(calls) == 1
+    assert set(calls[0]["periods"]) == {"1d", "30m", "5m"}
     assert calls[0]["count"] == -1
-    warmup_calls = {c["periods"][0]: c for c in calls[1:]}
-    assert set(warmup_calls) == {"1d", "30m"}
-    for c in warmup_calls.values():
-        assert c["start"] == "" and c["end"] == "20260728" and c["count"] == 255
+    assert calls[0]["start"] < "20260729"
+    assert calls[0]["end"] == "20260731"
+    # 预热窗口 = max(formula_count)=255：1d 前推 545 天
+    assert calls[0]["start"] == "20250130"
 
-    # 合并后含预热 bar：1d 有 3 根（07-28 预热 + 07-29/30 主段）
+    # klines 含预热 bar：1d 有 3 根（07-28 预热 + 07-29/30 主段）
     df = klines["000001.SZ"]["1d"]
     assert df.height == 3
     assert df["datetime"].to_list()[0] == datetime(2026, 7, 28)
@@ -813,90 +952,116 @@ def test_build_signal_cache_minute_warmup_align_then_filter(db_session, monkeypa
     assert (strat.id, "000001.SZ", datetime(2026, 7, 28, 14, 55)) not in cache
 
 
-def test_build_signal_cache_minute_aligns_to_strategy_period_only(db_session, monkeypatch):
-    """#3：klines 同时含 1d 与 5m 时，5m 策略信号须只按 5m bar 对齐，
-    不得把 1d 午夜 bar 混入时间轴导致串位。"""
+# ---------------------------------------------------------------------------
+# 多周期信号对齐：klines 含 1d + 5m 时，5m 策略的 bar_times 必须只取 5m 时间轴，
+# 不能混入 1d 午夜时间戳（否则索引串位，cache key 落在错误时间点）。
+# ---------------------------------------------------------------------------
+def test_build_signal_cache_multi_period_filters_by_strategy_period(db_session, monkeypatch):
+    """多周期 klines（1d + 5m）：5m 策略 signal_cache key 全部在 5m 时间点，
+    不含 1d 午夜时间——_bar_times_by_period 按策略周期过滤，避免并集串位。"""
     from core.models import Strategy
     db = db_session
     ps, strat, formula = _seed_db(db)
     db.query(Strategy).filter_by(id=strat.id).update({"period": "5m"})
     db.commit()
 
+    # klines：1d 2 根（午夜）+ 5m 4 根（带时分）
     klines = {"000001.SZ": {
         "1d": pl.DataFrame({
-            "datetime": [datetime(2026, 7, 29)],
-            "Open": [Decimal("10")], "High": [Decimal("10.3")],
-            "Low": [Decimal("9.9")], "Close": [Decimal("10.2")], "Volume": [1000],
+            "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
+        }),
+        "5m": pl.DataFrame({
+            "datetime": [
+                datetime(2026, 7, 29, 9, 35),
+                datetime(2026, 7, 29, 9, 40),
+                datetime(2026, 7, 30, 9, 35),
+                datetime(2026, 7, 30, 9, 40),
+            ],
+            "Open": [Decimal("10"), Decimal("10.2"), Decimal("10.1"), Decimal("10.3")],
+            "High": [Decimal("10.3"), Decimal("10.5"), Decimal("10.4"), Decimal("10.6")],
+            "Low": [Decimal("9.9"), Decimal("8.9"), Decimal("10.0"), Decimal("10.1")],
+            "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("10.3"), Decimal("10.4")],
+            "Volume": [1000, 1000, 1000, 1000],
+        }),
+    }}
+
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                     start_time="", end_time="", return_count=-1, return_date=True):
+        # 4 条 5m 输出（Date 日粒度，Value 逐条变）
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},    # → 5m bar 09:35
+                    {"Date": "20260729", "Value": -1},   # → 5m bar 09:40
+                    {"Date": "20260730", "Value": 1},    # → 5m bar 09:35
+                    {"Date": "20260730", "Value": -1},   # → 5m bar 09:40
+                ],
+            },
+        }
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 4 个 cache key 全部在 5m 时间点
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 9, 35)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 9, 40)) in cache
+    # 1d 午夜时间不应出现在 5m 策略的 cache 中
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 0, 0)) not in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30, 0, 0)) not in cache
+    # 信号值不串位
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
+
+
+def test_build_signal_cache_multi_period_daily_strategy_uses_date_match(db_session, monkeypatch):
+    """同上 klines（1d + 5m），1d 策略走 Date 匹配（不传 bar_times）→
+    cache key 在 1d 午夜时间点。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)  # 默认 1d 策略
+
+    klines = {"000001.SZ": {
+        "1d": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Volume": [1000, 1000],
         }),
         "5m": pl.DataFrame({
             "datetime": [datetime(2026, 7, 29, 9, 35), datetime(2026, 7, 29, 9, 40)],
-            "Open": [Decimal("10"), Decimal("10.2")], "High": [Decimal("10.3"), Decimal("10.5")],
-            "Low": [Decimal("9.9"), Decimal("8.9")], "Close": [Decimal("10.2"), Decimal("9.0")],
+            "Open": [Decimal("10"), Decimal("10.2")],
+            "High": [Decimal("10.3"), Decimal("10.5")],
+            "Low": [Decimal("9.9"), Decimal("8.9")],
+            "Close": [Decimal("10.2"), Decimal("9.0")],
             "Volume": [1000, 1000],
         }),
     }}
 
     def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
                      start_time="", end_time="", return_count=-1, return_date=True):
-        return {"000001.SZ": {"open_sig": [
-            {"Date": "20260729", "Value": 1},   # → 5m bar 09:35
-            {"Date": "20260729", "Value": -1},  # → 5m bar 09:40
-        ]}}
+        return {
+            "000001.SZ": {
+                "open_sig": [
+                    {"Date": "20260729", "Value": 1},
+                    {"Date": "20260730", "Value": -1},
+                ],
+            },
+        }
     monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
 
     cache = bt_api.build_signal_cache(ps, klines, db)
-    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "open_sig", "value": 1}]
-    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "open_sig", "value": -1}]
-    # 不得把 1d 午夜 bar 混入对齐（否则 09:35 会拿到 None 或错位值）
-    assert all(k[2] != datetime(2026, 7, 29, 0, 0) for k in cache)
 
-
-def test_convert_formula_output_warns_on_length_mismatch(caplog):
-    """#3：公式输出条数 != bar 数时记 warning（不崩溃，仍按索引截断）。"""
-    import logging
-    bar_times = [datetime(2026, 7, 28, 9, 35)]   # 1 根 bar
-    raw = {"000001.SZ": {"open_sig": [
-        {"Date": "20260728", "Value": 1},
-        {"Date": "20260728", "Value": -1},       # 多出 1 条
-    ]}}
-    with caplog.at_level(logging.WARNING):
-        entries = bt_api._convert_formula_output(
-            raw, 1, ["000001.SZ"], bar_times_by_code={"000001.SZ": bar_times}
-        )
-    assert (1, "000001.SZ", bar_times[0]) in entries
-    assert any("长度" in r.message for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# 复权口径（回测）：真机 bug —— TDX 前复权为「加性」且锚定查询 end 日期，
-# 长区间下高分红股（如 601225.SH 陕西煤业）2020 年真实价 ~7.8 被整体减 ~7.94，
-# 2020-08-26 前 Close 全 ≤0（1296 根，最低 -5.44），2020-07-13 Close=0.01。
-# 0.01 是正数，通过 portfolio 的 close<=0 闸 → 下单量 0.2×资金/0.01 = 2000 万股。
-# 后复权（back）恒为正且与查询区间无关（锚定个股首日），可根除该问题。
-# ---------------------------------------------------------------------------
-def test_build_klines_uses_back_adjust_for_backtest(db_session, monkeypatch):
-    """回测行情（主段 + 预热段）必须用后复权 back，不得用前复权 front。"""
-    import pandas as pd
-    db = db_session
-    ps, strat, formula = _seed_db(db)  # formula_count 默认 >0 → 触发预热段
-    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
-    raw = {
-        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.2]}, index=ts),
-        "High": pd.DataFrame({"000001.SZ": [10.3, 10.5]}, index=ts),
-        "Low": pd.DataFrame({"000001.SZ": [9.9, 8.9]}, index=ts),
-        "Close": pd.DataFrame({"000001.SZ": [10.2, 9.0]}, index=ts),
-        "Volume": pd.DataFrame({"000001.SZ": [1000, 1000]}, index=ts),
-        "Amount": pd.DataFrame({"000001.SZ": [10200.0, 9000.0]}, index=ts),
-    }
-    seen = []
-    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
-        seen.append(dividend_type)
-        return {"1d": raw}
-    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
-
-    bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db)
-
-    assert seen, "应至少调用一次 get_history_raw"
-    assert all(dt == "back" for dt in seen), \
-        "回测行情必须用后复权 back，实际 %r" % seen
+    # 1d 走 Date 匹配 → cache key 在午夜
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29)) in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30)) in cache
+    # 5m 时间点不应出现在 1d 策略的 cache 中
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) not in cache
 

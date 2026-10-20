@@ -13,7 +13,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
@@ -62,6 +62,7 @@ from .live.order_machine import (
 from .live.breaker import BreakerService
 from .live.daily_closer import DailyCloser
 from .decision import DecisionRecorder
+from .regime import CausalRegimeTracker
 from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -98,6 +99,8 @@ class LiveEngine:
         formula_count_by_name: Optional[Dict[str, int]] = None,
         code_period_count: Optional[Dict[tuple, int]] = None,
         trading_calendar: Optional[TradingCalendar] = None,
+        regime_provider: Optional[Callable] = None,
+        benchmark_codes: Optional[Dict[int, str]] = None,
     ):
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
@@ -120,6 +123,15 @@ class LiveEngine:
         for p in portfolios:
             p.set_recorder(self._recorder)
         self._poll_interval = poll_interval
+        # B5 市场状态闸（默认关）：regime_provider(code, end_date) → {date: Decimal}
+        # 基准收盘全量历史；每组合每日首个 bar 重建因果跟踪器并注入
+        # portfolio.current_regime。provider 为 None（默认）时完全不启用，行为不变。
+        self._regime_provider = regime_provider
+        self._benchmark_codes: Dict[int, str] = benchmark_codes or {}
+        self._regime_updated: Dict[int, date] = {}
+        # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
+        # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
+        self._enter_day_updated: Dict[int, date] = {}
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
@@ -659,6 +671,37 @@ class LiveEngine:
             return self._calendar.is_trading_day(bt.date())
         return self._calendar.is_trading_allowed(bt)
 
+    def _maybe_update_regime(self, portfolio: Portfolio, bar_date: date) -> None:
+        """B5：每日首 bar 更新组合市场状态（纯因果——只吸收 ≤当日的基准收盘）。
+
+        跳过条件：provider 未注入 / 组合无启用 regime 的策略（结果缓存于 ctx）/
+        当日已更新 / 无 benchmark_code。provider 异常时告警并沿用旧标签（不中断 bar）。
+        """
+        if self._regime_provider is None:
+            return
+        if self._regime_updated.get(portfolio.portfolio_id) == bar_date:
+            return
+        enabled = getattr(portfolio, "_regime_any_enabled", None)
+        if enabled is None:
+            enabled = any(c.regime_filter_enabled for c in portfolio.strategies)
+            portfolio._regime_any_enabled = enabled
+        if not enabled:
+            return
+        code = self._benchmark_codes.get(portfolio.portfolio_id)
+        if not code:
+            return
+        try:
+            series = self._regime_provider(code, bar_date)  # {date: Decimal} 全量历史
+            tracker = CausalRegimeTracker()
+            tracker.feed_history(series)
+            portfolio.current_regime = tracker.label
+            self._regime_updated[portfolio.portfolio_id] = bar_date
+        except Exception:
+            logger.warning(
+                "portfolio %s regime 更新失败（%s），沿用旧标签",
+                portfolio.portfolio_id, code, exc_info=True,
+            )
+
     def _handle_bar(
         self,
         portfolio: Portfolio,
@@ -678,6 +721,15 @@ class LiveEngine:
         """
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         total_value = portfolio.total_value(bar)
+        # R3：每日首根 bar 补算上一日 daily_loss（与回测 enter_day 对齐，镜像回测时序——
+        # 必须在 on_bar_update 之前调用：后者会把 _last_bar_date 置为当日，enter_day
+        # 的跨日判断将失效）。日内亏损暂停/次日恢复在日首即生效，14:30 closer 的
+        # update_daily 仍做当日收尾。首根 bar（无上一日数据）不调用，行为不变。
+        if self._enter_day_updated.get(portfolio.portfolio_id) != bar.bar_time.date():
+            portfolio.risk_manager.enter_day(
+                bar.bar_time.date(), portfolio.account.initial_capital
+            )
+            self._enter_day_updated[portfolio.portfolio_id] = bar.bar_time.date()
         # update_peak + max_drawdown 次日自动恢复检测 + H4 计数持久化归 BreakerService（0010 步骤 4）
         self._breaker.on_bar_update(portfolio, total_value, bar.bar_time.date())
         # F5：每 bar 刷一次桥可用持仓（多组合共享同一 bar 对象 → 强引用去重），
@@ -698,6 +750,8 @@ class LiveEngine:
         for lo in self._pending_orders.values():
             if lo.trade_type == "buy":
                 inflight_opens.setdefault(lo.strategy_id, set()).add(lo.stock_code)
+        # B5：每日首 bar 更新组合市场状态（未启用策略/provider 缺省 → 跳过，行为不变）
+        self._maybe_update_regime(portfolio, bar.bar_time.date())
         orders = portfolio.on_bar(
             bar, signal_cache=self.signal_cache, period=bar.period,
             inflight_opens=inflight_opens or None,
@@ -839,7 +893,7 @@ class LiveEngine:
                     "order_id": live_order.id,
                     "strategy_id": live_order.strategy_id,
                     "stock_code": live_order.stock_code,
-                    "trade_type": live_order.trade_type,
+                    "trade_type": (live_order.trade_type or "").upper(),
                     "status": "submitted",
                     "quantity": live_order.quantity,
                     "price": float(live_order.price) if live_order.price is not None else None,
@@ -864,6 +918,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()
@@ -883,6 +940,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()
@@ -902,6 +962,9 @@ class LiveEngine:
                         "order_id": live_order.id,
                         "status": "rejected",
                         "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                         "error_message": live_order.error_message,
                     })
                     db.commit()

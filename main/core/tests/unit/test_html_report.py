@@ -1,10 +1,15 @@
 """TR-19 单文件离线 HTML 报告：自包含/无外链/数字同源（FR-21/FR-22）。"""
 import json
 import re
+import sys
 
 import pytest
 
-from core.services.html_report import build_html_report, ALLOWED_EXTERNAL_URLS
+from core.services.html_report import (
+    build_html_report,
+    ALLOWED_EXTERNAL_URLS,
+)
+import core.services.html_report as _hr
 
 
 def _detail(**overrides):
@@ -190,6 +195,128 @@ def test_robustness_ok_renders_tables_and_chart():
     assert "chart-rb" in html
 
 
+def test_robustness_check_section_renders():
+    """离线报告含「稳健性检验」：年度/3年滚动/集中度/样本内外表。"""
+    detail = _detail()
+    detail["robustness"] = {
+        "status": "completed", "computed_at": "2026-10-12T10:00:00",
+        "data": {
+            "total_return": 10.0847, "benchmark_return": 0.8593,
+            "years_positive": "13/13",
+            "annual": [{"year": "2014", "return": 0.814, "max_drawdown": -0.079},
+                       {"year": "2026", "return": 0.048, "max_drawdown": -0.005}],
+            "rolling_3y": [{"start": "2014", "end": "2016", "cagr": 0.532,
+                            "max_drawdown": -0.079}],
+            "concentration": {
+                "total_realized_pnl": 1000000,
+                "top": [{"code": "000408.SZ", "pnl": 338874, "share": 0.036}],
+                "top20_share": 0.42, "profitable_stocks": 195, "total_stocks": 262,
+            },
+            "oos": {
+                "split_year": "2023",
+                "in_sample": {"start": "2014-01-02", "end": "2023-12-29",
+                              "return": 8.145, "cagr": 0.248,
+                              "max_drawdown": -0.079, "benchmark_return": 0.478},
+                "out_of_sample": {"start": "2024-01-02", "end": "2026-10-09",
+                                  "return": 0.212, "cagr": 0.066,
+                                  "max_drawdown": -0.008, "benchmark_return": 0.275},
+            },
+        },
+    }
+    html = build_html_report(detail)
+    for token in ["稳健性检验", "年度收益与年内最大回撤", "3年滚动窗口",
+                  "个股已实现净", "样本内 / 样本外对比", "000408.SZ",
+                  "断点年份", "13/13", "2024 ~ 2026"]:
+        assert token in html, f"报告缺少 {token!r}"
+
+
+def test_new_sections_returns_buckets_decisions_trades_strategy_eval():
+    """收益分布/风控统计/交易明细/策略评估四区块在新版离线报告完整渲染。"""
+    detail = _detail()
+    detail["returns_buckets"] = {
+        "monthly_matrix": {
+            "years": [2024, 2025], "months": ["1月", "2月"],
+            "matrix": [[1.5, -0.8], [2.0, 0.6]],
+            "text": [["+1.50%", "-0.80%"], ["+2.00%", "+0.60%"]],
+        },
+        "yearly": [
+            {"year": 2024, "daily_returns": [0.01, -0.02, 0.03],
+             "monthly_returns": [0.05, -0.03], "annual_return": 0.25},
+            {"year": 2025, "daily_returns": [0.02, 0.01],
+             "monthly_returns": [0.03, 0.04], "annual_return": 0.08},
+        ],
+    }
+    detail["decision_summary"] = [{
+        "gate": "stop_loss", "layer": "strategy_risk", "action": "trigger",
+        "param_name": "stop_loss_ratio", "param_value": 0.05,
+        "count": 3, "stock_count": 2,
+        "first_bar_time": "2024-01-02T09:30:00", "last_bar_time": "2024-01-05T09:30:00",
+    }]
+    detail["decisions"] = [{
+        "gate": "stop_loss", "param_name": "stop_loss_ratio",
+        "bar_time": "2024-01-02T09:30:00", "strategy_id": 1,
+        "stock_code": "000001.SZ", "param_value": 0.05, "actual_value": 0.062,
+        "message": "止损：成本 10.000 现价 9.380 亏 6.20%",
+    }]
+    detail["trades"] = [
+        {"bar_time": "2024-01-02T09:30:00", "strategy_id": 1, "strategy_name": "s1",
+         "stock_code": "000001.SZ", "trade_type": "BUY", "price": 10.0,
+         "quantity": 1000, "amount": 10000.0, "commission": 5.0, "stamp_duty": 0.0},
+        {"bar_time": "2024-01-05T09:30:00", "strategy_id": 1, "strategy_name": "s1",
+         "stock_code": "000001.SZ", "trade_type": "SELL", "price": 11.0,
+         "quantity": 1000, "amount": 11000.0, "commission": 5.0, "stamp_duty": 5.5},
+    ]
+    detail["strategy_evaluations"] = [{
+        "strategy_id": 1, "strategy_name": "s1",
+        "total_return": 0.3, "annual_return": 0.12, "max_drawdown": -0.06,
+        "sharpe_ratio": 1.1,
+    }]
+    html = build_html_report(detail)
+    for token in ["收益分布", "月度收益热力图", "年度日收益箱线图", "各年年收益柱状图",
+                  "风控与拦截统计", "止损", "交易明细", "000001.SZ",
+                  "策略绩效评估", "组合整体指标", "策略 #1：s1", "买入"]:
+        assert token in html, f"报告缺少 {token!r}"
+    assert "chart-return-heat" in html
+    assert "chart-box-daily" in html
+    assert "chart-return-annual" in html
+
+
+def test_market_regime_window_disclosure():
+    """五/六/七/七-B 披露实际统计窗口；短于回测区间时写明被指数历史截断。
+
+    背景：_exposure_block 对全体指数求交集，科创50(000688.SH) 仅 2019-12-31 起，
+    会把窗口整体截断（如 651 周回测只剩 343 周）而不告知用户。
+    """
+    detail = _detail()
+    data = detail["market_regime"]["data"]
+    data["meta"]["n_weeks_labeled"] = 651
+    data["style"]["weeks"] = [{"date": "2020-01-10"}, {"date": "2020-01-17"}]
+    data["dispersion"]["series"] = [
+        {"date": "2020-01-10", "dispersion": 0.02},
+        {"date": "2020-01-17", "dispersion": 0.03},
+    ]
+    data["exposure"].update({
+        "available_codes": ["000300.SH"], "available_names": ["沪深300"],
+        "dates": ["2020-01-10", "2020-01-17"],
+        "corr": {"000300.SH": [0.4, 0.5]}, "beta": {"000300.SH": [0.3, 0.35]},
+    })
+    # 七-B 覆盖全区间（651 周）→ 不应被标为截断
+    full_dates = ["2014-01-10"] + [f"2014-01-{17 + i}" for i in range(649)] + ["2026-09-18"]
+    assert len(full_dates) == 651
+    data["quadrant_exposure"] = {
+        "available_codes": ["399372.SZ"], "available_names": ["大盘成长"],
+        "skipped": [], "dates": full_dates,
+        "corr": {"399372.SZ": [0.4] * 651}, "beta": {"399372.SZ": [0.3] * 651},
+        "window": 52,
+    }
+    html = build_html_report(detail)
+    assert "实际统计窗口 2020-01-10 ~ 2020-01-17（2 周）" in html
+    assert "短于回测区间 651 周" in html
+    # 七-B 全区间窗口只报窗口，不报截断
+    assert "实际统计窗口 2014-01-10 ~ 2026-09-18（651 周）" in html
+    assert "实际统计窗口 2014-01-10 ~ 2026-09-18（651 周）；短于" not in html
+
+
 def test_appendix_embeds_raw_detail_json():
     """Minor-4：报告末尾附录折叠展示完整 detail 原始 JSON。"""
     html = build_html_report(_detail())
@@ -208,3 +335,66 @@ def test_appendix_escapes_html_in_payload():
     html = build_html_report(detail)
     assert '<script>alert("x")</script>' not in html.split(
         'class="json-dump"', 1)[1]
+
+
+def test_signal_preflight_warnings_render_at_top():
+    """record.warnings 非空 → 报告顶部渲染信号预检警告条及每条警告（转义）。"""
+    detail = _detail()
+    detail["record"]["warnings"] = [
+        '策略「s1」(1d) 的开仓信号「买」（触发值=2）在回测区间内从未触发。',
+        '<img src=x onerror=alert(1)>',
+    ]
+    html = build_html_report(detail)
+
+    assert 'class="spb"' in html
+    assert "回测告警 2 项" in html
+    assert "从未触发" in html
+    # 警告文案中的 HTML 必须转义
+    assert "<img src=x" not in html
+    assert "&lt;img src=x" in html
+    # 警告条必须在首个 KPI 网格之前（置顶）
+    assert html.index('class="spb"') < html.index('class="kpi-grid"')
+
+
+def test_no_signal_preflight_banner_when_warnings_empty():
+    """record.warnings 为空/缺省 → 不渲染警告条。"""
+    assert 'class="spb"' not in build_html_report(_detail())
+
+
+def test_echarts_source_falls_back_to_exe_dir(monkeypatch, tmp_path):
+    """打包环境（__file__ 推算路径缺失 + 无 node_modules）回退到 exe 同级 echarts.min.js。
+
+    回归：打包后 /export/html 曾 500——报告需内联 ECharts 运行时，却只从
+    __file__.parents 推算 web/node_modules（包内不存在）。"""
+    from core.services import html_report as hr
+
+    fake_exe = tmp_path / "tq-iquant.exe"
+    fake_exe.write_bytes(b"")
+    (tmp_path / "echarts.min.js").write_text(
+        "window.echarts = { version: '5' };", encoding="utf-8")
+    monkeypatch.setattr(hr, "_ECHARTS_PATH",
+                        tmp_path / "not-exist" / "echarts.min.js")
+    monkeypatch.setattr(sys, "argv", [str(fake_exe)])
+    hr._echarts_source.cache_clear()
+    try:
+        # 回退命中 exe 同级清单文件
+        assert "window.echarts" in hr._echarts_source()
+    finally:
+        hr._echarts_source.cache_clear()
+
+
+def test_echarts_source_all_candidates_missing_raises_clear(monkeypatch, tmp_path):
+    """所有候选都缺失 → 抛出带候选清单的 FileNotFoundError，便于定位。"""
+    from core.services import html_report as hr
+
+    monkeypatch.setattr(hr, "_ECHARTS_PATH",
+                        tmp_path / "none" / "echarts.min.js")
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "x.exe")])
+    hr._echarts_source.cache_clear()
+    try:
+        with pytest.raises(FileNotFoundError) as ei:
+            hr._echarts_source()
+        assert "echarts.min.js" in str(ei.value)
+        assert "已尝试" in str(ei.value)
+    finally:
+        hr._echarts_source.cache_clear()

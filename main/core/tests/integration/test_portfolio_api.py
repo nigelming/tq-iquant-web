@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 from core.main import app
 from core.db import get_db
 from core.models import (
-    Base, PortfolioStrategy, Strategy, StockPool, Formula,
+    Base, PortfolioStrategy, Strategy, StockPool, StockPoolStock, Formula,
 )
 
 
@@ -71,6 +71,18 @@ def _seed_pool(db, code="TQCS", name="tq自选"):
         return existing.id
     p = StockPool(code=code, name=name)
     db.add(p); db.flush(); db.commit()
+    return p.id
+
+
+def _seed_pool_with(db, codes, code=None, name=None):
+    """建 StockPool + 成分股，返回 pool id。code 缺省时用成分签名保证唯一。"""
+    code = code or ("P_" + "_".join(sorted(codes)))
+    name = name or code
+    p = StockPool(code=code, name=name)
+    db.add(p); db.flush()
+    for c in codes:
+        db.add(StockPoolStock(pool_id=p.id, stock_code=c))
+    db.commit()
     return p.id
 
 
@@ -507,6 +519,40 @@ def test_delete_portfolio_cascades_strategies(client):
     db.close()
 
 
+def test_delete_portfolio_with_master_slave_cascades(client):
+    """组合内含 master/slave 自引用时，删组合也应成功。
+
+    回归：strategies.master_strategy_id 是 RESTRICT 外键，级联删子策略时先删 master
+    会让仍引用它的 slave 触发 IntegrityError，被路由误报为"被回测记录或实盘 session
+    引用，无法删除"。删除前需先解除组合内的主从自引用。
+    """
+    c, Session = client
+    db = Session()
+    pid_pool = _seed_pool(db)
+    fid = _seed_formula(db)
+    p = PortfolioStrategy(
+        name="ps", stock_pool_id=pid_pool, initial_capital=Decimal("100000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(p); db.flush()
+    master = Strategy(portfolio_id=p.id, name="M", formula_id=fid, period="1d", role="master")
+    db.add(master); db.flush()
+    slave = Strategy(portfolio_id=p.id, name="S", formula_id=fid, period="1d",
+                     role="slave", master_strategy_id=master.id)
+    db.add(slave)
+    db.commit()
+    pid = p.id
+    db.close()
+
+    body = c.delete(f"/api/portfolios/{pid}").json()
+    assert body["code"] == 0
+
+    db = Session()
+    assert db.get(PortfolioStrategy, pid) is None
+    assert db.query(Strategy).filter(Strategy.portfolio_id == pid).count() == 0
+    db.close()
+
+
 def test_delete_portfolio_not_found(client):
     c, Session = client
     body = c.delete("/api/portfolios/9999").json()
@@ -753,6 +799,91 @@ def test_create_strategy_slave_master_wrong_portfolio(client):
     assert body["code"] == 400
 
 
+def test_create_strategy_slave_pool_subset_ok(client):
+    """slave 独立池 ⊆ master 独立池 → 允许创建。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    master_pool = _seed_pool_with(db, ["000001.SZ", "600000.SH"])
+    slave_pool = _seed_pool_with(db, ["000001.SZ"])
+    master = db.query(Strategy).filter(Strategy.portfolio_id == pid).first()
+    master.stock_pool_id = master_pool
+    db.commit()
+    master_id = master.id
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        name="SLAVE", role="slave", master_strategy_id=master_id,
+        stock_pool_id=slave_pool,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["stock_pool_id"] == slave_pool
+
+
+def test_create_strategy_slave_pool_not_subset_rejected(client):
+    """slave 独立池存在 master 池之外的股票 → 400（避免永久静默失效）。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    master_pool = _seed_pool_with(db, ["000001.SZ"])
+    slave_pool = _seed_pool_with(db, ["000001.SZ", "000003.SZ"])
+    master = db.query(Strategy).filter(Strategy.portfolio_id == pid).first()
+    master.stock_pool_id = master_pool
+    db.commit()
+    master_id = master.id
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        name="SLAVE", role="slave", master_strategy_id=master_id,
+        stock_pool_id=slave_pool,
+    )).json()
+    assert body["code"] == 400
+    assert "股票池" in body["message"]
+
+
+def test_create_strategy_slave_pool_inherit_portfolio_ok(client):
+    """master/slave 均继承组合级池（组合池为超集）→ 允许。"""
+    c, Session = client
+    db = Session()
+    portfolio_pool = _seed_pool_with(db, ["000001.SZ", "600000.SH"])
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    # _seed_portfolio 建了自带组合池，改指向我们可控的组合池
+    db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).update(
+        {"stock_pool_id": portfolio_pool}
+    )
+    db.commit()
+    master_id = db.query(Strategy).filter(Strategy.portfolio_id == pid).first().id
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        name="SLAVE", role="slave", master_strategy_id=master_id,
+        stock_pool_id=None,
+    )).json()
+    assert body["code"] == 0
+
+
+def test_create_portfolio_batch_slave_pool_not_subset_rejected(client):
+    """批量建组合：slave 独立池越出 master 池 → 400（master_strategy_id=0 指本批索引）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db)  # 组合级池 id=1
+    _seed_formula(db)
+    master_pool = _seed_pool_with(db, ["000001.SZ"])
+    slave_pool = _seed_pool_with(db, ["000009.SZ"])
+    db.close()
+
+    payload = _create_payload(strategies=[
+        {"name": "M", "formula_id": 1, "period": "1d", "role": "master",
+         "stock_pool_id": master_pool, "capital_ratio": 0.6, "max_positions": 5},
+        {"name": "S", "formula_id": 1, "period": "1d", "role": "slave",
+         "master_strategy_id": 0, "stock_pool_id": slave_pool,
+         "capital_ratio": 0.3, "max_positions": 5},
+    ])
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 400
+    assert "股票池" in body["message"]
+
+
 def test_update_strategy(client):
     """PUT — 编辑单个子策略。"""
     c, Session = client
@@ -767,6 +898,170 @@ def test_update_strategy(client):
     assert body["code"] == 0
     assert body["data"]["name"] == "RENAMED"
     assert body["data"]["capital_ratio"] == 0.8
+
+
+# ===========================================================================
+# #1 涨跌停约束开关：新组合默认开、显式设置按值、编辑未携带不动
+# ===========================================================================
+def test_create_portfolio_price_limit_default_on(client):
+    """创建请求未携带 price_limit_check_enabled → 新组合默认开启。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is True
+
+
+def test_create_portfolio_price_limit_explicit_off(client):
+    """创建请求显式 price_limit_check_enabled=false → 按值关闭。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        price_limit_check_enabled=False,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is False
+
+
+def test_update_portfolio_price_limit_untouched_when_omitted(client):
+    """PUT 未携带该字段 → 不动已存值（关闭的旧组合编辑后不偷改）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+    pid = c.post("/api/portfolios", json=_create_payload(
+        price_limit_check_enabled=False,
+    )).json()["data"]["id"]
+
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(name="RENAMED")).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is False
+    # 显式开启 → 按值更新
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        price_limit_check_enabled=True,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["price_limit_check_enabled"] is True
+
+
+# ===========================================================================
+# #2 成交量约束开关：默认关 + 显式设置按值 + 比例校验
+# ===========================================================================
+def test_portfolio_volume_limit_default_off(client):
+    """创建未携带 volume_limit_* → 默认关、ratio 0.10。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["volume_limit_enabled"] is False
+    assert body["data"]["volume_limit_ratio"] == 0.10
+
+
+def test_portfolio_volume_limit_explicit_on_roundtrip(client):
+    """显式开启 + 自定义比例 → 按值落库并回显；非法比例 → 400。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        volume_limit_enabled=True, volume_limit_ratio=0.2,
+    )).json()
+    assert body["code"] == 0
+    assert body["data"]["volume_limit_enabled"] is True
+    assert body["data"]["volume_limit_ratio"] == 0.2
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        volume_limit_ratio=1.5,
+    )).json()
+    assert body["code"] == 400
+    assert "volume_limit_ratio" in body["message"]
+
+
+# ===========================================================================
+# W2 仓位模型 / 现金管理增强字段
+# ===========================================================================
+def test_portfolio_position_sizing_default_dynamic(client):
+    """新建组合未携带 → position_sizing='dynamic'，现金管理默认关/阈值 None。"""
+    c, Session = client
+    db = Session(); _seed_pool(db); _seed_formula(db); db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    d = body["data"]
+    assert d["position_sizing"] == "dynamic"
+    assert d["cash_enhance_enabled"] is False
+    assert d["cash_enhance_equity_threshold"] is None
+    assert d["cash_enhance_position_ratio_threshold"] is None
+
+
+def test_portfolio_position_sizing_fixed_roundtrip(client):
+    """显式 fixed + 现金管理字段 → 回显；非法 position_sizing → 400。"""
+    c, Session = client
+    db = Session(); _seed_pool(db); _seed_formula(db); db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        position_sizing="fixed",
+        cash_enhance_enabled=True,
+        cash_enhance_equity_threshold=1000000,
+        cash_enhance_position_ratio_threshold=0.3,
+    )).json()
+    assert body["code"] == 0
+    d = body["data"]
+    assert d["position_sizing"] == "fixed"
+    assert d["cash_enhance_enabled"] is True
+    assert d["cash_enhance_equity_threshold"] == 1000000
+    assert d["cash_enhance_position_ratio_threshold"] == 0.3
+
+    bad = c.post("/api/portfolios", json=_create_payload(position_sizing="bogus")).json()
+    assert bad["code"] == 400
+    assert "position_sizing" in bad["message"]
+
+
+# ===========================================================================
+# #3 策略级敞口上限开关：默认关 + 显式开启回显
+# ===========================================================================
+def test_strategy_exposure_cap_default_off(client):
+    """子策略未携带 exposure_cap_enabled → 默认关。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["strategies"][0]["exposure_cap_enabled"] is False
+
+
+def test_strategy_exposure_cap_explicit_on_roundtrip(client):
+    """显式 exposure_cap_enabled=true → 按值落库并回显；PUT 子策略可编辑。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload(strategies=[
+        {"name": "S1", "formula_id": 1, "period": "1d", "role": "independent",
+         "capital_ratio": 0.6, "max_positions": 5, "exposure_cap_enabled": True},
+    ])
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 0
+    s = body["data"]["strategies"][0]
+    assert s["exposure_cap_enabled"] is True
+
+    body = c.put(f"/api/portfolios/{body['data']['id']}/strategies/{s['id']}",
+                 json=_strategy_payload(name="S1", exposure_cap_enabled=False)).json()
+    assert body["code"] == 0
+    assert body["data"]["exposure_cap_enabled"] is False
 
 
 def test_update_strategy_not_found(client):
@@ -820,7 +1115,7 @@ def test_delete_strategy_referenced_by_backtest_trade(client):
     rec = BacktestRecord(
         portfolio_strategy_id=pid, name="bt1",
         start_date=datetime(2026, 7, 1).date(), end_date=datetime(2026, 7, 31).date(),
-        status="completed", progress=100,
+        status="completed",
     )
     db.add(rec); db.flush()
     db.add(BacktestTrade(
@@ -839,3 +1134,129 @@ def test_delete_strategy_referenced_by_backtest_trade(client):
     assert resp.status_code != 500
     body = resp.json()
     assert body["code"] != 0  # 不是成功
+
+
+# ---------------------------------------------------------------------------
+# 编辑场景约束：跨池子集回校 + master 降级拦截 + 自引用/空名校验
+# ---------------------------------------------------------------------------
+def test_update_strategy_slave_self_reference_rejected(client):
+    """PUT slave 指向自身 → 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None), ("S", "slave", None)])
+    fid = db.query(Formula).first().id
+    m = db.query(Strategy).filter_by(portfolio_id=pid, role="master").first()
+    s = db.query(Strategy).filter_by(portfolio_id=pid, role="slave").first()
+    s.master_strategy_id = m.id
+    db.commit()
+    sid = s.id
+    db.close()
+
+    body = c.put(
+        f"/api/portfolios/{pid}/strategies/{sid}",
+        json=_strategy_payload(name="S", role="slave",
+                               master_strategy_id=sid, formula_id=fid),
+    ).json()
+    assert body["code"] == 400
+    assert "自身" in body["message"]
+
+
+def test_update_strategy_master_demotion_rejected(client):
+    """被 slave 引用的 master 不能改为 independent/slave → 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None), ("S", "slave", None)])
+    fid = db.query(Formula).first().id
+    m = db.query(Strategy).filter_by(portfolio_id=pid, role="master").first()
+    s = db.query(Strategy).filter_by(portfolio_id=pid, role="slave").first()
+    s.master_strategy_id = m.id
+    db.commit()
+    mid = m.id
+    db.close()
+
+    body = c.put(
+        f"/api/portfolios/{pid}/strategies/{mid}",
+        json=_strategy_payload(name="M", role="independent",
+                               master_strategy_id=None, formula_id=fid),
+    ).json()
+    assert body["code"] == 400
+    assert "被从策略引用" in body["message"]
+
+
+def test_update_strategy_master_pool_change_rechecks_slaves(client):
+    """改 master 股票池导致既存 slave 越界 → 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    fid = db.query(Formula).first().id
+    master_pool = _seed_pool_with(db, ["000001.SZ", "600000.SH"], code="MP1")
+    slave_pool = _seed_pool_with(db, ["000001.SZ"], code="SP1")
+    m = db.query(Strategy).filter_by(portfolio_id=pid).first()
+    m.stock_pool_id = master_pool
+    db.flush()
+    db.add(Strategy(portfolio_id=pid, name="S", formula_id=fid, period="1d",
+                    role="slave", master_strategy_id=m.id, stock_pool_id=slave_pool))
+    db.commit()
+    mid = m.id
+    new_master_pool = _seed_pool_with(db, ["600000.SH"], code="MP2")
+    db.close()
+
+    body = c.put(
+        f"/api/portfolios/{pid}/strategies/{mid}",
+        json=_strategy_payload(name="M", role="master", master_strategy_id=None,
+                               formula_id=fid, stock_pool_id=new_master_pool),
+    ).json()
+    assert body["code"] == 400
+    assert "股票池" in body["message"]
+
+
+def test_update_portfolio_pool_change_rechecks_slaves(client):
+    """改组合级股票池导致继承/独立 slave 越界 → 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[("M", "master", None)])
+    fid = db.query(Formula).first().id
+    pool_wide = _seed_pool_with(db, ["000001.SZ", "600000.SH", "000002.SZ"], code="PP1")
+    slave_pool = _seed_pool_with(db, ["000002.SZ"], code="SPX")
+    db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).update(
+        {"stock_pool_id": pool_wide}
+    )
+    m = db.query(Strategy).filter_by(portfolio_id=pid).first()
+    m.stock_pool_id = None  # 继承组合级池
+    db.flush()
+    db.add(Strategy(portfolio_id=pid, name="S", formula_id=fid, period="1d",
+                    role="slave", master_strategy_id=m.id, stock_pool_id=slave_pool))
+    db.commit()
+    pool_narrow = _seed_pool_with(db, ["000001.SZ", "600000.SH"], code="PP2")
+    db.close()
+
+    body = c.put(
+        f"/api/portfolios/{pid}",
+        json=_create_payload(name="PS1", stock_pool_id=pool_narrow),
+    ).json()
+    assert body["code"] == 400
+    assert "股票池" in body["message"]
+
+
+def test_create_strategy_empty_name_rejected(client):
+    """空名 → 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(name="")).json()
+    assert body["code"] == 400
+    assert "名称" in body["message"]
+
+
+def test_create_portfolio_empty_name_rejected(client):
+    """组合空名 → 400。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(name="")).json()
+    assert body["code"] == 400
+    assert "名称" in body["message"]

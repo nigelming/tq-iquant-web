@@ -54,79 +54,123 @@ onMounted(load)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
-    <button @click="load" class="btn">刷新</button>
+  <div class="dash-hero">
+    <div class="dash-hero-main">
+      <div class="dash-hero-stats">
+        <span><b>{{ poolCount }}</b> 股票池</span>
+        <span><b>{{ formulaCount }}</b> 公式</span>
+        <span><b>{{ portfolioCount }}</b> 组合</span>
+        <span><b>{{ backtestCount }}</b> 回测</span>
+        <span><b class="db-accent">{{ liveCount }}</b> 实盘</span>
+      </div>
+    </div>
+    <div class="dash-hero-actions">
+      <button @click="load" class="btn">刷新</button>
+    </div>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:16px">
     {{ errorMsg }}
   </div>
 
-  <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
+  <div v-if="loading" class="card" style="padding:16px"><p>加载中…</p></div>
   <template v-else>
-    <div class="metric-grid">
-      <div class="metric-card">
-        <span class="metric-label">股票池</span>
-        <span class="metric-value">{{ poolCount }}</span>
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">01</span>
+        <span class="frame-title">核心指标</span>
       </div>
-      <div class="metric-card">
-        <span class="metric-label">公式</span>
-        <span class="metric-value">{{ formulaCount }}</span>
-      </div>
-      <div class="metric-card">
-        <span class="metric-label">组合策略</span>
-        <span class="metric-value">{{ portfolioCount }}</span>
-      </div>
-      <div class="metric-card">
-        <span class="metric-label">回测记录</span>
-        <span class="metric-value">{{ backtestCount }}</span>
-      </div>
-      <div class="metric-card">
-        <span class="metric-label">实盘会话</span>
-        <span class="metric-value">{{ liveCount }}</span>
-      </div>
-      <div class="metric-card">
-        <span class="metric-label">Core 状态</span>
-        <span class="metric-value" :style="{ fontSize: '15px' }">
-          {{ status ? (status.core.online ? '在线' : '离线') : '-' }}
-        </span>
-        <span class="metric-label" style="font-size:11px">
-          {{ status ? `v${status.core.version} · 运行 ${status.core.uptime}` : '未获取到状态' }}
-        </span>
-      </div>
-    </div>
-
-    <div class="card" style="margin-bottom:16px">
-      <h3 style="margin:0 0 8px">最近回测</h3>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>名称</th><th>区间</th><th>状态</th><th>进度</th></tr></thead>
-          <tbody>
-            <tr v-for="r in recentBacktests" :key="r.id">
-              <td>{{ r.name }}</td>
-              <td style="color:var(--ink-soft)">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
-              <td>
-                <span v-if="r.status === 'completed'" class="badge badge-green">完成</span>
-                <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
-                <span v-else class="badge badge-gray">{{ r.status }}</span>
-              </td>
-              <td>{{ r.progress != null ? r.progress + '%' : '-' }}</td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-if="recentBacktests.length === 0" class="empty-state"><p>暂无回测记录</p></div>
+      <div class="frame-body">
+        <div class="metric-grid" style="gap:12px;margin-bottom:0">
+          <div class="metric-card">
+            <span class="metric-label">股票池</span>
+            <span class="metric-value">{{ poolCount }}</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">公式</span>
+            <span class="metric-value">{{ formulaCount }}</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">组合策略</span>
+            <span class="metric-value">{{ portfolioCount }}</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">回测记录</span>
+            <span class="metric-value">{{ backtestCount }}</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">实盘会话</span>
+            <span class="metric-value">{{ liveCount }}</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Core 状态</span>
+            <span class="metric-value" :style="{ fontSize: '15px' }">
+              {{ status ? (status.core.online ? '在线' : '离线') : '-' }}
+            </span>
+            <span class="metric-label" style="font-size:11px">
+              {{ status ? `v${status.core.version} · 运行 ${status.core.uptime}` : '未获取到状态' }}
+            </span>
+          </div>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <h3 style="margin:0 0 8px">系统配置</h3>
-      <p v-if="cfg" style="margin:0;color:var(--ink-soft)">
-        通达信路径：{{ cfg.tdx_path }}<br>
-        iQuant 路径：{{ cfg.iquant_path }}<br>
-        仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>
-        实盘桥：{{ cfg.iquant_bridge.live.base_url }}
-      </p>
-      <p v-else style="margin:0;color:var(--ink-soft)">配置加载失败</p>
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">02</span>
+        <span class="frame-title">最近回测</span>
+      </div>
+      <div class="frame-body">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>名称</th><th>区间</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr v-for="r in recentBacktests" :key="r.id">
+                <td>{{ r.name }}</td>
+                <td style="color:var(--ink-soft);font-variant-numeric:tabular-nums">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
+                <td>
+                  <span v-if="r.status === 'completed'" class="badge badge-green">完成</span>
+                  <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
+                  <span v-else class="badge badge-gray">{{ r.status }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="recentBacktests.length === 0" class="empty-state"><p>暂无回测记录</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">03</span>
+        <span class="frame-title">系统配置</span>
+      </div>
+      <div class="frame-body">
+        <p v-if="cfg" style="margin:0;color:var(--ink-soft);line-height:1.8">
+          通达信路径：{{ cfg.tdx_path }}<br>
+          iQuant 路径：{{ cfg.iquant_path }}<br>
+          仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>
+          实盘桥：{{ cfg.iquant_bridge.live.base_url }}
+        </p>
+        <p v-else style="margin:0;color:var(--ink-soft)">配置加载失败</p>
+      </div>
     </div>
   </template>
 </template>
+
+<style scoped>
+.dash-hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 4px 2px 20px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.dash-hero-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 12px; color: var(--ink-soft) }
+.dash-hero-stats b { font-family: var(--font-serif); font-size: 18px; font-weight: 800; color: var(--ink); margin-right: 5px; font-variant-numeric: tabular-nums }
+.dash-hero-stats .db-accent { color: var(--red) }
+.dash-hero-actions { flex-shrink: 0 }
+</style>

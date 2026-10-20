@@ -5,6 +5,8 @@ import {
   getTdxFormulas, getTdxInfo, importTdxFormula,
   type SignalItem, type FormulaItem, type TdxFormulaListItem,
 } from '../api'
+import PageHeader from '../components/PageHeader.vue'
+import { buildPinyinIndex, matchTdx, type TdxPinyin } from '../utils/tdxSearch'
 
 const formulas = ref<FormulaItem[]>([])
 const loading = ref(true)
@@ -20,12 +22,9 @@ const tdxItems = ref<TdxFormulaListItem[]>([])
 const TDX_PAGE_SIZE = 10
 const tdxQuery = ref('')
 const tdxPage = ref(1)
-const filteredTdx = computed(() => {
-  const q = tdxQuery.value.trim().toLowerCase()
-  if (!q) return tdxItems.value
-  return tdxItems.value.filter(it =>
-    it.acCode.toLowerCase().includes(q) || (it.acName || '').toLowerCase().includes(q))
-})
+const tdxPy = ref(new Map<string, TdxPinyin>())
+const filteredTdx = computed(() =>
+  tdxItems.value.filter(it => matchTdx(tdxQuery.value, it, tdxPy.value.get(it.acCode))))
 const tdxTotalPages = computed(() => Math.max(1, Math.ceil(filteredTdx.value.length / TDX_PAGE_SIZE)))
 const pagedTdx = computed(() =>
   filteredTdx.value.slice((tdxPage.value - 1) * TDX_PAGE_SIZE, tdxPage.value * TDX_PAGE_SIZE))
@@ -103,6 +102,7 @@ async function openTdx() {
   tdxPage.value = 1
   try {
     tdxItems.value = await getTdxFormulas(true)
+    tdxPy.value = buildPinyinIndex(tdxItems.value)
   } catch (e) {
     alert(`获取通达信公式列表失败：${errMsg(e)}`)
     showTdx.value = false
@@ -134,6 +134,19 @@ function removeSignal(idx: number) {
 }
 
 async function submit() {
+  if (!form.value.name.trim()) {
+    alert('公式名称不能为空')
+    return
+  }
+  // formula_count 空/非法回落默认 200（后端要求 ≥1）
+  const count = Number(form.value.formula_count)
+  if (!Number.isFinite(count) || count < 1) form.value.formula_count = 200
+  for (const sig of form.value.signals) {
+    if (!String(sig.signal_name ?? '').trim()) {
+      alert('信号名称不能为空')
+      return
+    }
+  }
   try {
     if (editingId.value === null) {
       await createFormula(form.value)
@@ -141,7 +154,9 @@ async function submit() {
       await updateFormula(editingId.value, form.value)
     }
   } catch (e) {
-    alert(`保存失败：${errMsg(e)}`)
+    const msg = `保存失败：${errMsg(e)}`
+    errorMsg.value = msg
+    alert(msg)
     return  // 弹窗保持打开，供用户修正
   }
   showForm.value = false
@@ -163,10 +178,10 @@ onMounted(load)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end;gap:8px">
+  <PageHeader title="公式管理">
     <button @click="openTdx" class="btn tdx-import-btn">从通达信导入</button>
     <button @click="openCreate" class="btn btn-primary">+ 新建公式</button>
-  </div>
+  </PageHeader>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
@@ -197,7 +212,7 @@ onMounted(load)
     <div class="modal-content">
       <h3>从通达信导入公式</h3>
       <p style="color:var(--ink-soft);font-size:13px">列出通达信自编公式（isSys=0）；导入后请在编辑弹窗中配置信号。</p>
-      <input v-model="tdxQuery" class="tdx-search" placeholder="搜索公式名 / 中文名" style="margin-bottom:8px;width:100%" />
+      <input v-model="tdxQuery" class="tdx-search" placeholder="搜索公式名 / 中文名 / 拼音首字母" style="margin-bottom:8px;width:100%" />
       <div v-if="tdxLoading" style="padding:12px">加载中…</div>
       <template v-else>
         <table class="tdx-table">
@@ -229,32 +244,42 @@ onMounted(load)
   <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
     <div class="modal-content">
       <h3>{{ editingId === null ? '新建公式' : '编辑公式' }}</h3>
-      <label>名称</label>
-      <input v-model="form.name" placeholder="例如：MACROSSPRO（公式名称）" />
-      <label>公式内容</label>
-      <textarea v-model="form.content" rows="3" placeholder="通达信公式文本"></textarea>
+      <div class="modal-body">
+        <div class="form-group">
+          <div class="field-row field-span-2">
+            <span class="field-label">名称</span>
+            <input v-model="form.name" placeholder="例如：MACROSSPRO（公式名称）" />
+          </div>
+          <div class="field-row field-span-2">
+            <span class="field-label">公式内容</span>
+            <textarea v-model="form.content" rows="3" placeholder="通达信公式文本"></textarea>
+          </div>
+          <div class="field-row field-span-2">
+            <span class="field-label">注入根数</span>
+            <input v-model.number="form.formula_count" type="number" min="1" placeholder="200" />
+            <span class="form-hint" style="margin:0;align-self:center">公式内最长均线/函数需的 bar 数，默认 200</span>
+          </div>
+        </div>
 
-      <label>注入历史根数 count（公式内最长均线/函数需的 bar 数，默认 200）</label>
-      <input v-model.number="form.formula_count" type="number" min="1" placeholder="200" />
-
-      <label>信号配置</label>
-      <datalist id="tdx-line-names">
-        <option v-for="n in lineNames" :key="n" :value="n" />
-      </datalist>
-      <div v-for="(sig, idx) in form.signals" :key="idx" class="signal-row">
-        <input v-model="sig.signal_name" list="tdx-line-names" placeholder="信号名称（可从通达信线名中选）" />
-        <select v-model="sig.signal_type">
-          <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
-        </select>
-        <select v-model="sig.trigger_value">
-          <option :value="2">2</option>
-          <option :value="1">1</option>
-          <option :value="-1">-1</option>
-          <option :value="-2">-2</option>
-        </select>
-        <button @click="removeSignal(idx)" class="btn btn-sm btn-danger">×</button>
+        <label class="group-label">信号配置</label>
+        <datalist id="tdx-line-names">
+          <option v-for="n in lineNames" :key="n" :value="n" />
+        </datalist>
+        <div v-for="(sig, idx) in form.signals" :key="idx" class="signal-row">
+          <input v-model="sig.signal_name" list="tdx-line-names" placeholder="信号名称（可从通达信线名中选）" />
+          <select v-model="sig.signal_type">
+            <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
+          </select>
+          <select v-model="sig.trigger_value" title="触发值：公式输出线等于该值时产生信号。0 是无信号常态值，不可用">
+            <option :value="-2">-2</option>
+            <option :value="-1">-1</option>
+            <option :value="1">1</option>
+            <option :value="2">2</option>
+          </select>
+          <button @click="removeSignal(idx)" class="btn btn-sm btn-danger">×</button>
+        </div>
+        <button @click="addSignal" class="btn btn-sm signal-add">+ 添加信号</button>
       </div>
-      <button @click="addSignal" class="btn btn-sm signal-add">+ 添加信号</button>
 
       <div class="modal-actions">
         <button @click="submit" class="btn btn-primary">确认</button>

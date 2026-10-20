@@ -143,6 +143,28 @@ def test_get_formula_not_found(client):
 # ---------------------------------------------------------------------------
 # POST /api/formulas — 创建公式 + 信号（事务）
 # ---------------------------------------------------------------------------
+def test_create_formula_empty_signal_name_rejected(client):
+    """signal_name 为空 → 400。"""
+    c, Session = client
+    payload = {
+        "name": "EMPTYSIG",
+        "content": "MA(CLOSE,5);",
+        "signals": [{"signal_name": "  ", "signal_type": "OPEN", "trigger_value": 1}],
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+
+
+def test_create_formula_empty_name_rejected(client):
+    """公式名为空 → 400。"""
+    c, Session = client
+    payload = {"name": "  ", "content": "MA(CLOSE,5);", "signals": []}
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+
+
 def test_create_formula_with_signals(client):
     """POST 创建公式 + 2 信号 → DB 落库 Formula + 2 FormulaSignal。"""
     c, Session = client
@@ -224,6 +246,20 @@ def test_create_formula_accepts_tdx_trigger_values(client):
         assert resp.json()["code"] == 0, f"trigger_value={tv} 应被接受"
 
 
+def test_create_formula_trigger_zero_rejected(client):
+    """trigger_value=0 被拒：0 是公式无信号常态值，配置后每根 bar 都会匹配。"""
+    c, Session = client
+    payload = {
+        "name": "BADZERO", "content": "X",
+        "signals": [{"signal_name": "x", "signal_type": "OPEN", "trigger_value": 0}],
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 400
+    assert "0" in body["message"]
+
+
 # ---------------------------------------------------------------------------
 # PUT /api/formulas/{id} — 编辑公式 + 信号全量替换
 # ---------------------------------------------------------------------------
@@ -263,6 +299,24 @@ def test_update_formula_not_found(client):
     resp = c.put("/api/formulas/9999", json={"name": "X", "content": "Y", "signals": []})
     assert resp.status_code == 200
     assert resp.json()["code"] == 404
+
+
+# ---------------------------------------------------------------------------
+# W4：已移除未来函数关键字预检（strict_future_check）。公式内容原样入库，
+# 是否使用未来函数由用户自行判断。
+# ---------------------------------------------------------------------------
+def test_create_formula_no_future_check(client):
+    """含 ZIG 的内容原样入库，不再做未来函数拦截（含旧 strict_future_check 键也忽略）。"""
+    c, Session = client
+    payload = {
+        "name": "FUT_OK", "content": "A:ZIG(3,5);", "signals": [],
+        "strict_future_check": True,
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["content"] == "A:ZIG(3,5);"
 
 
 # ---------------------------------------------------------------------------

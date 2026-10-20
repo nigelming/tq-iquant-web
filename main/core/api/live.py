@@ -61,9 +61,13 @@ def list_sessions(db: Session = Depends(get_db)):
 
 @router.post("/sessions")
 def create_session(data: dict, db: Session = Depends(get_db)):
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return err(400, "会话名称不能为空")
     mode = data.get("mode", "simulation")
     if mode not in ("simulation", "live"):
         return err(400, "mode 非法，仅支持 simulation(仿真) / live(实盘)")
+    data["name"] = name
     return ok(svc.create_session(db, data, mode))
 
 

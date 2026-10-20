@@ -20,7 +20,7 @@
 日频收盘价（每周取最后一个交易日），周末标签日为该周**周五**。
 """
 from datetime import date, timedelta
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # 规则常量（口径评审入口）
@@ -90,6 +90,149 @@ def _to_weekly(daily: List[Tuple[date, float]]) -> List[Tuple[date, float]]:
     return [(w[0], w[1]) for w in weeks]
 
 
+class _WeekLabeler:
+    """周频四态标签机（增量）。规则与历史 segment_regime 内联循环完全一致——
+    segment_regime 与本类共用同一实现，杜绝批量/增量两路漂移。
+
+    状态：weekly closes 序列 + 趋势状态机（state/bear_trough）。
+    ``append_week`` 推进到新一周；``update_last_week`` 在周内用最新收盘价重算
+    当周标签（回滚到处理当周前的机器状态再重放，保证与批量结果逐周一致）。
+    """
+
+    def __init__(self) -> None:
+        self.closes: List[float] = []
+        self.labels: List[str] = []
+        self._state: str = REGIME_RANGE
+        self._bear_trough: Optional[float] = None
+        # 处理最后一周之前的机器状态快照（周内更新时回滚重算用）
+        self._pre_state: str = REGIME_RANGE
+        self._pre_bear_trough: Optional[float] = None
+
+    def _ma(self, t: int, window: int) -> float:
+        return sum(self.closes[t - window + 1:t + 1]) / window
+
+    def _signal(self, i: int) -> Tuple[bool, bool]:
+        """第 i 周的原始牛/熊信号（不含确认）。调用处保证 i 可算。"""
+        closes = self.closes
+        c = closes[i]
+        f = sum(closes[i - MA_FAST_WEEKS + 1:i + 1]) / MA_FAST_WEEKS
+        s = sum(closes[i - MA_SLOW_WEEKS + 1:i + 1]) / MA_SLOW_WEEKS
+        win = closes[i - BREAKOUT_WEEKS:i]
+        bull = c > max(win) and f > s and c > s
+        bear = c < min(win) and f < s and c < s
+        return bull, bear
+
+    def _step(self, t: int) -> str:
+        """计算第 t 周标签并推进机器状态。t < MA_SLOW_WEEKS 为预热期，恒 range。"""
+        if t < MA_SLOW_WEEKS:
+            return REGIME_RANGE
+        closes = self.closes
+        close = closes[t]
+        ma10 = self._ma(t, MA_FAST_WEEKS)
+        ma30 = self._ma(t, MA_SLOW_WEEKS)
+        ma10_prev = self._ma(t - 1, MA_FAST_WEEKS)
+
+        bull_now, bear_now = self._signal(t)
+        bull_prev, bear_prev = self._signal(t - 1)
+        confirm_bull = bull_now and bull_prev
+        confirm_bear = bear_now and bear_prev
+
+        # 信号优先级：趋势反转确认最高（与风控优先于公式的平台约定一致）
+        if confirm_bear:
+            self._state = REGIME_BEAR
+            self._bear_trough = close
+        elif confirm_bull:
+            self._state = REGIME_BULL
+            self._bear_trough = None
+        elif self._state == REGIME_BEAR:
+            self._bear_trough = min(self._bear_trough, close)
+            rebound_pct = close / self._bear_trough - 1
+            if (rebound_pct >= REBOUND_MIN_PCT
+                    and close > ma10 and ma10 >= ma10_prev):
+                self._state = REGIME_REBOUND
+        elif self._state == REGIME_REBOUND:
+            # 再创下跌段新低 → 反弹失败回到下跌；新高新低反转由上面的确认处理
+            if close < self._bear_trough:
+                self._state = REGIME_BEAR
+                self._bear_trough = close
+        elif self._state == REGIME_BULL:
+            # 周收盘跌破 MA30：趋势破坏，回到无方向状态（未破位前续用 bull）
+            if close < ma30:
+                self._state = REGIME_RANGE
+        return self._state
+
+    def append_week(self, close: float) -> str:
+        """新一周（以该周首个交易日收盘价开仓），返回当周标签。"""
+        self._pre_state = self._state
+        self._pre_bear_trough = self._bear_trough
+        self.closes.append(close)
+        label = self._step(len(self.closes) - 1)
+        self.labels.append(label)
+        return label
+
+    def update_last_week(self, close: float) -> str:
+        """周内更新：用最新收盘价重算当周标签（已完成周标签不回改）。"""
+        if not self.closes:
+            return self.append_week(close)
+        self._state = self._pre_state
+        self._bear_trough = self._pre_bear_trough
+        self.closes[-1] = close
+        label = self._step(len(self.closes) - 1)
+        self.labels[-1] = label
+        return label
+
+
+def _label_weeks(weekly: List[Tuple[date, float]]) -> List[str]:
+    """批量打标：逐周喂标签机（与 segment_regime 历史行为一致）。"""
+    labeler = _WeekLabeler()
+    for _, v in weekly:
+        labeler.append_week(v)
+    return labeler.labels
+
+
+class CausalRegimeTracker:
+    """逐日因果市场状态跟踪（引擎运行时 B5 用）。
+
+    ``update(d, close)`` 只吸收 ≤d 的收盘价：新 ISO 周 → 开新周；同周 →
+    用最新收盘重算当周标签。标签规则与 ``segment_regime`` 完全一致
+    （共用 ``_WeekLabeler``），已产出标签不随后续数据回改（纯因果）。
+    日期必须单调不减；同日重复 update 幂等（直接返回当前标签）。
+    """
+
+    def __init__(self) -> None:
+        self._labeler = _WeekLabeler()
+        self._cur_iso: Optional[Tuple[int, int]] = None
+        self._last_date: Optional[date] = None
+        self._label: str = REGIME_RANGE
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    def update(self, d: date, close: float) -> str:
+        if self._last_date is not None:
+            if d < self._last_date:
+                raise ValueError(
+                    "CausalRegimeTracker 只接受单调不减的日期：%s < %s"
+                    % (d, self._last_date))
+            if d == self._last_date:
+                return self._label
+        iso = d.isocalendar()[:2]
+        if iso != self._cur_iso:
+            self._cur_iso = iso
+            self._label = self._labeler.append_week(float(close))
+        else:
+            self._label = self._labeler.update_last_week(float(close))
+        self._last_date = d
+        return self._label
+
+    def feed_history(self, prices) -> str:
+        """批量预喂历史收盘（回测预热段 / 实盘启动回放），返回最新标签。"""
+        for d, v in _normalize_prices(prices):
+            self.update(d, v)
+        return self._label
+
+
 def segment_regime(prices) -> dict:
     """对基准收盘价序列做周频四态分段。
 
@@ -102,67 +245,8 @@ def segment_regime(prices) -> dict:
         - counts: 四态周数统计
     """
     weekly = _to_weekly(_normalize_prices(prices))
-    n = len(weekly)
-    labels: List[str] = [REGIME_RANGE] * n
-
-    if n >= MA_SLOW_WEEKS:
-        closes = [v for _, v in weekly]
-
-        def _ma(t: int, window: int) -> float:
-            return sum(closes[t - window + 1:t + 1]) / window
-
-        state = REGIME_RANGE
-        bear_trough = None  # 当前下跌段的近端低点（含 bear/rebound 期间）
-
-        # 确认需要 t 与 t-1 两周信号均可计算（MA30 从索引 29 起可算），
-        # 故最早在 t=30 产出非 range 标签；索引 0..29 为预热期。
-        for t in range(MA_SLOW_WEEKS, n):
-            close = closes[t]
-            ma10 = _ma(t, MA_FAST_WEEKS)
-            ma30 = _ma(t, MA_SLOW_WEEKS)
-            ma10_prev = _ma(t - 1, MA_FAST_WEEKS)
-
-            prior_window = closes[t - BREAKOUT_WEEKS:t]
-
-            def _signal(i: int) -> Tuple[bool, bool]:
-                """第 i 周的原始牛/熊信号（不含确认）。调用处保证 i 可算。"""
-                c = closes[i]
-                f = sum(closes[i - MA_FAST_WEEKS + 1:i + 1]) / MA_FAST_WEEKS
-                s = sum(closes[i - MA_SLOW_WEEKS + 1:i + 1]) / MA_SLOW_WEEKS
-                win = closes[i - BREAKOUT_WEEKS:i]
-                bull = c > max(win) and f > s and c > s
-                bear = c < min(win) and f < s and c < s
-                return bull, bear
-
-            bull_now, bear_now = _signal(t)
-            bull_prev, bear_prev = _signal(t - 1)
-            confirm_bull = bull_now and bull_prev
-            confirm_bear = bear_now and bear_prev
-
-            # 信号优先级：趋势反转确认最高（与风控优先于公式的平台约定一致）
-            if confirm_bear:
-                state = REGIME_BEAR
-                bear_trough = close
-            elif confirm_bull:
-                state = REGIME_BULL
-                bear_trough = None
-            elif state == REGIME_BEAR:
-                bear_trough = min(bear_trough, close)
-                rebound_pct = close / bear_trough - 1
-                if (rebound_pct >= REBOUND_MIN_PCT
-                        and close > ma10 and ma10 >= ma10_prev):
-                    state = REGIME_REBOUND
-            elif state == REGIME_REBOUND:
-                # 再创下跌段新低 → 反弹失败回到下跌；新高新低反转由上面的确认处理
-                if close < bear_trough:
-                    state = REGIME_BEAR
-                    bear_trough = close
-            elif state == REGIME_BULL:
-                # 周收盘跌破 MA30：趋势破坏，回到无方向状态（未破位前续用 bull）
-                if close < ma30:
-                    state = REGIME_RANGE
-
-            labels[t] = state
+    # 标签规则与 CausalRegimeTracker 共用 _WeekLabeler（单一实现）。
+    labels: List[str] = _label_weeks(weekly)
 
     weeks = [{
         "date": d,

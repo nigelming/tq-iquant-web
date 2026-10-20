@@ -28,6 +28,8 @@ def serialize_strategy(s: Strategy) -> dict:
         "period": s.period,
         "role": s.role,
         "master_strategy_id": s.master_strategy_id,
+        "stock_pool_id": s.stock_pool_id,
+        "slave_exit_mode": s.slave_exit_mode,
         "capital_ratio": float(s.capital_ratio) if s.capital_ratio is not None else None,
         "max_positions": s.max_positions,
         "single_open_ratio": float(s.single_open_ratio) if s.single_open_ratio is not None else None,
@@ -38,6 +40,15 @@ def serialize_strategy(s: Strategy) -> dict:
         "max_add_count": s.max_add_count,
         "add_position_ratio": float(s.add_position_ratio) if s.add_position_ratio is not None else None,
         "reduce_position_ratio": float(s.reduce_position_ratio) if s.reduce_position_ratio is not None else None,
+        # B4/B5 可选增强（默认关）
+        "rotation_enabled": bool(s.rotation_enabled) if s.rotation_enabled is not None else False,
+        "rotation_momentum_bars": s.rotation_momentum_bars if s.rotation_momentum_bars is not None else 20,
+        "rotation_hysteresis": float(s.rotation_hysteresis) if s.rotation_hysteresis is not None else 0.05,
+        "regime_filter_enabled": bool(s.regime_filter_enabled) if s.regime_filter_enabled is not None else False,
+        "trend_trailing_stop_ratio": float(s.trend_trailing_stop_ratio) if s.trend_trailing_stop_ratio is not None else None,
+        "trend_max_positions": s.trend_max_positions,
+        # #3 策略级敞口上限（默认关）
+        "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
     }
 
 
@@ -64,6 +75,21 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
         "slippage": float(p.slippage) if p.slippage is not None else None,
         "trading_session": p.trading_session,
+        "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else False,
+        "volume_limit_enabled": bool(p.volume_limit_enabled) if p.volume_limit_enabled is not None else False,
+        "volume_limit_ratio": float(p.volume_limit_ratio) if p.volume_limit_ratio is not None else 0.10,
+        "adaptive_slippage_enabled": bool(p.adaptive_slippage_enabled) if p.adaptive_slippage_enabled is not None else False,
+        "slippage_impact_coef": float(p.slippage_impact_coef) if p.slippage_impact_coef is not None else 0.10,
+        "position_sizing": p.position_sizing or "dynamic",
+        "cash_enhance_enabled": bool(p.cash_enhance_enabled) if p.cash_enhance_enabled is not None else False,
+        "cash_enhance_equity_threshold": (
+            float(p.cash_enhance_equity_threshold) if p.cash_enhance_equity_threshold is not None else None
+        ),
+        "cash_enhance_position_ratio_threshold": (
+            float(p.cash_enhance_position_ratio_threshold)
+            if p.cash_enhance_position_ratio_threshold is not None else None
+        ),
+        "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -86,6 +112,30 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     p.slippage = req.slippage
     p.trading_session = req.trading_session
     p.status = req.status
+    # #1 涨跌停约束：None（请求未携带）不动已有值——编辑旧组合不偷改开关；
+    # 新建默认 True 在 create_portfolio 兜底
+    if getattr(req, "price_limit_check_enabled", None) is not None:
+        p.price_limit_check_enabled = req.price_limit_check_enabled
+    # #2 成交量约束（默认关）：None 不动（新建落 ORM 默认 False/0.10）
+    if getattr(req, "volume_limit_enabled", None) is not None:
+        p.volume_limit_enabled = req.volume_limit_enabled
+    if getattr(req, "volume_limit_ratio", None) is not None:
+        p.volume_limit_ratio = req.volume_limit_ratio
+    # #4 自适应滑点（默认关）：None 不动（新建落 ORM 默认 False/0.10）
+    if getattr(req, "adaptive_slippage_enabled", None) is not None:
+        p.adaptive_slippage_enabled = req.adaptive_slippage_enabled
+    if getattr(req, "slippage_impact_coef", None) is not None:
+        p.slippage_impact_coef = req.slippage_impact_coef
+    # W2 仓位模型 + 现金管理（请求携带默认值，按值落库）
+    if getattr(req, "position_sizing", None) is not None:
+        p.position_sizing = req.position_sizing
+    if getattr(req, "cash_enhance_enabled", None) is not None:
+        p.cash_enhance_enabled = req.cash_enhance_enabled
+    p.cash_enhance_equity_threshold = getattr(req, "cash_enhance_equity_threshold", None)
+    p.cash_enhance_position_ratio_threshold = getattr(
+        req, "cash_enhance_position_ratio_threshold", None)
+    # W3 容量上限（可选，None=不设上限）
+    p.equity_cap = getattr(req, "equity_cap", None)
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:
@@ -103,6 +153,14 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             trailing_stop_ratio=s.trailing_stop_ratio,
             add_position_threshold=s.add_position_threshold, max_add_count=s.max_add_count,
             add_position_ratio=s.add_position_ratio, reduce_position_ratio=s.reduce_position_ratio,
+            stock_pool_id=s.stock_pool_id, slave_exit_mode=s.slave_exit_mode,
+            rotation_enabled=getattr(s, "rotation_enabled", False),
+            rotation_momentum_bars=getattr(s, "rotation_momentum_bars", 20),
+            rotation_hysteresis=getattr(s, "rotation_hysteresis", 0.05),
+            regime_filter_enabled=getattr(s, "regime_filter_enabled", False),
+            trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
+            trend_max_positions=getattr(s, "trend_max_positions", None),
+            exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
         )
         db.add(strat)
         inserted.append(strat)
@@ -136,6 +194,9 @@ def create_portfolio(db: Session, req) -> dict:
     """建组合 + 子策略（两步 commit）。req 已校验合法。"""
     p = PortfolioStrategy()
     _apply_portfolio_fields(p, req)
+    # #1 新组合默认开启涨跌停约束（旧组合迁移后 server_default '0' 保持关闭）
+    if getattr(req, "price_limit_check_enabled", None) is None:
+        p.price_limit_check_enabled = True
     db.add(p)
     db.flush()
     _create_strategies_two_step(db, p.id, req.strategies)
@@ -165,10 +226,17 @@ def delete_portfolio(db: Session, pid: int) -> bool:
     """删组合（Strategy 随 ondelete=CASCADE 删）。
 
     False=不存在；被回测记录/实盘 session 引用时 ondelete=RESTRICT 抛 IntegrityError（路由 catch→409）。
+
+    删除前先解除组合内子策略的主从自引用（strategies.master_strategy_id 亦为 RESTRICT）：
+    否则级联删子策略时先删 master 会因仍被 slave 引用触发 IntegrityError，被路由误报为
+    "被回测记录或实盘 session 引用"。master_strategy_id 只可能指向同组合策略，故置空安全。
     """
     p = db.query(PortfolioStrategy).filter(PortfolioStrategy.id == pid).first()
     if p is None:
         return False
+    db.query(Strategy).filter(Strategy.portfolio_id == pid).update(
+        {Strategy.master_strategy_id: None}, synchronize_session=False
+    )
     db.delete(p)
     db.commit()
     return True
@@ -193,6 +261,17 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.max_add_count = req.max_add_count
     s.add_position_ratio = req.add_position_ratio
     s.reduce_position_ratio = req.reduce_position_ratio
+    s.stock_pool_id = req.stock_pool_id
+    s.slave_exit_mode = req.slave_exit_mode
+    # B4/B5 可选增强（默认关；缺省字段回落默认，保持旧请求行为不变）
+    s.rotation_enabled = getattr(req, "rotation_enabled", False)
+    s.rotation_momentum_bars = getattr(req, "rotation_momentum_bars", 20)
+    s.rotation_hysteresis = getattr(req, "rotation_hysteresis", 0.05)
+    s.regime_filter_enabled = getattr(req, "regime_filter_enabled", False)
+    s.trend_trailing_stop_ratio = getattr(req, "trend_trailing_stop_ratio", None)
+    s.trend_max_positions = getattr(req, "trend_max_positions", None)
+    # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
+    s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
 
 
 def portfolio_exists(db: Session, pid: int) -> bool:

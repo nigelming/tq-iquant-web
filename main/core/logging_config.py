@@ -23,7 +23,13 @@ def setup_logging():
     # 幂等：uvicorn reload / lifespan 重复进入时不重复挂 handler。
     if not any(getattr(h, "_core_logging", False) for h in root.handlers):
         if not _under_pytest():
-            log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
+            # Nuitka 打包后 __file__ 位于 <exe目录>/core/，.parent×3 会跑到分发目录的上一级；
+            # 打包环境（argv[0] 为 exe）下日志固定写到 exe 同级的 logs/。
+            argv0 = Path(sys.argv[0])
+            if argv0.suffix.lower() == ".exe":
+                log_dir = argv0.resolve().parent / "logs"
+            else:
+                log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
             log_dir.mkdir(exist_ok=True)
             log_file = log_dir / "core.log"
             file_handler = logging.handlers.RotatingFileHandler(

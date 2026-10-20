@@ -185,3 +185,64 @@ def test_weekly_date_is_friday_of_iso_week():
 def test_chinese_label_map_covers_four_states():
     assert set(REGIME_LABELS_CN) == {
         REGIME_BULL, REGIME_BEAR, REGIME_RANGE, REGIME_REBOUND}
+
+
+# ===========================================================================
+# B5：CausalRegimeTracker —— 逐日因果跟踪（引擎运行时注入 portfolio.current_regime）
+# ===========================================================================
+from core.engine.regime import CausalRegimeTracker
+
+
+def _daily_from_weekly(vals):
+    """每周五收盘展开成 周一~周五 日频（周内从上周五值线性渐变到本周五值）。"""
+    out = {}
+    for i, v in enumerate(vals):
+        friday = _FIRST_FRIDAY + timedelta(weeks=i)
+        prev = vals[i - 1] if i > 0 else vals[0]
+        for offset in range(5):
+            d = friday - timedelta(days=4 - offset)
+            out[d] = prev + (v - prev) * (offset + 1) / 5
+    return out
+
+
+def test_tracker_prefix_labels_match_batch():
+    """纯因果：逐日喂入时任一前缀的 tracker.label == segment_regime(前缀) 末周标签。
+
+    这是禁未来函数的关键性质：标签只依赖 ≤当日的数据，且不随后续数据回改。
+    """
+    vals = [100.0] * 30 + [100.0 * (1.02 ** i) for i in range(1, 31)]
+    series = _daily_from_weekly(vals)
+    dates = sorted(series)
+    tracker = CausalRegimeTracker()
+    for i, d in enumerate(dates):
+        tracker.update(d, series[d])
+        prefix = {k: series[k] for k in dates[: i + 1]}
+        batch_label = segment_regime(prefix)["weeks"][-1]["label"]
+        assert tracker.label == batch_label, (
+            "前缀 %d 天（%s）：tracker=%s batch=%s" % (i + 1, d, tracker.label, batch_label)
+        )
+
+
+def test_tracker_feed_history_matches_batch_final_label():
+    """feed_history 批量预喂与 segment_regime 末周标签一致。"""
+    series = _series([100.0] * 30 + [100.0 * (1.02 ** i) for i in range(1, 31)])
+    tracker = CausalRegimeTracker()
+    assert tracker.feed_history(series) == segment_regime(series)["weeks"][-1]["label"]
+
+
+def test_tracker_same_day_update_idempotent():
+    """同日重复 update 幂等：直接返回当前标签，不吸收新值、不改状态。"""
+    tracker = CausalRegimeTracker()
+    d = date(2024, 1, 5)
+    tracker.update(d, 100.0)
+    label = tracker.label
+    assert tracker.update(d, 999.0) == label
+    assert tracker.label == label
+
+
+def test_tracker_out_of_order_raises():
+    """日期必须单调不减：乱序 update 抛 ValueError。"""
+    tracker = CausalRegimeTracker()
+    tracker.update(date(2024, 1, 5), 100.0)
+    with pytest.raises(ValueError):
+        tracker.update(date(2024, 1, 4), 101.0)

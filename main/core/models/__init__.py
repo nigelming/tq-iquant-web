@@ -11,6 +11,9 @@ from .backtest_daily_snapshot import BacktestDailySnapshot
 from .backtest_evaluation import BacktestEvaluation
 from .backtest_crisis_alpha import BacktestCrisisAlpha
 from .backtest_market_regime import BacktestMarketRegimeAnalysis
+from .backtest_robustness import BacktestRobustnessAnalysis
+from .walk_forward_run import WalkForwardRun
+from .param_perturb_run import ParamPerturbRun
 from .live_session import LiveSession
 from .live_session_portfolio import LiveSessionPortfolio
 from .live_order import LiveOrder
@@ -31,6 +34,9 @@ __all__ = [
     "BacktestEvaluation",
     "BacktestCrisisAlpha",
     "BacktestMarketRegimeAnalysis",
+    "BacktestRobustnessAnalysis",
+    "WalkForwardRun",
+    "ParamPerturbRun",
     "LiveSession",
     "LiveSessionPortfolio",
     "LiveOrder",

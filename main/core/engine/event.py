@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from typing import Dict, Optional
 
@@ -47,6 +47,11 @@ class OrderEvent:
     bar_time: Optional[datetime] = None
     # 触发该订单的信号名（公式变量名如 open_sig，风控如 stop_loss/take_profit/trailing_stop）
     signal_name: str = ""
+    # 信号所属 bar 的日期（仅日线级 1d/1w/1mon 信号设置）。
+    #   None = 分钟级信号，下一 bar open 立即成交（现有行为）。
+    #   非 None = 日线级信号，须在 t.date() > signal_bar_date 的下一交易日 bar open 成交，
+    #   防止当日 00:00 日线 bar 的信号在当日 09:30 分钟 bar 成交（未来函数）。
+    signal_bar_date: Optional[date] = None
     # 产生该订单的 bar 周期（"1m"/"1d"...）：订单只在同周期下一根 bar 成交（回测 #1a）
     period: Optional[str] = None
 

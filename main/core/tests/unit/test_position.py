@@ -1,9 +1,54 @@
 from decimal import Decimal
 from datetime import datetime
 
-from core.engine.position import Position
+from core.engine.position import Position, is_convertible_bond, lot_size_for
 from core.engine.event import TradeEvent
 from tq_iquant_shared.constants import TradeType
+
+
+def test_is_convertible_bond_prefixes():
+    """沪深北可转债代码识别（实证自 TDX 板块32：沪11/深12/北81）。"""
+    # 沪市可转债：110/111/113/118
+    assert is_convertible_bond("111024.SH") is True
+    assert is_convertible_bond("113709.SH") is True
+    assert is_convertible_bond("118064.SH") is True
+    # 深市可转债：123/127/128
+    assert is_convertible_bond("123273.SZ") is True
+    assert is_convertible_bond("127096.SZ") is True
+    # 北交所定向可转债：810
+    assert is_convertible_bond("810011.BJ") is True
+    # 普通股票 / 指数 / 基金一律 False
+    assert is_convertible_bond("600000.SH") is False
+    assert is_convertible_bond("000001.SZ") is False
+    assert is_convertible_bond("920072.BJ") is False
+    assert is_convertible_bond("000300.SH") is False
+    assert is_convertible_bond("510300.SH") is False
+
+
+def test_lot_size_for():
+    """转债 10 张取整开关：关=全部100（原行为）；开=转债10/股票100。"""
+    assert lot_size_for("111024.SH", False) == 100
+    assert lot_size_for("111024.SH", True) == 10
+    assert lot_size_for("600000.SH", True) == 100
+    assert lot_size_for("810011.BJ", True) == 10
+
+
+def test_position_same_day_sellable_t0():
+    """可转债 T+0 回转（可选，默认关）：开启后当日买入当日可卖、可卖量含当日份额。"""
+    buy_day = datetime(2026, 7, 30, 9, 35)
+    # 默认 T+1：当日不可卖
+    pos = Position("111024.SH")
+    pos.apply_trade(_trade(TradeType.BUY, "200", 100, buy_day))
+    assert pos.available_shares_on(buy_day.date()) == 0
+    assert pos.can_sell_on(buy_day.date()) is False
+    # T+0：当日全部可卖
+    bond = Position("111024.SH", same_day_sellable=True)
+    bond.apply_trade(_trade(TradeType.BUY, "200", 100, buy_day))
+    assert bond.available_shares_on(buy_day.date()) == 100
+    assert bond.can_sell_on(buy_day.date()) is True
+    # 无持仓仍不可卖
+    empty = Position("111024.SH", same_day_sellable=True)
+    assert empty.can_sell_on(buy_day.date()) is False
 
 
 def test_buy_sell():
@@ -62,6 +107,28 @@ def test_apply_trade_sell_reduces_quantity():
     pos.apply_trade(_trade(TradeType.BUY, "10", 1000, datetime(2026, 7, 30, 9, 30)))
     pos.apply_trade(_trade(TradeType.SELL, "12", 400, datetime(2026, 7, 30, 14, 0)))
     assert pos.quantity == 600
+
+
+def test_full_close_resets_highest_price_on_reentry():
+    """全平后再建仓，最高价应重置为新的建仓价，不得沿用旧持仓的高点。"""
+    pos = Position("000001.SZ")
+    pos.apply_trade(_trade(TradeType.BUY, "50", 1000, datetime(2026, 7, 29, 9, 30)))
+    assert pos.highest_price == Decimal("50")
+    pos.apply_trade(_trade(TradeType.SELL, "45", 1000, datetime(2026, 7, 30, 9, 30)))
+    assert pos.quantity == 0
+    pos.apply_trade(_trade(TradeType.BUY, "40", 1000, datetime(2026, 8, 3, 9, 30)))
+    assert pos.highest_price == Decimal("40")
+
+
+def test_update_high_raises_only():
+    """移动止损的持仓最高价只升不降。"""
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"))
+    assert pos.highest_price == Decimal("10")
+    pos.update_high(Decimal("12"))
+    assert pos.highest_price == Decimal("12")
+    pos.update_high(Decimal("11"))
+    assert pos.highest_price == Decimal("12")
 
 
 def test_buy_time_records_first_buy_only():
