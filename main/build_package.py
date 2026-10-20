@@ -26,6 +26,7 @@ def main():
         python_exe, "-m", "nuitka",
         "--standalone",
         "--low-memory",
+        "--assume-yes-for-downloads",
         "--include-package=core",
         "--include-package=tq_iquant_shared",
         "--include-package=sqlalchemy",

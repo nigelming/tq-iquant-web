@@ -32,11 +32,25 @@ switch ($Action) {
             $stdin = Join-Path $backend_dir "stdin.empty"
             if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
             Start-Process -WindowStyle Hidden -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
-            Start-Sleep 3
-            Write-Host "  backend started (PID: $(Get-BackendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
         } else {
             Write-Host "  backend already running (PID: $($bp.Id))" -ForegroundColor Yellow
         }
+
+        # 等待后端真正就绪（uv 冷启动/模块导入常超 3 秒，固定 sleep 会导致前端先就绪报 502）
+        $deadline = (Get-Date).AddSeconds(60)
+        $ready = $false
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$backend_port/api/status" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ready = $true; break }
+            } catch { }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ready) {
+            Write-Host "  backend NOT ready in 60s, abort (check $err)" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "  backend ready (PID: $(Get-BackendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
 
         $fp = Get-FrontendPid
         if (-not $fp) {

@@ -62,3 +62,9 @@ docs/risk/
 
 # One-off diagnostics (local only, not for commit)
 live/bridge/diag_*.py
+# SQLite WAL/SHM sidecars
+main/data/*.db-shm
+main/data/*.db-wal
+
+# Superpowers session workspace (local scratch)
+.superpowers/
