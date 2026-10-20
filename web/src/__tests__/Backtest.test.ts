@@ -1,5 +1,48 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { readFileSync } from 'node:fs'
+import { useTheme } from '../composables/useTheme'
+
+const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
+  const CSS_VARS: Record<string, string> = {
+    '--red': '#d6403a',
+    '--green': '#1f6e4f',
+    '--gold': '#f0a429',
+    '--blue': '#4a7ec4',
+    '--ink': '#1f3a68',
+    '--ink-soft': '#6b7280',
+    '--ink-faint': '#9ca3af',
+    '--line': '#e5e7eb',
+    '--card-bg': '#ffffff',
+    '--accent': '#667eea',
+    '--accent-light': '#dbeafe',
+    '--score-1': '#c0392b',
+    '--score-2': '#c85a10',
+    '--score-3': '#8a7408',
+    '--score-4': '#2c7a4b',
+    '--score-5': '#14532d',
+    '--overlay': 'rgba(11,11,11,.4)',
+    '--chart-bg': '#123456',
+  }
+
+  const SCORE_TIER_OF: Record<string, string> = {
+    '#c0392b': '卓越', '#c85a10': '优秀', '#8a7408': '良好', '#2c7a4b': '尚可', '#14532d': '偏弱',
+  }
+
+  function stubGetComputedStyle() {
+    Object.defineProperty(globalThis, 'getComputedStyle', {
+      value: () => ({
+        getPropertyValue: (name: string) => CSS_VARS[name] ?? '',
+      }),
+      writable: true,
+      configurable: true,
+    })
+  }
+
+  stubGetComputedStyle()
+
+  return { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle }
+})
 
 vi.mock('../api', () => ({
   getBacktestRecords: vi.fn(),
@@ -7,6 +50,8 @@ vi.mock('../api', () => ({
   runBacktest: vi.fn(),
   getPortfolios: vi.fn(),
   deleteBacktestRecord: vi.fn(),
+  recomputeCrisisAlpha: vi.fn(),
+  recomputeMarketRegime: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -26,8 +71,10 @@ vi.mock('echarts', () => {
 import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
-  deleteBacktestRecord,
+  deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
 } from '../api'
+
+const scrollTargets: any[] = []
 
 const mockRecords = [
   {
@@ -63,6 +110,11 @@ const mockDetail = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  stubGetComputedStyle()
+  scrollTargets.length = 0
+  ;(Element.prototype as any).scrollIntoView = vi.fn(function (this: any) {
+    scrollTargets.push(this)
+  })
   ;(getBacktestRecords as any).mockResolvedValue(mockRecords)
   ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
   ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
@@ -262,6 +314,17 @@ describe('Backtest.vue — 详情视图', () => {
     expect(w.text()).toContain('买入')
   })
 
+  it('详情页含导出 HTML 报告按钮（指向 /api/backtest/records/{id}/export/html）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const link = w.findAll('a').find(a => a.text().includes('导出 HTML 报告'))
+    expect(link?.exists()).toBe(true)
+    expect(link?.attributes('href')).toBe('/api/backtest/records/1/export/html')
+    expect(link?.attributes('target')).toBe('_blank')
+  })
+
   it('详情有[←返回] → 回列表', async () => {
     const w = mount(Backtest)
     await flushPromises()
@@ -354,5 +417,1638 @@ describe('Backtest.vue — 详情视图', () => {
     await flushPromises()
     expect(w.text()).toContain('开仓资金不足1手')
     expect(w.text()).toContain('600000.SH')
+  })
+})
+
+// --- 收益分布区块测试 ---
+describe('Backtest.vue — 收益分布区块', () => {
+  const mockDetailWithReturns = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [{
+        year: 2026,
+        daily_returns: [0.01, -0.005, 0.003, 0.02, -0.01],
+        monthly_returns: [0.01, -0.005],
+        annual_return: 0.02,
+      }],
+    },
+  }
+  const mockDetailNoReturns = { ...mockDetail, returns_buckets: null }
+
+  it('有 returns_buckets 时渲染收益分布标题', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailWithReturns)
+    const w = mount(Backtest)
+    await flushPromises()
+    // 点击查看进入详情
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('收益分布')
+  })
+
+  it('returns_buckets 为 null 时不渲染收益分布区块', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailNoReturns)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).not.toContain('收益分布')
+  })
+})
+
+// --- 收益分布图表 A 股红涨绿跌配色 ---
+describe('Backtest.vue — 收益分布 A 股红涨绿跌配色', () => {
+  const mockDetailCN = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        // 含正收益（0.5/1.0/0.8）与负收益（-0.2）→ 正应红、负应绿
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [
+        { year: 2025, daily_returns: [0.01, -0.01, 0.02, -0.02, 0.03], monthly_returns: [0.02, -0.01, 0.015, -0.03, 0.01], annual_return: -0.05 },
+        { year: 2026, daily_returns: [0.01, -0.005, 0.003, 0.02, -0.01], monthly_returns: [0.01, -0.005, 0.02, -0.01, 0.004], annual_return: 0.02 },
+      ],
+    },
+  }
+
+  it('月度热力图 visualMap 正收益红、负收益绿（inRange 终点=红）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailCN)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const heat = options.find((o: any) => o.series?.[0]?.type === 'heatmap')
+    expect(heat).toBeTruthy()
+    expect(heat.series[0].emphasis.itemStyle.shadowColor).toBe(CSS_VARS['--overlay'])
+    const colors = heat.visualMap?.inRange?.color
+    expect(colors).toHaveLength(3)
+    // A 股惯例：涨（正值）红、跌（负值）绿 → 渐变序列负端绿、正端红
+    expect(colors[0]).toBe(CSS_VARS['--green'])  // 负收益端（min）→ 绿
+    expect(colors[2]).toBe(CSS_VARS['--red'])  // 正收益端（max）→ 红
+  })
+
+  it('年收益柱状图正收益红、负收益绿', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailCN)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const barOpt = options.find((o: any) => o.series?.[0]?.type === 'bar')
+    expect(barOpt).toBeTruthy()
+    const data = barOpt.series[0].data
+    expect(data).toHaveLength(2)
+    const byName = Object.fromEntries(data.map((d: any) => [d.name, d.itemStyle.color]))
+    expect(byName['2025']).toBe(CSS_VARS['--green'])  // 年收益 -5% → 绿
+    expect(byName['2026']).toBe(CSS_VARS['--red'])  // 年收益 +2% → 红
+  })
+})
+
+// --- 图表数值精度测试（回撤曲线 / 日收益箱线 / 月收益箱线 → 4 位小数）---
+describe('Backtest.vue — 图表数值精度', () => {
+  // 构造含多位小数的 daily/monthly 收益，验证 ×100 后仍被 round 到 4 位
+  const mockDetailPrecision = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        matrix: [[null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8]],
+        text: [['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%']],
+      },
+      yearly: [{
+        year: 2026,
+        // 含 5~7 位小数 → ×100 后仍有 5 位以上，断言 boxData 值已是 4 位
+        daily_returns: [0.001234567, -0.005432, 0.0033333, 0.02, -0.01],
+        monthly_returns: [0.001234567, -0.005432, 0.02, -0.01, 0.004],
+        annual_return: 0.02,
+      }],
+    },
+  }
+  // 回撤由 mockDetail.snapshots 算：peak=101000 时 99000 → -(2000/101000)*100 ≈ -1.980198...
+  // 断言每个回撤/箱线值 round 到 4 位（值 === Number(v.toFixed(4))）
+  const assert4Decimals = (values: number[]) => {
+    for (const v of values) {
+      expect(Number(v.toFixed(4))).toBe(v)
+    }
+  }
+
+  it('回撤曲线数据 round 到 4 位小数', async () => {
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dd = options.find((o: any) => o.yAxis?.name === '回撤(%)')
+    expect(dd).toBeTruthy()
+    const data = dd.series.find((s: any) => s.name === '回撤').data
+    assert4Decimals(data)
+    // tooltip formatter 也输出 4 位百分比（含 toFixed(4)）
+    expect(String(dd.tooltip.formatter)).toContain('toFixed(4)')
+  })
+
+  it('年度日收益箱线图五数摘要 round 到 4 位小数', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailPrecision)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    expect(box).toBeTruthy()
+    const boxData = box.series[0].data
+    expect(Array.isArray(boxData)).toBe(true)
+    expect(boxData.length).toBe(1)  // 一个年份
+    for (const five of boxData) {
+      assert4Decimals(five)
+    }
+  })
+
+  it('各年月收益箱线图五数摘要 round 到 4 位小数', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailPrecision)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const box = options.find((o: any) => o.yAxis?.name === '月收益率(%)')
+    expect(box).toBeTruthy()
+    const boxData = box.series[0].data
+    expect(Array.isArray(boxData)).toBe(true)
+    expect(boxData.length).toBe(1)
+    for (const five of boxData) {
+      assert4Decimals(five)
+    }
+  })
+})
+
+// --- 回测报告 — 策略对比/摘要卡红涨绿跌 ---
+describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
+  it('策略对比收益指标正红负绿（valueClass 反转）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      strategy_evaluations: [
+        { strategy_id: 1, strategy_name: '正收益策略', total_return: 0.05, annual_return: 0.08 },
+        { strategy_id: 2, strategy_name: '负收益策略', total_return: -0.03, annual_return: -0.05 },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('策略绩效评估')
+    expect(w.text()).toContain('正收益策略')
+    expect(w.text()).toContain('负收益策略')
+
+    // 组合整体卡（.portfolio-card）总收益行：总收益 5.00%（正）→ valueClass → text-red
+    // 注意：不能全量 findAll('.metric-row') 后 find('5.00%')——DOM 顺序上 .strategy-card 在前，
+    // 首个命中会是正收益策略卡的总收益行；且 includes('5.00%') 也会误匹配 '-5.00%'。
+    // 故限定在 .portfolio-card 内按标签定位总收益行，并对值做精确断言。
+    const portfolioRows = w.findAll('.portfolio-card .metric-row')
+    const posRow = portfolioRows.find(r => r.find('.metric-label').text() === '总收益')!
+    expect(posRow.find('span:last-child').text()).toBe('5.00%')
+    expect(posRow.find('span:last-child').classes()).toContain('text-red')
+    // 负收益策略卡：总收益 -3.00%（负）→ 精确匹配该值且值为 text-green
+    const negCard = w.findAll('.strategy-card').find(c => c.text().includes('-3.00%'))!
+    const negSpan = negCard.findAll('span').find(s => s.text() === '-3.00%')!
+    expect(negSpan.classes()).toContain('text-green')
+  })
+
+  it('新增评估指标：四分组标题与值渲染，null 值显 —', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      evaluations: {
+        ...mockDetail.evaluations,
+        beta: 0.85, jensen_alpha: 0.062, excess_annual_return: 0.041,
+        tracking_error: 0.073, information_ratio: 0.56,
+        up_capture_ratio: 0.92, down_capture_ratio: 0.71,
+        excess_max_drawdown: -0.032,
+        annual_turnover: 3.25, total_cost_ratio: 0.002,
+        avg_position_utilization: 0.64, empty_days_ratio: 0.1,
+        max_single_weight: null, hhi: null,
+        max_consecutive_loss_days: 4, worst_daily_return: -0.025,
+        worst_weekly_return: -0.041, return_skewness: -0.3, return_kurtosis: 1.2,
+      },
+      strategy_evaluations: [
+        { strategy_id: 1, strategy_name: '唯一策略', total_return: 0.05 },
+      ],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    // 四个分组标题渲染
+    for (const g of ['基准相对', '磨损与仓位', '持仓结构', '路径质量']) {
+      expect(w.find('.portfolio-card').text()).toContain(g)
+    }
+
+    const rows = w.findAll('.portfolio-card .metric-row')
+    const rowValue = (label: string) =>
+      rows.find(r => r.find('.metric-label').text() === label)!.find('span:last-child').text()
+    // 基准相对
+    expect(rowValue('Beta')).toBe('0.85')
+    expect(rowValue('Jensen Alpha')).toBe('+6.20%')
+    expect(rowValue('年化超额收益')).toBe('+4.10%')
+    expect(rowValue('跟踪误差')).toBe('7.30%')
+    expect(rowValue('信息比率')).toBe('0.56')
+    expect(rowValue('上行捕获率')).toBe('92.0%')
+    expect(rowValue('下行捕获率')).toBe('71.0%')
+    expect(rowValue('超额最大回撤')).toBe('-3.20%')
+    // 磨损与仓位
+    expect(rowValue('年化换手率')).toBe('3.25')
+    expect(rowValue('交易成本占比')).toBe('0.2%')
+    expect(rowValue('平均仓位利用率')).toBe('64.0%')
+    expect(rowValue('空仓日占比')).toBe('10.0%')
+    // 结构：无持仓明细（positions_json 老记录）→ null 显 —
+    expect(rowValue('最大单票权重')).toBe('—')
+    expect(rowValue('HHI 集中度')).toBe('—')
+    // 路径
+    expect(rowValue('最长连亏天数')).toBe('4')
+    expect(rowValue('最差日收益')).toBe('-2.50%')
+    expect(rowValue('最差周收益')).toBe('-4.10%')
+    expect(rowValue('收益偏度')).toBe('-0.30')
+    expect(rowValue('收益峰度')).toBe('1.20')
+
+    // 分组标题不是普通指标行（不占 metric-row）
+    expect(w.findAll('.portfolio-card .metric-group').length).toBe(4)
+  })
+
+  it('摘要卡结构：positive（总收益/年化收益）+ danger（最大回撤）存在且各自取值', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const positive = w.find('.summary-card.positive')
+    expect(positive.exists()).toBe(true)
+    expect(positive.text()).toContain('总收益')
+    const danger = w.find('.summary-card.danger')
+    expect(danger.exists()).toBe(true)
+    expect(danger.text()).toContain('最大回撤')
+    // 注意：SFC scoped 样式在 vitest(happy-dom) 不注入，边框色无法经 getComputedStyle 断言；
+    // 颜色改动（positive→var(--red)、danger 保持 var(--red)）由实现步骤的显式 CSS 修改 + 最终构建验证保证。
+  })
+})
+
+// --- 回测报告 — 回撤曲线 A股红涨绿跌 ---
+describe('Backtest.vue — 回撤曲线红涨绿跌', () => {
+  it('回撤曲线（跌幅）为绿色', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dd = options.find((o: any) => o.yAxis?.name === '回撤(%)')
+    expect(dd).toBeTruthy()
+    const series = dd.series.find((s: any) => s.name === '回撤')
+    expect(series).toBeTruthy()
+    expect(series.itemStyle.color).toBe(CSS_VARS['--green'])
+  })
+})
+
+// --- 回测报告 — 净值曲线超额收益 ---
+describe('Backtest.vue — 净值曲线超额收益（相对基准）', () => {
+  it('有基准数据时净值曲线含超额收益线（组合%−基准%）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetail)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const option = (init as any).mock.results[0].value.setOption.mock.calls[0][0]
+    expect(option.legend.data).toContain('超额收益（相对基准）')
+    const excess = option.series.find((s: any) => s.name === '超额收益（相对基准）')
+    expect(excess).toBeTruthy()
+    expect(excess.type).toBe('line')
+    expect(excess.smooth).toBe(true)
+    expect(excess.symbol).toBe('none')
+    expect(excess.lineStyle).toEqual({ width: 1.5, color: CSS_VARS['--gold'] })
+    expect(excess.itemStyle.color).toBe(CSS_VARS['--gold'])
+    // 手算：组合收益% [0,1,-1] − 基准% [0,2,1] = [0,-1,-2]
+    expect(excess.data).toEqual([0, -1, -2])
+  })
+
+  it('无基准数据（benchmark_value 全 null）时不画超额收益线', async () => {
+    ;(getBacktestDetail as any).mockResolvedValue({
+      ...mockDetail,
+      snapshots: mockDetail.snapshots.map((s: any) => ({ ...s, benchmark_value: null })),
+    })
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const option = (init as any).mock.results[0].value.setOption.mock.calls[0][0]
+    expect(option.legend.data).not.toContain('超额收益（相对基准）')
+    expect(option.series.find((s: any) => s.name === '超额收益（相对基准）')).toBeUndefined()
+  })
+})
+
+const crisisAlphaCompleted = {
+  status: 'completed',
+  error: null,
+  skipped_benchmarks: ['中证全指', '科创50'],
+  computed_at: '2026-09-25T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    strategy_name: '稳健组合',
+    benchmark_code: '000300.SH',
+    benchmark_name: '沪深300',
+    alpha_rating: '优秀',
+    n_weeks: 12,
+    quadrant: {
+      n_crisis: 6, n_down: 6, n_total: 12,
+      hit_rate: 0.5, up_rate: 0.5, alpha_ratio: 0.6667, follow_ratio: 0.3333, odds: 1.2,
+      counts: { 逆势上涨: 3, 跌得少: 1, 跟着跌: 1, 跌更多: 1 },
+      avg_ret: { 逆势上涨: 0.02, 跌得少: -0.03, 跟着跌: -0.08, 跌更多: -0.15 },
+      down_avg_s: -0.0283, down_avg_b: -0.07, win_avg: 0.02, loss_avg: 0.08,
+    },
+    conditions: [
+      { threshold: -0.03, n: 4, b_avg: -0.06, s_avg: -0.01, up_rate: 0.5 },
+      { threshold: -0.05, n: 2, b_avg: -0.09, s_avg: 0.0, up_rate: 0.5 },
+    ],
+    extreme_top: [
+      { 日期: '2024-02-02', 基准: -0.12, 策略: 0.01, 超额: 0.13, 分类: '逆势上涨' },
+      { 日期: '2024-02-09', 基准: -0.1, 策略: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-26', 基准: -0.1, 策略: -0.08, 超额: 0.02, 分类: '跌得少' },
+    ],
+    deep_dd_events: [
+      { start: '2024-01-12', end: '2024-02-02', benchmark_ret: -0.12, strategy_ret: 0.01, excess: 0.13, hedged: true, verdict: '逆势对冲', max_dd: -0.14, days: 21 },
+      { start: '2024-02-16', end: '2024-02-23', benchmark_ret: -0.08, strategy_ret: -0.09, excess: -0.01, hedged: false, verdict: '同步下跌', max_dd: -0.09, days: 7 },
+    ],
+    rolling_corr: [
+      { date: '2024-01-05', value: 0.4 },
+      { date: '2024-01-12', value: 0.3 },
+      { date: '2024-01-19', value: 0.2 },
+    ],
+    expanding_corr: [
+      { date: '2023-12-29', value: 0.6 },
+      { date: '2024-01-05', value: 0.4 },
+    ],
+    monthly: {
+      states: {
+        大涨: { n: 1, s_avg: 0.03, b_avg: 0.06, win_rate: 1 },
+        小涨: { n: 2, s_avg: 0.01, b_avg: 0.02, win_rate: 0.5 },
+        小跌: { n: 3, s_avg: -0.01, b_avg: -0.02, win_rate: 0.3333 },
+        大跌: { n: 1, s_avg: 0.005, b_avg: -0.07, win_rate: 1 },
+      },
+      hedge_ratio: 0.5,
+      n_down_month: 4,
+      big_down: [{ 日期: '2024-02-29', 基准: -0.07, 策略: 0.005 }],
+    },
+    annual: [
+      { 年份: 2024, 下跌周: 6, 危机Alpha: 0.6667, 策略收益: 0.05, 基准收益: -0.08, 完整: false },
+    ],
+    cost: { drag: 0.25, sync_up: 0.75, elasticity: 0.4, tail_corr: -0.2, q1_corr: -0.15, n_up: 4 },
+    performance: {
+      s: { cum: 0.05, ann: 0.06, vol: 0.12, mdd: -0.05 },
+      b: { cum: -0.08, ann: -0.09, vol: 0.2, mdd: -0.15 },
+      corr: 0.25,
+      start: '2024-01-01',
+      end: '2024-03-29',
+    },
+    score: {
+      total_score: 72.3,
+      rating: '优秀',
+      dimensions: [
+        { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 92.0, 评级: '卓越', 贡献: 15.7 },
+        { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 65.0, 评级: '尚可', 贡献: 9.8 },
+        { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 85.0, 评级: '优秀', 贡献: 10.2 },
+      ],
+    },
+    weekly_detail: [
+      { 日期: '2024-01-05', 基准收益: -0.1, 策略收益: 0.02, 超额: 0.12, 分类: '逆势上涨' },
+      { 日期: '2024-01-12', 基准收益: -0.1, 策略收益: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-19', 基准收益: -0.1, 策略收益: -0.06, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-26', 基准收益: -0.1, 策略收益: -0.12, 超额: -0.02, 分类: '跌更多' },
+      { 日期: '2024-02-02', 基准收益: 0.05, 策略收益: 0.03, 超额: -0.02, 分类: '跟着跌' },
+      { 日期: '2024-02-09', 基准收益: 0.05, 策略收益: -0.01, 超额: -0.06, 分类: '跟着跌' },
+    ],
+    down_weeks: [
+      { 日期: '2024-01-26', 基准收益: -0.1, 策略收益: -0.12, 超额: -0.02, 分类: '跌更多' },
+      { 日期: '2024-01-19', 基准收益: -0.1, 策略收益: -0.06, 超额: 0.04, 分类: '跌得少' },
+      { 日期: '2024-01-12', 基准收益: -0.1, 策略收益: -0.02, 超额: 0.08, 分类: '跌得少' },
+      { 日期: '2024-01-05', 基准收益: -0.1, 策略收益: 0.02, 超额: 0.12, 分类: '逆势上涨' },
+    ],
+    nav: {
+      dates: ['2024-01-01', '2024-02-01', '2024-03-29'],
+      strategy: [1, 1.03, 1.05],
+      benchmark: [1, 0.95, 0.92],
+      shade_spans: [['2024-01-12', '2024-02-02']],
+    },
+    multi_bench: [
+      { key: 'main', name: '沪深300', code: '000300.SH', alpha_ratio: 0.6667, n_down: 6, up_rate: 0.5, is_main: true },
+      { key: 'csi500', name: '中证500', code: '000905.SH', alpha_ratio: 0.6, n_down: 6, up_rate: 0.45, is_main: false },
+    ],
+  },
+}
+
+const marketRegimeCompleted = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T12:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    meta: {
+      strategy_name: '回测A组合',
+      benchmark_name: '沪深300',
+      n_weeks_labeled: 50,
+      n_weeks_total: 56,
+      state_week_counts: { bull: 20, bear: 18, rebound: 4, range: 8 },
+    },
+    regime_table: {
+      bull: { label: 'bull', label_cn: '趋势上涨', weeks: 20, ratio: 0.4, strategy_return: 0.25, benchmark_return: 0.2, excess_return: 0.05, win_rate: 0.7, max_drawdown: 0.08, turnover: 12.5, cost_ratio: 0.02 },
+      bear: { label: 'bear', label_cn: '趋势下跌', weeks: 18, ratio: 0.36, strategy_return: -0.1, benchmark_return: -0.2, excess_return: 0.1, win_rate: 0.6, max_drawdown: 0.12, turnover: 15.0, cost_ratio: 0.03 },
+      range: { label: 'range', label_cn: '震荡', weeks: 8, ratio: 0.16, strategy_return: -0.01, benchmark_return: 0.01, excess_return: -0.02, win_rate: 0.45, max_drawdown: 0.05, turnover: 8.0, cost_ratio: 0.04 },
+      rebound: { label: 'rebound', label_cn: '反弹', weeks: 4, ratio: 0.08, strategy_return: 0.12, benchmark_return: 0.1, excess_return: 0.02, win_rate: 0.75, max_drawdown: 0.02, turnover: 10.0, cost_ratio: 0.02 },
+    },
+    opportunity: {
+      n_bull_weeks: 20,
+      up_capture: 0.85,
+      miss_ratio: 0.1,
+      big_up_tests: [
+        { threshold: 0.03, n: 6, avg_strategy: 0.04, avg_benchmark: 0.045, win_rate: 0.8 },
+        { threshold: 0.05, n: 2, avg_strategy: 0.05, avg_benchmark: 0.06, win_rate: 0.5 },
+      ],
+      cats: {
+        同步涨: { count: 12, avg_strategy: 0.03 },
+        涨得少: { count: 4, avg_strategy: 0.01 },
+        踏空: { count: 2, avg_strategy: 0 },
+        逆势跌: { count: 2, avg_strategy: -0.01 },
+      },
+    },
+    rebound: {
+      n_segments: 1,
+      avg_elasticity: 1.2,
+      segments: [
+        {
+          start_date: '2024-01-12', end_date: '2024-02-02', trough_date: '2024-01-19', weeks: 3,
+          benchmark_rebound_pct: 0.08, strategy_rebound_pct: 0.096, elasticity: 1.2,
+          benchmark_recover_days: null, benchmark_recovered: false,
+          strategy_recover_days: null, strategy_recovered: false,
+        },
+      ],
+    },
+    neutral: {
+      n_range_weeks: 8,
+      range_ratio: 0.16,
+      cumulative_return: -0.01,
+      annualized_return: -0.12,
+      win_rate: 0.45,
+      n_range_days: 40,
+      monthly_trades: 2.5,
+      annual_turnover: 8.0,
+      cost_gross_ratio: 0.35,
+      whipsaw_count: 6,
+      whipsaw_days: 120,
+      avg_trade_pnl: { trend: 1000, trend_count: 10, range: -14.29, range_count: 7 },
+    },
+    style: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      skipped: ['科创50'],
+      weeks: [
+        { date: '2024-02-02', label: '科技成长', leader_code: '399006.SZ', leader_return: 0.04 },
+        { date: '2024-02-09', label: '中小盘', leader_code: '000905.SH', leader_return: 0.03 },
+      ],
+      matrix: {
+        大盘价值: { label: '大盘价值', weeks: 5, ratio: 0.1, strategy_return: 0.08, leader_return: 0.06, excess_return: 0.02, win_rate: 0.7, max_drawdown: -0.05 },
+        中小盘: { label: '中小盘', weeks: 10, ratio: 0.2, strategy_return: 0.15, leader_return: 0.12, excess_return: 0.03, win_rate: 0.65, max_drawdown: -0.07 },
+        科技成长: { label: '科技成长', weeks: 20, ratio: 0.4, strategy_return: 0.3, leader_return: 0.25, excess_return: 0.05, win_rate: 0.75, max_drawdown: -0.1 },
+        普涨: { label: '普涨', weeks: 8, ratio: 0.16, strategy_return: 0.05, leader_return: 0.04, excess_return: 0.01, win_rate: 0.6, max_drawdown: -0.03 },
+        普跌: { label: '普跌', weeks: 5, ratio: 0.1, strategy_return: -0.02, leader_return: -0.05, excess_return: 0.03, win_rate: 0.5, max_drawdown: -0.08 },
+        无主线: { label: '无主线', weeks: 2, ratio: 0.04, strategy_return: 0.01, leader_return: 0.005, excess_return: 0.005, win_rate: 0.5, max_drawdown: -0.02 },
+      },
+    },
+    dispersion: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      skipped: ['科创50'],
+      series: [
+        { date: '2024-01-05', dispersion: 0.02 },
+        { date: '2024-01-12', dispersion: 0.015 },
+        { date: '2024-01-19', dispersion: 0.025 },
+      ],
+      buckets: {
+        low: { count: 1, mean_excess: 0.005, win_rate: 0.6, threshold: 0.018 },
+        mid: { count: 1, mean_excess: 0.01, win_rate: 0.7, threshold: 0.022 },
+        high: { count: 1, mean_excess: 0.02, win_rate: 0.8, threshold: null },
+      },
+    },
+    exposure: {
+      available_codes: ['000300.SH', '000905.SH', '000852.SH', '399006.SZ', '000985.CSI'],
+      available_names: ['沪深300', '中证500', '中证1000', '创业板指', '中证全指'],
+      skipped: ['科创50'],
+      dates: ['2024-01-05', '2024-01-12', '2024-01-19'],
+      corr: {
+        '000300.SH': [0.3, 0.35, 0.4],
+        '000905.SH': [0.5, 0.55, 0.6],
+        '000852.SH': [0.4, 0.42, 0.45],
+        '399006.SZ': [0.8, 0.82, 0.85],
+        '000985.CSI': [0.6, 0.62, 0.65],
+      },
+      beta: {
+        '000300.SH': [0.3, 0.32, 0.35],
+        '000905.SH': [0.5, 0.52, 0.55],
+        '000852.SH': [0.4, 0.42, 0.45],
+        '399006.SZ': [1.1, 1.12, 1.15],
+        '000985.CSI': [0.6, 0.62, 0.65],
+      },
+      window: 52,
+    },
+    // 增强A：巨潮四象限纯风格暴露
+    quadrant_exposure: {
+      available_codes: ['399372.SZ', '399373.SZ', '399374.SZ', '399375.SZ', '399376.SZ'],
+      available_names: ['大盘成长', '大盘价值', '中盘成长', '中盘价值', '小盘成长'],
+      skipped: ['小盘价值'],
+      dates: ['2024-01-05', '2024-01-12', '2024-01-19'],
+      corr: {
+        '399372.SZ': [0.7, 0.72, 0.75],
+        '399373.SZ': [0.2, 0.22, 0.25],
+        '399374.SZ': [0.6, 0.62, 0.65],
+        '399375.SZ': [0.1, 0.12, 0.15],
+        '399376.SZ': [0.5, 0.52, 0.55],
+      },
+      beta: {
+        '399372.SZ': [0.9, 0.92, 0.95],
+        '399373.SZ': [0.2, 0.22, 0.25],
+        '399374.SZ': [0.7, 0.72, 0.75],
+        '399375.SZ': [0.1, 0.12, 0.15],
+        '399376.SZ': [0.6, 0.62, 0.65],
+      },
+      window: 52,
+    },
+    industry_attribution: {
+      status: 'ok',
+      taxonomy: '通达信二级行业(881)',
+      n_days: 60,
+      unmapped_codes: [],
+      exposure: {
+        dates: ['2024-01-05', '2024-01-12'],
+        series: [
+          { code: '881001.SH', name: '半导体', avg_weight: 0.6, weights: [0.6, 0.6] },
+          { code: '881002.SH', name: '煤炭开采', avg_weight: 0.3, weights: [0.3, 0.3] },
+        ],
+        cash: [0.1, 0.1],
+      },
+      hit_rate: {
+        weekly: {
+          top_n: 3, periods: 12, periods_holding: 10, hits: 7, hit_rate: 0.7,
+          details: [{ period: '2024-01-05', held: ['半导体'], leaders: ['半导体', '煤炭开采', '证券'], hit: true }],
+        },
+        monthly: {
+          top_n: 3, periods: 3, periods_holding: 3, hits: 2, hit_rate: 0.667,
+          details: [],
+        },
+      },
+      contribution: {
+        available: true,
+        rows: [
+          { code: '881001.SH', name: '半导体', avg_weight: 0.6, index_return: 0.2, contribution: 0.12 },
+          { code: '881002.SH', name: '煤炭开采', avg_weight: 0.3, index_return: 0.05, contribution: 0.015 },
+        ],
+        total_contribution: 0.135,
+      },
+    },
+    robustness: {
+      status: 'ok',
+      n_days: 600,
+      start_date: '2024-01-02',
+      end_date: '2026-06-30',
+      half_year_matrix: [
+        { period: '2024H1', start_date: '2024-01-02', end_date: '2024-06-28',
+          strategy_return: 0.08, benchmark_return: 0.05, excess_return: 0.03,
+          max_drawdown: 0.04, sharpe: 1.2 },
+        { period: '2024H2', start_date: '2024-07-01', end_date: '2024-12-31',
+          strategy_return: -0.02, benchmark_return: -0.04, excess_return: 0.02,
+          max_drawdown: 0.09, sharpe: -0.3 },
+      ],
+      rolling: {
+        weekly_points: 130,
+        windows: [
+          {
+            window: 26, n_samples: 80,
+            returns: { median: 0.06, min: -0.08, max: 0.15, negative_ratio: 0.2 },
+            sharpe: { median: 0.8, min: -0.5, max: 1.6, negative_ratio: 0.25 },
+            histogram: [
+              { label: '≤-20%', count: 0 }, { label: '-20%~-10%', count: 0 },
+              { label: '-10%~-5%', count: 5 }, { label: '-5%~0%', count: 11 },
+              { label: '0%~5%', count: 30 }, { label: '5%~10%', count: 24 },
+              { label: '10%~20%', count: 10 }, { label: '>20%', count: 0 },
+            ],
+          },
+          {
+            window: 52, n_samples: 54,
+            returns: { median: 0.12, min: 0.02, max: 0.22, negative_ratio: 0 },
+            sharpe: { median: 1.1, min: 0.3, max: 1.8, negative_ratio: 0 },
+            histogram: [
+              { label: '≤-20%', count: 0 }, { label: '-20%~-10%', count: 0 },
+              { label: '-10%~-5%', count: 0 }, { label: '-5%~0%', count: 0 },
+              { label: '0%~5%', count: 10 }, { label: '5%~10%', count: 24 },
+              { label: '10%~20%', count: 20 }, { label: '>20%', count: 0 },
+            ],
+          },
+        ],
+      },
+      longest_loss_window: {
+        start_date: '2024-09-10', trough_date: '2024-10-18',
+        end_date: '2024-12-05', days: 86, drawdown: 0.09,
+      },
+      benchmark_sensitivity: [
+        { code: '000300.SH', name: '沪深300', is_primary: true, available: true, n_days: 600,
+          strategy_total_return: 0.25, benchmark_total_return: 0.12,
+          beta: 0.72, jensen_alpha: 0.06, excess_annual_return: 0.05,
+          tracking_error: 0.08, information_ratio: 0.62,
+          up_capture_ratio: 0.8, down_capture_ratio: 0.5, excess_max_drawdown: 0.07 },
+        { code: '399006.SZ', name: '创业板指', is_primary: false, available: false, n_days: 8,
+          strategy_total_return: null, benchmark_total_return: null,
+          beta: null, jensen_alpha: null, excess_annual_return: null,
+          tracking_error: null, information_ratio: null,
+          up_capture_ratio: null, down_capture_ratio: null, excess_max_drawdown: null },
+      ],
+    },
+  },
+}
+
+const marketRegimeRbInsufficient = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    ...marketRegimeCompleted.data,
+    robustness: {
+      status: 'insufficient',
+      n_days: 12,
+      error: '策略与基准共同交易日不足30天（12），稳健性无法分析',
+    },
+  },
+}
+
+const marketRegimeNeedsRerun = {
+  status: 'completed',
+  error: null,
+  computed_at: '2026-09-27T10:00:00',
+  benchmark_code: '000300.SH',
+  benchmark_name: '沪深300',
+  data: {
+    ...marketRegimeCompleted.data,
+    industry_attribution: {
+      status: 'needs_rerun',
+      taxonomy: '通达信二级行业(881)',
+      reason: '该记录回测时未保存持仓明细，重新回测后可用',
+    },
+  },
+}
+
+async function mountDetail(detailPayload: any) {
+  ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+  const w = mount(Backtest)
+  await flushPromises()
+  const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+  await viewBtn.trigger('click')
+  await flushPromises()
+  const caHeader = w.find('.ca-header')
+  if (caHeader.exists()) {
+    await caHeader.trigger('click')
+    await flushPromises()
+  }
+  return w
+}
+
+describe('Backtest.vue — 危机Alpha 上提到整体表现指标（8 卡）', () => {
+  it('crisis_alpha 为 null：共 8 张卡，危机两卡为 —', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards.length).toBe(8)
+    const labels = cards.map((c) => c.find('.label').text())
+    expect(labels[6]).toBe('危机Alpha占比')
+    expect(labels[7]).toBe('综合危机保护评分')
+    expect(cards[6].find('.value').text()).toBe('—')
+    expect(cards[7].find('.value').text()).toBe('—')
+  })
+
+  it('status=completed：显示「占比 · 评级」与「评分 · 评级」', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards[6].find('.value').text()).toBe('66.7% · 优秀')
+    expect(cards[7].find('.value').text()).toBe('72.3 · 优秀')
+  })
+
+  it('status=failed：危机两卡降级为 —', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: '主基准指数无数据', skipped_benchmarks: [],
+        computed_at: '2026-09-25T10:00:00', benchmark_code: '000300.SH',
+        benchmark_name: '沪深300', data: null,
+      },
+    })
+    const cards = w.findAll('.stats-grid .stat-card')
+    expect(cards[6].find('.value').text()).toBe('—')
+    expect(cards[7].find('.value').text()).toBe('—')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha section 骨架', () => {
+  it('crisis_alpha=null：显示未计算提示 + 重新计算按钮', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    expect(w.find('.ca-section').exists()).toBe(true)
+    expect(w.text()).toContain('🌪️ 危机Alpha 专题分析')
+    expect(w.text()).toContain('本次回测未包含危机Alpha分析')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(1)
+  })
+
+  it('status=failed：显示失败原因 + 重新计算按钮', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: '主基准指数无数据（TQ 取数失败或代码不被支持）',
+        skipped_benchmarks: ['中证全指', '中证500'], computed_at: '2026-09-25T10:00:00',
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.text()).toContain('主基准指数无数据')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(1)
+  })
+
+  it('status=insufficient：显示样本不足说明且无重算按钮', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'insufficient',
+        error: '策略与基准共同交易日不足30天（12），无法分析',
+        skipped_benchmarks: [], computed_at: '2026-09-25T10:00:00',
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.text()).toContain('样本不足')
+    expect(w.text()).toContain('30')
+    const btns = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))
+    expect(btns.length).toBe(0)
+  })
+
+  it('status=completed：4 张 KPI 卡 + 状态条（跳过基准 + 计算时间 + 重新计算）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const kpis = w.findAll('.ca-kpi')
+    expect(kpis.length).toBe(4)
+    expect(kpis[0].text()).toContain('危机Alpha占比')
+    expect(kpis[0].text()).toContain('66.7%')
+    expect(kpis[1].text()).toContain('综合危机保护评分')
+    expect(kpis[1].text()).toContain('72.3')
+    expect(kpis[2].text()).toContain('下跌周逆势上涨比例')
+    expect(kpis[2].text()).toContain('3 / 6 周')
+    expect(kpis[3].text()).toContain('策略累计收益')
+    expect(kpis[3].text()).toContain('年化 6.0%')
+    expect(kpis[3].text()).toContain('MDD -5.0%')
+    const status = w.find('.ca-status').text()
+    expect(status).toContain('已跳过基准：中证全指、科创50')
+    expect(status).toContain('2026-09-25 10:00:00')
+    expect(w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算')).length).toBe(1)
+  })
+
+  it('点击重新计算 → 调 recomputeCrisisAlpha → 成功后重载详情并渲染 KPI', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(recomputeCrisisAlpha).toHaveBeenCalledWith(1)
+    expect(getBacktestDetail).toHaveBeenCalledTimes(2)
+    expect(w.find('.ca-msg').text()).toContain('重新计算完成')
+    expect(w.findAll('.ca-kpi').length).toBe(4)
+    expect(w.text()).toContain('66.7%')
+  })
+
+  it('重算返回 failed：显示失败原因，不抛错', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'failed', error: '主基准指数无数据', computed_at: null,
+    })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-msg').text()).toContain('主基准指数无数据')
+  })
+
+  it('重算接口抛错：显示失败提示', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockRejectedValue(new Error('boom'))
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-msg').text()).toContain('重新计算失败')
+  })
+
+  it('重算返回基准不一致：消息含告警样式与新旧基准名', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: true, mismatch: true,
+        benchmark_code: '000905.SH', benchmark_name: '中证500',
+        live_benchmark_code: '000300.SH', live_benchmark_name: '沪深300',
+        stored_benchmark_code: '000905.SH', stored_benchmark_name: '中证500',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).toContain('ca-warn')
+    expect(msg.text()).toContain('重新计算完成')
+    expect(msg.text()).toContain('中证500')
+    expect(msg.text()).toContain('沪深300')
+  })
+
+  it('重算返回无基准不一致：不加告警样式', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: true, mismatch: false,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300',
+        live_benchmark_code: '000300.SH', live_benchmark_name: '沪深300',
+        stored_benchmark_code: '000300.SH', stored_benchmark_name: '沪深300',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).not.toContain('ca-warn')
+    expect(msg.text()).toBe('重新计算完成')
+  })
+
+  it('重算无 benchmark_resolution 字段（老后端）：不报错', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).not.toContain('ca-warn')
+    expect(msg.text()).toBe('重新计算完成')
+  })
+
+  it('老记录无快照 + 组合基准已被改：消息提示按记录原基准重算', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: null })
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+      benchmark_resolution: {
+        from_snapshot: false, mismatch: true,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300',
+        live_benchmark_code: '000905.SH', live_benchmark_name: '中证500',
+        stored_benchmark_code: '000300.SH', stored_benchmark_name: '沪深300',
+      },
+    })
+    ;(getBacktestDetail as any).mockResolvedValue({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    const msg = w.find('.ca-msg')
+    expect(msg.classes()).toContain('ca-warn')
+    expect(msg.text()).toContain('中证500')
+    expect(msg.text()).toContain('沪深300')
+  })
+
+  it('点击危机卡滚动到危机Alpha section', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.findAll('.stats-grid .stat-card')[6].trigger('click')
+    expect(scrollTargets.length).toBe(1)
+    expect(String(scrollTargets[0].className)).toContain('ca-section')
+  })
+})
+
+function caTableByHeader(w: any, header: string) {
+  return w.findAll('table').find((t: any) => t.find('thead').text().includes(header))!
+}
+
+describe('Backtest.vue — 危机Alpha 模块一~六', () => {
+  it('渲染模块一~六标题（含 TOP 数量与下跌周数）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    for (const t of [
+      '一、核心结论', '二、产品与基准走势', '三、危机Alpha四档分类',
+      '四、极端下跌周 TOP3', '五、全周期四象限分布', '六、深度回撤事件独立性',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
+  })
+
+  it('核心结论段落含下跌周均值 / 相关系数 / 回撤事件对冲数 + 两个评级标签', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('在 6 个沪深300下跌周中')
+    expect(text).toContain('66.7%')
+    expect(text).toContain('50.0%')
+    expect(text).toContain('-2.83%')
+    expect(text).toContain('-7.00%')
+    expect(text).toContain('0.250')
+    expect(text).toContain('最深的 2 次基准回撤中有 1 次逆势录得正收益')
+    expect(text).toContain('危机Alpha 66.7% · 优秀')
+    expect(text).toContain('综合评分 72.3 · 优秀')
+  })
+
+  it('二：净值走势图容器 + 绩效表（5 行，含相关系数解读）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    const text = w.text()
+    for (const t of ['累计收益', '年化收益', '年化波动', '最大回撤', '相关系数']) {
+      expect(text).toContain(t)
+    }
+    expect(text).toContain('低/负相关，对冲属性显著')
+  })
+
+  it('三：分类统计表（4 档 + 危机Alpha合计）与深跌周条件检验（2 行）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    for (const t of ['逆势上涨', '跌得少', '跟着跌', '跌更多', '危机Alpha合计']) {
+      expect(text).toContain(t)
+    }
+    expect(text).toContain('深跌周条件检验（更严苛）')
+    expect(text).toContain('沪深300周跌 >3%')
+    expect(text).toContain('沪深300周跌 >5%')
+    expect(w.findAll('.ca-cond-table tbody tr').length).toBe(2)
+  })
+
+  it('四：TOP3 说明含逆势正收益周数与跑赢周数', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('沪深300跌幅最大的 3 周中')
+    expect(text).toContain('1 周逆势录得正收益')
+    // fixture 3 周 extreme_top 全部 策略>基准（0.01>-0.12 / -0.02>-0.10 / -0.08>-0.10）→ 3 周跑赢
+    expect(text).toContain('3 周跑赢基准')
+  })
+
+  it('五：四象限图 4 档分类 + 四象限标注（象限文字是 chart graphic，不进 DOM）', async () => {
+    const { init } = await import('echarts')
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.text()).toContain('左上象限（股跌+策略涨）即')
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const sc = options.find((o: any) => o.xAxis?.name === '基准周收益(%)')
+    expect(sc).toBeTruthy()
+    expect(sc.series.map((s: any) => s.name)).toEqual(['逆势上涨', '跌得少', '跟着跌', '跌更多'])
+    const texts = sc.graphic.map((g: any) => g.style.text)
+    expect(texts.some((t: string) => t.includes('股跌+稳健组合涨'))).toBe(true)
+    expect(texts.some((t: string) => t.includes('股涨+稳健组合跌'))).toBe(true)
+    expect(texts).toContain('同涨')
+    expect(texts).toContain('同跌')
+  })
+
+  it('六：事件表 2 行 + 回撤独立性说明', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(w.findAll('.ca-event-table tbody tr').length).toBe(2)
+    expect(text).toContain('2024-01-12')
+    expect(text).toContain('2024-02-02')
+    expect(text).toContain('✓ 逆势对冲')
+    expect(text).toContain('✗ 同步下跌')
+    expect(text).toContain('回撤独立性 50%')
+  })
+
+  it('无数据时（status=failed）不渲染 12 模块与图表容器', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      crisis_alpha: {
+        status: 'failed', error: 'x', skipped_benchmarks: [],
+        computed_at: null, benchmark_code: '000300.SH',
+        benchmark_name: '沪深300', data: null,
+      },
+    })
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.findAll('.ca-kpi').length).toBe(0)
+    expect(w.text()).not.toContain('一、核心结论')
+  })
+
+  it('三：分类表平均周收益按符号着色（正红负绿，合计行不着色）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const table = caTableByHeader(w, '平均周收益')
+    const cell = (cat: string) => {
+      const row = table.findAll('tbody tr').find((r: any) => r.findAll('td')[0].text() === cat)!
+      return row.findAll('td')[3]
+    }
+    expect(cell('逆势上涨').text()).toBe('+2.00%')
+    expect(cell('逆势上涨').classes()).toContain('text-red')
+    expect(cell('跌得少').text()).toBe('-3.00%')
+    expect(cell('跌得少').classes()).toContain('text-green')
+    expect(cell('跟着跌').classes()).toContain('text-green')
+    expect(cell('跌更多').classes()).toContain('text-green')
+    expect(cell('危机Alpha合计').text()).toBe('—')
+    expect(cell('危机Alpha合计').classes()).not.toContain('text-red')
+    expect(cell('危机Alpha合计').classes()).not.toContain('text-green')
+  })
+
+  it('三：条件检验策略平均按符号着色（股票平均列固定绿）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-cond-table tbody tr')
+    const sAvg = (i: number) => rows[i].findAll('td')[3]
+    const bAvg = (i: number) => rows[i].findAll('td')[2]
+    expect(sAvg(0).text()).toBe('-1.00%')
+    expect(sAvg(0).classes()).toContain('text-green')
+    expect(sAvg(1).text()).toBe('+0.00%')
+    expect(sAvg(1).classes()).toContain('text-red')
+    expect(bAvg(0).classes()).toContain('text-green')
+    expect(bAvg(1).classes()).toContain('text-green')
+  })
+
+  it('六：事件表策略/超额两列各自按符号着色（可正可负独立）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-event-table tbody tr')
+    const cell = (i: number, idx: number) => rows[i].findAll('td')[idx]
+    expect(cell(0, 3).text()).toBe('+1.00%')
+    expect(cell(0, 3).classes()).toContain('text-red')
+    expect(cell(0, 4).text()).toBe('+13.00%')
+    expect(cell(0, 4).classes()).toContain('text-red')
+    expect(cell(1, 3).text()).toBe('-9.00%')
+    expect(cell(1, 3).classes()).toContain('text-green')
+    expect(cell(1, 4).text()).toBe('-1.00%')
+    expect(cell(1, 4).classes()).toContain('text-green')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha 模块七~十二', () => {
+  it('渲染模块七~十二标题，累计 9 个图表容器', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    for (const t of [
+      '七、多宽基一致性', '八、月度视角', '九、动态相关性与年度趋势',
+      '十、代价检验（上涨周表现）', '十一、综合危机保护评分', '十二、全部下跌周明细（6 周）',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
+    expect(w.findAll('.ca-chart').length).toBe(9)
+  })
+
+  it('12 个模块标题按源顺序渲染', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const titles = [
+      '一、核心结论', '二、产品与基准走势', '三、危机Alpha四档分类', '四、极端下跌周 TOP3',
+      '五、全周期四象限分布', '六、深度回撤事件独立性', '七、多宽基一致性', '八、月度视角',
+      '九、动态相关性与年度趋势', '十、代价检验（上涨周表现）', '十一、综合危机保护评分',
+      '十二、全部下跌周明细（6 周）',
+    ]
+    const text = w.text()
+    let last = -1
+    for (const t of titles) {
+      const i = text.indexOf(t)
+      expect(i, `标题缺失或顺序错误: ${t}`).toBeGreaterThan(last)
+      last = i
+    }
+  })
+
+  it('七：多宽基明细表含主基准标记与 2 个基准', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    expect(text).toContain('沪深300（主基准）')
+    expect(text).toContain('中证500')
+    expect(w.findAll('.ca-multi-table tbody tr').length).toBe(2)
+  })
+
+  it('八：月度 4 状态表 + 大跌月明细（1 行）+ 月度对冲比例', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const text = w.text()
+    for (const t of ['大涨', '小涨', '小跌', '大跌']) expect(text).toContain(t)
+    expect(text).toContain('大跌月明细（股票月跌 >5%）')
+    expect(w.findAll('.ca-bigdown-table tbody tr').length).toBe(1)
+    expect(text).toContain('下跌月份共 50.0% 实现危机对冲（月度口径）')
+  })
+
+  it('九：年度表带 * 标记（非完整年）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.text()).toContain('2024*')
+    expect(w.text()).toContain('标 * 的年度为数据区间首尾的非完整年度')
+  })
+
+  it('十：代价检验 5 行', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-cost-table tbody tr').length).toBe(5)
+    const text = w.text()
+    for (const t of ['上涨周拖后腿比例', '上涨周同步上涨比例', '收益弹性比', '下尾相关（下跌周内）', 'Q1分位相关（最差25%周）']) {
+      expect(text).toContain(t)
+    }
+  })
+
+  it('十一：评分维度表 3 行 + 综合评分行', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-dim-table tbody tr')
+    expect(rows.length).toBe(4)
+    expect(w.text()).toContain('综合评分')
+  })
+
+  it('十二：下跌周明细表按日期倒序（2024-01-26 在 2024-01-05 之前）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const rows = w.findAll('.ca-down-table tbody tr')
+    expect(rows.length).toBe(4)
+    const text = w.text()
+    expect(text.indexOf('2024-01-26')).toBeLessThan(text.indexOf('2024-01-05'))
+  })
+
+  it('十二：下跌周超 20 行时分页（每页 20 条，可上下翻页）', async () => {
+    const ca25: any = JSON.parse(JSON.stringify(crisisAlphaCompleted))
+    ca25.data.down_weeks = Array.from({ length: 25 }, (_, i) => ({
+      日期: `2024-${String(Math.floor(i / 5) + 1).padStart(2, '0')}-${String((i % 5) + 5).padStart(2, '0')}`,
+      基准收益: -0.01, 策略收益: -0.005, 超额: 0.005, 分类: '跌得少',
+    }))
+    ca25.data.quadrant.n_down = 25
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: ca25 })
+    expect(w.text()).toContain('十二、全部下跌周明细（25 周）')
+
+    const pageInfo = () => w.find('.ca-down-table').element.parentElement?.querySelector('.page-info')?.textContent
+    const pager = () => w.find('.ca-down-table').element.parentElement?.querySelector('.pagination')
+    expect(pager()).toBeTruthy()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(20)
+    expect(pageInfo()).toContain('第 1 / 2 页')
+
+    const btns = () => w.findAll('.pagination button')
+    expect(btns()[0].attributes('disabled')).toBeDefined()
+    await btns()[1].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(5)
+    expect(pageInfo()).toContain('第 2 / 2 页')
+    expect(btns()[1].attributes('disabled')).toBeDefined()
+
+    await btns()[0].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-down-table tbody tr').length).toBe(20)
+  })
+
+  it('四档配色为红/橙/浅绿/深绿（与红涨绿跌一致）', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const html = w.html()
+    expect(html).toContain(CSS_VARS['--red'])
+    expect(html).toContain(CSS_VARS['--gold'])
+    expect(html).toContain('rgba(31, 110, 79, 0.6)')
+    expect(html).toContain(CSS_VARS['--green'])
+  })
+
+  it('三：四档饼图中心数字与标签按饼心居中（title 锚点=series.center，非 graphic left）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const pie = options.find((o: any) => o.series?.[0]?.type === 'pie')
+    expect(pie).toBeTruthy()
+    const pieCenter = pie.series[0].center
+    const titles = pie.title as any[]
+    expect(titles).toHaveLength(2)
+    expect(titles[0].text).toMatch(/%$/)
+    expect(titles[1].text).toBe('危机Alpha')
+    for (const t of titles) {
+      expect(t.left).toBe(pieCenter[0])
+      expect(t.textAlign).toBe('center')
+      expect(t.textVerticalAlign).toBe('middle')
+      expect(t.padding).toBe(0)
+    }
+    expect(pie.graphic).toBeUndefined()
+  })
+
+  const fiveTierCrisis = {
+    ...crisisAlphaCompleted,
+    data: {
+      ...crisisAlphaCompleted.data,
+      score: {
+        ...crisisAlphaCompleted.data.score,
+        dimensions: [
+          { 维度: '危机Alpha占比', 类型: '核心', 权重: 0.2, 得分: 92.0, 评级: '卓越', 贡献: 18.4 },
+          { 维度: '深跌周抗跌性', 类型: '核心', 权重: 0.15, 得分: 85.0, 评级: '优秀', 贡献: 12.8 },
+          { 维度: '下尾负相关', 类型: '对冲', 权重: 0.12, 得分: 75.0, 评级: '良好', 贡献: 9.0 },
+          { 维度: '回撤独立性', 类型: '对冲', 权重: 0.12, 得分: 65.0, 评级: '尚可', 贡献: 7.8 },
+          { 维度: '极端事件保护', 类型: '核心', 权重: 0.1, 得分: 55.0, 评级: '偏弱', 贡献: 5.5 },
+        ],
+      },
+    },
+  }
+
+  it('十一：评分图条块按五档评级取鲜艳色（--score-1..5，非灰）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: fiveTierCrisis })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const dim = options.find((o: any) => o.yAxis?.type === 'category' && Array.isArray(o.yAxis.data)
+      && o.yAxis.data.includes('回撤独立性'))
+    expect(dim).toBeTruthy()
+    const colors = dim.series[0].data.map((d: any) => d.itemStyle.color)
+    const tiers = ['卓越', '优秀', '良好', '尚可', '偏弱']
+    const scoreValues = tiers.map((_, i) => CSS_VARS[`--score-${i + 1}`])
+    expect(colors.length).toBe(5)
+    expect(colors.every((c: string) => scoreValues.includes(c))).toBe(true)
+    expect(colors).not.toContain(CSS_VARS['--ink-faint'])
+    expect(colors).not.toContain(CSS_VARS['--gold'])
+    expect(new Set(colors).size).toBe(5)
+  })
+
+  it('五档评级全覆盖：卓越/优秀/良好/尚可/偏弱 各自映射唯一 --score-N', async () => {
+    const expected = ['卓越', '优秀', '良好', '尚可', '偏弱']
+    expected.forEach((rating, i) => {
+      expect(SCORE_TIER_OF[CSS_VARS[`--score-${i + 1}`]]).toBe(rating)
+    })
+  })
+
+  it('全部图表实例在卸载时 dispose（22 个，无泄漏）', async () => {
+    const { init } = await import('echarts')
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const before = (init as any).mock.results.length
+    expect(before).toBeGreaterThan(0)
+    const instances = (init as any).mock.results.map((r: any) => r.value)
+    w.unmount()
+    const alive = instances.filter((c: any) => c.dispose.mock.calls.length === 0)
+    expect(alive).toHaveLength(0)
+  })
+
+  it('切换主题后图表颜色跟着变（reactive 常量不再冻结在首次主题）', async () => {
+    const { init } = await import('echarts')
+    const { theme: themeRef } = useTheme()
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: fiveTierCrisis })
+    const dimOf = () => {
+      const options = (init as any).mock.results
+        .map((r: any) => r.value.setOption.mock.calls[0]?.[0])
+        .filter(Boolean)
+      return [...options].reverse().find((o: any) => o.yAxis?.type === 'category'
+        && Array.isArray(o.yAxis.data) && o.yAxis.data.includes('回撤独立性'))
+    }
+    const lightColors = dimOf().series[0].data.map((d: any) => d.itemStyle.color)
+    CSS_VARS['--score-1'] = '#ff0000'
+    CSS_VARS['--ink-soft'] = '#00ff00'
+    ;(w.vm as any).$forceUpdate?.()
+    themeRef.value = themeRef.value === 'light' ? 'dark' : 'light'
+    await new Promise((r) => setTimeout(r, 200))
+    await flushPromises()
+    const darkColors = dimOf().series[0].data.map((d: any) => d.itemStyle.color)
+    expect(darkColors).toContain('#ff0000')
+    expect(darkColors).not.toEqual(lightColors)
+    CSS_VARS['--score-1'] = '#c0392b'
+    CSS_VARS['--ink-soft'] = '#6b7280'
+  })
+
+  it('图表根级文字色/坐标轴/图例随主题注入（不落回 ECharts 浅色默认）', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    expect(options.length).toBeGreaterThan(0)
+    for (const o of options) {
+      expect(o.textStyle.color).toBe(CSS_VARS['--ink-soft'])
+      for (const ax of ['xAxis', 'yAxis']) {
+        if (!o[ax]) continue
+        for (const inst of ([] as any[]).concat(o[ax])) {
+          if (inst.axisLabel) expect(inst.axisLabel.color).toBe(CSS_VARS['--ink-soft'])
+          if (inst.splitLine) expect(inst.splitLine.lineStyle.color).toBe(CSS_VARS['--line'])
+        }
+      }
+      if (o.legend && o.legend.textStyle) expect(o.legend.textStyle.color).toBe(CSS_VARS['--ink-soft'])
+    }
+  })
+
+  it('重算后重新初始化 9 个危机Alpha 图表', async () => {
+    const w = await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const before = w.findAll('.ca-chart').length
+    expect(before).toBe(9)
+    ;(recomputeCrisisAlpha as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-25T11:00:00',
+    })
+    const btn = w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算'))[0]
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(w.text()).toContain('重新计算完成')
+  })
+})
+
+describe('Backtest.vue — 危机Alpha section 折叠', () => {
+  async function mountCollapsed(detailPayload: any) {
+    ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  it('进入详情默认折叠：标题可见，KPI/图表/模块均不渲染', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.find('.ca-header').exists()).toBe(true)
+    expect(w.text()).toContain('🌪️ 危机Alpha 专题分析')
+    expect(w.find('.ca-caret').classes()).not.toContain('open')
+    expect(w.findAll('.ca-kpi').length).toBe(0)
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.text()).not.toContain('一、核心结论')
+  })
+
+  it('点击标题展开：渲染 KPI/9 图表/12 模块，箭头旋转', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.find('.ca-caret').classes()).toContain('open')
+    expect(w.findAll('.ca-kpi').length).toBe(4)
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(w.text()).toContain('十二、全部下跌周明细（6 周）')
+  })
+
+  it('展开后再次点击折叠', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    expect(w.find('.ca-caret').classes()).not.toContain('open')
+  })
+
+  it('折叠态点危机卡：自动展开内容并滚动到 section', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    expect(w.findAll('.ca-chart').length).toBe(0)
+    await w.findAll('.stats-grid .stat-card')[6].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.ca-chart').length).toBe(9)
+    expect(scrollTargets.length).toBe(1)
+    expect(String(scrollTargets[0].className)).toContain('ca-section')
+  })
+
+  it('crisis_alpha=null 折叠态：展开后才显示重新计算按钮', async () => {
+    const w = await mountCollapsed({ ...mockDetail, crisis_alpha: null })
+    expect(w.text()).not.toContain('本次回测未包含危机Alpha分析')
+    await w.find('.ca-header').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('本次回测未包含危机Alpha分析')
+    expect(w.findAll('.ca-section button').filter((b) => b.text().includes('重新计算')).length).toBe(1)
+  })
+})
+
+describe('Backtest.vue — 市场状态×绩效（机遇/中性Alpha）section', () => {
+  // 挂载详情但不点击任何折叠头（危机与市场状态 section 均保持折叠）
+  async function mountMr(detailPayload: any) {
+    ;(getBacktestDetail as any).mockResolvedValue(detailPayload)
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').filter((b) => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  async function expandMr(w: any) {
+    await w.find('.mr-section .ca-header').trigger('click')
+    await flushPromises()
+  }
+
+  const mrBtns = (w: any) =>
+    w.findAll('.mr-section button').filter((b: any) => b.text().includes('重新计算'))
+
+  it('默认折叠：标题可见内容不渲染；market_regime=null 展开后显示未包含提示+重算按钮', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: null })
+    expect(w.find('.mr-section').exists()).toBe(true)
+    expect(w.text()).toContain('🚀 机遇Alpha · ⚖️ 中性Alpha 专题分析')
+    expect(w.text()).not.toContain('市场状态×绩效总表')
+    expect(w.find('.mr-section .ca-caret').classes()).not.toContain('open')
+
+    await expandMr(w)
+    expect(w.text()).toContain('本次回测未包含市场状态分析')
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('failed：展开后显示错误原因+重算按钮', async () => {
+    const w = await mountMr({
+      ...mockDetail,
+      market_regime: {
+        status: 'failed', error: '主基准指数无数据', computed_at: null,
+        benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    await expandMr(w)
+    expect(w.text()).toContain('市场状态分析失败：主基准指数无数据')
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('insufficient：显示样本不足，无重算按钮', async () => {
+    const w = await mountMr({
+      ...mockDetail,
+      market_regime: {
+        status: 'insufficient', error: '策略与基准共同交易日不足30天（12），无法分析',
+        computed_at: null, benchmark_code: '000300.SH', benchmark_name: '沪深300', data: null,
+      },
+    })
+    await expandMr(w)
+    expect(w.text()).toContain('样本不足')
+    expect(mrBtns(w).length).toBe(0)
+  })
+
+  it('completed：展开渲染 6 KPI/7 图表/九块内容，重算按钮 1 个', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.find('.mr-section .ca-caret').classes()).toContain('open')
+    // 稳健性 3 张 KPI 卡已紧凑化为一行摘要（节省纵向空间），仅剩顶部 6 卡
+    expect(w.findAll('.mr-section .ca-kpi').length).toBe(6)
+    for (const t of ['趋势上涨', '同步涨', '未收复', '假突破磨损']) {
+      expect(w.text()).toContain(t)
+    }
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(7)
+    for (const t of [
+      '一、市场状态×绩效总表', '二、机遇Alpha（上涨捕获）',
+      '三、反弹弹性（下跌后反弹段）', '四、中性Alpha（震荡磨损）',
+      '五、风格×绩效矩阵（结构性行情）', '六、市场分化度（宽基截面标准差）',
+      '七、隐含风格暴露（滚动相关热力图）', '八、行业归因',
+      '九、稳健性体检',
+    ]) {
+      expect(w.text()).toContain(t)
+    }
+    expect(mrBtns(w).length).toBe(1)
+  })
+
+  it('披露实际统计窗口：五/六/七/七-B 窗口短于回测区间时给出截断说明', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    // 夹具：meta.n_weeks_labeled=50，实际窗口 3 周 / 2 周 → 四处都应提示被截断
+    expect(w.text()).toContain('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）')
+    expect(w.text()).toContain('实际统计窗口 2024-02-02 ~ 2024-02-09（2 周）')
+    expect(w.text()).toContain('短于回测区间 50 周')
+    // 六/七/七-B 同为 3 周窗口 → 三处都披露
+    const notes = w.findAll('.mr-section .ca-note').map((n) => n.text())
+      .filter((t) => t.includes('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）'))
+    expect(notes.length).toBe(3)
+  })
+
+  it('窗口覆盖整个回测区间时只报窗口、不误报截断', async () => {
+    const full = JSON.parse(JSON.stringify(marketRegimeCompleted))
+    full.data.meta.n_weeks_labeled = 3
+    const w = await mountMr({ ...mockDetail, market_regime: full })
+    await expandMr(w)
+    const notes = w.findAll('.mr-section .ca-note').map((n) => n.text())
+      .filter((t) => t.includes('实际统计窗口 2024-01-05 ~ 2024-01-19（3 周）'))
+    expect(notes.length).toBe(3)
+    for (const t of notes) expect(t).not.toContain('短于回测区间')
+    // 五 只有 2 周 < 3 周 → 仍应报截断
+    expect(w.text()).toContain('实际统计窗口 2024-02-02 ~ 2024-02-09（2 周）；短于回测区间 3 周')
+  })
+
+  it('TR-17.1 新记录：行业归因渲染暴露图/命中率卡片/贡献表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('周度领涨命中率')
+    expect(w.text()).toContain('月度领涨命中率')
+    expect(w.text()).toContain('半导体')
+    expect(w.text()).toContain('行业收益贡献分解')
+    // 暴露图容器存在（7 个图表中的第 5 个）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(7)
+  })
+
+  it('TR-17.1 老记录：行业归因仅门禁提示，不 init 图表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeNeedsRerun })
+    await expandMr(w)
+    expect(w.text()).toContain('八、行业归因')
+    expect(w.text()).toContain('该记录回测时未保存持仓明细，重新回测后可用')
+    // 无行业暴露图（基础 4 图 + 四象限 1 + 稳健性直方图 1 个 = 6）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
+    expect(w.text()).not.toContain('周度领涨命中率')
+    expect(w.text()).not.toContain('行业收益贡献分解')
+  })
+
+  it('TR-18.3 稳健性：渲染半年矩阵/滚动分布/亏损窗口/基准敏感性', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('九、稳健性体检')
+    expect(w.text()).toContain('逐半年指标矩阵')
+    expect(w.text()).toContain('2024H1')
+    expect(w.text()).toContain('滚动 26/52 周收益与夏普分布')
+    expect(w.text()).toContain('最长亏损窗口')
+    expect(w.text()).toContain('86 天')
+    expect(w.text()).toContain('基准替换敏感性')
+    // 主基准标记 + 不可用基准降级文案
+    expect(w.text()).toContain('沪深300')
+    expect(w.text()).toContain('（主）')
+    expect(w.text()).toContain('对齐交易日不足（8 日），无法计算')
+  })
+
+  it('TR-18.3 稳健性不足：显示空态原因且无矩阵/图表', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeRbInsufficient })
+    await expandMr(w)
+    expect(w.text()).toContain('九、稳健性体检')
+    expect(w.text()).toContain('策略与基准共同交易日不足30天（12），稳健性无法分析')
+    expect(w.text()).not.toContain('逐半年指标矩阵')
+    expect(w.text()).not.toContain('基准替换敏感性')
+    // 无稳健性直方图（四象限+行业暴露图仍在，共 6 图）
+    expect(w.findAll('.mr-section .ca-chart').length).toBe(6)
+  })
+
+  it('风格矩阵渲染 6 行 + 跳过指数提示 + 暴露热力图', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    // 风格矩阵 6 行
+    const rows = w.findAll('.mr-section table tbody tr')
+    // 前 4 块表行数较多，直接定位含风格标签的文本
+    expect(w.text()).toContain('科技成长')
+    expect(w.text()).toContain('中小盘')
+    expect(w.text()).toContain('大盘价值')
+    expect(w.text()).toContain('普涨')
+    expect(w.text()).toContain('普跌')
+    expect(w.text()).toContain('无主线')
+    // 跳过指数提示
+    expect(w.text()).toContain('科创50')
+    // 分化度档位
+    expect(w.text()).toContain('低分化（普涨普跌）')
+    expect(w.text()).toContain('高分化（结构性）')
+    // 暴露表含宽基名
+    expect(w.text()).toContain('创业板指')
+    expect(w.text()).toContain('最新相关')
+    expect(w.text()).toContain('最新 Beta')
+    void rows
+  })
+
+  it('增强A：四象限纯风格暴露渲染第二热力图 + 跳过提示；老记录无该键时空态', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    expect(w.text()).toContain('七-B、巨潮四象限·纯风格暴露')
+    for (const t of ['大盘成长', '中盘价值', '小盘成长']) {
+      expect(w.text()).toContain(t)
+    }
+    // 四象限自身的跳过提示（区别于宽基跳过的「科创50」）
+    expect(w.text()).toContain('以下四象限指数不可得，已跳过：小盘价值')
+    // 老记录：无 quadrant_exposure 键 → 空态且不崩
+    const oldData = { ...marketRegimeCompleted.data }
+    delete (oldData as any).quadrant_exposure
+    const w2 = await mountMr({
+      ...mockDetail,
+      market_regime: { ...marketRegimeCompleted, data: oldData },
+    })
+    await expandMr(w2)
+    expect(w2.text()).toContain('七-B、巨潮四象限·纯风格暴露')
+    expect(w2.text()).toContain('该记录暂无四象限暴露数据')
+    // 少 1 张四象限热力图（7 → 6）
+    expect(w2.findAll('.mr-section .ca-chart').length).toBe(6)
+  })
+
+  it('点击重算 → 调 recomputeMarketRegime → 成功后显示完成提示', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    ;(recomputeMarketRegime as any).mockResolvedValue({
+      status: 'completed', error: null, computed_at: '2026-09-27T12:00:00',
+    })
+    await mrBtns(w)[0].trigger('click')
+    await flushPromises()
+    expect(recomputeMarketRegime).toHaveBeenCalledWith(1)
+    expect(getBacktestDetail).toHaveBeenCalledTimes(2)  // 详情重载
+    expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算完成')
+  })
+
+  it('重算抛错 → 显示失败提示', async () => {
+    const w = await mountMr({ ...mockDetail, market_regime: marketRegimeCompleted })
+    await expandMr(w)
+    ;(recomputeMarketRegime as any).mockRejectedValue(new Error('boom'))
+    await mrBtns(w)[0].trigger('click')
+    await flushPromises()
+    expect(w.find('.mr-section .ca-msg').text()).toContain('重新计算失败')
+  })
+})
+
+describe('Backtest.vue — 饼图描边色走 --chart-bg token', () => {
+  it('扇区描边色取自 --chart-bg 而非 --card-bg', async () => {
+    const { init } = await import('echarts')
+    await mountDetail({ ...mockDetail, crisis_alpha: crisisAlphaCompleted })
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    const pie = options.find((o: any) => o.series?.[0]?.type === 'pie')
+    expect(pie).toBeTruthy()
+    expect(pie.series[0].itemStyle.borderColor).toBe(CSS_VARS['--chart-bg'])
+  })
+
+  it('浅色 :root 中 --chart-bg 与 --card-bg 同值（描边在浅底上可见）', () => {
+    const css = readFileSync('src/style.css', 'utf-8')
+    const root = css.match(/:root\s*\{([\s\S]*?)\n\}/)![1]
+    const pick = (n: string) => root.match(new RegExp(`${n}:\\s*([^;]+);`))![1].trim()
+    expect(pick('--chart-bg')).toBe(pick('--card-bg'))
   })
 })

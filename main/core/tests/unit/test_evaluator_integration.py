@@ -57,13 +57,8 @@ def test_run_produces_evaluations_from_snapshots():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {
-        datetime(2026, 7, 30): Decimal("10.2"),
-        datetime(2026, 7, 31): Decimal("9.0"),
-    }}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     evaluations = result["evaluations"]
     assert evaluations is not None
@@ -86,13 +81,8 @@ def test_evaluator_accepts_backtest_snapshots():
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     }
-    open_prices = {stock: {
-        datetime(2026, 7, 30): Decimal("10.2"),
-        datetime(2026, 7, 31): Decimal("9.0"),
-    }}
-
     engine = BacktestEngine()
-    result = engine.run(port, klines=klines, signal_cache=cache, open_prices=open_prices)
+    result = engine.run(port, klines=klines, signal_cache=cache)
 
     ev = Evaluator()
     evaluations = ev.evaluate(result["snapshots"])

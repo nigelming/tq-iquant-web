@@ -10,10 +10,10 @@ dependencies = [
     "fastapi>=0.140.13",
     "httpx>=0.28.1",
     "openpyxl>=3.1.5",
+    "pandas>=3.0.5",
     "polars>=1.43.1",
     "pydantic>=2.13.4",
     "pytdx>=1.72",
-    "pytest>=9.1.1",
     "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.51",
     "tq-iquant-shared",
@@ -22,6 +22,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
 

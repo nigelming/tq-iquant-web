@@ -1,19 +1,23 @@
+import sys
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
 
-_default_config_path = Path(__file__).resolve().parent.parent.parent / "config.yaml"
+def _default_config_path() -> Path:
+    if hasattr(sys, 'frozen'):
+        return Path(sys.argv[0]).resolve().parent / "config.yaml"
+    return Path(__file__).resolve().parent.parent.parent / "config.yaml"
 
 
 def get_config_path() -> Path:
-    return _default_config_path
+    return _default_config_path()
 
 
 def _defaults() -> dict:
     return {
-        "tdx_path": "",
+        "tdx_path": "D:\\zd_zyb",
         "iquant_path": "",
         "max_concurrent_backtest": 1,
         "database": {
@@ -38,7 +42,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(config_path: Optional[str] = None) -> dict:
-    path = Path(config_path) if config_path else _default_config_path
+    path = Path(config_path) if config_path else _default_config_path()
     if not path.exists():
         return _defaults()
     with open(path, "r", encoding="utf-8") as f:
@@ -47,6 +51,6 @@ def load_config(config_path: Optional[str] = None) -> dict:
 
 
 def save_config(cfg: dict, config_path: Optional[str] = None) -> None:
-    path = Path(config_path) if config_path else _default_config_path
+    path = Path(config_path) if config_path else _default_config_path()
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)

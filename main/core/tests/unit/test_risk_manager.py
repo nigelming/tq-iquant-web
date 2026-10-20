@@ -49,6 +49,44 @@ def test_max_drawdown_three_triggers_manual_recovery():
     assert pm.circuit_breaker_active is True
 
 
+# ===========================================================================
+# 回测模式：熔断不永久锁（enable_manual_recovery=False）
+# 真机 bug：加性前复权产生负/近零价 → 2000 万股异常单 → -41% 假回撤 →
+# max_drawdown 熔断 3 次 → manual_recovery 永久停机 6 年（回测无人工恢复）。
+# 回测应始终「触发次日恢复」，永不转永久手动锁。
+# ===========================================================================
+def test_backtest_mode_breaker_never_permanent_manual_lock():
+    """回测模式（enable_manual_recovery=False）：累计触发 >=3 次仍不转手动，
+    次日自动恢复，避免一次异常回撤永久停机。"""
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+        enable_manual_recovery=False,
+    )
+    initial = Decimal("100000")
+    trigger_days = [date(2026, 7, 2), date(2026, 7, 4), date(2026, 7, 6), date(2026, 7, 8)]
+    for td in trigger_days:
+        pm.update(Decimal("100000"), td - timedelta(days=1), initial)  # 建峰
+        pm.update(Decimal("79000"), td, initial)                       # 触发
+    assert pm.consecutive_drawdown_triggers == 4
+    assert pm.manual_recovery is False
+    # 触发次日回升 → 自动恢复，未永久停机
+    pm.update(Decimal("99000"), date(2026, 7, 9), initial)
+    assert pm.circuit_breaker_active is False
+    assert pm.is_trading_halted() is False
+
+
+def test_live_mode_breaker_still_permanent_manual_lock():
+    """默认（实盘）保持原语义：累计 3 次转手动永久锁。"""
+    pm = _pm()
+    initial = Decimal("100000")
+    for td in [date(2026, 7, 2), date(2026, 7, 4), date(2026, 7, 6)]:
+        pm.update(Decimal("100000"), td - timedelta(days=1), initial)
+        pm.update(Decimal("79000"), td, initial)
+    assert pm.manual_recovery is True
+    pm.update(Decimal("100000"), date(2026, 7, 10), initial)
+    assert pm.circuit_breaker_active is True
+
+
 def test_daily_loss_triggers_pause_next_day_recovery():
     """日内亏损 ≥ daily_loss_limit → daily_pause_active=True，次日恢复。
     initial=100000, limit=5% → 日内亏 6000(6%) 触发。"""

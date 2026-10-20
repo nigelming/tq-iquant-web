@@ -58,7 +58,7 @@ onMounted(load)
     <button @click="load" class="btn">刷新</button>
   </div>
 
-  <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:12px">
+  <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
   </div>
 
@@ -104,13 +104,13 @@ onMounted(load)
           <tbody>
             <tr v-for="r in recentBacktests" :key="r.id">
               <td>{{ r.name }}</td>
-              <td style="color:#888">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
+              <td style="color:var(--ink-soft)">{{ fmtDate(r.start_date) }} ~ {{ fmtDate(r.end_date) }}</td>
               <td>
                 <span v-if="r.status === 'completed'" class="badge badge-green">完成</span>
                 <span v-else-if="r.status === 'running'" class="badge badge-blue">运行中</span>
                 <span v-else class="badge badge-gray">{{ r.status }}</span>
               </td>
-              <td>{{ r.progress != null ? Math.round(r.progress * 100) + '%' : '-' }}</td>
+              <td>{{ r.progress != null ? r.progress + '%' : '-' }}</td>
             </tr>
           </tbody>
         </table>
@@ -120,13 +120,13 @@ onMounted(load)
 
     <div class="card">
       <h3 style="margin:0 0 8px">系统配置</h3>
-      <p v-if="cfg" style="margin:0;color:var(--text-secondary)">
+      <p v-if="cfg" style="margin:0;color:var(--ink-soft)">
         通达信路径：{{ cfg.tdx_path }}<br>
         iQuant 路径：{{ cfg.iquant_path }}<br>
         仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>
         实盘桥：{{ cfg.iquant_bridge.live.base_url }}
       </p>
-      <p v-else style="margin:0;color:var(--text-secondary)">配置加载失败</p>
+      <p v-else style="margin:0;color:var(--ink-soft)">配置加载失败</p>
     </div>
   </template>
 </template>

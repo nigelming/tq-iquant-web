@@ -7,7 +7,7 @@ import { getSystemConfigs, updateSystemConfigs, type SystemConfig } from '../api
 // iquant_bridge.simulation/live.base_url(双桥地址：仿真8790/实盘8791，按 session 模式选桥)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
-  tdx_path: '',
+  tdx_path: 'D:\\zd_zyb',
   iquant_path: '',
   max_concurrent_backtest: 1,
   database: { sqlite_path: '' },
@@ -60,21 +60,21 @@ async function save() {
     <div v-if="loading" class="empty-state"><p>加载中…</p></div>
 
     <div v-else>
-      <div v-if="errorMsg" class="card" style="padding:12px;color:#c0392b;margin-bottom:16px">
+      <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:16px">
         {{ errorMsg }}
       </div>
 
       <h3 style="margin:0 0 4px">通达信</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:#888">
+      <p style="margin:0 0 12px;font-size:12px;color:var(--ink-soft)">
         通达信客户端安装目录，回测行情 / 日线 / 周线数据的来源（通达信规范）
       </p>
       <div class="field">
         <label>通达信目录</label>
-        <input v-model="config.tdx_path" placeholder="D:\new_tdx64" />
+        <input v-model="config.tdx_path" placeholder="D:\zd_zyb" />
       </div>
 
       <h3 style="margin:20px 0 4px">iQuant</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:#888">
+      <p style="margin:0 0 12px;font-size:12px;color:var(--ink-soft)">
         iQuant 客户端安装目录，实盘桥策略所在（HTTP 桥 8790 仿真 / 8791 实盘）
       </p>
       <div class="field">
@@ -83,7 +83,7 @@ async function save() {
       </div>
 
       <h3 style="margin:20px 0 4px">实盘桥</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:#888">
+      <p style="margin:0 0 12px;font-size:12px;color:var(--ink-soft)">
         iQuant 客户端内两个桥策略的 HTTP 地址，按 session 模式选桥（仿真→仿真桥，实盘→实盘桥），绑 loopback 单用户，无鉴权
       </p>
       <div class="field">
@@ -96,7 +96,7 @@ async function save() {
       </div>
 
       <h3 style="margin:20px 0 4px">回测</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:#888">
+      <p style="margin:0 0 12px;font-size:12px;color:var(--ink-soft)">
         同一时刻最多允许运行的回测任务数，超出返回 HTTP 409
       </p>
       <div class="field">
@@ -105,7 +105,7 @@ async function save() {
       </div>
 
       <h3 style="margin:20px 0 4px">数据库</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:#888">
+      <p style="margin:0 0 12px;font-size:12px;color:var(--ink-soft)">
         SQLite 数据库文件路径（相对 main/ 目录解析，纯单用户本地工具）
       </p>
       <div class="field">
@@ -115,7 +115,7 @@ async function save() {
 
       <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
         <button @click="save" class="btn btn-primary">保存</button>
-        <span v-if="saved" style="color:#065f46;font-size:13px">已保存</span>
+        <span v-if="saved" style="color:var(--green);font-size:13px">已保存</span>
       </div>
     </div>
   </div>

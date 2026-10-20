@@ -12,6 +12,36 @@ class TQData:
         with get_tdx_lock():
             return self._get_stocks(pool_code)
 
+    def get_industry_list(self) -> List[dict]:
+        """通达信二级行业（881xxx，共 128 个），归一化 [{"code","name"}]。
+
+        list_type=1 时 get_sector_list 返回 [{"Code","Name"}] 字典。
+        """
+        with get_tdx_lock():
+            raw = get_tq().get_sector_list(list_type=1) or []
+            out: List[dict] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("Code") or "")
+                if code.startswith("881"):
+                    out.append({"code": code,
+                                "name": str(item.get("Name") or code)})
+            return out
+
+    def get_stock_industry(self, stock_code: str) -> Optional[dict]:
+        """个股所属通达信二级行业（get_relation 中 BlockType=='行业' 的唯一块）。
+
+        返回 {"code": "881002.SH", "name": "煤炭开采"}；无行业块返回 None。
+        """
+        with get_tdx_lock():
+            blocks = get_tq().get_relation(stock_code) or []
+            for b in blocks:
+                if isinstance(b, dict) and b.get("BlockType") == "行业":
+                    return {"code": b.get("BlockCode"),
+                            "name": b.get("BlockName")}
+            return None
+
     def get_history(
         self, stocks: List[str], periods: List[str],
         start: str = "", end: str = "",
