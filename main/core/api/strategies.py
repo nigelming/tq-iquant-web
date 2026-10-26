@@ -33,6 +33,7 @@ from core.services.strategy_service import (
     delete_strategy as _svc_delete_strategy,
     count_slave_strategies as _svc_count_slave_strategies,
 )
+from core.services.signal_schedule import validate_signal_config
 
 router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
@@ -79,6 +80,10 @@ class StrategyItem(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    signal_frequency: str | None = None
+    signal_at: str | None = None
+    signal_weekday: int | None = None
+    signal_data_end: str | None = None
 
 
 class PortfolioCreate(BaseModel):
@@ -390,6 +395,10 @@ class StrategyCreate(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    signal_frequency: str | None = None
+    signal_at: str | None = None
+    signal_weekday: int | None = None
+    signal_data_end: str | None = None
 
 
 def _validate_strategy(
@@ -405,6 +414,12 @@ def _validate_strategy(
         return f"role 必须为 {sorted(VALID_ROLES)}，收到 {req.role}"
     if req.period not in VALID_PERIODS:
         return f"period 必须为 {sorted(VALID_PERIODS)}，收到 {req.period}"
+    sig_msg = validate_signal_config(
+        req.period, req.signal_frequency, req.signal_at,
+        req.signal_weekday, req.signal_data_end,
+    )
+    if sig_msg:
+        return sig_msg
     if not (0 < req.capital_ratio <= 1):
         return f"capital_ratio 必须在 (0,1]，收到 {req.capital_ratio}"
     # 数值字段范围校验（max_positions/开平仓比例/风控比例）

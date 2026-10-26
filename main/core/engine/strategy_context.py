@@ -36,9 +36,17 @@ class StrategyContext:
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
         # ≤ capital_ratio × 组合初始资金（仅回测成交步传入生效）
         exposure_cap_enabled: bool = False,
+        signal_frequency: Optional[str] = None,
+        signal_at: Optional[str] = None,
+        signal_weekday: Optional[int] = None,
+        signal_data_end: Optional[str] = None,
     ):
         self.strategy_id = strategy_id
         self.period = period
+        self.signal_frequency = signal_frequency
+        self.signal_at = signal_at
+        self.signal_weekday = signal_weekday
+        self.signal_data_end = signal_data_end
         self.capital_ratio = capital_ratio
         self.max_positions = max_positions
         # 下单量参数（对应策略表字段，默认值同表默认）

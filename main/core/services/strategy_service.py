@@ -49,6 +49,10 @@ def serialize_strategy(s: Strategy) -> dict:
         "trend_max_positions": s.trend_max_positions,
         # #3 策略级敞口上限（默认关）
         "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
+        "signal_frequency": s.signal_frequency,
+        "signal_at": s.signal_at,
+        "signal_weekday": s.signal_weekday,
+        "signal_data_end": s.signal_data_end,
     }
 
 
@@ -165,6 +169,10 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
             trend_max_positions=getattr(s, "trend_max_positions", None),
             exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
+            signal_frequency=getattr(s, "signal_frequency", None),
+            signal_at=getattr(s, "signal_at", None),
+            signal_weekday=getattr(s, "signal_weekday", None),
+            signal_data_end=getattr(s, "signal_data_end", None),
         )
         db.add(strat)
         inserted.append(strat)
@@ -279,6 +287,10 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.trend_max_positions = getattr(req, "trend_max_positions", None)
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
+    s.signal_frequency = getattr(req, "signal_frequency", None)
+    s.signal_at = getattr(req, "signal_at", None)
+    s.signal_weekday = getattr(req, "signal_weekday", None)
+    s.signal_data_end = getattr(req, "signal_data_end", None)
 
 
 def portfolio_exists(db: Session, pid: int) -> bool:

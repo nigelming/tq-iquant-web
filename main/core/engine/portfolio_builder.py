@@ -120,6 +120,10 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
             trend_max_positions=getattr(strat, "trend_max_positions", None),
             # #3 策略级敞口上限（可选，默认关；仅回测成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
+            signal_frequency=strat.signal_frequency,
+            signal_at=strat.signal_at,
+            signal_weekday=strat.signal_weekday,
+            signal_data_end=strat.signal_data_end,
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()
