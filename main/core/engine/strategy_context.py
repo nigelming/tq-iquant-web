@@ -40,6 +40,8 @@ class StrategyContext:
         signal_at: Optional[str] = None,
         signal_weekday: Optional[int] = None,
         signal_data_end: Optional[str] = None,
+        formula_name: str = "",
+        formula_id: Optional[int] = None,
     ):
         self.strategy_id = strategy_id
         self.period = period
@@ -47,6 +49,8 @@ class StrategyContext:
         self.signal_at = signal_at
         self.signal_weekday = signal_weekday
         self.signal_data_end = signal_data_end
+        self.formula_name = formula_name
+        self.formula_id = formula_id
         self.capital_ratio = capital_ratio
         self.max_positions = max_positions
         # 下单量参数（对应策略表字段，默认值同表默认）

@@ -110,7 +110,17 @@ class LiveEngine:
         trading_calendar: Optional[TradingCalendar] = None,
         regime_provider: Optional[Callable] = None,
         benchmark_codes: Optional[Dict[int, str]] = None,
+        execution_mode: str = "auto",
+        signal_monitor=None,
+        signal_scheduler=None,
+        formula_id_by_strategy: Optional[Dict[int, int]] = None,
+        enable_signal_monitor: bool = False,
     ):
+        # alert/auto mode
+        self.execution_mode = execution_mode
+        self._signal_monitor = signal_monitor
+        self._signal_scheduler = signal_scheduler
+        self._formula_id_by_strategy = formula_id_by_strategy or {}
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
         self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
@@ -157,7 +167,10 @@ class LiveEngine:
         self.market_data = MarketDataService(
             self.ctx,
             bar_poller,
-            on_bar=self._handle_bar,
+            on_bar=(
+                self._handle_alert_bar
+                if execution_mode == "alert" else self._handle_bar
+            ),
             set_available_map=self._t1_checker.set_available_map,
             tq_formula=tq_formula,
             formula_by_strategy=formula_by_strategy,
@@ -459,9 +472,10 @@ class LiveEngine:
         self._executor = ThreadPoolExecutor(max_workers=1)
         # C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路）。
         # 一次同步 TDX 计算（get_tdx_lock 串行），阻塞事件循环可接受（启动一次性）。
-        self._inject_startup_periods(
-            datetime.combine(now_shanghai().date(), datetime.min.time())
-        )
+        if self.execution_mode != "alert":
+            self._inject_startup_periods(
+                datetime.combine(now_shanghai().date(), datetime.min.time())
+            )
         # 预热 1m/5m/15m/30m/1h 历史 bar 到 _preheat_cache（启动一次性同步拉取）。
         # 运行期 _get_bars_with_increment 读缓存 + 增量拼接，省去每 bar/每边界全量重拉。
         # 必须在 _loop 起来前完成（否则首个 bar 触发时缓存未就绪）；与 _inject_startup_periods
@@ -470,7 +484,8 @@ class LiveEngine:
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
         # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 60s 拉 bar 一起）
-        self._deals_task = asyncio.create_task(self._deals_loop())
+        if self.execution_mode != "alert":
+            self._deals_task = asyncio.create_task(self._deals_loop())
 
     async def stop(self) -> None:
         """停循环任务。"""
@@ -532,6 +547,9 @@ class LiveEngine:
         下一轮继续。BridgeUnavailableError → 置离线，本轮跳过。
         """
         try:
+            if self.execution_mode == "alert":
+                self._tick_alert()
+                return
             # E8：心跳前的在线状态，用于离线→在线转场时重建基线
             was_online = self._bridge_online
             if not self._dispatcher.heartbeat():
@@ -637,9 +655,13 @@ class LiveEngine:
         df_cache: Dict = {}
         raw_cache: Dict = {}
         bars_by_code = getattr(bar, "bars_by_code", None) or None
+        handler = (
+            self._handle_alert_bar
+            if self.execution_mode == "alert" else self._handle_bar
+        )
         for portfolio in self.portfolios:
             try:
-                self._handle_bar(
+                handler(
                     portfolio, bar, bars_by_code=bars_by_code,
                     df_cache=df_cache, raw_cache=raw_cache,
                 )
@@ -711,6 +733,49 @@ class LiveEngine:
                 portfolio.portfolio_id, code, exc_info=True,
             )
 
+    def _tick_alert(self, now: Optional[datetime] = None) -> None:
+        """alert 单轮：TQ 心跳 → 拉行情 → 调度信号；不碰委托/成交/持仓。"""
+        was_online = self._bridge_online
+        if not self._dispatcher.heartbeat():
+            self._bridge_online = False
+            return
+        self._bridge_online = True
+        if not was_online:
+            # 离线恢复：丢弃离线期间积压的 bar/预热缓存，避免恢复首轮补发陈旧预警。
+            if hasattr(self._bar_poller, "reset_baseline"):
+                self._bar_poller.reset_baseline()
+            self._preheat_cache.clear()
+        self._bar_poller.poll()
+        now = now or now_shanghai()
+        if self._signal_scheduler is not None:
+            for batch in self._signal_scheduler.due(now):
+                self._signal_scheduler.execute(batch)
+
+    def _handle_alert_bar(
+        self,
+        portfolio,
+        bar,
+        bars_by_code=None,
+        df_cache=None,
+        raw_cache=None,
+    ) -> None:
+        """alert 模式：只算公式 + 监控信号，不下单、不跑风控。"""
+        self.market_data.fill_signal_cache(
+            portfolio,
+            bar,
+            bars_by_code=bars_by_code,
+            df_cache=df_cache,
+            raw_cache=raw_cache,
+        )
+        if self._signal_monitor is not None:
+            self._signal_monitor.evaluate(
+                portfolio,
+                bar,
+                self.market_data.signal_cache,
+                strategies=portfolio.strategies,
+                frequency=bar.period or "1m",
+            )
+
     def _handle_bar(
         self,
         portfolio: Portfolio,
@@ -750,6 +815,14 @@ class LiveEngine:
             portfolio, bar, bars_by_code=bars_by_code,
             df_cache=df_cache, raw_cache=raw_cache,
         )
+        if self._signal_monitor is not None:
+            self._signal_monitor.evaluate(
+                portfolio,
+                bar,
+                self.signal_cache,
+                strategies=portfolio.strategies,
+                frequency=bar.period or "1m",
+            )
         # C6：period 过滤——5m 边界 bar 不触发 1m 策略的风控单（_check_risks 读 bar.stocks close）
         # 在途单注入（OPEN 闸门 × max_positions）：_pending_orders 里的未成交 BUY
         # （submitted/partial）尚未落持仓（submitted 只建 quantity=0 的 Position），
@@ -773,15 +846,17 @@ class LiveEngine:
                 ctx = portfolio.find_strategy(order.strategy_id)
                 if ctx is None:
                     continue
-                # B5：信号触发推送（在下单前——被 cap/拒单的信号也可见）
-                self._emit("signal", {
-                    "portfolio_id": portfolio.portfolio_id,
-                    "strategy_id": order.strategy_id,
-                    "stock_code": order.stock_code,
-                    "signal_name": order.signal_name,
-                    "signal_type": order.signal_type.value if order.signal_type else None,
-                    "bar_time": order.bar_time.isoformat() if order.bar_time else None,
-                })
+                # 1w/1mon 的 signal_cache 由注入路径提供、monitor 不重算，
+                # 保留旧成单 SSE 避免前端丢信号；其余周期由 monitor 统一发。
+                if self._signal_monitor is None or bar.period in ("1w", "1mon"):
+                    self._emit("signal", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "strategy_id": order.strategy_id,
+                        "stock_code": order.stock_code,
+                        "signal_name": order.signal_name,
+                        "signal_type": order.signal_type.value if order.signal_type else None,
+                        "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+                    })
                 # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
                 # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
                 # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
