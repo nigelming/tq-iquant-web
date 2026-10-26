@@ -120,7 +120,7 @@ def test_portfolio_add_threshold_message_no_long_decimal():
     bar = BarEvent(stocks={"000001.SZ": _ohlcv("7.30")}, bar_time=datetime(2026, 7, 30, 15, 0))
     sig = SignalEvent(strategy_id=1, stock_code="000001.SZ",
                       signal_name="add_sig", signal_type=SignalType.ADD, bar_time=bar.bar_time)
-    assert port._signal_to_order(ctx, sig, bar) is None
+    assert port._signal_to_order(ctx, sig, bar) == []
     msgs = _messages(rec, "add_threshold_not_met")
     assert msgs and not _LONG_DEC.search(msgs[0]), msgs
 

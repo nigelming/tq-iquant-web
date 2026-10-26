@@ -228,6 +228,52 @@ def test_open_signal_quantity_from_single_open_ratio():
     assert orders[0].quantity == 500
 
 
+def test_strategy_fund_capped_by_equity_cap():
+    """W3 容量上限：dynamic 资金 = capital_ratio × min(净值, equity_cap)。
+    净值超上限 → 资金封顶；未设上限 → 按净值放大（历史行为不变）。"""
+    port, ctx = _strategy_with_params("000001.SZ", [])
+    # 未设上限：0.6 × 200000 = 120000
+    port._bar_equity = Decimal("200000")
+    assert port._strategy_fund(ctx) == Decimal("120000")
+    # 设上限 50000：0.6 × min(200000, 50000) = 30000（封顶）
+    port.equity_cap = Decimal("50000")
+    assert port._strategy_fund(ctx) == Decimal("30000")
+    # 净值未超上限：0.6 × 40000 = 24000
+    port._bar_equity = Decimal("40000")
+    assert port._strategy_fund(ctx) == Decimal("24000")
+    # fixed 模式不受上限影响：按初始资金
+    port.position_sizing = "fixed"
+    port.equity_cap = Decimal("50000")
+    assert port._strategy_fund(ctx) == ctx.capital_ratio * Decimal("100000")
+
+
+def test_fee_reserve_setter_syncs_account_cfg():
+    """费用预留 setter：置 True 从 cost_params 写入 account.buy_fee_cfg；
+    置 False 清回 None（审批恢复仅价×量原行为）。"""
+    port = Portfolio(
+        portfolio_id=1, initial_capital=Decimal("100000"),
+        risk_manager=PortfolioRiskManager(
+            max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05")),
+        cost_params={"min_commission": Decimal("5"),
+                     "buy_commission_rate": Decimal("0.00025")},
+    )
+    assert port.fee_reserve_enabled is False
+    assert port.account.buy_fee_cfg is None
+    port.fee_reserve_enabled = True
+    assert port.account.buy_fee_cfg == (Decimal("5"), Decimal("0.00025"))
+    port.fee_reserve_enabled = False
+    assert port.account.buy_fee_cfg is None
+    # cost_params 缺费率时不写（保持不启用）
+    port2 = Portfolio(
+        portfolio_id=2, initial_capital=Decimal("100000"),
+        risk_manager=PortfolioRiskManager(
+            max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05")),
+        cost_params={},
+    )
+    port2.fee_reserve_enabled = True
+    assert port2.account.buy_fee_cfg is None
+
+
 def test_add_signal_respects_threshold_and_count():
     """ADD：现价较成本下跌 ≥ threshold 且 add_count < max_add_count 才出单。
     预置 avg_cost=10，现价 9.4（跌 6% ≥ 5%），add_count=0<2。
@@ -289,7 +335,7 @@ def test_add_signal_threshold_minus_one_adds_on_rise():
     """threshold=-1 特殊值：跳过 drop 检查，上涨也加仓。
     预置 avg_cost=10，现价 11（涨 10%，drop=-0.1），正常阈值会拦。
     stop_loss 抬到 0.2、take_profit 抬到 0.2 避免风控抢跑。
-    量 = add_position_ratio(0.05)×60000/11=272→200。"""
+    量 = add_position_ratio(0.05)×策略资金/11：dynamic 资金=0.6×(100000+1000×11)=66600→302.7→300。"""
     port, ctx = _strategy_with_params(
         "000001.SZ",
         [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
@@ -308,7 +354,7 @@ def test_add_signal_threshold_minus_one_adds_on_rise():
 
     assert len(orders) == 1
     assert orders[0].trade_type == TradeType.BUY
-    assert orders[0].quantity == 200
+    assert orders[0].quantity == 300
 
 
 def test_add_signal_threshold_minus_one_adds_on_extreme_rise():
@@ -610,6 +656,35 @@ def test_slave_sell_allowed_after_master_cleared():
     sell_orders = [o for o in orders if o.trade_type == TradeType.SELL and o.strategy_id == 2]
     assert len(sell_orders) == 1
     assert sell_orders[0].quantity == 1000
+
+
+def test_slave_open_blocked_when_master_closes_same_bar():
+    """Bug1 回归：master 本 bar 同步清仓 000001.SZ → slave 同 bar OPEN 该股被拦。
+
+    slave 的 OPEN 门禁查 master 的"已成交"持仓（_has_position），此时 master 的
+    SELL 尚未成交仍显示持仓 → 旧逻辑误放行，slave 会买入 master 正卖出的同一只
+    股票。修复后按本 bar 生成的订单后扫，剥掉同 bar slave 的 OPEN BUY。
+    """
+    port, master, slave = _master_slave_portfolio(master_has_position=True,
+                                                  master_holds_stock="000001.SZ")
+    # master 本 bar 触发 CLOSE（清仓 000001.SZ）
+    master.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    # slave 本 bar 触发 OPEN（同股）
+    slave.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    cache = {
+        (1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}],
+        (2, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}],
+    }
+    orders = port.on_bar(bar, signal_cache=cache)
+    master_sells = [o for o in orders if o.trade_type == TradeType.SELL and o.strategy_id == 1]
+    assert len(master_sells) == 1
+    slave_buys = [o for o in orders if o.trade_type == TradeType.BUY and o.strategy_id == 2]
+    assert slave_buys == []
 
 
 def test_slave_add_allowed_without_master_check():
@@ -1201,3 +1276,221 @@ def test_follow_master_order_carries_signal_bar_date_for_daily_slave():
     follow_sells = [o for o in orders if o.signal_name == "follow_master"]
     assert len(follow_sells) == 1
     assert follow_sells[0].signal_bar_date == _date(2026, 7, 30)
+
+
+# ===========================================================================
+# B4 OPEN 择优轮动（rotation_enabled 默认关）+ B5 状态参数生效
+# ===========================================================================
+from core.engine.decision import DecisionRecorder
+
+
+def _buy_code(code, price, quantity, trade_time):
+    from core.engine.event import TradeEvent
+    return TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code=code,
+        trade_type=TradeType.BUY, price=Decimal(str(price)), quantity=quantity,
+        amount=Decimal(str(price)) * quantity, commission=Decimal("0"),
+        stamp_duty=Decimal("0"), trade_time=trade_time,
+    )
+
+
+def _rotation_portfolio(**kw):
+    """max_positions=2、rotation_momentum_bars=3 的轮动组合（默认 rotation_enabled=True）。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    params = dict(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("1.0"), max_positions=2,
+        single_open_ratio=Decimal("0.1"),
+        rotation_enabled=True, rotation_momentum_bars=3,
+        rotation_hysteresis=Decimal("0.05"),
+    )
+    params.update(kw)
+    ctx = StrategyContext(**params)
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    # 风控全部钝化：止损/止盈极宽、移动止损 0 禁用，不干扰轮动断言
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    return port, ctx
+
+
+_ROT_DAYS = [datetime(2026, 7, 27), datetime(2026, 7, 28),
+             datetime(2026, 7, 29), datetime(2026, 7, 30)]
+
+
+def _feed_history(port, closes_by_code, final_signal_code=None):
+    """逐日喂 4 根 bar（A/B/C 同 bar）；末日给 final_signal_code 挂 OPEN 信号。"""
+    cache = {}
+    orders = []
+    for i, t in enumerate(_ROT_DAYS):
+        stocks = {}
+        for code, closes in closes_by_code.items():
+            c = Decimal(str(closes[i]))
+            stocks[code] = {"open": c, "high": c, "low": c, "close": c, "volume": 1000}
+        bar = BarEvent(stocks=stocks, bar_time=t)
+        if i == len(_ROT_DAYS) - 1 and final_signal_code:
+            cache = {(1, final_signal_code, t): [{"name": "open_sig", "value": 1}]}
+        orders = port.on_bar(bar, signal_cache=cache)
+        cache = {}
+    return orders
+
+
+def _hold_pair(ctx, a_time=datetime(2026, 7, 1), b_time=datetime(2026, 7, 1)):
+    pa = Position("000001.SZ")
+    pa.apply_trade(_buy_code("000001.SZ", "7", 1000, a_time))
+    ctx.positions["000001.SZ"] = pa
+    pb = Position("000002.SZ")
+    pb.apply_trade(_buy_code("000002.SZ", "10", 1000, b_time))
+    ctx.positions["000002.SZ"] = pb
+
+
+_STRONG_CLOSES = {
+    "000001.SZ": ["10", "9", "8", "7"],      # 动量 -0.30（最弱）
+    "000002.SZ": ["10", "10", "10", "10"],   # 动量 0
+    "000003.SZ": ["10", "11", "12", "13"],   # 动量 +0.30（新信号）
+}
+
+
+def test_rotation_replaces_weakest_on_strong_signal():
+    """满槽 + 强信号（动量 0.30 ≥ 最弱 -0.30 + 滞环 0.05）→ 轮出最弱 A + 换入 C。"""
+    port, ctx = _rotation_portfolio()
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    _hold_pair(ctx)
+
+    orders = _feed_history(port, _STRONG_CLOSES, final_signal_code="000003.SZ")
+
+    assert len(orders) == 2
+    sell, buy = orders
+    assert sell.stock_code == "000001.SZ"
+    assert sell.trade_type == TradeType.SELL
+    assert sell.signal_name == "rotation_exit"
+    assert sell.signal_type == SignalType.CLOSE
+    assert sell.quantity == 1000
+    assert buy.stock_code == "000003.SZ"
+    assert buy.trade_type == TradeType.BUY
+    assert buy.signal_name == "open_sig"
+    assert buy.signal_type == SignalType.OPEN
+    assert buy.quantity == 900  # dynamic：int(0.1×117000/13/100)×100（净值=100000+7000+10000）
+    # 日线信号两单都带 signal_bar_date（防未来函数闸门同常规）
+    assert sell.signal_bar_date == datetime(2026, 7, 30).date()
+    assert buy.signal_bar_date == datetime(2026, 7, 30).date()
+    assert any(ev.gate == "rotation_replaced" for ev in rec.drain())
+
+
+def test_rotation_weak_signal_blocked():
+    """新信号动量 -0.28 < 最弱 -0.30 + 滞环 0.05 → 不轮动，记 rotation_signal_weak。"""
+    port, ctx = _rotation_portfolio()
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    _hold_pair(ctx)
+    closes = dict(_STRONG_CLOSES)
+    closes["000003.SZ"] = ["10", "9", "8.5", "7.2"]  # 动量 -0.28
+
+    orders = _feed_history(port, closes, final_signal_code="000003.SZ")
+
+    assert orders == []
+    assert any(ev.gate == "rotation_signal_weak" for ev in rec.drain())
+
+
+def test_rotation_disabled_keeps_max_positions_full_block():
+    """默认（未开 rotation）：满槽 OPEN 一律拦截，记 max_positions_full（原逻辑）。"""
+    port, ctx = _rotation_portfolio(rotation_enabled=False)
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    _hold_pair(ctx)
+
+    orders = _feed_history(port, _STRONG_CLOSES, final_signal_code="000003.SZ")
+
+    assert orders == []
+    gates = {ev.gate for ev in rec.drain()}
+    assert "max_positions_full" in gates
+    assert "rotation_replaced" not in gates
+
+
+def test_rotation_skips_same_day_bought_candidate():
+    """当日买入的持仓 T+1 不可卖 → 跳过，轮出次弱（B，动量 0）。"""
+    port, ctx = _rotation_portfolio()
+    _hold_pair(ctx, a_time=datetime(2026, 7, 30, 9, 30))  # A 当日买入不可卖
+
+    orders = _feed_history(port, _STRONG_CLOSES, final_signal_code="000003.SZ")
+
+    assert len(orders) == 2
+    assert orders[0].stock_code == "000002.SZ"
+    assert orders[0].signal_name == "rotation_exit"
+
+
+def test_regime_bull_widens_max_positions_in_on_bar():
+    """B5：开闸 + bull → 槽位上限取 trend_max_positions(3)，第 3 只 OPEN 放行。"""
+    port, ctx = _rotation_portfolio(
+        rotation_enabled=False, regime_filter_enabled=True, trend_max_positions=3,
+    )
+    port.current_regime = "bull"
+    _hold_pair(ctx)  # 已持 2 只，原上限 2
+    t = datetime(2026, 7, 30)
+    bar = BarEvent(stocks={
+        "000003.SZ": {"open": Decimal("10"), "high": Decimal("10"),
+                      "low": Decimal("10"), "close": Decimal("10"), "volume": 1000},
+    }, bar_time=t)
+    cache = {(1, "000003.SZ", t): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.BUY
+
+
+def test_regime_none_keeps_max_positions_block():
+    """B5：开闸但无状态（默认）→ 仍按 max_positions=2 拦截（行为不变）。"""
+    port, ctx = _rotation_portfolio(
+        rotation_enabled=False, regime_filter_enabled=True, trend_max_positions=3,
+    )
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    _hold_pair(ctx)
+    t = datetime(2026, 7, 30)
+    bar = BarEvent(stocks={
+        "000003.SZ": {"open": Decimal("10"), "high": Decimal("10"),
+                      "low": Decimal("10"), "close": Decimal("10"), "volume": 1000},
+    }, bar_time=t)
+    cache = {(1, "000003.SZ", t): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert orders == []
+    assert any(ev.gate == "max_positions_full" for ev in rec.drain())
+
+
+def test_regime_bull_relaxes_trailing_stop():
+    """B5：开闸 + bull + 覆盖 8% → 回撤 5% 不触发移动止损；无状态（默认）触发 3%。"""
+    port, ctx = _rotation_portfolio(
+        regime_filter_enabled=True,
+        trend_trailing_stop_ratio=Decimal("0.08"),
+    )
+    # 移动止损实例阈值 3%（覆盖默认 0 禁用）
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy_code("000001.SZ", "10", 1000, datetime(2026, 7, 1)))
+    pos.update_high(Decimal("10"))
+    ctx.positions["000001.SZ"] = pos
+
+    def _bar_95():
+        c = Decimal("9.5")  # 较最高 10 回撤 5%
+        return BarEvent(stocks={
+            "000001.SZ": {"open": c, "high": c, "low": c, "close": c, "volume": 1000},
+        }, bar_time=datetime(2026, 7, 30))
+
+    # 默认（无状态）：3% 阈值 → 触发 SELL
+    port.current_regime = None
+    orders = port.on_bar(_bar_95(), signal_cache={})
+    assert len(orders) == 1
+    assert orders[0].signal_name == "trailing_stop"
+    # 清仓后恢复持仓，切 bull 态：8% 阈值 → 不触发
+    ctx.positions["000001.SZ"].quantity = 1000
+    port.current_regime = "bull"
+    orders = port.on_bar(_bar_95(), signal_cache={})
+    assert orders == []

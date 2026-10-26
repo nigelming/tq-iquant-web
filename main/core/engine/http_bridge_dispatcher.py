@@ -44,6 +44,8 @@ class BridgeOrderRejected(RuntimeError):
 
 
 class HttpBridgeDispatcher(OrderDispatcher):
+    channel = "iquant_bridge"
+
     def __init__(self, base_url: str = "http://127.0.0.1:8790",
                  timeout: float = 10.0,
                  client: Optional[httpx.Client] = None):

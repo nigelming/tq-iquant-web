@@ -105,7 +105,11 @@ def _empty(text: str) -> str:
 
 
 def _chart(cid: str, height: int = 320) -> str:
-    return f'<div id="{cid}" class="chart" style="height:{height}px"></div>'
+    # 外层 chart-box 承担窄窗口下的横向滚动：图表本身保底 760px 宽，
+    # 避免窗口 <900px 时 12 个月热力图/多序列折线的文字被压扁重叠。
+    return (f'<div class="chart-box">'
+            f'<div id="{cid}" class="chart" style="height:{height}px"></div>'
+            f'</div>')
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +143,7 @@ def _nav_chart(snapshots: List[dict]) -> Optional[Tuple[str, dict]]:
             "name": "基准净值", "type": "line",
             "data": [bench_map.get(d) for d in dates],
             "connectNulls": True, "showSymbol": False,
-            "xAxisIndex": 0, "yAxisIndex": 0, "color": "#4a7ec4",
+            "xAxisIndex": 0, "yAxisIndex": 2, "color": "#4a7ec4",
         })
     series.append({
         "name": "回撤", "type": "line", "data": dd, "areaStyle": {"opacity": 0.25},
@@ -150,19 +154,28 @@ def _nav_chart(snapshots: List[dict]) -> Optional[Tuple[str, dict]]:
         "tooltip": {"trigger": "axis"},
         "legend": {"bottom": 0, "data": ["策略净值", "基准净值", "回撤"]},
         "grid": [
-            {"left": 52, "right": 24, "top": 28, "height": "52%"},
-            {"left": 52, "right": 24, "top": "72%", "height": "18%"},
+            {"left": 70, "right": 84, "top": 34, "height": "52%"},
+            {"left": 70, "right": 84, "top": "74%", "height": "16%"},
         ],
         "xAxis": [
             {"type": "category", "data": dates, "boundaryGap": False,
-             "axisLabel": {"formatter": "__DATEFMT__"}},
+             "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
             {"type": "category", "data": dates, "gridIndex": 1,
              "boundaryGap": False, "show": False},
         ],
         "yAxis": [
-            {"type": "value", "scale": True, "gridIndex": 0},
+            # 左轴：策略净值（归一化）；轴名竖排居中，避免顶部被裁切
+            {"type": "value", "scale": True, "gridIndex": 0, "name": "策略净值",
+             "nameLocation": "middle", "nameRotate": 90, "nameGap": 54,
+             "nameTextStyle": {"fontSize": 12}},
+            # 网格1 的左轴：回撤（%）
             {"type": "value", "gridIndex": 1, "max": 0,
              "axisLabel": {"formatter": "{value}%"}},
+            # 右轴：基准净值（独立刻度，避免与策略净值量级不同被压平）
+            {"type": "value", "scale": True, "gridIndex": 0, "position": "right",
+             "name": "基准净值", "nameLocation": "middle", "nameRotate": 90,
+             "nameGap": 54, "nameTextStyle": {"fontSize": 12},
+             "splitLine": {"show": False}},
         ],
         "series": series,
     }
@@ -175,11 +188,15 @@ def _dispersion_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis"},
-        "grid": {"left": 52, "right": 24, "top": 28, "bottom": 40, "containLabel": True},
+        # 轴名竖排居中：默认 nameLocation='end' 会把「截面标准差」挤在左上角
+        # 与刻度挤在一起（顶部 top=28 时被裁掉半截）
+        "grid": {"left": 66, "right": 24, "top": 30, "bottom": 40},
         "xAxis": {"type": "category", "data": [p["date"] for p in series],
                   "boundaryGap": False,
                   "axisLabel": {"formatter": "__DATEFMT__"}},
         "yAxis": {"type": "value", "name": "截面标准差",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 46,
+                  "nameTextStyle": {"fontSize": 12},
                   "axisLabel": {"formatter": "{value}"},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [{"name": "宽基分化度", "type": "line", "showSymbol": False,
@@ -214,10 +231,13 @@ def _industry_chart(ia: dict) -> Optional[Tuple[str, dict]]:
     option = {
         "tooltip": {"trigger": "axis"},
         "legend": {"bottom": 0, "type": "scroll"},
-        "grid": {"left": 48, "right": 20, "bottom": 44, "top": 24, "containLabel": True},
+        "grid": {"left": 24, "right": 20, "bottom": 44, "top": 24, "containLabel": True},
         "xAxis": {"type": "category", "data": exp.get("dates", []),
                   "boundaryGap": False, "axisLabel": {"formatter": "__DATEFMT__"}},
+        # 竖排居中，避免「仓位(%)」在左上角与 100% 刻度重叠
         "yAxis": {"type": "value", "name": "仓位(%)", "min": 0, "max": 100,
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 44,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": series,
     }
@@ -231,11 +251,15 @@ def _robustness_chart(rb: dict) -> Optional[Tuple[str, dict]]:
     labels = [b["label"] for b in wins[0]["histogram"]]
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "legend": {"bottom": 0},
-        "grid": {"left": 40, "right": 20, "bottom": 40, "top": 24, "containLabel": True},
+        "legend": {"bottom": 0, "itemGap": 18, "textStyle": {"fontSize": 12}},
+        "grid": {"left": 68, "right": 24, "bottom": 54, "top": 34},
         "xAxis": {"type": "category", "data": labels,
-                  "axisLabel": {"interval": 0, "fontSize": 10}},
+                  "axisLabel": {"interval": 0, "fontSize": 11}},
+        # 轴名竖排居中：默认 'end' 会与顶部刻度挤在一起，被裁切成半截
         "yAxis": {"type": "value", "name": "窗口数", "minInterval": 1,
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 52,
+                  "nameTextStyle": {"fontSize": 12},
+                  "axisLabel": {"fontSize": 11},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [
             {"name": f"{w['window']} 周滚动收益", "type": "bar", "barMaxWidth": 26,
@@ -307,20 +331,30 @@ def _ca_nav_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     series = [{
         "name": "策略净值", "type": "line", "data": strategy,
-        "showSymbol": False, "color": _RED,
+        "showSymbol": False, "color": _RED, "yAxisIndex": 0,
     }]
     if benchmark:
         series.append({
             "name": "基准净值", "type": "line", "data": benchmark,
-            "showSymbol": False, "color": "#4a7ec4",
+            "showSymbol": False, "color": "#4a7ec4", "yAxisIndex": 1,
         })
     option = {
         "tooltip": {"trigger": "axis"},
         "legend": {"bottom": 0},
-        "grid": {"left": 52, "right": 24, "top": 28, "bottom": 44, "containLabel": True},
+        "grid": {"left": 74, "right": 92, "top": 34, "bottom": 46},
         "xAxis": {"type": "category", "data": dates, "boundaryGap": False,
-                  "axisLabel": {"formatter": "__DATEFMT__"}},
-        "yAxis": {"type": "value", "scale": True},
+                  "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
+        "yAxis": [
+            # 左轴=策略净值、右轴=基准净值：两者量级差异大时同一刻度会把曲线压平；
+            # 轴名均竖排居中，避免顶部横排被裁切
+            {"type": "value", "scale": True, "name": "策略净值",
+             "nameLocation": "middle", "nameRotate": 90, "nameGap": 54,
+             "nameTextStyle": {"fontSize": 12}, "axisLabel": {"fontSize": 11}},
+            {"type": "value", "scale": True, "name": "基准净值", "position": "right",
+             "nameLocation": "middle", "nameRotate": 90, "nameGap": 54,
+             "nameTextStyle": {"fontSize": 12}, "axisLabel": {"fontSize": 11},
+             "splitLine": {"show": False}},
+        ],
         "series": series,
     }
     return "chart-ca-nav", option
@@ -334,15 +368,21 @@ def _ca_scatter_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "item", "formatter": "基准 {c}"},
-        "grid": {"left": 52, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
-        "xAxis": {"type": "value", "name": "基准周收益", "scale": True,
+        # 轴名放轴中点（nameLocation=middle）：默认 'end' 会把「策略周收益」挤在左上角被
+        # 裁切；grid 手动让出轴名与刻度的空间（containLabel 不再兜底，避免双重挤压）。
+        "grid": {"left": 68, "right": 40, "top": 34, "bottom": 58},
+        "xAxis": {"type": "value", "name": "基准周收益(%)", "scale": True,
+                  "nameLocation": "middle", "nameGap": 30,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
-        "yAxis": {"type": "value", "name": "策略周收益", "scale": True,
+        "yAxis": {"type": "value", "name": "策略周收益(%)", "scale": True,
+                  "nameLocation": "middle", "nameGap": 46,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [{
-            "type": "scatter", "symbolSize": 9,
+            "type": "scatter", "symbolSize": 8,
             "data": [[round(x * 100, 2), round(y * 100, 2)] for x, y in data],
-            "itemStyle": {"color": "rgba(192,57,43,.6)"},
+            "itemStyle": {"color": "rgba(192,57,43,.55)"},
             "markLine": {"silent": True, "symbol": "none",
                          "data": [{"xAxis": 0}, {"yAxis": 0}],
                          "lineStyle": {"type": "dashed", "color": "#9ca3af"}},
@@ -372,10 +412,14 @@ def _ca_corr_chart(d: dict) -> Optional[Tuple[str, dict]]:
     option = {
         "tooltip": {"trigger": "axis"},
         "legend": {"bottom": 0, "data": ["52周滚动相关", "扩展窗口相关"]},
-        "grid": {"left": 52, "right": 24, "top": 24, "bottom": 44, "containLabel": True},
+        "grid": {"left": 72, "right": 34, "top": 34, "bottom": 46},
         "xAxis": {"type": "category", "data": dates, "boundaryGap": False,
-                  "axisLabel": {"formatter": "__DATEFMT__"}},
+                  "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
+        # 轴名放轴中点并竖排：默认 nameLocation='end' 会把「相关系数」挤到左上角被裁切
         "yAxis": {"type": "value", "name": "相关系数",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 52,
+                  "nameTextStyle": {"fontSize": 12},
+                  "axisLabel": {"fontSize": 11},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [
             {"name": "52周滚动相关", "type": "line", "data": roll,
@@ -394,10 +438,13 @@ def _ca_multi_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 48, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [r["name"] + ("（主）" if r.get("is_main") else "") for r in rows]},
+        # 竖排居中：默认 'end' 会把「危机Alpha占比」挤在左上角被裁切
         "yAxis": {"type": "value", "name": "危机Alpha占比",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 46,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [{"type": "bar", "barMaxWidth": 40,
                     "data": [{"value": round(r.get("alpha_ratio", 0) * 100, 2),
@@ -413,10 +460,13 @@ def _ca_annual_bar(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 48, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [f"{r['年份']}{'*' if not r.get('完整') else ''}" for r in rows]},
+        # 竖排居中，避免「危机Alpha」轴名与顶部刻度重叠
         "yAxis": {"type": "value", "name": "危机Alpha",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 42,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [{"type": "bar", "barMaxWidth": 34,
                     "data": [{"value": round(r.get("危机Alpha", 0) * 100, 2),
@@ -499,7 +549,7 @@ def _crisis_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
     c = _ca_scatter_chart(d)
     if c:
         charts.append(c)
-        body.append("<h3>1.5 全周期四象限分布</h3>" + _chart(c[0], 320))
+        body.append("<h3>1.5 全周期四象限分布</h3>" + _chart(c[0], 420))
 
     # 六、深度回撤事件
     events = d.get("deep_dd_events") or []
@@ -647,7 +697,7 @@ def _regime_states(d: dict) -> str:
                         None, None])
     return _table(
         ["市场状态", "周数", "占比", "策略收益", "基准收益", "超额",
-         "日胜率", "最大回撤", "换手", "成本占比"], rows, row_cls)
+         "日胜率", "最大回撤", "换手（双边）", "成本/日均净值"], rows, row_cls)
 
 
 def _opportunity(d: dict) -> str:
@@ -712,7 +762,8 @@ def _neutral(d: dict) -> str:
         _kpi("年化收益", pct_signed(n.get("annualized_return"))),
         _kpi("周胜率", pct1(n.get("win_rate"))),
         _kpi("月均交易", num(n.get("monthly_trades"), 1)),
-        _kpi("年化换手", num(n.get("annual_turnover"))),
+        _kpi("年化换手（双边）", "-" if n.get("annual_turnover") is None
+             else f"{num(n.get('annual_turnover'))}×/年"),
         _kpi("成本/毛利", pct1(n.get("cost_gross_ratio"))),
         _kpi("假突破磨损", f"{n.get('whipsaw_count', 0)} 次",
              f"{n.get('whipsaw_days', 0)} 个交易日"),
@@ -1056,8 +1107,11 @@ def _robustness_section(detail: dict) -> str:
 # 收益分布（月度热力图 / 年度箱线图 / 年收益柱）
 # ---------------------------------------------------------------------------
 def _boxplot_data(values: list):
-    """[min, Q1, median, Q3, max]（与前端 boxplotData 同口径，线性插值分位）。"""
-    if not values:
+    """[min, Q1, median, Q3, max]（与前端 boxplotData 同口径，线性插值分位）。
+
+    样本 <5 无法构成箱体（前端同口径剔除），返回 None。
+    """
+    if not values or len(values) < 5:
         return None
     import statistics
     v = sorted(values)
@@ -1084,43 +1138,164 @@ def _monthly_heat_chart(rb: dict) -> Optional[Tuple[str, dict]]:
     if not data:
         return None
     abs_max = max(max(abs(d[2]) for d in data), 5)
+    # 标签文本预先算好写成纯字符串：
+    # ECharts 的 `{@[2]:+.1f}` 格式化在本报告内置的运行时里不解析数值（只渲染出“%”），
+    # 逐项 label.formatter 传字面量最稳。
+    # 关键：value 必须保持 [x, y, 数值] 三维，第 4 维若塞文本，visualMap 默认维度会取
+    # 「最后一维」（即字符串）→ 取不到数值，整张图不着色（颜色条与格子不匹配的根因）。
+    items = []
+    for ci, ri, val in data:
+        txt = f"{val:+.1f}%"
+        # 仅最深的红/绿两档用白字，其余浅色档用深字
+        strong = abs(val) >= abs_max * 2 / 3
+        items.append({
+            "name": f"{years[ri]}年 {months[ci]}",
+            "value": [ci, ri, round(val, 2)],
+            "label": {
+                "formatter": txt,
+                "fontSize": 12,
+                "color": "#ffffff" if strong else "#111827",
+            },
+        })
+
+    def _edge(k: float) -> float:
+        return abs_max * k
+
+    # 分段色阶：图例是离散档位并带区间文字，与格子颜色一一对应；
+    # 连续渐变在数据整体偏正时（如本月度矩阵 -0.2%~+15%）会让大多数格子停留在
+    # 浅橙中间色，用户观感就是「右侧颜色条与图形对不上」。
+    pieces = [
+        {"min": -abs_max, "max": -_edge(2 / 3), "color": "#1e7e4f",
+         "label": f"≤ -{_edge(2 / 3):.1f}%"},
+        {"min": -_edge(2 / 3), "max": -_edge(1 / 3), "color": "#5da283",
+         "label": f"-{_edge(2 / 3):.1f}% ~ -{_edge(1 / 3):.1f}%"},
+        {"min": -_edge(1 / 3), "max": 0, "color": "#b9d8c8",
+         "label": f"-{_edge(1 / 3):.1f}% ~ 0"},
+        {"min": 0, "max": _edge(1 / 3), "color": "#f3c7b9",
+         "label": f"0 ~ +{_edge(1 / 3):.1f}%"},
+        {"min": _edge(1 / 3), "max": _edge(2 / 3), "color": "#d98873",
+         "label": f"+{_edge(1 / 3):.1f}% ~ +{_edge(2 / 3):.1f}%"},
+        {"min": _edge(2 / 3), "max": abs_max, "color": "#c0392b",
+         "label": f"≥ +{_edge(2 / 3):.1f}%"},
+    ]
     option = {
-        "tooltip": {"trigger": "item"},
-        "grid": {"left": 56, "right": 80, "top": 20, "bottom": 30},
-        "xAxis": {"type": "category", "data": months, "splitArea": {"show": True}},
-        "yAxis": {"type": "category", "data": [str(y) for y in years], "inverse": True},
+        "tooltip": {"trigger": "item", "formatter": "{b}<br/>收益率：{@[2]}%"},
+        "grid": {"left": 64, "right": 132, "top": 26, "bottom": 34},
+        "xAxis": {"type": "category", "data": months,
+                  "axisLabel": {"fontSize": 12}},
+        "yAxis": {"type": "category", "data": [str(y) for y in years], "inverse": True,
+                  "axisLabel": {"fontSize": 12}},
         "visualMap": {
-            "min": -abs_max, "max": abs_max, "calculable": True,
+            "type": "piecewise",
+            # 显式指定取数值维（index=2），不依赖 default 的「最后一维」
+            "dimension": 2,
             "orient": "vertical", "right": 0, "top": "center",
-            "inRange": {"color": [_GREEN, "rgba(240,164,41,.35)", _RED]},
-            "text": ["+", "-"],
+            "itemWidth": 20, "itemHeight": 14, "itemGap": 6,
+            "textStyle": {"fontSize": 11},
+            "pieces": pieces,
         },
-        "series": [{"type": "heatmap", "data": data}],
+        "series": [{
+            "type": "heatmap", "data": items,
+            "encode": {"x": 0, "y": 1, "value": 2},
+            # 白色描边分隔每个年度×月份格子，避免相邻色块糊成一片
+            "itemStyle": {"borderColor": "#ffffff", "borderWidth": 1},
+            "label": {"show": True, "fontSize": 11, "fontWeight": "bold"},
+            "emphasis": {"itemStyle": {"shadowBlur": 8,
+                                       "shadowColor": "rgba(0,0,0,0.4)"}},
+        }],
     }
     return "chart-return-heat", option
 
 
 def _box_chart(rb: dict, key: str, name: str) -> Optional[Tuple[str, dict]]:
     yearly = rb.get("yearly") or []
-    categories = [str(y.get("year")) for y in yearly]
-    box_data = [
-        _boxplot_data([round(r * 100, 4) for r in (y.get(key) or [])])
+    # 先配对（年份, 箱体, 均值）再统一过滤：<5 样本年份整年剔除，
+    # categories 与 box_data 始终保持一一对齐，避免箱体与年份轴错位。
+    raw_pairs = [
+        (str(y.get("year")),
+         [round(r * 100, 4) for r in (y.get(key) or [])])
         for y in yearly
     ]
-    box_data = [b for b in box_data if b]
-    if not box_data:
+    pairs = [(c, vals) for c, vals in raw_pairs if len(vals) >= 5]
+    if not pairs:
         return None
+    categories = [c for c, _ in pairs]
+    box_data = [_boxplot_data(vals) for _, vals in pairs]
+    means = [round(sum(vals) / len(vals), 4) for _, vals in pairs]
     cid = "chart-box-daily" if key == "daily_returns" else "chart-box-month"
     color = "#4a7ec4" if key == "daily_returns" else _GREEN
     option = {
-        "tooltip": {"trigger": "item"},
-        "grid": {"left": 56, "right": 24, "top": 30, "bottom": 30},
+        "tooltip": {
+            "trigger": "item",
+            "formatter": (
+                f"{{b}}（{name}收益）<br/>"
+                "最大值：<b>{c5}</b>%<br/>"
+                "上四分位 Q3：{c4}%<br/>"
+                "中位数：<b>{c3}</b>%<br/>"
+                "下四分位 Q1：{c2}%<br/>"
+                "最小值：{c1}%"
+            ),
+        },
+        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": categories},
-        "yAxis": {"type": "value", "name": f"{name}收益率(%)"},
-        "series": [{"type": "boxplot", "data": box_data,
-                    "itemStyle": {"color": color, "borderColor": color}}],
+        # 竖排居中：默认 'end' 会把「日收益率(%)」等轴名挤到左上角被裁切
+        "yAxis": {"type": "value", "name": f"{name}收益率(%)",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 46,
+                  "nameTextStyle": {"fontSize": 12},
+                  "splitLine": {"show": True}},
+        "series": [
+            {"name": "箱体", "type": "boxplot", "data": box_data,
+             "itemStyle": {"color": color, "borderColor": color}},
+            # 零轴参考线（虚线）：正红负绿的分界
+            {"name": "零轴", "type": "line", "markLine": {
+                "silent": True, "symbol": "none",
+                "lineStyle": {"type": "dashed", "color": "#999", "width": 1},
+                "data": [{"yAxis": 0}],
+            }},
+            # 均值点：金色菱形，常驻可见
+            {"name": "均值", "type": "scatter", "data": means,
+             "symbol": "diamond", "symbolSize": 10,
+             "itemStyle": {"color": "#d4a017"},
+             "label": {"show": True, "position": "top", "fontSize": 10,
+                       "formatter": "{c}%", "color": "#d4a017"}},
+        ],
     }
     return cid, option
+
+
+def _box_stats_table(rb: dict, key: str) -> str:
+    """箱线图下方常驻统计表：与图表同一份计算逻辑，保证口径一致。"""
+    yearly = rb.get("yearly") or []
+    rows = []
+    for y in yearly:
+        vals = [round(r * 100, 4) for r in (y.get(key) or [])]
+        if len(vals) < 5:
+            continue
+        b = _boxplot_data(vals)
+        mean = sum(vals) / len(vals)
+        pos = sum(1 for v in vals if v > 0)
+        rows.append((
+            str(y.get("year")), len(vals),
+            f"{mean:+.2f}", f"{b[2]:+.2f}", f"{b[1]:+.2f}",
+            f"{b[3]:+.2f}", f"{b[0]:+.2f}", f"{b[4]:+.2f}",
+            f"{pos / len(vals) * 100:.0f}%",
+        ))
+    if not rows:
+        return ""
+    head = ["年份", "样本数", "均值", "中位数", "Q1", "Q3", "最小", "最大", "正值占比"]
+    body = ["<table class='data-table' style='font-size:12px;margin-top:8px'><thead><tr>"
+            + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    for r in rows:
+        def cell(v, i):
+            # 均值/中位/Q1/Q3/最小/最大 按正负着色（正红负绿，A股口径）
+            if 2 <= i <= 7:
+                num = float(v)
+                color = _RED if num > 0 else _GREEN if num < 0 else "inherit"
+                return f"<td style='color:{color}'>{v}%</td>"
+            return f"<td>{v}</td>"
+        body.append("<tr>" + "".join(cell(v, i) for i, v in enumerate(r)) + "</tr>")
+    body.append("</tbody></table>")
+    return "".join(body)
 
 
 def _annual_bar_chart(rb: dict) -> Optional[Tuple[str, dict]]:
@@ -1132,13 +1307,143 @@ def _annual_bar_chart(rb: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 48, "right": 24, "top": 24, "bottom": 30},
+        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": [str(y.get("year")) for y in yearly]},
+        # 竖排居中，避免「年收益(%)」与顶部刻度挤在一起
         "yAxis": {"type": "value", "name": "年收益(%)",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 46,
+                  "nameTextStyle": {"fontSize": 12},
                   "splitLine": {"lineStyle": {"type": "dashed"}}},
         "series": [{"type": "bar", "data": data, "barMaxWidth": 30}],
     }
     return "chart-return-annual", option
+
+
+def _persistence_rolling_chart(d: dict) -> Optional[Tuple[str, dict]]:
+    """持续性检验：滚动年化曲线（策略 6M/12M vs 基准 12M）。值×100 → %，避免 lambda 不可序列化。"""
+    r = d.get("rolling") or {}
+    dates = r.get("dates") or []
+    if not dates:
+        return None
+
+    def scale(vals):
+        return [round(v * 100, 2) if v is not None else None for v in (vals or [])]
+
+    return "chart-p-rolling", {
+        "tooltip": {"trigger": "axis"},
+        "legend": {"itemGap": 20, "textStyle": {"fontSize": 12}},
+        "grid": {"left": 70, "right": 24, "bottom": 46, "top": 46},
+        "xAxis": {"type": "category", "data": dates,
+                  "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
+        # 竖排居中：默认 'end' 会把「滚动年化(%)」挤在左上角被裁切
+        "yAxis": {"type": "value", "name": "滚动年化(%)",
+                  "nameLocation": "middle", "nameRotate": 90, "nameGap": 52,
+                  "nameTextStyle": {"fontSize": 12},
+                  "axisLabel": {"fontSize": 11},
+                  "splitLine": {"lineStyle": {"type": "dashed"}}},
+        "series": [
+            {"name": "策略 6M", "type": "line", "data": scale(r.get("strat_6m")),
+             "symbol": "none", "lineStyle": {"color": "#5a8fc0", "width": 1.2}},
+            {"name": "策略 12M", "type": "line", "data": scale(r.get("strat_12m")),
+             "symbol": "none", "lineStyle": {"color": "#e06550", "width": 2}},
+            {"name": "基准 12M", "type": "line", "data": scale(r.get("bench_12m")),
+             "symbol": "none", "lineStyle": {"color": "#c9a24a", "width": 1.4, "type": "dashed"}},
+        ],
+    }
+
+
+def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
+    """四、持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化。"""
+    title = "四、持续性检验（阿尔法衰减 vs 风格钟摆）"
+    pp = detail.get("persistence")
+    if pp is None:
+        return _section(title, _empty("本次回测未计算持续性检验"))
+    if pp.get("status") != "completed":
+        return _section(title, _empty(
+            f"分析状态：{esc(pp.get('status'))}；{esc(pp.get('error') or '')}"))
+    d = pp.get("data") or {}
+    v = d.get("verdict") or {}
+    level_label = {
+        "alpha_decay": "疑似阿尔法衰减",
+        "style_pendulum": "风格钟摆（市场温度周期）",
+        "stable": "稳定",
+        "mixed": "信号混合",
+        "insufficient": "样本不足",
+    }.get(v.get("level"), v.get("level") or "—")
+    main_name = ""
+    for b in d.get("benchmarks") or []:
+        if b.get("is_main"):
+            main_name = b.get("name") or b.get("code") or ""
+            break
+    window = v.get("window_years") or []
+    window_text = f"{window[0]}–{window[-1]}（{len(window)} 个满年）" if window else "—"
+    cards = "".join([
+        _kpi("判定", level_label, value_cls="lv-" + str(v.get("level") or "")),
+        _kpi("主基准", esc(main_name) if main_name else "—"),
+        _kpi("判定窗口", esc(window_text)),
+        _kpi("计算时间", esc(str(pp.get("computed_at") or ""))[:19] or "—"),
+    ])
+    body = [f'<div class="kpi-grid">{cards}</div>']
+    body.append(f'<p class="note">{esc(v.get("summary") or "")}</p>')
+    signals = v.get("signals") or []
+    if signals:
+        s_rows, s_cls = [], []
+        for s in signals:
+            st = s.get("status")
+            s_rows.append([
+                f"<b>{esc(s.get('label') or '')}</b>",
+                esc(s.get("detail") or "—"),
+                f'<span class="sig-{st}">{esc(s.get("word") or "")}</span>' if st in ("bad", "mixed", "good")
+                else f'<span>{esc(s.get("word") or "")}</span>',
+            ])
+            s_cls.append([None, None, None])
+        body.append("<h3>4.0 判定信号（判定窗口实测 → 结论）</h3>")
+        body.append(_table(["维度", "实测", "判定"], s_rows, s_cls))
+    elif v.get("reasons"):
+        body.append('<ul class="note">')
+        body += [f'<li>{esc(r)}</li>' for r in v["reasons"]]
+        body.append('</ul>')
+    body.append(f'<p class="note">{esc(v.get("caveat") or "")}</p>')
+
+    years = d.get("years") or []
+    m_rows, m_cls = [], []
+    for y in years:
+        m_rows.append([
+            f"{esc(str(y.get('year')))}" + (" *" if y.get("is_partial") else ""),
+            pct_signed(y.get("nav_return")), pct(y.get("max_drawdown")),
+            num(y.get("sharpe")), num(y.get("calmar")),
+            pct(y.get("win_rate")), num(y.get("profit_factor")),
+            ("-" if y.get("turnover") is None else f"{num(y.get('turnover'))}×"),
+            pct(y.get("cost_ratio")),
+        ])
+        m_cls.append([None, cls(y.get("nav_return")), "neg", None, None, None, None, None, None])
+    body.append("<h3>4.1 分年度指标矩阵（* 未满 200 交易日，不参与判定）</h3>")
+    body.append(_table(["年份", "收益", "最大回撤", "夏普", "卡玛", "胜率", "盈亏比", "换手×（双边）", "成本/日均净值"],
+                       m_rows, m_cls) if m_rows else _empty("无年度数据"))
+
+    benchs = d.get("benchmarks") or []
+    head = ["年份"] + [b.get("name") + ("（主）" if b.get("is_main") else "")
+                       + ("（无数据）" if not b.get("available") else "") for b in benchs]
+    e_rows, e_cls = [], []
+    for y in years:
+        row, rc = [str(y.get("year"))], [None]
+        for b in benchs:
+            ex = y.get("excess") or {}
+            val = ex.get(b.get("code"))
+            row.append(pct_signed(val) if val is not None else "—")
+            rc.append(cls(val) if val is not None else None)
+        e_rows.append(row)
+        e_cls.append(rc)
+    body.append("<h3>4.2 分年度超额收益（vs 组合基准 + 宽基）</h3>")
+    body.append(_table(head, e_rows, e_cls) if e_rows else _empty("无超额数据"))
+
+    roll_opt = _persistence_rolling_chart(d)
+    if roll_opt:
+        charts.append(roll_opt)
+        body.append("<h3>4.3 滚动年化收益（策略 6M/12M vs 基准 12M）</h3>")
+        body.append(_chart(roll_opt[0], 340))
+        body.append('<p class="note">解读：策略 12M 与基准 12M 同步回落→风格钟摆；策略 12M 单独下坠而基准平稳→疑似阿尔法衰减；6M 波动大于 12M 属正常，连续下行段才是关注点。</p>')
+    return _section(title, "".join(body))
 
 
 def _returns_bucket_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
@@ -1146,11 +1451,11 @@ def _returns_bucket_section(detail: dict, charts: List[Tuple[str, dict]]) -> str
     if not rb:
         return ""
     body = []
-    for builder, title, height in (
-        (_monthly_heat_chart, "月度收益热力图", 420),
-        (lambda r: _box_chart(r, "daily_returns", "日"), "年度日收益箱线图", 300),
-        (lambda r: _box_chart(r, "monthly_returns", "月"), "各年月收益箱线图", 300),
-        (_annual_bar_chart, "各年年收益柱状图", 300),
+    for builder, title, height, stat_key in (
+        (_monthly_heat_chart, "月度收益热力图", 420, None),
+        (lambda r: _box_chart(r, "daily_returns", "日"), "年度日收益箱线图", 300, "daily_returns"),
+        (lambda r: _box_chart(r, "monthly_returns", "月"), "各年月收益箱线图", 300, "monthly_returns"),
+        (_annual_bar_chart, "各年年收益柱状图", 300, None),
     ):
         c = builder(rb)
         if c is None:
@@ -1158,11 +1463,15 @@ def _returns_bucket_section(detail: dict, charts: List[Tuple[str, dict]]) -> str
         cid, option = c
         charts.append(c)
         body.append(f"<h3>{esc(title)}</h3>{_chart(cid, height)}")
+        if stat_key:
+            body.append(_box_stats_table(rb, stat_key))
     if not body:
         return ""
     return _section("五、收益分布",
-                    "".join(body) + '<p class="note">月度热力图红涨绿跌；箱线图为各年日/月收益分布，'
-                    "年收益柱红涨绿跌（A股口径）。</p>")
+                    "".join(body) + '<p class="note">月度热力图红涨绿跌、数值常驻显示；'
+                    "箱线图方块为 Q1~Q3 四分位区间、中线为中位数、金色菱形◆为均值、"
+                    "灰色虚线为零轴；下方统计表与图表同口径，正红负绿（A股口径）。"
+                    "样本不足 5 个的年份不构成箱体，已整年剔除。</p>")
 
 
 # ---------------------------------------------------------------------------
@@ -1279,7 +1588,7 @@ _EVAL_ROWS = [
     ("excess_annual_return", "年化超额", "pct"), ("tracking_error", "跟踪误差", "pct"),
     ("information_ratio", "信息比率", "num"), ("up_capture_ratio", "上行捕获", "pct"),
     ("down_capture_ratio", "下行捕获", "pct"), ("excess_max_drawdown", "超额回撤", "pct"),
-    ("annual_turnover", "年化换手", "num"), ("total_cost_ratio", "总成本占比", "pct"),
+    ("annual_turnover", "年化换手（双边）", "turnover"), ("total_cost_ratio", "交易成本/日均净值", "pct"),
     ("avg_position_utilization", "平均仓位利用率", "pct"), ("empty_days_ratio", "空仓日占比", "pct"),
     ("max_single_weight", "最大单票权重", "pct"), ("hhi", "持仓集中度 HHI", "num"),
     ("max_consecutive_loss_days", "最长连亏天数", "int"),
@@ -1299,6 +1608,8 @@ def _eval_rows(ev: dict) -> List[List[str]]:
             out.append([label, pct(v), cls(v)])
         elif kind == "int":
             out.append([label, str(int(v)), ""])
+        elif kind == "turnover":
+            out.append([label, f"{num(v)}×/年", cls(v)])
         else:
             out.append([label, num(v), cls(v)])
     return out
@@ -1381,30 +1692,25 @@ table{border-collapse:collapse;width:100%;font-size:12.5px;margin:8px 0 12px}
 th,td{border:1px solid #e5e7eb;padding:6px 8px;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}th{background:#f3f4f6;color:#374151}
 .pos{color:#c0392b}.neg{color:#1e7e4f}
+/* 持续性检验判定色（与涨跌红绿解耦，与前端 Backtest.vue 同口径）：
+   蓝=良性(稳定/风格钟摆)、金=关注(信号混合)、红=恶化(疑似衰减)、灰=样本不足 */
+.kpi-value.lv-alpha_decay{color:#c0392b}.kpi-value.lv-style_pendulum{color:#2b5c8a}
+.kpi-value.lv-mixed{color:#8a6d1c}.kpi-value.lv-stable{color:#2b5c8a}
+.kpi-value.lv-insufficient{color:#9ca3af}
+.sig-bad{color:#c0392b;font-weight:700}.sig-mixed{color:#8a6d1c;font-weight:700}.sig-good{color:#2b5c8a;font-weight:700}
 .empty{background:#f9fafb;border:1px dashed #d1d5db;border-radius:6px;padding:18px;text-align:center;color:#6b7280;font-size:13px}
 .note{font-size:12px;color:#9ca3af;margin:6px 0}
 .spb{background:rgba(180,83,9,.10);border:1px solid #e29b4f;border-left:4px solid #b45309;border-radius:6px;padding:12px 16px;margin:12px 0}
 .spb-t{color:#b45309;font-weight:700;font-size:13.5px;margin-bottom:6px}
 .spb-t span{font-weight:400;color:#6b7280;font-size:12px;margin-left:6px}
 .spb ul{margin:0;padding-left:20px;color:#374151;font-size:12.5px;line-height:1.7}
-.chart{width:100%;margin:8px 0}
+.chart{width:100%;min-width:760px;margin:8px 0}
+.chart-box{width:100%;overflow-x:auto;overflow-y:hidden}
 details{margin:8px 0}summary{cursor:pointer;font-size:13px;color:#4b5563}
 .scroll-tbl{max-height:520px;overflow:auto}
 .gate-code{color:#9ca3af;font-size:10px;margin-left:4px}
 pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;font-size:11px;line-height:1.5;max-height:480px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 """
-
-
-def _appendix(detail: dict) -> str:
-    """附录：完整 detail payload 原始 JSON（折叠展示，离线复核/调试用）。
-
-    Minor-4 修复：tasks 证据声称的「附录原始 JSON」补实现。esc 防 XSS。
-    """
-    raw = json.dumps(detail, ensure_ascii=False, default=str, indent=1)
-    return _section(
-        "附录 · 原始数据 JSON",
-        f'<details><summary>展开查看完整回测详情数据（{len(raw)} 字符）</summary>'
-        f'<pre class="json-dump">{esc(raw)}</pre></details>')
 
 
 def build_html_report(detail: dict) -> str:
@@ -1421,11 +1727,11 @@ def build_html_report(detail: dict) -> str:
         + _crisis_section(detail, charts)
         + _market_regime_section(detail, charts)
         + _robustness_section(detail)
+        + _persistence_section(detail, charts)
         + _strategy_eval_section(detail)
         + _returns_bucket_section(detail, charts)
         + _decision_section(detail)
         + _trades_section(detail)
-        + _appendix(detail)
     )
     options = {cid: opt for cid, opt in charts}
     options_json = json.dumps(options, ensure_ascii=False).replace("</", "<\\/")
@@ -1434,6 +1740,7 @@ def build_html_report(detail: dict) -> str:
 var __CHARTS__ = __OPTIONS__;
 // 日期轴标签只显示月-日，避免拥挤
 function __datefmt(v){ return v ? String(v).slice(5) : v; }
+var __INSTANCES__ = [];
 document.querySelectorAll('.chart').forEach(function(el){
   var opt = __CHARTS__[el.id];
   if(!opt) return;
@@ -1442,7 +1749,13 @@ document.querySelectorAll('.chart').forEach(function(el){
       ax.axisLabel.formatter = __datefmt;
     }
   });
-  echarts.init(el, null, {renderer:'canvas'}).setOption(opt);
+  var ch = echarts.init(el, null, {renderer:'canvas'});
+  ch.setOption(opt);
+  __INSTANCES__.push(ch);
+});
+// 窗口尺寸变化/缩放后重算布局，避免 canvas 停在初始化时的宽度导致文字挤压
+window.addEventListener('resize', function(){
+  __INSTANCES__.forEach(function(ch){ ch.resize(); });
 });
 </script>
 """.replace("__OPTIONS__", options_json)

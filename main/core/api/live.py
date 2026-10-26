@@ -9,9 +9,14 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import SessionLocal, get_db
-from core.models import LiveSession
+from core.models import LiveSession, PortfolioStrategy
+from core.config import load_config
 from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.live_engine import LiveEngine
+try:
+    from core.engine.ths_ui_dispatcher import ThsUiDispatcher
+except Exception:  # pragma: no cover - 依赖缺失时仍可走 iQuant 桥
+    ThsUiDispatcher = None  # type: ignore
 # 业务逻辑已下沉到 core.services.live_service（与 backtest_service 同一范式）。
 # 路由层仅留 HTTP 壳：参数校验 + asyncio 任务调度 + 调 service + ok/err 翻译。
 from core.services import live_service as svc
@@ -38,15 +43,39 @@ from core.services.live_service import (  # noqa: E402
 )
 
 
-def _build_engine(session_id: int, db: Session, mode: str = "simulation") -> LiveEngine:
-    """薄 wrapper：绑定 db_session_factory=SessionLocal + 本模块的 HttpBridgeDispatcher。
+def _dispatcher_cls():
+    """旧行为兼容：按 config.ths_ui.enabled 选通道（同花顺 UI / iQuant HTTP 桥）。
 
-    测试 monkeypatch live_api.SessionLocal / live_api.HttpBridgeDispatcher 后，
-    直接调 live_api._build_engine(sid, db) 仍走测试库 + mock 桥（4 处 test_build_engine_* 直调）。
+    enabled=false（默认）时返回本模块的 HttpBridgeDispatcher（测试 monkeypatch 生效）；
+    enabled=true 且依赖可用时返回 ThsUiDispatcher。新会话请用 session.engine 显式选择。
+    """
+    cfg = load_config()
+    ths = cfg.get("ths_ui", {}) if isinstance(cfg, dict) else {}
+    if isinstance(ths, dict) and ths.get("enabled") and ThsUiDispatcher is not None:
+        return ThsUiDispatcher
+    return HttpBridgeDispatcher
+
+
+def _dispatcher_cls_for(session):
+    """按 session 生效引擎选 dispatcher 类：iquant 保留 HttpBridgeDispatcher（测试可 patch），
+    其余引擎交给 svc.make_dispatcher 按 engine 构造。"""
+    if svc.session_engine(session) == "iquant":
+        return HttpBridgeDispatcher
+    return None
+
+
+def _build_engine(session_id: int, db: Session, mode: str = "simulation",
+                  dispatcher_cls=None) -> LiveEngine:
+    """薄 wrapper：绑定 db_session_factory=SessionLocal + 当前配置选出的 dispatcher。
+
+    dispatcher_cls 显式传入时优先（测试 monkeypatch 直调）；否则沿用旧的全局通道选择
+    （ths_ui.enabled → 同花顺，否则 iQuant 桥）。新会话请经 /sessions/{id}/start
+    由 session 生效引擎决定通道。
     """
     return svc.build_engine(
         session_id, db, mode,
-        db_session_factory=SessionLocal, dispatcher_cls=HttpBridgeDispatcher,
+        db_session_factory=SessionLocal,
+        dispatcher_cls=dispatcher_cls or _dispatcher_cls(),
     )
 
 
@@ -67,7 +96,32 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     mode = data.get("mode", "simulation")
     if mode not in ("simulation", "live"):
         return err(400, "mode 非法，仅支持 simulation(仿真) / live(实盘)")
+    engine = str(data.get("engine") or "iquant")
+    if engine not in svc.ENGINES_META:
+        return err(400, "engine 非法，仅支持 %s" % " / ".join(svc.ENGINES_META))
     data["name"] = name
+    data["engine"] = engine
+    # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
+    # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
+    pids = data.get("portfolio_ids") or []
+    if not isinstance(pids, list):
+        return err(400, "portfolio_ids 必须为数组")
+    try:
+        pids = [int(p) for p in pids]
+    except (TypeError, ValueError):
+        return err(400, "portfolio_ids 只能包含整数组合 id")
+    if len(set(pids)) != len(pids):
+        return err(400, "portfolio_ids 存在重复项")
+    if pids:
+        existing = {
+            row.id for row in
+            db.query(PortfolioStrategy.id)
+            .filter(PortfolioStrategy.id.in_(pids)).all()
+        }
+        missing = [str(p) for p in pids if p not in existing]
+        if missing:
+            return err(400, "组合不存在：%s" % "、".join(missing))
+    data["portfolio_ids"] = pids
     return ok(svc.create_session(db, data, mode))
 
 
@@ -91,7 +145,8 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
 
     engine, _session, error = svc.start_session(
         db, session_id, _ENGINES, session.mode,
-        db_session_factory=SessionLocal, dispatcher_cls=HttpBridgeDispatcher,
+        db_session_factory=SessionLocal,
+        dispatcher_cls=_dispatcher_cls_for(session),
     )
     if error is not None:
         status, message = error
@@ -112,10 +167,19 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
 
 @router.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int, db: Session = Depends(get_db)):
-    engine = svc.stop_session(db, session_id, _ENGINES)
-    if engine is None:
+    """停止会话。幂等：已停止的会话重复调用仍返回 200（此前返回 404）。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
         return err(404, "资源不存在")
-    asyncio.create_task(engine.stop())
+    if session_id not in _ENGINES and session.status != "running":
+        return ok({"id": session_id, "status": "stopped"})
+    engine = svc.stop_session(db, session_id, _ENGINES)
+    # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
+    # 避免用户立刻 start 后新旧引擎并存各下一笔委托。
+    if engine is not None:
+        if hasattr(engine, "_running"):
+            engine._running = False
+        asyncio.create_task(engine.stop())
     return ok({"id": session_id, "status": "stopped"})
 
 
@@ -125,6 +189,25 @@ def recover_breaker(session_id: int, portfolio_id: int, db: Session = Depends(ge
     if not ok_flag:
         return err(404, message)
     return ok({"portfolio_id": portfolio_id, "status": "active", "circuit_breaker_count": 0})
+
+
+@router.get("/channel")
+def channel_info(engine: Optional[str] = None):
+    """交易引擎清单 + 当前生效通道与在线状态。
+
+    engine（可选，session.engine）决定 active/label；不传沿用旧默认（ths_ui.enabled → 同花顺）。
+    """
+    return ok(svc.channel_status(engine_key=engine))
+
+
+@router.post("/channel/test")
+def channel_test(data: Optional[dict] = None):
+    """只读连通性探测：读一次持仓 / ping 一次。不产生下单。"""
+    data = data or {}
+    channel = data.get("channel") or "ths_ui"
+    if channel not in ("ths_ui", "iquant_bridge", "tdx_tq", "qmt"):
+        return err(400, "channel 非法，仅支持 ths_ui / iquant_bridge / tdx_tq / qmt")
+    return ok(svc.test_channel(channel, data.get("mode") or "simulation"))
 
 
 @router.get("/sessions/{session_id}/bridge-status")

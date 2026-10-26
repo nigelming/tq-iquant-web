@@ -21,6 +21,8 @@ class BacktestEvaluation(Base):
     win_rate = Column(Numeric(10, 4), nullable=True)
     profit_factor = Column(Numeric(10, 4), nullable=True)
     total_trades = Column(Integer, nullable=True)
+    # FIFO 平仓批次数（与 total_trades 成交笔数口径区分：win_rate/profit_factor 按平仓批次）
+    closed_trades = Column(Integer, nullable=True)
     benchmark_return = Column(Numeric(10, 4), nullable=True)
     avg_holding_days = Column(Numeric(10, 4), nullable=True)
     var_95 = Column(Numeric(10, 4), nullable=True)

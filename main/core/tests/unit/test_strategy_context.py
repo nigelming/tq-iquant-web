@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from core.engine.strategy_context import StrategyContext
 from core.engine.event import BarEvent
+from core.engine.risk_manager import StrategyRiskManager
+from core.engine.regime import REGIME_BEAR, REGIME_BULL, REGIME_RANGE
 from tq_iquant_shared.constants import SignalType
 
 
@@ -146,3 +148,70 @@ def test_get_signal_pool_none_allows_all():
     }
     signals = ctx.get_signal(bar, signal_cache=cache)
     assert len(signals) == 2
+
+
+# ===========================================================================
+# B5 市场状态闸：effective_* 参数解析（默认回落原参数，行为不变）
+# ===========================================================================
+def _ctx_regime(**kw):
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=6, **kw,
+    )
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.15"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    return ctx
+
+
+def test_effective_max_positions_default_unchanged():
+    """默认（未开闸）：任何 regime 下都回落 max_positions。"""
+    ctx = _ctx_regime(trend_max_positions=10)
+    assert ctx.effective_max_positions(None) == 6
+    assert ctx.effective_max_positions(REGIME_BULL) == 6
+    assert ctx.effective_max_positions(REGIME_RANGE) == 6
+
+
+def test_effective_max_positions_bull_override():
+    """开闸 + bull + 配置覆盖 → trend_max_positions；其余态回落。"""
+    ctx = _ctx_regime(regime_filter_enabled=True, trend_max_positions=10)
+    assert ctx.effective_max_positions(REGIME_BULL) == 10
+    assert ctx.effective_max_positions(REGIME_RANGE) == 6
+    assert ctx.effective_max_positions(REGIME_BEAR) == 6
+    assert ctx.effective_max_positions(None) == 6
+
+
+def test_effective_max_positions_bull_without_override():
+    """开闸 + bull 但未配 trend_max_positions → 回落 max_positions。"""
+    ctx = _ctx_regime(regime_filter_enabled=True)
+    assert ctx.effective_max_positions(REGIME_BULL) == 6
+
+
+def test_effective_trailing_stop_default_unchanged():
+    """默认（未开闸）：取 strategy_risk.trailing_stop_ratio。"""
+    ctx = _ctx_regime(trend_trailing_stop_ratio=Decimal("0.08"))
+    assert ctx.effective_trailing_stop(None) == Decimal("0.03")
+    assert ctx.effective_trailing_stop(REGIME_BULL) == Decimal("0.03")
+
+
+def test_effective_trailing_stop_bull_override():
+    """开闸 + bull + 覆盖 → trend 值；其余态回落。"""
+    ctx = _ctx_regime(
+        regime_filter_enabled=True,
+        trend_trailing_stop_ratio=Decimal("0.08"),
+    )
+    assert ctx.effective_trailing_stop(REGIME_BULL) == Decimal("0.08")
+    assert ctx.effective_trailing_stop(REGIME_RANGE) == Decimal("0.03")
+
+
+def test_effective_trailing_stop_no_strategy_risk():
+    """strategy_risk 未注入 → 基准 None；bull 覆盖仍生效。"""
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=6,
+        regime_filter_enabled=True,
+        trend_trailing_stop_ratio=Decimal("0.08"),
+    )
+    assert ctx.effective_trailing_stop(REGIME_RANGE) is None
+    assert ctx.effective_trailing_stop(REGIME_BULL) == Decimal("0.08")

@@ -12,15 +12,29 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
-  recoverLiveBreaker,
+  recoverLiveBreaker, getLiveChannel, testLiveChannel,
   type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
+  type LiveChannelInfo, type LiveEngineKey,
 } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const sessions = ref<LiveSessionItem[]>([])
 const loading = ref(true)
+// 当前生效的下单通道（全局配置 ths_ui.enabled 决定，切换需重启运行中 session）
+const channel = ref<LiveChannelInfo | null>(null)
+const channelTesting = ref(false)
+const channelTestMsg = ref<{ ok: boolean; text: string } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
-const form = ref({ name: '', mode: 'simulation', portfolio_ids: [] as number[] })
+const form = ref({ name: '', mode: 'simulation', engine: 'iquant' as LiveEngineKey, portfolio_ids: [] as number[] })
+// 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
+const ENGINE_LABEL: Record<string, string> = {
+  iquant: 'iQuant 桥', tdx: '通达信', ths: '同花顺', qmt: 'miniQMT',
+}
+function engineLabel(key?: string): string {
+  if (!key) return ENGINE_LABEL.iquant
+  return channel.value?.engines?.find((e) => e.key === key)?.label || ENGINE_LABEL[key] || key
+}
 
 // 组合级状态列表：优先用后端 portfolios 字段，缺省时兜底 portfolio_ids(无状态视为 active)
 function portfolioStatuses(s: LiveSessionItem): { portfolio_id: number; status: string }[] {
@@ -159,10 +173,12 @@ async function load() {
   // B6 全局限 1 个运行 session,自动接它的流
   const running = sessions.value.find((s) => s.status === 'running')
   if (running) startEventStream(running.id)
+  // 通道条跟随运行中 session 的引擎；无运行会话时跟随默认引擎
+  loadChannel(running?.engine)
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: 'iquant', portfolio_ids: [] }
   showCreate.value = true
 }
 
@@ -173,7 +189,7 @@ async function create() {
   }
   await createLiveSession(form.value)
   showCreate.value = false
-  form.value = { name: '', mode: 'simulation', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: 'iquant', portfolio_ids: [] }
   load()
 }
 
@@ -203,19 +219,66 @@ async function deleteSession(s: LiveSessionItem) {
   }
 }
 
-onMounted(load)
+async function loadChannel(engine?: LiveEngineKey) {
+  try {
+    channel.value = await getLiveChannel(engine)
+  } catch {
+    channel.value = null
+  }
+}
+
+async function testChannel() {
+  if (!channel.value) return
+  channelTesting.value = true
+  channelTestMsg.value = null
+  try {
+    const r = await testLiveChannel(channel.value.active)
+    const label = channel.value.label
+    channelTestMsg.value = r.ok
+      ? { ok: true, text: `${label} 已连接${r.positions !== undefined ? `，读到 ${r.positions} 条持仓` : r.base_url ? `（${r.base_url}）` : ''}` }
+      : { ok: false, text: r.error || '连接失败' }
+  } catch (e: any) {
+    channelTestMsg.value = { ok: false, text: e?.message || '连接失败' }
+  } finally {
+    channelTesting.value = false
+  }
+}
+
+onMounted(() => { load() })
 onUnmounted(closeEventStream)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+  <PageHeader title="实盘交易">
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
+  </PageHeader>
+
+  <div class="card channel-bar">
+    <span class="channel-label">执行引擎</span>
+    <span class="badge" :class="channel?.online ? 'badge-green' : 'badge-gray'">
+      {{ channel?.label || '未知' }}
+    </span>
+    <span v-for="e in channel?.engines || []" :key="e.key" class="badge"
+      :class="e.key === channel?.engine ? 'badge-blue' : (e.configured ? 'badge-gray' : 'badge-red')"
+      :title="e.detail">{{ e.label }}{{ e.configured ? '' : '（未配置）' }}</span>
+    <span
+      v-if="channel?.online !== null && channel?.online !== undefined"
+      class="badge" :class="channel.online ? 'badge-green' : 'badge-red'"
+    >{{ channel.online ? '在线' : '离线' }}</span>
+    <button class="btn btn-sm" :disabled="channelTesting" @click="testChannel">
+      {{ channelTesting ? '测试中…' : '测试连接' }}
+    </button>
+    <span
+      v-if="channelTestMsg"
+      :style="{ color: channelTestMsg.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }"
+    >{{ channelTestMsg.text }}</span>
+    <router-link to="/system" style="margin-left:auto;font-size:13px">通道配置 →</router-link>
   </div>
 
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>引擎</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:var(--ink-soft)">#{{ s.id }}</td>
@@ -228,6 +291,7 @@ onUnmounted(closeEventStream)
             </span>
             <span v-if="portfolioStatuses(s).length === 0">-</span>
           </td>
+          <td><span class="badge badge-gray">{{ engineLabel(s.engine) }}</span></td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
@@ -373,7 +437,17 @@ onUnmounted(closeEventStream)
       <h3>新建实盘</h3>
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
       <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
-      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。模拟/实盘下单由 iQuant 客户端启动按钮控制，此处仅选账号环境。</p>
+      <label>交易引擎</label>
+      <select v-model="form.engine">
+        <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
+          {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
+        </option>
+      </select>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。下单由所选引擎执行：
+        iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 与 miniQMT 直连各自客户端；
+        同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
+      </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
@@ -393,6 +467,15 @@ onUnmounted(closeEventStream)
 </template>
 
 <style scoped>
+.channel-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+.channel-label { font-size: 13px; color: var(--ink-soft); }
 .event-log {
   max-height: 420px;
   overflow-y: auto;

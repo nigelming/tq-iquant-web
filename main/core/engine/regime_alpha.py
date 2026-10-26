@@ -25,7 +25,7 @@ dict），``analyze()`` 输出四块 JSON 安全 payload：
 - 态内最大回撤 = 仅取标签为该态的交易日，日净值对态内运行高点的最大回撤。
 - 年化换手率（分态/震荡）= 该态交易日双边成交额（BUY+SELL amount 全计）
   / 该态日均总净值 / 自然年数（该态首末交易日天数差 / 365.25）。
-- 成本占比（分态）= 该态交易日（佣金+印花税）/ 该态首日总净值。
+- 成本占比（分态）= 该态交易日（佣金+印花税）/ 该态日均总净值（与换手同分母）。
 - 成本/毛利比（震荡）= 震荡日（佣金+印花税）/ 震荡日平仓盈利交易的毛
   PnL 之和（FIFO 配对价差，未扣费用）；毛利 ≤ 0 时为 None。
 - 假突破磨损 = 买入开仓后 ≤ ``WHIPSAW_DAYS`` 个交易日内同票平仓且毛
@@ -363,13 +363,12 @@ class RegimeAlphaAnalyzer:
                 cost += tr["commission"] + tr["stamp_duty"]
         navs = [float(self.s_nav.loc[d]) for d in days]
         avg_total = _mean(navs)
-        first_total = navs[0]
         years = (days[-1] - days[0]).days / DAYS_PER_YEAR
         turnover = (
             amount / avg_total / years
             if avg_total > 0 and years > 0 else None
         )
-        cost_ratio = cost / first_total if first_total > 0 else None
+        cost_ratio = cost / avg_total if avg_total > 0 else None
         return turnover, cost_ratio
 
     # ------------------------------------------------------------------

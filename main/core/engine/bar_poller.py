@@ -28,10 +28,13 @@ parse_bar_time 优先 stime(14 位串),次选 time(按 Asia/Shanghai +8 显式�
 """
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .event import BarEvent
-from .http_bridge_dispatcher import HttpBridgeDispatcher
+try:
+    from .http_bridge_dispatcher import HttpBridgeDispatcher
+except Exception:
+    HttpBridgeDispatcher = Any  # type: ignore
 
 # Asia/Shanghai 固定时区(时间戳路径显式转换用,不依赖本机时区)
 _CST = timezone(timedelta(hours=8))
@@ -164,7 +167,7 @@ class BarPoller:
 
     def __init__(
         self,
-        dispatcher: HttpBridgeDispatcher,
+        dispatcher: Any,
         stock_codes: List[str],
         period: str = "1m",
         count: int = 10,

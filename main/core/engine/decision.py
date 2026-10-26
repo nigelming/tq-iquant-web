@@ -157,3 +157,55 @@ def summarize_decisions(
     # 最常触发在前；同频按 gate 名字稳定排序
     result.sort(key=lambda s: (-s["count"], str(s["gate"]), str(s["param_name"] or "")))
     return result
+
+
+# C9 年度归因关注的风控闸门（action=trigger 才算一次风控触发）
+_RISK_GATES = ("stop_loss", "trailing_stop", "take_profit")
+# 槽位拦截闸门（block/trigger 都算一次拦截）
+_BLOCK_GATE = "max_positions_full"
+
+
+def summarize_decisions_yearly(
+    events: Union[List[DecisionEvent], List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """按日历年聚合决策事件，供年度归因（止损率↑ + 拦截↑ 诊断）。
+
+    每年返回：year(str)/total/by_gate({gate: {action: count}}) +
+    便利汇总 stop_loss_triggers/trailing_stop_triggers/take_profit_triggers/
+    risk_triggers（三者合计）/max_positions_full_blocks。
+    无 bar_time 的事件无法归年，跳过。结果按 year 升序，JSON 安全。
+    """
+    by_year: Dict[int, Dict[str, Any]] = {}
+    for ev in events:
+        bt = _get(ev, "bar_time")
+        if bt is None:
+            continue
+        y = by_year.setdefault(bt.year, {"total": 0, "by_gate": {}})
+        y["total"] += 1
+        gate = _get(ev, "gate")
+        action = _get(ev, "action")
+        actions = y["by_gate"].setdefault(gate, {})
+        actions[action] = actions.get(action, 0) + 1
+
+    result: List[Dict[str, Any]] = []
+    for year in sorted(by_year):
+        y = by_year[year]
+        by_gate = y["by_gate"]
+
+        def _trigger_count(gate: str) -> int:
+            return (by_gate.get(gate) or {}).get("trigger", 0)
+
+        risk = {g: _trigger_count(g) for g in _RISK_GATES}
+        blocks = sum((by_gate.get(_BLOCK_GATE) or {}).get(a, 0)
+                     for a in ("block", "trigger"))
+        result.append({
+            "year": str(year),
+            "total": y["total"],
+            "by_gate": {g: dict(a) for g, a in by_gate.items()},
+            "stop_loss_triggers": risk["stop_loss"],
+            "trailing_stop_triggers": risk["trailing_stop"],
+            "take_profit_triggers": risk["take_profit"],
+            "risk_triggers": sum(risk.values()),
+            "max_positions_full_blocks": blocks,
+        })
+    return result

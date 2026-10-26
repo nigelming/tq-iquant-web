@@ -27,6 +27,8 @@ def serialize_formula(db: Session, f: Formula) -> dict:
         "name": f.name,
         "content": f.content,
         "formula_count": f.formula_count,
+        "engine": f.engine,
+        "no_leak_cross": bool(f.no_leak_cross),
         "created_at": f.created_at,
         "updated_at": f.updated_at,
         "signals": [
@@ -56,7 +58,9 @@ def get_formula(db: Session, formula_id: int) -> dict | None:
 
 def create_formula(db: Session, req) -> dict:
     """建公式 + 信号（事务）。req 含 name/content/formula_count/signals。"""
-    f = Formula(name=req.name, content=req.content, formula_count=req.formula_count)
+    f = Formula(name=req.name, content=req.content, formula_count=req.formula_count,
+                engine=req.engine,
+                no_leak_cross=bool(getattr(req, "no_leak_cross", False)))
     db.add(f)
     db.flush()
     for sig in req.signals:
@@ -77,6 +81,8 @@ def update_formula(db: Session, formula_id: int, req) -> dict | None:
     f.name = req.name
     f.content = req.content
     f.formula_count = req.formula_count
+    f.engine = req.engine
+    f.no_leak_cross = bool(getattr(req, "no_leak_cross", False))
     # 信号全量替换：删旧建新（简单可靠）
     db.query(FormulaSignal).filter(FormulaSignal.formula_id == formula_id).delete()
     for sig in req.signals:

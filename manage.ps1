@@ -3,7 +3,8 @@ param(
     [string]$Action = "status"
 )
 
-$backend_port = 8000
+# 8001：8000 被「通达信量化 · Quant Terminal」（另一项目）长期占用，本项目后端改用 8001
+$backend_port = 8001
 $frontend_port = 5173
 $backend_dir = "D:\project\tq-iquant-web\main"
 $frontend_dir = "D:\project\tq-iquant-web\web"
@@ -22,6 +23,17 @@ function Get-FrontendPid {
     return $p
 }
 
+# 轮询等待端口进入 LISTENING（uv 首次同步虚拟环境可能耗时数十秒，固定 sleep 会导致服务未就绪就打开浏览器出现 502）
+function Wait-PortListening {
+    param([int]$Port, [int]$TimeoutSec = 120)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (netstat -ano | Select-String ":${Port}.*LISTENING") { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 switch ($Action) {
     "start" {
         $bp = Get-BackendPid
@@ -32,8 +44,12 @@ switch ($Action) {
             $stdin = Join-Path $backend_dir "stdin.empty"
             if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
             Start-Process -WindowStyle Hidden -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
-            Start-Sleep 3
-            Write-Host "  backend started (PID: $(Get-BackendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
+            Write-Host "  waiting for backend to listen on $backend_port ..." -ForegroundColor DarkGray
+            if (Wait-PortListening -Port $backend_port -TimeoutSec 180) {
+                Write-Host "  backend started (PID: $(Get-BackendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
+            } else {
+                Write-Host "  backend NOT ready within 180s, check $err" -ForegroundColor Red
+            }
         } else {
             Write-Host "  backend already running (PID: $($bp.Id))" -ForegroundColor Yellow
         }
@@ -46,8 +62,12 @@ switch ($Action) {
             $stdin = Join-Path $frontend_dir "stdin.empty"
             if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
             Start-Process -WindowStyle Hidden -FilePath "cmd" -ArgumentList "/c npm run dev -- --host 0.0.0.0" -WorkingDirectory $frontend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
-            Start-Sleep 3
-            Write-Host "  frontend started (PID: $(Get-FrontendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
+            Write-Host "  waiting for frontend to listen on $frontend_port ..." -ForegroundColor DarkGray
+            if (Wait-PortListening -Port $frontend_port -TimeoutSec 60) {
+                Write-Host "  frontend started (PID: $(Get-FrontendPid | Select-Object -ExpandProperty Id))" -ForegroundColor Green
+            } else {
+                Write-Host "  frontend NOT ready within 60s, check $err" -ForegroundColor Red
+            }
         } else {
             Write-Host "  frontend already running (PID: $($fp.Id))" -ForegroundColor Yellow
         }

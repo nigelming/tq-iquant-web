@@ -10,6 +10,10 @@ class LiveSession(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     mode = Column(String(10), nullable=False)
+    # 交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI) / qmt(miniQMT)。
+    # 为 NULL 表示迁移前的历史会话，运行时按全局默认引擎（ths_ui.enabled 判定）解析，
+    # 保持升级前行为不变；新建会话一律显式写入。
+    engine = Column(String(10), nullable=True)
     # 执行模式：alert（半自动，只预警不下单）/ auto（现有自动交易）。
     # 迁移前历史会话写 auto；新建会话由 live_service 显式写 alert。
     execution_mode = Column(String(10), nullable=False, server_default="auto")

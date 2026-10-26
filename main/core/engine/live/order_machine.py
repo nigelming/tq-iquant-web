@@ -136,7 +136,10 @@ class OrderStateMachine:
                 return  # 桥离线，下轮再找
         claimed = claimed_refs if claimed_refs is not None else set()
         bridge_oid = live_order.bridge_order_id
-        if bridge_oid:
+        # 通道不支持 remark 回写（如 THS UI 自动化）时，bridge_order_id 无法在柜台
+        # 委托上找到，直接走 legacy 模糊匹配，避免 180s 后被误判超时拒单。
+        supports_remark = getattr(self._ctx.dispatcher, "supports_remark", True)
+        if bridge_oid and supports_remark:
             ref = self.match_by_remark(orders, bridge_oid[:20], claimed)
         else:
             ref = self.match_legacy_fuzzy(live_order, orders, claimed)
@@ -671,6 +674,16 @@ class OrderStateMachine:
         if pos is None and trade.trade_type == TradeType.BUY:
             pos = Position(live_order.stock_code)
             ctx.positions[live_order.stock_code] = pos
+        elif pos is None and trade.trade_type == TradeType.SELL:
+            # 虚拟持仓缺失却收到卖出成交：现金会按成交额增加但持仓无从扣减，
+            # 两者口径不一致（对账只能告警）。记日志便于事后定位（手工卖出/
+            # live_trades 回放缺 BUY 等），不阻断记账以免与真实账户现金背离。
+            logger.warning(
+                "live trade: SELL without virtual position (portfolio %s, strategy %s, "
+                "code %s, qty %s, order %s) — cash credited but no position deducted",
+                live_order.portfolio_strategy_id, live_order.strategy_id,
+                live_order.stock_code, qty, live_order.id,
+            )
         portfolio.account.apply_trade(trade)
         if pos is not None:
             pos.apply_trade(trade)

@@ -11,12 +11,15 @@ vi.mock('../api', () => ({
   getTdxFormulas: vi.fn(),
   getTdxInfo: vi.fn(),
   importTdxFormula: vi.fn(),
+  precheckFormula: vi.fn(),
+  normalizePreview: vi.fn(),
 }))
 
 import Formulas from '../views/Formulas.vue'
 import {
   getFormulas, createFormula, deleteFormula,
   getTdxFormulas, getTdxInfo, importTdxFormula,
+  precheckFormula, normalizePreview,
 } from '../api'
 
 const mockFormulas = [
@@ -46,6 +49,16 @@ beforeEach(() => {
   })
   ;(importTdxFormula as any).mockResolvedValue({
     id: 99, name: 'COSTLINE', content: '', formula_count: 200, signals: [],
+  })
+  ;(precheckFormula as any).mockResolvedValue({
+    ok: true, issues: [], errors: [], outputs: ['DIF', 'MACD'],
+  })
+  ;(normalizePreview as any).mockResolvedValue({
+    new_content: 'DIF:=EMA(C,12);\nXG:CROSS(DIF,0);',
+    output_lines: [
+      { name: 'XG', source_line: 'DIF', rule: 'cross_zero', expr: 'CROSS(DIF,0)', meaning: '1=上穿0轴当根，0=其他' },
+    ],
+    warnings: [],
   })
 })
 
@@ -315,6 +328,30 @@ describe('Formulas.vue', () => {
     expect(w.text()).toContain('无匹配公式')
   })
 
+  it('通达信弹窗搜索支持拼音首字母（lmsj → 六脉神剑，zb → acName 首字母）', async () => {
+    ;(getTdxFormulas as any).mockResolvedValue([
+      { acCode: '六脉神剑', acName: '指标共震6红上车，3红下车', isSys: 0, imported: false, formula_id: null },
+      { acCode: '逆时钟', acName: '', isSys: 0, imported: false, formula_id: null },
+    ])
+    const w = mount(Formulas)
+    await flushPromises()
+
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+    expect(w.find('input.tdx-search').attributes('placeholder')).toContain('拼音首字母')
+
+    await w.find('input.tdx-search').setValue('lmsj')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+    expect(w.text()).toContain('六脉神剑')
+
+    await w.find('input.tdx-search').setValue('zb')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+
+    await w.find('input.tdx-search').setValue('nsz')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(1)
+    expect(w.text()).toContain('逆时钟')
+  })
+
   it('通达信弹窗分页：每页 10 条，可翻页，搜索后回到第 1 页', async () => {
     ;(getTdxFormulas as any).mockResolvedValue(
       Array.from({ length: 25 }, (_, i) => ({
@@ -354,5 +391,132 @@ describe('Formulas.vue', () => {
     expect(rows.length).toBe(10)
     expect(rows[0].text()).toContain('F01')
     expect(w.text()).toContain('第 1 / 3 页')
+  })
+
+  it('后端 400 → 顶部显示错误消息', async () => {
+    ;(createFormula as any).mockRejectedValue({ response: { data: { code: 400, message: '公式含未来函数：ZIG' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[placeholder*="名称"]').setValue('FUTURE_F')
+    await w.find('.signal-row input').setValue('sig1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('ZIG')
+    vi.unstubAllGlobals()
+  })
+
+  // -------------------------------------------------------------------------
+  // 0016 信号标准化向导：选线 → 配规则 → 预览并保存为新公式（源公式零改动）
+  // -------------------------------------------------------------------------
+  it('点[信号标准化] → 先跑语法预检，通过后打开向导第一步显示输出线勾选列表', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+
+    const entry = w.findAll('button').find(b => b.text() === '信号标准化')!
+    await entry.trigger('click')
+    await flushPromises()
+
+    expect(precheckFormula).toHaveBeenCalledWith('REF(CLOSE,1)')
+    expect(w.text()).toContain('信号标准化向导')
+    expect(w.text()).toContain('源公式：MACROSSPRO')
+    expect(w.text()).toContain('第 1 / 3 步')
+    const checks = w.findAll('.norm-line-row input[type="checkbox"]')
+    expect(checks.length).toBe(2)
+  })
+
+  it('预检未通过或无 `:` 输出线 → alert 拦截，向导不打开（E6 入口闸门）', async () => {
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+
+    // 语法错误
+    ;(precheckFormula as any).mockResolvedValue({ ok: false, issues: [], errors: ['错误'], outputs: [] })
+    await w.findAll('button').find(b => b.text() === '信号标准化')!.trigger('click')
+    await flushPromises()
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('语法预检未通过')
+    expect(w.find('.modal-overlay').exists()).toBe(false)
+
+    // 无输出线
+    ;(precheckFormula as any).mockResolvedValue({ ok: true, issues: [], errors: [], outputs: [] })
+    await w.findAll('button').find(b => b.text() === '信号标准化')!.trigger('click')
+    await flushPromises()
+    expect(alertMock.mock.calls[1][0]).toContain('没有 `:` 输出线')
+    expect(w.find('.modal-overlay').exists()).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('勾选输出线 → 下一步 → 生成预览 → 调 normalizePreview 且 plans 结构正确', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '信号标准化')!.trigger('click')
+    await flushPromises()
+
+    // 第一步：勾选第一条输出线 DIF
+    await w.findAll('.norm-line-row input[type="checkbox"]')[0].setValue(true)
+    await w.findAll('.modal-actions button').find(b => b.text() === '下一步')!.trigger('click')
+    expect(w.text()).toContain('第 2 / 3 步')
+
+    // 第二步：默认 cross_zero 双向，直接生成预览
+    await w.findAll('.modal-actions button').find(b => b.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+
+    expect(normalizePreview).toHaveBeenCalledTimes(1)
+    const [content, plans] = (normalizePreview as any).mock.calls[0]
+    expect(content).toBe('REF(CLOSE,1)')
+    expect(plans).toEqual([
+      { line: 'DIF', rule: 'cross_zero', params: { direction: 'both' } },
+    ])
+    expect(w.text()).toContain('第 3 / 3 步')
+    expect(w.find('.norm-preview-src').text()).toContain('XG:CROSS(DIF,0)')
+  })
+
+  it('预览后信号预填生成线名，保存 → createFormula 收到 -STD 名称与新源码（源公式零改动）', async () => {
+    ;(createFormula as any).mockResolvedValue({ id: 100 })
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '信号标准化')!.trigger('click')
+    await flushPromises()
+    await w.findAll('.norm-line-row input[type="checkbox"]')[0].setValue(true)
+    await w.findAll('.modal-actions button').find(b => b.text() === '下一步')!.trigger('click')
+    await w.findAll('.modal-actions button').find(b => b.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+
+    // 名称预填 原名-STD；信号预填生成线 XG
+    const nameInput = w.find('input[placeholder*="默认：原公式名-STD"]')
+    expect((nameInput.element as HTMLInputElement).value).toBe('MACROSSPRO-STD')
+    expect(w.find('.norm-out-table').text()).toContain('XG')
+    const sigInput = w.find('.signal-row input')
+    expect((sigInput.element as HTMLInputElement).value).toBe('XG')
+
+    await w.findAll('.modal-actions button').find(b => b.text().includes('保存为新公式'))!.trigger('click')
+    await flushPromises()
+
+    expect(createFormula).toHaveBeenCalledTimes(1)
+    const arg = (createFormula as any).mock.calls[0][0]
+    expect(arg.name).toBe('MACROSSPRO-STD')
+    expect(arg.content).toBe('DIF:=EMA(C,12);\nXG:CROSS(DIF,0);')
+    expect(arg.signals).toEqual([
+      { signal_name: 'XG', signal_type: 'OPEN', trigger_value: 1 },
+    ])
+  })
+
+  it('第一步未勾选任何线 → alert 提示，不进入第二步', async () => {
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '信号标准化')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('.modal-actions button').find(b => b.text() === '下一步')!.trigger('click')
+    expect(alertMock).toHaveBeenCalled()
+    expect(w.text()).toContain('第 1 / 3 步')
+    vi.unstubAllGlobals()
   })
 })

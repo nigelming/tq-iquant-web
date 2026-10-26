@@ -4,6 +4,7 @@ from decimal import Decimal
 from .position import Position
 from .event import SignalEvent, BarEvent
 from .risk_manager import StrategyRiskManager
+from .regime import REGIME_BULL
 from tq_iquant_shared.constants import SignalType
 
 
@@ -24,6 +25,17 @@ class StrategyContext:
         master_strategy_id: Optional[int] = None,
         stock_pool: Optional[Set[str]] = None,
         slave_exit_mode: str = "independent",
+        # B4 OPEN 择优轮动（默认关）：满槽时强信号可轮动替换最弱持仓
+        rotation_enabled: bool = False,
+        rotation_momentum_bars: int = 20,
+        rotation_hysteresis: Decimal = Decimal("0.05"),
+        # B5 市场状态闸（默认关）：bull 态用 trend_* 覆盖参数，其余态用原参数
+        regime_filter_enabled: bool = False,
+        trend_trailing_stop_ratio: Optional[Decimal] = None,
+        trend_max_positions: Optional[int] = None,
+        # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
+        # ≤ capital_ratio × 组合初始资金（仅回测成交步传入生效）
+        exposure_cap_enabled: bool = False,
     ):
         self.strategy_id = strategy_id
         self.period = period
@@ -42,6 +54,15 @@ class StrategyContext:
         self.slave_exit_mode = slave_exit_mode
         # 本策略可交易股票池（组合的 stock_pool_id 对应成分；None=不限，回测单池/旧调用）
         self.stock_pool: Optional[Set[str]] = stock_pool
+        # B4/B5 可选增强开关（全部默认关/None，关闭时行为与原逻辑一致）
+        self.rotation_enabled = rotation_enabled
+        self.rotation_momentum_bars = rotation_momentum_bars
+        self.rotation_hysteresis = rotation_hysteresis
+        self.regime_filter_enabled = regime_filter_enabled
+        self.trend_trailing_stop_ratio = trend_trailing_stop_ratio
+        self.trend_max_positions = trend_max_positions
+        # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
+        self.exposure_cap_enabled = exposure_cap_enabled
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
         self.strategy_risk: Optional[StrategyRiskManager] = None
@@ -99,3 +120,31 @@ class StrategyContext:
                 bar_time=bar_time,
             ))
         return result
+
+    def effective_max_positions(self, regime: Optional[str]) -> int:
+        """当前市场状态下的生效槽位上限。仅在开关打开、状态为 bull 且配置了
+        trend_max_positions 时用覆盖值，其余一律回落 max_positions（默认行为不变）。"""
+        if (
+            self.regime_filter_enabled
+            and regime == REGIME_BULL
+            and self.trend_max_positions is not None
+        ):
+            return self.trend_max_positions
+        return self.max_positions
+
+    def effective_trailing_stop(self, regime: Optional[str]) -> Optional[Decimal]:
+        """当前市场状态下的生效移动止损比例。基准值取 strategy_risk 的
+        trailing_stop_ratio；仅在开关打开、状态为 bull 且配置了覆盖值时替换。
+        strategy_risk 未注入时返回 None（调用方按未配置移动止损处理）。"""
+        base = (
+            self.strategy_risk.trailing_stop_ratio
+            if self.strategy_risk is not None
+            else None
+        )
+        if (
+            self.regime_filter_enabled
+            and regime == REGIME_BULL
+            and self.trend_trailing_stop_ratio is not None
+        ):
+            return self.trend_trailing_stop_ratio
+        return base

@@ -283,3 +283,65 @@ def test_get_formula_info_returns_raw(fake_tq):
 
     assert info["acCode"] == "QZQ"
     assert info["Line"][0]["LineName"] == "普通金叉信号"
+
+
+# ---------------------------------------------------------------------------
+# compute 分批：TQ formula_process_mul 对 250 只股票会返回 ErrorId=19
+# （数据过多无法完全加载），且每次返回的 150 只子集不同，导致回测不可复现。
+# 必须按股票分块执行并合并；仍返回 19 时不能静默当成成功。
+# ---------------------------------------------------------------------------
+def test_compute_chunks_stocks_at_50(monkeypatch):
+    """compute 把 120 只股票拆成 50/50/20 三次调用并合并全部结果。"""
+    calls = []
+
+    def fake_run(self, *args, **kwargs):
+        chunk = list(kwargs.get("stocks", args[2] if len(args) > 2 else []))
+        calls.append(chunk)
+        return {"ErrorId": "0", **{
+            code: {"sig": [{"Date": "20260101", "Value": 1}]}
+            for code in chunk
+        }}
+
+    monkeypatch.setattr(TQFormula, "_run_formula", fake_run)
+    codes = [f"{i:06d}.SZ" for i in range(120)]
+    with patch("core.tq.formula.get_tdx_lock"):
+        raw = TQFormula().compute("F", "", codes)
+
+    assert [len(c) for c in calls] == [50, 50, 20]
+    assert raw["ErrorId"] == "0"
+    assert {k for k in raw if k != "ErrorId"} == set(codes)
+
+
+def test_compute_recursively_splits_error19(monkeypatch):
+    """某块返回 19 时继续二分，直到小批量成功，最终合并为 ErrorId=0。"""
+    calls = []
+
+    def fake_run(self, *args, **kwargs):
+        chunk = list(kwargs.get("stocks", args[2] if len(args) > 2 else []))
+        calls.append(chunk)
+        if len(chunk) > 2:
+            return {"ErrorId": "19", "Error": "too much"}
+        return {"ErrorId": "0", **{code: {"sig": []} for code in chunk}}
+
+    monkeypatch.setattr(TQFormula, "_run_formula", fake_run)
+    codes = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+    with patch("core.tq.formula.get_tdx_lock"):
+        raw = TQFormula().compute("F", "", codes)
+
+    assert [len(c) for c in calls] == [4, 2, 2]
+    assert raw["ErrorId"] == "0"
+    assert {k for k in raw if k != "ErrorId"} == set(codes)
+
+
+def test_compute_surfaces_error19_when_single_stock_still_partial(monkeypatch):
+    """单只股票仍返回 19 时，compute 必须暴露错误，不能返回 ErrorId=0。"""
+    def fake_run(self, *args, **kwargs):
+        return {"ErrorId": "19", "Error": "too much"}
+
+    monkeypatch.setattr(TQFormula, "_run_formula", fake_run)
+    with patch("core.tq.formula.get_tdx_lock"):
+        raw = TQFormula().compute("F", "", ["000001.SZ"])
+
+    assert raw["ErrorId"] == "19"
+    assert "无法完全加载" in raw["Error"]
+    assert "000001.SZ" in raw["Error"]

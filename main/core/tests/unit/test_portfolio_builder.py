@@ -79,3 +79,46 @@ def test_assemble_no_warning_when_slave_pool_subset(db, caplog):
         assemble_portfolio(ps, strategies, db)
 
     assert not any("越出 master" in r.getMessage() for r in caplog.records)
+
+
+def test_assemble_reads_position_sizing(db):
+    """builder 从组合表读取 position_sizing 注入 Portfolio。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.position_sizing = "fixed"
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.position_sizing == "fixed"
+
+
+def test_assemble_defaults_position_sizing_dynamic(db):
+    """组合表未显式设置 → 默认 dynamic。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.position_sizing == "dynamic"
+
+
+def test_portfolio_price_limit_check_defaults_on(db):
+    """W3：ORM/server 默认开启涨跌停约束（未显式设置时为 True）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.price_limit_check_enabled is True
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.price_limit_check_enabled is True
+
+
+def test_assemble_daily_loss_basis_defaults_equity(db):
+    """日内亏损分母默认 equity（昨收净值），builder 注入 risk_manager。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.daily_loss_basis == "equity"
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.risk_manager.daily_loss_on_equity_enabled is True
+
+
+def test_assemble_daily_loss_basis_initial(db):
+    """组合显式选 initial → 分母回落初始资金（旧口径）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.daily_loss_basis = "initial"
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.risk_manager.daily_loss_on_equity_enabled is False

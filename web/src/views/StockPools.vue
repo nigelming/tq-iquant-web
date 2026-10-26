@@ -4,6 +4,7 @@ import {
   getTdxPools, getTdxPoolStocks, syncStockPool, getStockPools, deleteStockPool,
   type TdxPoolItem, type TdxPoolStockItem,
 } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const pools = ref<TdxPoolItem[]>([])
 const localIdByCode = ref<Record<string, number>>({})  // 删除用：code → 本地池 id
@@ -82,9 +83,9 @@ onMounted(load)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+  <PageHeader title="备选股池">
     <button @click="load" class="btn">刷新</button>
-  </div>
+  </PageHeader>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
@@ -121,17 +122,19 @@ onMounted(load)
   <div v-if="showStocks" class="modal-overlay modal-lg" @click.self="showStocks = false">
     <div class="modal-content">
       <h3>{{ stocksPoolName }} 成分股（{{ stocksList.length }}）</h3>
-      <div class="card table-wrap" style="margin-bottom:12px">
-        <table>
-          <thead><tr><th>股票代码</th><th>名称</th></tr></thead>
-          <tbody>
-            <tr v-for="s in stocksList" :key="s.stock_code">
-              <td>{{ s.stock_code }}</td>
-              <td style="color:var(--ink-soft)">{{ s.stock_name || '-' }}</td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-if="stocksList.length === 0" class="empty-state"><p>该板块暂无成分股</p></div>
+      <div class="modal-body">
+        <div class="card table-wrap" style="margin-bottom:12px">
+          <table>
+            <thead><tr><th>股票代码</th><th>名称</th></tr></thead>
+            <tbody>
+              <tr v-for="s in stocksList" :key="s.stock_code">
+                <td>{{ s.stock_code }}</td>
+                <td style="color:var(--ink-soft)">{{ s.stock_name || '-' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="stocksList.length === 0" class="empty-state"><p>该板块暂无成分股</p></div>
+        </div>
       </div>
       <div class="modal-actions">
         <button @click="showStocks = false" class="btn">关闭</button>

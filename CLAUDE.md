@@ -62,9 +62,13 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 ## 实现状态（更新：2026-08-10）
 
 **已实现（较完整）**：
-- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ 7 个 Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束等后续迁移；head = `d4a5b6c7d8e9`）
+- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束/回测增强/`live_sessions.engine` 等后续迁移；head = `c3f7a1b9d402`）
 - 7 个 API 路由模块已注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status 全部可用（回测、实盘 CRUD + start/stop + SSE 流）
 - iQuant HTTP 桥 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
+- 同花顺 UI 执行通道 `ThsUiDispatcher`（可选，`ths_ui.enabled`；UIA 切「资金股票/当日委托」+ 剪贴板取数，Windows 内置 OCR 自动过复制验证码；`query_quote/query_calendar` 复用 TQ；无备注列，Core 走 legacy 模糊匹配）
+- 通达信 TQ 交易通道 `TdxTqDispatcher`（[main/core/engine/tdx_tq_dispatcher.py](main/core/engine/tdx_tq_dispatcher.py)）：`tq.stock_account` / `query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `order_stock`，与回测取数共用同一条 TQ 连接；委托表无备注列且无时间列 → `supports_remark=False`，下单后回查 `Wtbh` 认领并在进程内记录提交时间供 legacy 模糊匹配；半自动「下单确认」模式显式拒单告警
+- miniQMT 交易通道 `QmtDispatcher`（[main/core/engine/qmt_dispatcher.py](main/core/engine/qmt_dispatcher.py)）：`xtquant.xttrader` 限价下单 + `order_remark` 写入确定性订单 ID → 走 remark 精确认领；`can_use_volume` 作 T+1 可用；xtquant 缺失/未配置路径时启动直接 503 告警，不静默换通道
+- 实盘引擎按会话可选：`live_sessions.engine`（iquant/tdx/ths/qmt，NULL=历史会话走全局默认 `ths_ui.enabled` 判定），`/api/live/channel` 返回四引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher
 - 引擎层全 TDD 实现：`BacktestEngine.run` 完整逐 bar 回测；`LiveEngine` 实盘主链路（订单状态机 + /deals 回填 + 三段式周期 1m 边界/1d 14:30/1w·1mon 通达信 + B5 SSE 五类事件流 + E5/E6 熔断 + D3 对账告警）已接线。`SignalEngine` 为未接线的冗余壳（信号走 `strategy_context` + `Portfolio.on_bar` 直接求值）
 - TQ 模块（[main/core/tq/](main/core/tq/)）data/formula/utils 已对接通达信真机可用；`tdx_path` 从 config.yaml 读取
 - 前端 6 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig）

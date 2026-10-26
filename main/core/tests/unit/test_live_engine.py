@@ -425,6 +425,9 @@ def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 10, 0)
     port.account.cash = Decimal("0")  # 现金清零 → 不足1手拒绝
+    # 本例专测执行层资金不足路径：dynamic 会因净值=0 在信号层拦零股，故固定名义
+    # 口径保留信号层出单、走到 execution 的 cap 拒绝路径（INFO 日志）。
+    port.position_sizing = "fixed"
 
     rec = _Recorder()
     disp, _ = _make_dispatcher(rec)
@@ -2941,6 +2944,79 @@ def test_handle_bar_persists_breaker_count_on_drawdown_trigger():
     db.close()
 
 
+def test_recover_restores_risk_state_peak_and_daily_pause():
+    """风控内存态持久化：重启后峰值/昨收/暂停态不丢。
+
+    只恢复计数不恢复峰值时，重启首根 bar 会重设 peak → 历史回撤被抹平、max_drawdown
+    少触发；日内暂停也会被意外解除。这里覆盖 peak/prev_close/daily_pause 的读回。
+    """
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.peak_value = Decimal("1200000")
+    rm.prev_close_value = Decimal("1180000")
+    rm.daily_pause_active = True
+    rm.daily_loss_trigger_date = date(2026, 10, 24)
+    rm.breaker_trigger_date = date(2026, 10, 23)
+    engine._breaker.persist_risk_state(port)
+
+    # 模拟重启：内存态清零后走 recover 读回
+    rm.peak_value = Decimal("0")
+    rm.prev_close_value = None
+    rm.daily_pause_active = False
+    rm.daily_loss_trigger_date = None
+    rm.breaker_trigger_date = None
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert rm.peak_value == Decimal("1200000")
+    assert rm.prev_close_value == Decimal("1180000")
+    assert rm.daily_pause_active is True
+    assert rm.daily_loss_trigger_date == date(2026, 10, 24)
+    assert rm.breaker_trigger_date == date(2026, 10, 23)
+
+
+def test_recover_restores_risk_state_even_with_zero_trigger_count():
+    """计数为 0 也要还原风险态：峰值与熔断计数是两套独立状态。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.peak_value = Decimal("900000")
+    engine._breaker.persist_risk_state(port)
+
+    rm.peak_value = Decimal("0")
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert rm.peak_value == Decimal("900000")
+
+
+def test_restore_risk_state_bad_date_does_not_partially_apply():
+    """risk_state 日期字段损坏时整体放弃恢复，不能留下「半恢复」的峰值/暂停态。"""
+    from types import SimpleNamespace
+    from core.engine.live.breaker import BreakerService
+
+    rm = SimpleNamespace(
+        peak_value=Decimal("1000"),
+        prev_close_value=None,
+        daily_pause_active=False,
+        breaker_trigger_date=None,
+        daily_loss_trigger_date=None,
+    )
+    raw = json.dumps({
+        "peak_value": "9999",
+        "prev_close_value": "9000",
+        "daily_pause_active": True,
+        "breaker_trigger_date": "not-a-date",
+    })
+    assert BreakerService._restore_risk_state(rm, raw) is False
+    assert rm.peak_value == Decimal("1000")
+    assert rm.prev_close_value is None
+    assert rm.daily_pause_active is False
+
+
 def test_recover_restores_breaker_count():
     """D4：recover 读回 circuit_breaker_count → consecutive_drawdown_triggers（重启后不丢累计次数）。"""
     factory, _ = _db_factory()
@@ -3524,6 +3600,41 @@ def test_maybe_daily_close_emits_risk_on_daily_loss(monkeypatch):
     assert ev["triggered"] is True
     assert ev["portfolio_id"] == 1
     assert port.risk_manager.daily_pause_active is True
+
+
+def test_daily_close_uses_market_value_does_not_false_trigger(monkeypatch):
+    """R1：日终 total 用市值口径（现金 + 持仓市值），有持仓不误触 daily_loss。
+
+    持仓 1000 股 avg_cost=10，昨收（prev_close_value）市值口径 95000（现金 8 万 +
+    昨价 15×1000）。今市值口径 total=80000+11×1000=91000 → pnl=-4000（-4% < 5%
+    不触发）。旧成本口径 total=80000+10×1000=90000 → pnl=-5000（-5% = 阈值，
+    会误触）。断言市值口径下不暂停。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    port.account.cash = Decimal("80000")
+    code = "600000.SH"
+    pos = Position(code)
+    pos.apply_trade(TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code=code,
+        trade_type=TradeType.BUY, price=Decimal("10"), quantity=1000,
+        amount=Decimal("10000"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 8, 3, 9, 30),
+    ))
+    ctx.positions[code] = pos
+    port._price_snapshot[code] = Decimal("11")  # 今市值 11×1000
+    port.risk_manager.prev_close_value = Decimal("95000")  # 80000 + 15×1000
+    engine, _ = _ss_engine(factory, port)
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 5, 14, 30)
+    monkeypatch.setattr("core.engine.live.timing.datetime", _FakeDateTime)
+
+    engine._maybe_daily_close()
+
+    assert port.risk_manager.daily_pause_active is False
 
 
 def test_now_shanghai_returns_shanghai_wall_clock(monkeypatch):
@@ -5197,6 +5308,57 @@ def test_daily_loss_auto_recovery_logs_info(caplog):
     msgs = _log_msgs(caplog)
     assert rm.daily_pause_active is False
     assert any("daily_loss" in m and "恢复" in m for m in msgs), msgs
+
+
+def test_daily_loss_pause_cleared_at_first_bar_next_day():
+    """R3：daily_loss 暂停在次一交易日首根 bar 即解除（enter_day 镜像回测时序）。
+
+    8/21（周五）触发暂停；8/24（周一）首根 1m bar 在 on_bar_update（置 _last_bar_date
+    为当日）之前调 enter_day → 跨日补算 8/21、recovery_date=8/24 解除暂停。
+    断言首根 bar 后 daily_pause_active 已为 False，且同日后续 bar 不重复补算。
+    """
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    rm = engine.portfolios[0].risk_manager
+    rm.daily_pause_active = True
+    rm.daily_loss_trigger_date = date(2026, 8, 21)  # 周五触发
+    # 昨收：8/21 收盘 94000（建立 _last_bar_date/_last_bar_total_value）
+    rm.update_peak(Decimal("94000"), date(2026, 8, 21))
+    stock = "600000.SH"
+    # 首根 bar（8/24 09:30）：enter_day 补算 8/21 → 恢复
+    engine._handle_bar(engine.portfolios[0], _bar(stock, "94", datetime(2026, 8, 24, 9, 30)))
+    assert rm.daily_pause_active is False
+    assert engine._enter_day_updated[1] == date(2026, 8, 24)
+    # 同日后续 bar（8/24 09:35）：不再重复 enter_day（幂等）
+    engine._handle_bar(engine.portfolios[0], _bar(stock, "94", datetime(2026, 8, 24, 9, 35)))
+    assert engine._enter_day_updated[1] == date(2026, 8, 24)
+
+
+def test_daily_loss_pause_blocks_new_buys_until_next_day_bar():
+    """R3：8/21 触发暂停后，8/24 首根 bar 恢复前整日剥 BUY；恢复后首个新日可开仓。
+
+    对照：首根 bar 后暂停已清，同日再来的 OPEN 信号可正常下单（不再剥）。
+    """
+    factory, _ = _db_factory()
+    engine, _q = _ss_engine(factory)
+    port = engine.portfolios[0]
+    rm = port.risk_manager
+    rm.daily_pause_active = True
+    rm.daily_loss_trigger_date = date(2026, 8, 21)
+    rm.update_peak(Decimal("100000"), date(2026, 8, 21))
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 9, 30)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.3", bar_time))
+
+    # 首根 bar 恢复暂停 → OPEN 信号正常落单（不再剥 BUY）
+    assert rm.daily_pause_active is False
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    assert len(orders) == 1
+    assert orders[0].status == "submitted"
 
 
 def test_recover_breaker_manual_logs_info(caplog):

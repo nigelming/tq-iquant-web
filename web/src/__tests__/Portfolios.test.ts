@@ -165,6 +165,8 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const minCommInput = w.find('input[data-field="min_commission"]')
     expect(Number((minCommInput.element as HTMLInputElement).value)).toBe(5)
 
+    await w.find('input[data-field="name"]').setValue('ROUND_TRIP')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()
 
@@ -178,7 +180,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(arg.initial_capital).toBe(500000)
     // select 字段保持字符串/原值，不被 Number() 转成 NaN
     expect(arg.trading_session).toBe('full')
-    expect(arg.stock_pool_id).toBe(0)
+    expect(arg.stock_pool_id).toBe(1)
   })
 
   it('填组合表 + 提交 → 调 createPortfolio，strategies 为空数组', async () => {
@@ -188,6 +190,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     await w.find('button.btn-primary').trigger('click')
 
     await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()
 
@@ -195,6 +198,55 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const arg = (createPortfolio as any).mock.calls[0][0]
     expect(arg.name).toBe('NEW_PS')
     expect(arg.strategies).toEqual([])
+    // #4 自适应滑点默认关；系数带 showIf 隐藏 → 不随默认提交（undefined）
+    expect(arg.adaptive_slippage_enabled).toBe(false)
+    expect(arg.slippage_impact_coef).toBeUndefined()
+  })
+
+  it('勾选自适应滑点并改冲击系数 25% → 提交 enabled=true / coef=0.25', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="adaptive_slippage_enabled"]').setValue(true)
+    await w.find('input[data-field="slippage_impact_coef"]').setValue('25')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.adaptive_slippage_enabled).toBe(true)
+    expect(arg.slippage_impact_coef).toBeCloseTo(0.25)
+  })
+
+  it('配置指南按钮 → 打开指南弹窗（含动态仓位/容量上限说明）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // 打开新建组合
+    await w.find('[data-field="guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('配置指南')
+    expect(w.text()).toContain('容量上限')
+    expect(w.text()).toContain('成交量约束')
+  })
+
+  it('新建子策略弹窗 → 配置指南按钮打开子策略指南（含轮动/主从说明）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    // 展开第一个组合行
+    await w.find('button.toggle-expand').trigger('click')
+    await flushPromises()
+    // 打开新建子策略
+    const addBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await addBtn.trigger('click')
+    await flushPromises()
+    await w.find('[data-field="strategy-guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('子策略配置指南')
+    expect(w.text()).toContain('OPEN 择优轮动')
+    expect(w.text()).toContain('主从策略')
   })
 
   it('提交失败（422）→ alert 错误且弹窗保持打开，不静默卡死', async () => {
@@ -205,6 +257,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     await flushPromises()
     await w.find('button.btn-primary').trigger('click')  // 新建组合
     await w.find('input[data-field="name"]').setValue('X')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
     await w.find('.modal-actions button.btn-primary').trigger('click')  // 确定
     await flushPromises()
 
@@ -307,6 +360,7 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
     expect(Number((posInput.element as HTMLInputElement).value)).toBe(5)
 
     await w.find('input[data-field="name"]').setValue('NEW_S')
+    await w.find('select[data-field="formula_id"]').setValue('1')
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()
 
@@ -339,6 +393,7 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
 
     await w.find('input[data-field="add_position_threshold"]').setValue('-1')
     await w.find('input[data-field="name"]').setValue('NEW_S')
+    await w.find('select[data-field="formula_id"]').setValue('1')
     await w.find('.modal-actions button.btn-primary').trigger('click')
     await flushPromises()
 
@@ -409,6 +464,233 @@ describe('Portfolios.vue — 子策略（树状子行 + 弹窗）', () => {
 
     expect(alertMock).toHaveBeenCalled()
     expect(alertMock.mock.calls[0][0]).toContain('被回测或实盘交易记录引用')
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('Portfolios.vue — 执行真实感与策略增强', () => {
+  it('组合表单含执行真实感开关并随 payload 提交', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // +新建组合
+
+    expect(w.text()).toContain('执行真实感')
+    expect(w.text()).toContain('涨跌停')
+    // 默认 price_limit_check_enabled=true
+    const plInput = w.find('input[data-field="price_limit_check_enabled"]')
+    expect((plInput.element as HTMLInputElement).checked).toBe(true)
+
+    // 勾选成交量约束 → ratio 字段显示，默认 10%
+    await w.find('input[data-field="volume_limit_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.price_limit_check_enabled).toBe(true)
+    expect(arg.volume_limit_enabled).toBe(true)
+    expect(arg.volume_limit_ratio).toBeCloseTo(0.1)
+  })
+
+  it('子策略表单含策略增强组字段', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+
+    expect(w.text()).toContain('策略增强')
+    expect(w.find('input[data-field="rotation_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="exposure_cap_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="regime_filter_enabled"]').exists()).toBe(true)
+  })
+
+  it('组合表单含仓位模型与现金管理组，默认 dynamic，字段随 payload 提交', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')  // +新建组合
+
+    expect(w.text()).toContain('仓位与现金管理')
+    const psSel = w.find('select[data-field="position_sizing"]')
+    expect(psSel.exists()).toBe(true)
+    expect((psSel.element as HTMLSelectElement).value).toBe('dynamic')
+
+    // 默认关闭现金管理增强 → 阈值字段隐藏（v-show 置 display:none）
+    const eqRow = w.find('input[data-field="cash_enhance_equity_threshold"]').element.closest('.field-row') as HTMLElement
+    expect(eqRow.style.display).toBe('none')
+    await w.find('input[data-field="cash_enhance_enabled"]').setValue(true)
+    await flushPromises()
+    expect(eqRow.style.display).not.toBe('none')
+
+    await w.find('input[data-field="name"]').setValue('NEW_PS')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="cash_enhance_equity_threshold"]').setValue('2000000')
+    await w.find('input[data-field="cash_enhance_position_ratio_threshold"]').setValue('30')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.position_sizing).toBe('dynamic')
+    expect(arg.cash_enhance_enabled).toBe(true)
+    expect(arg.cash_enhance_equity_threshold).toBe(2000000)
+    expect(arg.cash_enhance_position_ratio_threshold).toBeCloseTo(0.3)
+  })
+})
+
+describe('Portfolios.vue — 提交前门控（快速失败）', () => {
+  it('新建组合空名 → alert 且不调 createPortfolio', async () => {
+    ;(createPortfolio as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock).toHaveBeenCalled()
+    expect(createPortfolio).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('新建组合未选股票池 → alert 且不调 createPortfolio', async () => {
+    ;(createPortfolio as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[data-field="name"]').setValue('NO_POOL')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock.mock.calls[0][0]).toContain('股票池')
+    expect(createPortfolio).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('新建子策略从策略未选主策略 → alert 且不调 createStrategy', async () => {
+    ;(createStrategy as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('select[data-field="role"]').setValue('slave')
+    await w.find('input[data-field="name"]').setValue('SLAVE_NO_MASTER')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock.mock.calls[0][0]).toContain('主策略')
+    expect(createStrategy).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('新建子策略负止损比例 → alert 且不调 createStrategy', async () => {
+    ;(createStrategy as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const newSubBtn = w.findAll('button').find(b => b.text().includes('新建子策略'))!
+    await newSubBtn.trigger('click')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('input[data-field="name"]').setValue('NEG')
+    await w.find('input[data-field="stop_loss_ratio"]').setValue('-5')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock.mock.calls[0][0]).toContain('止损')
+    expect(createStrategy).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('Portfolios.vue — 门控条件输入留空归一为 null（不再 422）', () => {
+  it('开现金增强、两个阈值留空 → payload 为 null 且保存成功', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[data-field="cash_enhance_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('input[data-field="name"]').setValue('CASH_BLANK')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createPortfolio).toHaveBeenCalled()
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.cash_enhance_enabled).toBe(true)
+    expect(arg.cash_enhance_equity_threshold).toBeNull()
+    expect(arg.cash_enhance_position_ratio_threshold).toBeNull()
+  })
+
+  it('动态仓位、容量上限留空 → equity_cap 为 null', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[data-field="name"]').setValue('CAP_BLANK')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect((createPortfolio as any).mock.calls[0][0].equity_cap).toBeNull()
+  })
+
+  it('开市场状态闸、趋势字段清空 → payload 为 null', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 77 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('新建子策略'))!.trigger('click')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('input[data-field="name"]').setValue('REGIME_BLANK')
+    await w.find('input[data-field="regime_filter_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('input[data-field="trend_trailing_stop_ratio"]').setValue('3')
+    await w.find('input[data-field="trend_max_positions"]').setValue('5')
+    await w.find('input[data-field="trend_trailing_stop_ratio"]').setValue('')
+    await w.find('input[data-field="trend_max_positions"]').setValue('')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createStrategy).toHaveBeenCalled()
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.regime_filter_enabled).toBe(true)
+    expect(arg.trend_trailing_stop_ratio).toBeNull()
+    expect(arg.trend_max_positions).toBeNull()
+  })
+
+  it('开轮动但动量 bars 清空 → 明确提示且不提交', async () => {
+    ;(createStrategy as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('新建子策略'))!.trigger('click')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('input[data-field="name"]').setValue('ROT_BLANK')
+    await w.find('input[data-field="rotation_enabled"]').setValue(true)
+    await flushPromises()
+    await w.find('input[data-field="rotation_momentum_bars"]').setValue('')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(alertMock.mock.calls[0][0]).toContain('轮动动量bars')
+    expect(createStrategy).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
 })

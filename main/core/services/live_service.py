@@ -19,7 +19,7 @@ start_session 只返回构造好、heartbeat 通过、recover 已执行但尚未
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
@@ -32,12 +32,28 @@ from core.models import (
     StockPoolStock, Formula, LiveOrder, LiveTrade, LiveDecisionEvent,
 )
 from core.engine.portfolio_builder import assemble_portfolio
-from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
+try:
+    from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
+except Exception:
+    HttpBridgeDispatcher = None  # type: ignore
+try:
+    from core.engine.ths_ui_dispatcher import ThsUiDispatcher
+except Exception:
+    ThsUiDispatcher = None  # type: ignore
+try:
+    from core.engine.tdx_tq_dispatcher import TdxTqDispatcher
+except Exception:
+    TdxTqDispatcher = None  # type: ignore
+try:
+    from core.engine.qmt_dispatcher import QmtDispatcher
+except Exception:
+    QmtDispatcher = None  # type: ignore
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
-from core.engine.decision import summarize_decisions
-from core.engine.event import TradeEvent
 from core.engine.position import Position
+from core.engine.decision import summarize_decisions
+from core.engine.crisis_alpha import DEFAULT_BENCHMARK_CODE
+from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import TradeType
 
@@ -70,6 +86,243 @@ def bridge_config() -> dict:
     }
 
 
+def ths_ui_config() -> dict:
+    """读同花顺 UI 通道配置（config.ths_ui 段），缺省值对齐 core.config._defaults()。"""
+    cfg = load_config()
+    ths = cfg.get("ths_ui", {}) if isinstance(cfg, dict) else {}
+    ths = ths if isinstance(ths, dict) else {}
+    return {
+        "enabled": bool(ths.get("enabled")),
+        "available": ThsUiDispatcher is not None,
+        "window_title": ths.get("window_title") or "网上股票交易系统5.0",
+        "client_exe_path": ths.get("client_exe_path") or "",
+        "driver": ths.get("driver") or "clipboard",
+        "captcha_ocr": bool(ths.get("captcha_ocr")),
+    }
+
+
+def tq_trade_config() -> dict:
+    """读通达信 TQ 交易配置（config.tq_trade 段）。"""
+    cfg = load_config()
+    tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
+    tq = tq if isinstance(tq, dict) else {}
+    return {
+        "available": TdxTqDispatcher is not None,
+        "account": tq.get("account") or "",
+        "account_type": tq.get("account_type") or "stock",
+        "price_mode": tq.get("price_mode") or "my",
+        "client_path": tq.get("client_path") or "",
+    }
+
+
+def qmt_config() -> dict:
+    """读 miniQMT 交易配置（config.qmt 段）。"""
+    cfg = load_config()
+    qmt = cfg.get("qmt", {}) if isinstance(cfg, dict) else {}
+    qmt = qmt if isinstance(qmt, dict) else {}
+    return {
+        "available": QmtDispatcher is not None,
+        "path": qmt.get("path") or "",
+        "account": qmt.get("account") or "",
+        "account_type": qmt.get("account_type") or "STOCK",
+        "price_mode": qmt.get("price_mode") or "fix",
+        "xtquant_path": qmt.get("xtquant_path") or "",
+    }
+
+
+#: 实盘交易引擎：key -> (渠道标识, 中文名)。渠道标识是 Core 状态机/前端识别的通道名。
+ENGINES_META = {
+    "iquant": ("iquant_bridge", "iQuant HTTP 桥"),
+    "tdx": ("tdx_tq", "通达信 TQ 交易"),
+    "ths": ("ths_ui", "同花顺独立交易（UI 自动化）"),
+    "qmt": ("qmt", "miniQMT 交易"),
+}
+
+
+def default_engine() -> str:
+    """未显式选引擎时的默认值：沿用旧行为（ths_ui.enabled → ths，否则 iquant）。"""
+    ths = ths_ui_config()
+    return "ths" if (ths["enabled"] and ths["available"]) else "iquant"
+
+
+def session_engine(session) -> str:
+    """session 生效引擎：显式值优先；NULL（升级前的历史会话）回退全局默认。
+
+    历史会话列在迁移中留空，正是为了不改动升级前的 ths_ui.enabled 行为。
+    """
+    explicit = getattr(session, "engine", None)
+    return explicit if explicit in ENGINES_META else default_engine()
+
+
+def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
+    """按引擎标识构造 dispatcher（三个可选引擎 + iQuant 桥）。
+
+    依赖缺失/未配置时抛 RuntimeError，由 start_session 转成 503 明确告警，
+    绝不静默回退到别的通道（避免"以为在通达信下单、实际打到 iQuant"）。
+    """
+    if engine == "ths":
+        if ThsUiDispatcher is None:
+            raise RuntimeError("未安装同花顺 UI 自动化依赖（pywinauto/pyperclip）")
+        ths = ths_ui_config()
+        return ThsUiDispatcher(
+            window_title=ths["window_title"], client_exe_path=ths["client_exe_path"],
+            captcha_ocr=ths["captcha_ocr"],
+        )
+    if engine == "tdx":
+        if TdxTqDispatcher is None:
+            raise RuntimeError("通达信 TQ 交易通道不可用")
+        cfg = tq_trade_config()
+        return TdxTqDispatcher(
+            account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], client_path=cfg["client_path"],
+        )
+    if engine == "qmt":
+        if QmtDispatcher is None:
+            raise RuntimeError("miniQMT 交易通道不可用")
+        cfg = qmt_config()
+        return QmtDispatcher(
+            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
+            session_id=session_id,
+        )
+    if HttpBridgeDispatcher is None:
+        raise RuntimeError("HttpBridgeDispatcher not available")
+    br = bridge_config()
+    return HttpBridgeDispatcher(base_url=br.get(mode, br["simulation"]))
+
+
+def engine_status(engine: Optional[str]) -> dict:
+    """引擎清单 + 已配置情况（前端下拉与通道条共用）。"""
+    ths = ths_ui_config()
+    tq = tq_trade_config()
+    qmt = qmt_config()
+    items = []
+    for key, (channel, label) in ENGINES_META.items():
+        configured = True
+        detail = ""
+        if key == "ths":
+            configured = ths["available"]
+            detail = "依赖未安装（pywinauto/pyperclip）" if not configured else ths["window_title"]
+        elif key == "tdx":
+            configured = tq["available"]
+            detail = "通达信 TQ（需客户端已登录资金账号）" if configured else "通道不可用"
+        elif key == "qmt":
+            configured = qmt["available"] and bool(qmt["path"]) and bool(qmt["account"])
+            if not qmt["available"]:
+                detail = "未安装 xtquant"
+            elif not qmt["path"] or not qmt["account"]:
+                detail = "未配置 QMT 路径/资金账号"
+            else:
+                detail = qmt["account"]
+        elif key == "iquant":
+            br = bridge_config()
+            detail = "%s / %s" % (br["simulation"], br["live"])
+        items.append({
+            "key": key, "channel": channel, "label": label,
+            "configured": configured, "detail": detail,
+        })
+    current = engine or default_engine()
+    channel, label = ENGINES_META.get(current, ENGINES_META["iquant"])
+    return {
+        "engine": current, "active": channel, "label": label, "engines": items,
+        "ths_ui": ths, "tq_trade": tq, "qmt": qmt, "bridge": bridge_config(),
+    }
+
+
+def channel_status(engine: Optional[LiveEngine] = None,
+                    engine_key: Optional[str] = None) -> dict:
+    """当前生效的下单通道 + 在线状态（实盘页顶部通道条）。
+
+    engine_key 为 session.engine；未传时沿用旧行为（ths_ui.enabled → ths，否则 iquant）。
+    engine 为运行中的 LiveEngine 时取其 dispatcher 心跳，未运行 online=None（未知）。
+    """
+    data = engine_status(engine_key)
+    online = None
+    if engine is not None:
+        try:
+            online = bool(engine.dispatcher.heartbeat())
+        except Exception:
+            online = False
+    data["online"] = online
+    return data
+
+
+def test_channel(channel: str = "ths_ui", mode: str = "simulation") -> dict:
+    """只读连通性探测（实盘页/系统配置页「测试连接」按钮）。
+
+    ths_ui：连接 xiadan.exe 窗口并读一次持仓（只读，不下单）；
+    iquant_bridge：请求对应模式桥的 /ping；
+    tdx_tq：连通达信 TQ 交易账户并读一次持仓（只读）；
+    qmt：连 miniQMT 并读一次持仓（只读）。
+    """
+    if channel == "tdx_tq":
+        if TdxTqDispatcher is None:
+            return {"ok": False, "channel": "tdx_tq", "error": "通达信 TQ 交易通道不可用"}
+        cfg = tq_trade_config()
+        dispatcher = TdxTqDispatcher(
+            account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], client_path=cfg["client_path"],
+        )
+        try:
+            if not dispatcher.heartbeat():
+                return {"ok": False, "channel": "tdx_tq",
+                        "error": dispatcher.last_error or "通达信交易未就绪"}
+            rows = dispatcher.query_positions()
+            if dispatcher.last_error:
+                return {"ok": False, "channel": "tdx_tq", "error": dispatcher.last_error}
+            return {"ok": True, "channel": "tdx_tq", "positions": len(rows)}
+        finally:
+            dispatcher.close()
+    if channel == "qmt":
+        if QmtDispatcher is None:
+            return {"ok": False, "channel": "qmt", "error": "miniQMT 交易通道不可用"}
+        cfg = qmt_config()
+        dispatcher = QmtDispatcher(
+            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
+        )
+        try:
+            if not dispatcher.heartbeat():
+                return {"ok": False, "channel": "qmt",
+                        "error": dispatcher.last_error or "QMT 交易未就绪"}
+            rows = dispatcher.query_positions()
+            return {"ok": True, "channel": "qmt", "positions": len(rows)}
+        finally:
+            dispatcher.close()
+    if channel == "ths_ui":
+        if ThsUiDispatcher is None:
+            return {"ok": False, "channel": "ths_ui", "error": "未安装 UI 自动化依赖（pywinauto/pyperclip）"}
+        cfg = ths_ui_config()
+        dispatcher = ThsUiDispatcher(
+            window_title=cfg["window_title"], client_exe_path=cfg["client_exe_path"],
+            captcha_ocr=cfg["captcha_ocr"],
+        )
+        try:
+            if not dispatcher.connect():
+                return {"ok": False, "channel": "ths_ui",
+                        "error": dispatcher.last_error or "未找到同花顺交易客户端窗口"}
+            if not cfg["captcha_ocr"]:
+                return {"ok": False, "channel": "ths_ui",
+                        "error": "同花顺复制表格会触发验证码，请先在系统配置启用验证码 OCR"}
+            rows = dispatcher.query_positions()
+            if dispatcher.last_error:
+                return {"ok": False, "channel": "ths_ui",
+                        "error": dispatcher.last_error}
+            return {"ok": True, "channel": "ths_ui", "window_title": cfg["window_title"],
+                    "positions": len(rows)}
+        finally:
+            dispatcher.close()
+    br = bridge_config()
+    base_url = br.get(mode, br["simulation"])
+    try:
+        dispatcher = HttpBridgeDispatcher(base_url=base_url)
+        online = dispatcher.heartbeat()
+        return {"ok": bool(online), "channel": "iquant_bridge", "base_url": base_url,
+                "error": None if online else "iQuant 桥未响应（客户端未启动或桥策略未加载）"}
+    except Exception as e:
+        return {"ok": False, "channel": "iquant_bridge", "base_url": base_url, "error": str(e)}
+
+
 def resolve_stock_codes(db: Session, portfolio_strategy_id: int) -> list:
     """取某组合股票池的成分股代码列表（BarPoller 行情订阅范围）。"""
     ps = db.query(PortfolioStrategy).filter_by(id=portfolio_strategy_id).first()
@@ -89,17 +342,44 @@ def build_engine(
     mode: str = "simulation",
     db_session_factory=SessionLocal,
     dispatcher_cls=None,
+    engine: Optional[str] = None,
 ) -> LiveEngine:
-    """组装一个 session 的 LiveEngine：各组合 Portfolio + 桥 dispatcher + BarPoller。
+    """组装一个 session 的 LiveEngine：各组合 Portfolio + dispatcher + BarPoller。
 
     公式注入（0010）：遍历各组合策略，按 Strategy.formula_id → Formula.name 预加载
     {strategy_id: formula_name}，连同 TQFormula 实例传入 LiveEngine，供 _fill_signal_cache
     逐 bar 内存注入算公式信号。无公式的策略不入映射（_fill_signal_cache 跳过）。
 
-    dispatcher_cls：注入桥 dispatcher 类（测试 monkeypatch 用）；None 用真实类。
+    dispatcher_cls：注入 dispatcher 类（测试 monkeypatch 用）；None 时按 engine 选：
+    engine=None → 沿用旧行为（ths_ui.enabled → 同花顺，否则 iQuant 桥）；
+    engine=tdx/qmt → 通达信 TQ / miniQMT。
     """
     if dispatcher_cls is None:
-        dispatcher_cls = HttpBridgeDispatcher
+        dispatcher = make_dispatcher(engine or default_engine(), mode, session_id)
+    elif dispatcher_cls is ThsUiDispatcher:
+        ths_cfg = load_config().get("ths_ui", {})
+        ths_cfg = ths_cfg if isinstance(ths_cfg, dict) else {}
+        dispatcher = dispatcher_cls(
+            window_title=ths_cfg.get("window_title") or "网上股票交易系统5.0",
+            client_exe_path=ths_cfg.get("client_exe_path"),
+            captcha_ocr=bool(ths_cfg.get("captcha_ocr")),
+        )
+    elif dispatcher_cls is TdxTqDispatcher and TdxTqDispatcher is not None:
+        cfg = tq_trade_config()
+        dispatcher = dispatcher_cls(
+            account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], client_path=cfg["client_path"],
+        )
+    elif dispatcher_cls is QmtDispatcher and QmtDispatcher is not None:
+        cfg = qmt_config()
+        dispatcher = dispatcher_cls(
+            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
+            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
+            session_id=session_id,
+        )
+    else:
+        br = bridge_config()
+        dispatcher = dispatcher_cls(base_url=br.get(mode, br["simulation"]))
     links = (
         db.query(LiveSessionPortfolio)
         .filter(LiveSessionPortfolio.session_id == session_id)
@@ -107,6 +387,8 @@ def build_engine(
     )
     portfolios = []
     stock_codes: set = set()
+    # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
+    benchmark_codes: Dict[int, str] = {}
     formula_ids: set = set()
     strategy_formula: Dict[int, int] = {}  # strategy_id -> formula_id
     # 预热/分发按 (code, period) 取该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
@@ -121,9 +403,10 @@ def build_engine(
         ps = db.query(PortfolioStrategy).filter_by(id=link.portfolio_strategy_id).first()
         if ps is None:
             continue
-        strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).all()
+        strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
         port = assemble_portfolio(ps, strategies, db)
         portfolios.append(port)
+        benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
         pool_codes = resolve_stock_codes(db, ps.id)
         stock_codes.update(pool_codes)
         for strat in strategies:
@@ -160,16 +443,23 @@ def build_engine(
         # 无任何带公式的策略 → 兜底；有则取 max
         code_period_count[(code, period)] = max(counts) if counts else DEFAULT_COUNT
 
-    br = bridge_config()
-    # 按 session.mode 选桥：simulation→仿真桥(8790/虚拟资金)，live→实盘桥(8791/真实资金)。
-    # 未知 mode 兜底仿真桥（防误传走到真实资金桥）。
-    base_url = br.get(mode, br["simulation"])
-    dispatcher = dispatcher_cls(base_url=base_url)
+    def _regime_provider(code: str, end_date):
+        """B5：拉基准收盘历史（end_date 前 ~620 天 ~ end_date），供因果 regime 跟踪。
+        局部 import 避免 live_service ↔ backtest_service 模块级耦合；仅在有策略
+        开启 regime_filter_enabled 时被 LiveEngine 调用（默认完全不触发）。"""
+        from core.services.backtest_service import build_index_close_series
+        return build_index_close_series(
+            [code], end_date - timedelta(days=620), end_date,
+        ).get(code, {})
+
     # 股票池为空时给一个占位，避免空列表；首期实盘一般有成分股
-    poller = BarPoller(
-        dispatcher, sorted(stock_codes) or ["000001.SZ"],
-        period="1m", count=10,
-    )
+    try:
+        poller = BarPoller(
+            dispatcher, sorted(stock_codes) or ["000001.SZ"],
+            period="1m", count=10,
+        )
+    except Exception:
+        poller = None  # type: ignore
     return LiveEngine(
         session_id=session_id,
         portfolios=portfolios,
@@ -181,6 +471,8 @@ def build_engine(
         formula_count=200,
         formula_count_by_name=formula_count_by_name,
         code_period_count=code_period_count,
+        regime_provider=_regime_provider,
+        benchmark_codes=benchmark_codes,
     )
 
 
@@ -202,6 +494,7 @@ def list_sessions(db: Session) -> list:
             "id": s.id,
             "name": s.name,
             "mode": s.mode,
+            "engine": session_engine(s),
             "status": s.status,
             "started_at": s.started_at,
             "stopped_at": s.stopped_at,
@@ -213,15 +506,19 @@ def list_sessions(db: Session) -> list:
 
 
 def create_session(db: Session, data: dict, mode: str) -> dict:
-    """创建 session。mode 已由路由校验为 simulation|live。"""
-    session = LiveSession(name=data["name"], mode=mode, status="stopped")
+    """创建 session。mode 已由路由校验为 simulation|live，engine 已校验为合法 key。"""
+    session = LiveSession(
+        name=data["name"], mode=mode, status="stopped",
+        engine=data.get("engine") or "iquant",
+    )
     db.add(session)
     db.flush()
     for pid in data.get("portfolio_ids", []):
         link = LiveSessionPortfolio(session_id=session.id, portfolio_strategy_id=pid)
         db.add(link)
     db.commit()
-    return {"id": session.id, "status": session.status}
+    return {"id": session.id, "status": session.status,
+            "engine": session_engine(session)}
 
 
 def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = None) -> Optional[dict]:
@@ -237,6 +534,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "id": session.id,
         "name": session.name,
         "mode": session.mode,
+        "engine": session_engine(session),
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -314,11 +612,33 @@ def start_session(
     engine = build_engine(
         session_id, db, mode,
         db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
+        engine=session_engine(session),
     )
-    # 启动前探测桥在线：桥未起（iQuant 客户端未运行/策略未加载）直接拒绝，
-    # 不建引擎、不置 running，避免「一点就成功、桥离线却无告警」。
-    # heartbeat() 同步 httpx 调 /ping，本地 loopback 连接被拒瞬时失败，不阻塞事件循环。
+    # 启动前探测通道在线：客户端未起/未登录直接拒绝，不建引擎、不置 running，
+    # 避免「一点就成功、通道离线却无告警」。heartbeat() 本地 loopback 瞬时失败，
+    # 不阻塞事件循环。
     if not engine.dispatcher.heartbeat():
+        channel = getattr(engine.dispatcher, "channel", "")
+        detail = getattr(engine.dispatcher, "last_error", "") or ""
+        if channel == "ths_ui":
+            ths = ths_ui_config()
+            return None, session, (
+                503,
+                "同花顺交易客户端未就绪：请先启动并登录「%s」（%s）"
+                % (ths["window_title"], detail or "未找到交易窗口"),
+            )
+        if channel == "tdx_tq":
+            return None, session, (
+                503,
+                "通达信交易未就绪：请先启动并登录通达信交易客户端（%s）"
+                % (detail or "未获取到资金账号"),
+            )
+        if channel == "qmt":
+            return None, session, (
+                503,
+                "QMT 交易未就绪：请先启动 QMT 客户端并开启极简模式（%s）"
+                % (detail or "未连接"),
+            )
         mode_label = "实盘" if mode == "live" else "仿真"
         br = bridge_config()
         base_url = br.get(mode, br["simulation"])
@@ -326,6 +646,11 @@ def start_session(
             503,
             "桥未启动：%s（%s）— 请先在 iQuant 客户端加载并运行对应桥策略"
             % (mode_label, base_url),
+        )
+    if getattr(engine.dispatcher, "channel", "") == "ths_ui" and not ths_ui_config()["captcha_ocr"]:
+        return None, session, (
+            503,
+            "同花顺复制表格会触发验证码：请先在系统配置启用「验证码 OCR」再启动实盘",
         )
     # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金
     engine.recover(db)

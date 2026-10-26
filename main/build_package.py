@@ -18,8 +18,24 @@ def run_cmd(cmd, cwd=None):
         print(f"FAILED: {cmd}")
         sys.exit(1)
 
+def purge_nuitka_cache():
+    """编译前清空并重定向 Nuitka 模块缓存到项目内。
+
+    本机对 %LOCALAPPDATA%\\Nuitka 的缓存写入不稳定（多次 PermissionError），
+    故用 NUITKA_CACHE_DIR 改到项目内目录。只清 module-cache：该目录存放
+    依赖分析结果，属加速项；Cache 根下的 Dependency Walker 等工具需保留。
+    """
+    cache = ROOT / ".nuitka-cache"
+    os.environ["NUITKA_CACHE_DIR"] = str(cache)
+    module_cache = cache / "module-cache"
+    if module_cache.exists():
+        shutil.rmtree(module_cache, ignore_errors=True)
+        print(f"已清空 Nuitka 模块缓存：{module_cache}")
+
+
 def main():
     print("=== Step 1: Nuitka 编译 ===")
+    purge_nuitka_cache()
     venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
     python_exe = str(venv_python) if venv_python.exists() else sys.executable
     nuitka_cmd = [
@@ -27,6 +43,7 @@ def main():
         "--standalone",
         "--low-memory",
         "--include-package=core",
+        "--include-package-data=core",  # tdx_formula/data/tdx_funcs.json 等包内数据文件
         "--include-package=tq_iquant_shared",
         "--include-package=sqlalchemy",
         "--include-package=fastapi",
@@ -39,6 +56,28 @@ def main():
         "--include-package=openpyxl",
         "--include-package=yaml",
         "--include-package=alembic",
+        # 同花顺 UI 下单通道（可选）：pywinauto 窗口自动化 + 剪贴板 + 验证码截图
+        "--include-package=pywinauto",
+        "--include-package=pyperclip",
+        "--include-package=PIL",
+        # Windows 内置 OCR（同花顺复制验证码）：WinRT 扩展 + 运行时 DLL
+        "--include-package=winrt",
+        "--include-package-data=winrt",
+        # 排除第三方包自带的测试/校验代码：--include-package 会连 `pandas.tests`
+        # 等上千个测试模块一起编译，实测使编译时间成倍增加，且运行时毫无用处。
+        "--nofollow-import-to=*.tests",
+        "--nofollow-import-to=*.testing",
+        "--nofollow-import-to=alembic.testing",
+        # 杀软实时扫描会在 Nuitka 写入 %LOCALAPPDATA%\Nuitka 缓存 JSON 的瞬间锁定
+        # 文件（两次均在同一 sqlalchemy.dialects.oracle 缓存上 PermissionError），
+        # 缓存对本机编译只是加速项，禁用换取确定性。
+        "--disable-cache=all",
+        # 启动即写 updates\update-check-*.json，失败会直接中断编译；本机该目录写入
+        # 不稳定，离线打包场景也不需要版本检查。
+        "--update-check=never",
+        # 非交互环境默认拒绝下载 Dependency Walker，会直接 FATAL；
+        # 该项目仅用于分析扩展模块依赖，允许自动下载并缓存。
+        "--assume-yes-for-downloads",
         "--windows-disable-console",
         "--output-filename=tq-iquant",
         "--output-dir=" + str(ROOT / "dist" / "tq-iquant"),

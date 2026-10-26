@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.engine.tdx_formula import syntax_check
+from core.engine.tdx_formula.normalizer import normalize_formula
 from core.services import formula_service
 from core.services.formula_service import (
     list_formulas as _svc_list_formulas,
@@ -19,6 +21,8 @@ router = APIRouter(prefix="/api/formulas", tags=["formulas"])
 VALID_SIGNAL_TYPES = {"OPEN", "ADD", "REDUCE", "CLOSE"}
 # 0 故意排除：0 是通达信信号输出线的"无信号"常态值，配成触发值会导致每根 bar 都匹配。
 VALID_TRIGGER_VALUES = {-2, -1, 1, 2}
+# 计算引擎：tq=按名调通达信（默认，历史行为）/ builtin=内置公式子集解释器（仅回测）
+VALID_ENGINES = {"tq", "builtin"}
 
 
 class SignalItem(BaseModel):
@@ -33,10 +37,18 @@ class FormulaCreate(BaseModel):
     signals: list[SignalItem]
     # Q4 决策4：注入历史根数（公式级字段，同公式 count 恒定 → C4 去重 key 无需 count）
     formula_count: int = 200
+    # 计算引擎（默认 tq 保持原有行为；builtin 仅回测接线）
+    engine: str = "tq"
+    # 批次 9a：跨周期引用无泄露开关（默认 false=TDX 语义，仅 builtin 回测链路生效）
+    no_leak_cross: bool = False
 
 
 class FormulaImport(BaseModel):
     ac_code: str  # 通达信公式名（acCode）
+
+
+class FormulaPrecheck(BaseModel):
+    content: str  # 公式源码（无需落库）
 
 
 def _validate_signals(signals: list[SignalItem]) -> str | None:
@@ -101,6 +113,13 @@ def get_formula(formula_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
+def _validate_engine(engine: str) -> str | None:
+    """返回错误消息（str）或 None（校验通过）。"""
+    if engine not in VALID_ENGINES:
+        return f"engine 必须为 tq 或 builtin，收到 {engine}"
+    return None
+
+
 @router.post("")
 def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
     if not req.name.strip():
@@ -110,6 +129,9 @@ def create_formula(req: FormulaCreate, db: Session = Depends(get_db)):
         return err(400, err_msg)
     if req.formula_count < 1:
         return err(400, "formula_count 必须 ≥ 1")
+    err_msg = _validate_engine(req.engine)
+    if err_msg:
+        return err(400, err_msg)
     return ok(_svc_create_formula(db, req))
 
 
@@ -125,10 +147,44 @@ def update_formula(formula_id: int, req: FormulaCreate, db: Session = Depends(ge
         return err(400, err_msg)
     if req.formula_count < 1:
         return err(400, "formula_count 必须 ≥ 1")
+    err_msg = _validate_engine(req.engine)
+    if err_msg:
+        return err(400, err_msg)
     data = _svc_update_formula(db, formula_id, req)
     if data is None:
         return err(404, "公式不存在")
     return ok(data)
+
+
+@router.post("/precheck")
+def precheck_formula(req: FormulaPrecheck):
+    """内置引擎语法预检（无数据干跑，不落库）：词典闸门 + 语句/表达式解析。"""
+    return ok(syntax_check(req.content))
+
+
+class NormalizePlanItem(BaseModel):
+    line: str  # 源公式的 `:` 输出线名
+    rule: str  # cross_zero | above_threshold | map_values
+    params: dict = {}
+
+
+class NormalizePreviewRequest(BaseModel):
+    content: str  # 公式源码（接受草稿，无需先落库）
+    plans: list[NormalizePlanItem]
+
+
+@router.post("/normalize-preview")
+def normalize_preview(req: NormalizePreviewRequest):
+    """0016 信号标准化向导预览（不落库）：`:` 输出线降级 `:=` + 尾部追加
+    离散标识值（±1/±2/0）的标准化输出线。保存走 POST /api/formulas（新公式
+    记录，源公式零改动）。"""
+    try:
+        return ok(normalize_formula(
+            req.content,
+            [{"line": p.line, "rule": p.rule, "params": p.params} for p in req.plans],
+        ))
+    except ValueError as e:
+        return err(400, str(e))
 
 
 @router.delete("/{formula_id}")

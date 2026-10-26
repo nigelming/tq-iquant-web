@@ -42,6 +42,26 @@ def _defaults() -> dict:
             "simulation": {"base_url": "http://127.0.0.1:8790"},
             "live": {"base_url": "http://127.0.0.1:8791"},
         },
+        "ths_ui": {
+            "enabled": False,
+            "window_title": "网上股票交易系统5.0",
+            "client_exe_path": "D:/同花顺远航版/transaction/xiadan.exe",
+            "driver": "clipboard",
+            "captcha_ocr": False,
+        },
+        "tq_trade": {
+            "account": "",
+            "account_type": "stock",
+            "price_mode": "my",
+            "client_path": "",
+        },
+        "qmt": {
+            "path": "",
+            "account": "",
+            "account_type": "STOCK",
+            "price_mode": "fix",
+            "xtquant_path": "",
+        },
     }
 
 

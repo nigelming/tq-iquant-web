@@ -25,6 +25,7 @@ self._breaker_count_written → self.counts_written。
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date
 from decimal import Decimal
@@ -149,6 +150,8 @@ class BreakerService:
                 self.counts_written[portfolio.portfolio_id] = count
                 return
             link.circuit_breaker_count = count
+            # 触发/转手动时顺带落风控内存态，保证重启后峰值与暂停态不丢
+            link.risk_state = self._risk_state_payload(rm)
             if count >= 3:
                 link.status = "circuit_broken"
             db.commit()
@@ -156,6 +159,79 @@ class BreakerService:
         except Exception:  # noqa: BLE001
             db.rollback()
             logger.exception("persist breaker count error (portfolio %s)", portfolio.portfolio_id)
+        finally:
+            db.close()
+
+    # ---------------- 风控内存态持久化（重启不丢峰值 / 暂停态）----------------
+    @staticmethod
+    def _risk_state_payload(rm) -> str:
+        """把风控内存态序列化为 JSON 文本（存入 LiveSessionPortfolio.risk_state）。
+
+        只存"跨重启仍应生效"的状态：峰值（回撤基准）、昨收市值（日内亏损基准）、
+        当日暂停标志与两个触发日（次日/当日恢复判定依赖触发日）。
+        """
+        def _num(v):
+            return None if v is None else str(v)
+
+        def _day(v):
+            return None if v is None else v.isoformat()
+
+        return json.dumps({
+            "peak_value": _num(rm.peak_value),
+            "prev_close_value": _num(rm.prev_close_value),
+            "daily_pause_active": bool(rm.daily_pause_active),
+            "breaker_trigger_date": _day(rm.breaker_trigger_date),
+            "daily_loss_trigger_date": _day(rm.daily_loss_trigger_date),
+        }, ensure_ascii=False)
+
+    @staticmethod
+    def _restore_risk_state(rm, raw: str) -> bool:
+        """读回 risk_state。坏数据静默忽略（不阻断启动），返回是否成功还原。
+
+        先完整解析到局部变量再一次性赋值：此前是边解析边写 rm，如果后面的
+        日期字段解析失败，前面已写入的峰值/暂停态会留下「半恢复」的脏状态。
+        """
+        try:
+            d = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(d, dict):
+            return False
+        try:
+            peak = d.get("peak_value")
+            peak_v = Decimal(str(peak)) if peak is not None else None
+            prev = d.get("prev_close_value")
+            prev_v = None if prev is None else Decimal(str(prev))
+            pause_v = bool(d.get("daily_pause_active"))
+            bd = d.get("breaker_trigger_date")
+            breaker_d = date.fromisoformat(bd) if bd else None
+            dd = d.get("daily_loss_trigger_date")
+            daily_d = date.fromisoformat(dd) if dd else None
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        if peak_v is not None:
+            rm.peak_value = peak_v
+        rm.prev_close_value = prev_v
+        rm.daily_pause_active = pause_v
+        rm.breaker_trigger_date = breaker_d
+        rm.daily_loss_trigger_date = daily_d
+        return True
+
+    def persist_risk_state(self, portfolio: Portfolio) -> None:
+        """日终把风控内存态落库（每日一次，写入开销可忽略）。"""
+        db = self._ctx.db_session_factory()
+        try:
+            link = db.query(LiveSessionPortfolio).filter_by(
+                session_id=self._ctx.session_id,
+                portfolio_strategy_id=portfolio.portfolio_id,
+            ).first()
+            if link is None:
+                return
+            link.risk_state = self._risk_state_payload(portfolio.risk_manager)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("persist risk state error (portfolio %s)", portfolio.portfolio_id)
         finally:
             db.close()
 
@@ -186,6 +262,8 @@ class BreakerService:
             if link is not None:
                 link.circuit_breaker_count = 0
                 link.status = "active"
+                # 手动恢复后同步内存态（峰值保留，回撤基准不变）
+                link.risk_state = self._risk_state_payload(rm)
                 db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
@@ -217,7 +295,13 @@ class BreakerService:
         )
         for link in links:
             port = ports_by_id.get(link.portfolio_strategy_id)
-            if port is None or not link.circuit_breaker_count:
+            if port is None:
+                continue
+            # 先读回风控内存态（峰值/昨收/暂停态）：即便计数为 0 也要还原，
+            # 否则重启会从当根 bar 重建峰值，历史最大回撤被抹平而少触发熔断。
+            if link.risk_state:
+                self._restore_risk_state(port.risk_manager, link.risk_state)
+            if not link.circuit_breaker_count:
                 continue
             port.risk_manager.consecutive_drawdown_triggers = link.circuit_breaker_count
             self.counts_written[link.portfolio_strategy_id] = link.circuit_breaker_count
@@ -244,14 +328,10 @@ class BreakerService:
         （无最新 bar 时以当前持仓成本近似；有 bar 由 on_bar_update(update_peak) 已覆盖）。
         """
         try:
-            # 日终总市值：用组合最新现金 + 持仓市值（无最新 bar 时以当前持仓市值近似）
-            total = portfolio.account.cash
-            for ctx in portfolio.strategies:
-                for stock_code, pos in ctx.positions.items():
-                    if pos.quantity == 0:
-                        continue
-                    # 用持仓成本计市值作为日终基准近似（无 bar close 时；有 bar 由 update_peak 已覆盖）
-                    total += pos.avg_cost * pos.quantity
+            # R1：日终总市值改用市值口径（现金 + 持仓按最近已知价市值），与
+            # prev_close_value（市值）一致，避免"成本市值 vs 昨收市值"口径错配
+            # 造成 daily_loss 误触（浮盈/浮亏持仓按成本算会漏算/虚高当日盈亏）。
+            total = portfolio.account.cash + portfolio._holdings_value()
             was_paused = portfolio.risk_manager.daily_pause_active
             portfolio.risk_manager.update_daily(
                 total, today, portfolio.account.initial_capital
@@ -262,10 +342,13 @@ class BreakerService:
                 # 触发幅度（可观测性）：日终市值/昨收/日内盈亏/亏损%/阈值。
                 dpm = portfolio.risk_manager
                 prev = dpm.prev_close_value
+                # 分母与判定同源：daily_loss_base(initial_capital) 在净值口径下=昨收净值、
+                # 旧口径下=初始资金，避免观测值（loss%）与触发逻辑口径错配失真。
                 init_cap = portfolio.account.initial_capital
-                if prev is not None and init_cap > 0:
+                base = dpm.daily_loss_base(init_cap)
+                if prev is not None and base > 0:
                     pnl = total - prev
-                    loss_pct = abs(pnl) / init_cap * 100
+                    loss_pct = abs(pnl) / base * 100
                     detail = (
                         " total=%s prev_close=%s pnl=%s loss=%s threshold=%s"
                         % (fmt_money(total), fmt_money(prev), fmt_money(pnl),
@@ -292,6 +375,8 @@ class BreakerService:
                     "on %s (session %s)",
                     portfolio.portfolio_id, today, self._ctx.session_id,
                 )
+            # 日终落库风控内存态（每日一次）：重启后可继续沿用同一峰值与暂停基准
+            self.persist_risk_state(portfolio)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "update_daily error (portfolio %s, date %s)",

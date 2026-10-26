@@ -5,6 +5,16 @@ from .utils import get_tdx_lock, get_tq
 
 logger = logging.getLogger(__name__)
 
+# TQ formula_process_mul 在单次请求股票过多时返回 ErrorId=19（数据过多无法
+# 完全加载），且每次返回的股票子集可能不同，导致回测不可复现。按 50 只分批
+# 执行；若单批仍返回 19 则继续二分，直到成功或单只股票仍失败。
+_FORMULA_STOCK_CHUNK = 50
+_FORMULA_META_KEYS = ("ErrorId", "Error", "Date", "Time")
+
+
+def _chunks(items: List[str], size: int):
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
 
 class TQFormula:
     def compute(
@@ -15,11 +25,73 @@ class TQFormula:
         return_count: int = -1, return_date: bool = True,
     ) -> Optional[dict]:
         with get_tdx_lock():
-            return self._run_formula(
-                formula_name, formula_arg, stocks, period,
+            return self._run_chunked(
+                formula_name, formula_arg, list(stocks), period,
                 count, dividend_type, start_time, end_time,
                 return_count, return_date,
             )
+
+    def _run_chunked(
+        self, formula_name, formula_arg, stocks, period,
+        count, dividend_type, start_time, end_time,
+        return_count, return_date,
+    ) -> dict:
+        if not stocks:
+            return {"ErrorId": "0"}
+        merged: dict = {}
+        errors: List[str] = []
+        for chunk in _chunks(stocks, _FORMULA_STOCK_CHUNK):
+            data, err = self._run_split(
+                formula_name, formula_arg, chunk, period,
+                count, dividend_type, start_time, end_time,
+                return_count, return_date,
+            )
+            merged.update(data)
+            if err:
+                errors.append(err)
+        if errors:
+            return {
+                "ErrorId": "19",
+                "Error": "；".join(errors),
+                **merged,
+            }
+        return {"ErrorId": "0", **merged}
+
+    def _run_split(
+        self, formula_name, formula_arg, chunk, period,
+        count, dividend_type, start_time, end_time,
+        return_count, return_date,
+    ):
+        raw = self._run_formula(
+            formula_name, formula_arg, chunk, period,
+            count, dividend_type, start_time, end_time,
+            return_count, return_date,
+        )
+        if not isinstance(raw, dict) or not raw:
+            return {}, f"股票 {chunk[0]} 公式执行无返回"
+        err = raw.get("ErrorId")
+        if str(err) == "19":
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                left, left_err = self._run_split(
+                    formula_name, formula_arg, chunk[:mid], period,
+                    count, dividend_type, start_time, end_time,
+                    return_count, return_date,
+                )
+                right, right_err = self._run_split(
+                    formula_name, formula_arg, chunk[mid:], period,
+                    count, dividend_type, start_time, end_time,
+                    return_count, return_date,
+                )
+                errs = [e for e in (left_err, right_err) if e]
+                return {**left, **right}, "；".join(errs) or None
+            return {}, f"公式数据过多无法完全加载：{chunk[0]}"
+        if err is not None and str(err) != "0":
+            return {}, f"ErrorId={err} Error={raw.get('Error')}"
+        return {
+            code: value for code, value in raw.items()
+            if code not in _FORMULA_META_KEYS
+        }, None
 
     def compute_xg(
         self, formula_name: str, formula_arg: str,

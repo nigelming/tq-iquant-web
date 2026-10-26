@@ -1,0 +1,279 @@
+"""ThsUiDispatcher 纯映射逻辑测试（不启动同花顺 GUI）。
+
+覆盖 Core 契约：/orders 形状（source=BRIDGE、remark 空、order_ref=合同编号、
+整型状态码）、/deals 由委托表成交数量/均价合成、TQ 行情/日历转发、持仓 available=0
+不被回退成持仓量。
+"""
+from datetime import datetime, timedelta
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+from core.engine.http_bridge_dispatcher import BridgeUnavailableError
+from core.engine.live.order_machine import OrderStateMachine
+from core.engine.ths_ui_dispatcher import ThsUiDispatcher
+from tq_iquant_shared.constants import TradeType
+
+
+ORDER_HEADER = (
+    "委托时间\t证券代码\t证券名称\t操作\t备注\t委托数量\t成交数量\t"
+    "委托价格\t成交均价\t撤消数量\t合同编号\t交易市场\n"
+)
+
+
+def _order_row(time="20261023 09:30:01", code="000001", name="平安银行",
+               bs="买入", note="", volume=1000, filled=1000, price=10.5,
+               trade_price=10.4, cancelled=0, ref="100001", market="深圳"):
+    return "\t".join([
+        time, code, name, bs, note, str(volume), str(filled),
+        str(price), str(trade_price), str(cancelled), ref, market,
+    ])
+
+
+class _FakeThs(ThsUiDispatcher):
+    def __init__(self, text=""):
+        super().__init__()
+        self._text = text
+        self._connected = True
+
+    def get_orders(self):
+        return self._parse_orders(self._text)
+
+    def get_positions(self):
+        return self._parse_position_rows(
+            "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+            "000001\t平安银行\t1000\t0\t10.0\t10.5\t10500\n"
+            "600000\t浦发银行\t500\t500\t8.0\t8.2\t4100\n"
+        )
+
+
+def test_query_orders_maps_core_contract_for_filled_order():
+    d = _FakeThs(ORDER_HEADER + _order_row())
+    rows = d.query_orders()
+
+    assert len(rows) == 1
+    o = rows[0]
+    assert o["source"] == "BRIDGE"
+    assert o["remark"] == ""             # THS 无法回写 remark
+    assert o["order_ref"] == "100001"    # 合同编号
+    assert o["instrument"] == "000001"
+    assert o["exchange"] == "SZ"
+    assert o["direction"] == 48
+    assert o["volume"] == 1000
+    assert o["traded_volume"] == 1000
+    assert o["status"] == 56             # 已成
+    assert o["insert_date"] == "20261023"
+    assert o["insert_time"] == "093001"  # Core _parse_insert_utc 要 6 位纯数字
+
+
+def test_query_orders_status_codes_for_cancel_junk_and_partial():
+    text = ORDER_HEADER + "\n".join([
+        _order_row(filled=0, note="已撤", cancelled=1000, ref="1", trade_price=0),
+        _order_row(filled=0, note="废单", ref="2", trade_price=0),
+        _order_row(filled=300, cancelled=700, ref="3"),
+        _order_row(filled=300, volume=1000, ref="4"),
+        _order_row(filled=0, note="已报", ref="5", trade_price=0),
+    ])
+    rows = _FakeThs(text).query_orders()
+    by_ref = {r["order_ref"]: r["status"] for r in rows}
+    assert by_ref["1"] == 54   # 全撤
+    assert by_ref["2"] == 57   # 废单
+    assert by_ref["3"] == 53   # 部撤
+    assert by_ref["4"] == 55   # 部成（非终态）
+    assert by_ref["5"] == 50   # 已报
+
+
+def test_query_deals_synthesizes_cumulative_fill_rows():
+    text = ORDER_HEADER + "\n".join([
+        _order_row(filled=300, price=10.5, trade_price=10.4, ref="1"),
+        _order_row(filled=0, ref="2", trade_price=0),
+        _order_row(filled=1000, price=9.9, trade_price=9.8, ref="3"),
+    ])
+    deals = _FakeThs(text).query_deals()
+
+    assert [d["order_ref"] for d in deals] == ["1", "3"]
+    d1 = deals[0]
+    assert d1["instrument"] == "000001"
+    assert d1["exchange"] == "SZ"
+    assert d1["direction"] == 48
+    assert d1["volume"] == 300
+    assert d1["price"] == pytest.approx(10.4)
+    assert d1["amount"] == pytest.approx(3120.0)
+    assert d1["commission"] == 0
+    assert d1["remark"] == ""
+
+
+def test_split_time_accepts_time_only_and_full_datetime():
+    d = ThsUiDispatcher()
+    date_part, time_part = d._split_time("09:30:01")
+    assert len(date_part) == 8 and date_part.isdigit()
+    assert time_part == "093001"
+
+    date_part, time_part = d._split_time("20261023 14:59:58")
+    assert (date_part, time_part) == ("20261023", "145958")
+
+
+def test_query_positions_keeps_zero_available_for_t1():
+    rows = _FakeThs().query_positions()
+    by_code = {r["instrument"]: r for r in rows}
+    assert by_code["000001"]["available"] == 0   # 不能回退成 1000
+    assert by_code["000001"]["exchange"] == "SZ"
+    assert by_code["600000"]["exchange"] == "SH"
+    assert by_code["600000"]["cost"] == pytest.approx(8.0)
+
+
+def test_query_quote_forwards_tq_bars(monkeypatch):
+    index = pd.to_datetime(["2026-10-23 09:30:00", "2026-10-23 09:31:00"])
+    raw = {"1m": {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 10.1]}, index=index),
+        "High": pd.DataFrame({"000001.SZ": [10.2, 10.3]}, index=index),
+        "Low": pd.DataFrame({"000001.SZ": [9.9, 10.0]}, index=index),
+        "Close": pd.DataFrame({"000001.SZ": [10.1, 10.2]}, index=index),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 2000]}, index=index),
+        "Amount": pd.DataFrame({"000001.SZ": [10100, 20400]}, index=index),
+    }}
+
+    class FakeTQ:
+        def get_history_raw(self, stocks, periods, **kwargs):
+            assert stocks == ["000001.SZ"]
+            assert periods == ["1m"]
+            return raw
+
+    monkeypatch.setattr("core.tq.data.TQData", FakeTQ)
+    bars = ThsUiDispatcher().query_quote("000001.SZ", "1m", 2)
+    assert [b["stime"] for b in bars] == ["20261023093000", "20261023093100"]
+    assert bars[0]["close"] == pytest.approx(10.1)
+    assert bars[1]["volume"] == 2000
+
+
+def test_query_calendar_forwards_tq_daily_index(monkeypatch):
+    index = pd.to_datetime(["2026-10-22", "2026-10-23"])
+    raw = {"1d": {"Close": pd.DataFrame({"000001.SH": [1.0, 1.1]}, index=index)}}
+
+    class FakeTQ:
+        def get_history_raw(self, stocks, periods, **kwargs):
+            return raw
+
+    monkeypatch.setattr("core.tq.data.TQData", FakeTQ)
+    assert ThsUiDispatcher().query_calendar() == ["20261022", "20261023"]
+
+
+def test_try_match_order_ref_uses_legacy_fuzzy_when_channel_has_no_remark():
+    class Disp:
+        supports_remark = False
+
+        @staticmethod
+        def query_orders():
+            return []
+
+    om = OrderStateMachine.__new__(OrderStateMachine)
+    om._ctx = SimpleNamespace(dispatcher=Disp())
+    lo = SimpleNamespace(
+        stock_code="600000.SH", trade_type="buy", quantity=600,
+        created_at=datetime(2026, 10, 23, 1, 30, 0),  # UTC
+        bridge_order_id="deadbeef", order_ref=None,
+    )
+    orders = [{
+        "source": "BRIDGE", "remark": "", "order_ref": "ref-1",
+        "instrument": "600000", "exchange": "SH", "direction": 48,
+        "volume": 600, "insert_date": "20261023", "insert_time": "093030",
+    }]
+    om.try_match_order_ref(lo, orders=orders)
+    assert lo.order_ref == "ref-1"
+
+
+def test_read_fund_values_handles_grouped_and_alternating_layouts():
+    class Static:
+        def __init__(self, text):
+            self._text = text
+
+        def window_text(self):
+            return self._text
+
+    texts = [
+        "资金余额", "冻结金额", "可用金额",
+        "5541.66", "0.00", "5541.66",
+        "港股市值", "A股市值", "总资产",
+        "0.00", "142663.92", "148205.58",
+        "可用金额", "5541.66", "股票市值", "142663.92", "总资产", "148205.58",
+    ]
+
+    class FakeWin:
+        def descendants(self, class_name=None):
+            return [Static(t) for t in texts]
+
+    d = ThsUiDispatcher()
+    d._win = FakeWin()
+    funds = d._read_fund_values()
+    assert funds["available"] == 5541.66
+    assert funds["frozen"] == 0.0
+    assert funds["balance"] == 5541.66
+    assert funds["market_value"] == 142663.92
+    assert funds["total_asset"] == 148205.58
+
+
+def test_ocr_digits_extracts_four_digits_from_spaced_text(monkeypatch):
+    from PIL import Image
+
+    d = ThsUiDispatcher(captcha_ocr=True)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    monkeypatch.setattr(d, "_recognize_image", lambda engine, img: "3 5 1 0")
+
+    img = Image.new("RGB", (123, 51), "white")
+    assert d._ocr_digits(img) == "3510"
+
+
+def test_copy_grid_rereads_clipboard_after_captcha(monkeypatch):
+    """验证码弹窗时剪贴板仍是旧页数据；解完必须重读，不能返回旧内容。"""
+    old = ORDER_HEADER + _order_row(ref="OLD")
+    new = ORDER_HEADER + _order_row(ref="NEW")
+
+    class FakeClip:
+        def __init__(self):
+            self.value = old
+
+        def copy(self, value):
+            self.value = value
+
+        def paste(self):
+            return self.value
+
+    fake = FakeClip()
+    state = {"captcha": False}
+
+    def fake_key(keys):
+        if keys == "^c":
+            state["captcha"] = True
+
+    def fake_solve(dlg):
+        state["captcha"] = False
+        fake.value = new
+        return True
+
+    d = ThsUiDispatcher(captcha_ocr=True)
+    d._COPY_WAIT = 0
+    # 不得触发真实 _get_ocr_engine()：winrt 引擎在进程退出阶段会引发
+    # access violation（0xC0000005），拖垮整个 pytest 退出码。
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    monkeypatch.setattr(d, "_key", fake_key)
+    monkeypatch.setattr(d, "_find_captcha_dialog",
+                        lambda: object() if state["captcha"] else None)
+    monkeypatch.setattr(d, "_solve_captcha", fake_solve)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip", fake)
+
+    assert d._copy_grid(required=("委托时间", "合同编号")) == new
+
+
+def test_place_order_refuses_without_captcha_ocr():
+    """未启用 OCR 时必须先拒单：否则先发单再查不到合同编号会误报失败。"""
+    order = SimpleNamespace(
+        stock_code="000001.SZ", quantity=100, price=Decimal("10.00"),
+        trade_type=TradeType.BUY,
+    )
+    d = ThsUiDispatcher(captcha_ocr=False)
+    d._connected = True
+    with pytest.raises(BridgeUnavailableError):
+        d.place_order(order)

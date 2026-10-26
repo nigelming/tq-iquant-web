@@ -279,13 +279,12 @@ def test_tr72_cross_aggregation(market):
 
     s_rng = s_daily[s_daily.index.isin(rng_days)]
     avg_total = float(s_rng.mean())
-    first_total = float(s_rng.iloc[0])
     span_days = (s_rng.index[-1] - s_rng.index[0]).days
     years = span_days / 365.25
     months = max(span_days, 1) / 30.4375
 
     expected_turnover = amount / avg_total / years
-    expected_cost_ratio = cost / first_total
+    expected_cost_ratio = cost / avg_total
     expected_monthly = len(rng_trades) / months
 
     neu = p["neutral"]

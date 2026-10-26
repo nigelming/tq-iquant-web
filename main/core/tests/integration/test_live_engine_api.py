@@ -240,6 +240,43 @@ def test_stop_session_stops_engine(client, mock_bridge):
     assert sid not in live_api._ENGINES
 
 
+def test_stop_session_is_idempotent(client, mock_bridge):
+    """已停止的 session 再次 /stop → 仍返回 200（不是 404）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    assert c.post("/api/live/sessions/%d/stop" % sid).json()["code"] == 0
+
+    resp = c.post("/api/live/sessions/%d/stop" % sid)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "stopped"
+
+
+def test_create_session_rejects_duplicate_and_missing_portfolio(client, mock_bridge):
+    """portfolio_ids 重复/不存在 → 400 业务错误，而不是 FK/唯一约束的 500。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    dup = c.post("/api/live/sessions",
+                 json={"name": "dup", "portfolio_ids": [ps_id, ps_id]})
+    assert dup.status_code == 200
+    assert dup.json()["code"] != 0
+    assert "重复" in dup.json()["message"]
+
+    missing = c.post("/api/live/sessions",
+                     json={"name": "missing", "portfolio_ids": [999999]})
+    assert missing.status_code == 200
+    assert missing.json()["code"] != 0
+    assert "不存在" in missing.json()["message"]
+
+
 def test_bridge_status_endpoint(client, mock_bridge):
     """未运行 → online=None；运行中 → online=heartbeat()。"""
     c, Session = client
@@ -433,7 +470,7 @@ def _add_trade(db, sid, stock="600000.SH", trade_type="BUY", qty=100, price="10.
 def test_query_orders_history(client, mock_bridge):
     """GET /sessions/{id}/orders → 返回全部委托；?status= 过滤。"""
     c, Session = client
-    sid = _create_session(c)
+    sid = _create_session(c, portfolio_ids=())
     db = Session()
     db.add_all([
         _add_order(db, sid, status="filled"),
@@ -465,7 +502,7 @@ def test_query_orders_history(client, mock_bridge):
 def test_query_orders_returns_empty_list_when_none(client, mock_bridge):
     """无任何委托 → data 为空列表（非 null）。"""
     c, Session = client
-    sid = _create_session(c)
+    sid = _create_session(c, portfolio_ids=())
     resp = c.get("/api/live/sessions/%d/orders" % sid)
     assert resp.json()["code"] == 0
     assert resp.json()["data"] == []
@@ -474,7 +511,7 @@ def test_query_orders_returns_empty_list_when_none(client, mock_bridge):
 def test_query_trades_history(client, mock_bridge):
     """GET /sessions/{id}/trades → 成交明细按 trade_time 倒序。"""
     c, Session = client
-    sid = _create_session(c)
+    sid = _create_session(c, portfolio_ids=())
     db = Session()
     lo = _add_order(db, sid)
     db.add(lo)
@@ -504,7 +541,7 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
     600@10 BUY + 200@12 BUY + 100@11 SELL → 净 700 股，均价 (600*10+200*12)/800=10.5。
     """
     c, Session = client
-    sid = _create_session(c)
+    sid = _create_session(c, portfolio_ids=())
     db = Session()
     db.add_all([
         _add_trade(db, sid, qty=600, price="10"),
@@ -529,7 +566,7 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
 def test_query_positions_splits_rows_by_strategy(client, mock_bridge):
     """同票被两个子策略持有 → 停止态重放按 (组合, 子策略) 拆成两行。"""
     c, Session = client
-    sid = _create_session(c)
+    sid = _create_session(c, portfolio_ids=())
     db = Session()
     tr1 = _add_trade(db, sid, qty=300, price="10")
     tr2 = _add_trade(db, sid, qty=200, price="12")

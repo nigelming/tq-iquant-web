@@ -2,17 +2,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
   mockStopLiveSession: vi.fn(),
+  mockGetLiveChannel: vi.fn(),
+  mockTestLiveChannel: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
   createLiveSession: mockCreateLiveSession,
   startLiveSession: mockStartLiveSession,
   stopLiveSession: mockStopLiveSession,
+  getLiveChannel: mockGetLiveChannel,
+  testLiveChannel: mockTestLiveChannel,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -45,7 +49,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getPortfolios } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getPortfolios, getLiveChannel, testLiveChannel } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -64,6 +68,21 @@ beforeEach(() => {
   ;(getLiveTrades as any).mockResolvedValue([])
   ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
   ;(getPortfolios as any).mockResolvedValue([])
+  ;(getLiveChannel as any).mockResolvedValue({
+    engine: 'iquant',
+    active: 'iquant_bridge',
+    label: 'iQuant HTTP 桥',
+    online: null,
+    engines: [
+      { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
+      { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+      { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
+      { key: 'qmt', channel: 'qmt', label: 'miniQMT 交易', configured: false, detail: '未配置 QMT 路径/资金账号' },
+    ],
+    ths_ui: { enabled: false, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
+    bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+  })
+  ;(testLiveChannel as any).mockResolvedValue({ ok: true, channel: 'iquant_bridge', base_url: 'http://127.0.0.1:8790' })
 })
 
 afterEach(() => {
@@ -406,6 +425,70 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     // 失败不连流
     expect(FakeEventSource.instances.length).toBe(0)
     vi.unstubAllGlobals()
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 执行通道条', () => {
+  it('显示当前引擎并支持只读测试连接', async () => {
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'ths',
+      active: 'ths_ui',
+      label: '同花顺独立交易（UI 自动化）',
+      online: null,
+      engines: [
+        { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
+        { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+        { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
+        { key: 'qmt', channel: 'qmt', label: 'miniQMT 交易', configured: false, detail: '未安装 xtquant' },
+      ],
+      ths_ui: { enabled: true, available: true, window_title: '网上股票交易系统5.0', client_exe_path: 'D:/xiadan.exe', driver: 'clipboard' },
+      bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+    })
+    ;(testLiveChannel as any).mockResolvedValue({ ok: true, channel: 'ths_ui', positions: 2 })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(getLiveChannel).toHaveBeenCalled()
+    expect(w.text()).toContain('同花顺独立交易（UI 自动化）')
+    // 四个引擎全部可见，未配置的引擎带（未配置）标记
+    expect(w.text()).toContain('miniQMT 交易（未配置）')
+
+    await w.findAll('button').find((b) => b.text().includes('测试连接'))!.trigger('click')
+    await flushPromises()
+
+    expect(testLiveChannel).toHaveBeenCalledWith('ths_ui')
+    expect(w.text()).toContain('已连接，读到 2 条持仓')
+    w.unmount()
+  })
+
+  it('运行中会话按 session.engine 拉取通道状态', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, engine: 'tdx' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(getLiveChannel).toHaveBeenCalledWith('tdx')
+    w.unmount()
+  })
+
+  it('依赖未安装时以（未配置）红标提示', async () => {
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'iquant',
+      active: 'iquant_bridge',
+      label: 'iQuant HTTP 桥',
+      online: null,
+      engines: [
+        { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
+        { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: false, detail: '依赖未安装（pywinauto/pyperclip）' },
+      ],
+      ths_ui: { enabled: true, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
+      bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('iQuant HTTP 桥')
+    expect(w.text()).toContain('同花顺独立交易（UI 自动化）（未配置）')
     w.unmount()
   })
 })

@@ -230,6 +230,50 @@ def test_robustness_check_section_renders():
         assert token in html, f"报告缺少 {token!r}"
 
 
+def test_persistence_check_section_renders():
+    """离线报告含「持续性检验」：判定横幅 + 分年度指标/超额矩阵 + 滚动年化。"""
+    detail = _detail()
+    detail["persistence"] = {
+        "status": "completed", "computed_at": "2026-10-21T10:00:00",
+        "data": {
+            "years": [
+                {"year": 2024, "is_partial": False, "nav_return": 0.6, "max_drawdown": 0.08,
+                 "sharpe": 2.5, "calmar": 7.0, "win_rate": 0.6, "profit_factor": 1.9,
+                 "turnover": 22.5, "cost_ratio": 0.001,
+                 "excess": {"000300.SH": 0.30}, "bench_returns": {"000300.SH": 0.30}},
+                {"year": 2025, "is_partial": False, "nav_return": 0.3, "max_drawdown": 0.2,
+                 "sharpe": 1.0, "calmar": 1.5, "win_rate": 0.45, "profit_factor": 1.2,
+                 "turnover": 34.7, "cost_ratio": 0.002,
+                 "excess": {"000300.SH": 0.05}, "bench_returns": {"000300.SH": 0.25}},
+            ],
+            "rolling": {"dates": ["2024-06-01", "2025-06-01"],
+                        "strat_6m": [0.12, 0.08], "strat_12m": [0.10, 0.06],
+                        "bench_12m": [0.06, 0.05]},
+            "benchmarks": [{"code": "000300.SH", "name": "沪深300", "is_main": True, "available": True}],
+            "verdict": {
+                "level": "alpha_decay", "reasons": ["超额收敛", "风险恶化", "结构退化"],
+                "summary": "疑似阿尔法衰减", "caveat": "结论供参考，非自动判定",
+                "signals": [
+                    {"key": "excess", "label": "超额 vs 沪深300",
+                     "detail": "2024 +30.00% → 2025 +5.00%", "status": "bad", "word": "收敛"},
+                    {"key": "risk", "label": "风险指标",
+                     "detail": "夏普 2.50→1.00 · 卡玛 7.00→1.50 · 回撤 8.0%→20.0%",
+                     "status": "bad", "word": "恶化"},
+                    {"key": "struct", "label": "交易结构",
+                     "detail": "胜率 60.0%→45.0% · 盈亏比 1.90→1.20 · 换手 22.50→34.70×",
+                     "status": "bad", "word": "退化"},
+                ],
+                "window_years": [2024, 2025],
+            },
+        },
+    }
+    html = build_html_report(detail)
+    for token in ["持续性检验", "疑似阿尔法衰减", "分年度指标矩阵", "分年度超额收益",
+                  "滚动年化收益", "结论供参考，非自动判定", "沪深300", "34.7", "chart-p-rolling",
+                  "判定信号", "判定窗口", "夏普 2.50→1.00", "收敛", "退化"]:
+        assert token in html, f"报告缺少 {token!r}"
+
+
 def test_new_sections_returns_buckets_decisions_trades_strategy_eval():
     """收益分布/风控统计/交易明细/策略评估四区块在新版离线报告完整渲染。"""
     detail = _detail()
@@ -240,10 +284,11 @@ def test_new_sections_returns_buckets_decisions_trades_strategy_eval():
             "text": [["+1.50%", "-0.80%"], ["+2.00%", "+0.60%"]],
         },
         "yearly": [
-            {"year": 2024, "daily_returns": [0.01, -0.02, 0.03],
-             "monthly_returns": [0.05, -0.03], "annual_return": 0.25},
-            {"year": 2025, "daily_returns": [0.02, 0.01],
-             "monthly_returns": [0.03, 0.04], "annual_return": 0.08},
+            # 日/月收益样本均 ≥5（样本 <5 无法构成箱体，整年剔除——与前端同口径）
+            {"year": 2024, "daily_returns": [0.01, -0.02, 0.03, 0.005, -0.01, 0.02],
+             "monthly_returns": [0.05, -0.03, 0.02, 0.01, -0.01], "annual_return": 0.25},
+            {"year": 2025, "daily_returns": [0.02, 0.01, -0.01, 0.03, -0.02],
+             "monthly_returns": [0.03, 0.04, -0.02, 0.01, 0.005], "annual_return": 0.08},
         ],
     }
     detail["decision_summary"] = [{
@@ -317,24 +362,71 @@ def test_market_regime_window_disclosure():
     assert "实际统计窗口 2014-01-10 ~ 2026-09-18（651 周）；短于" not in html
 
 
-def test_appendix_embeds_raw_detail_json():
-    """Minor-4：报告末尾附录折叠展示完整 detail 原始 JSON。"""
+def test_appendix_raw_json_removed():
+    """附录原始 JSON 已移除（1.8M 字符噪声不再出现在报告中）。"""
     html = build_html_report(_detail())
-    assert "附录 · 原始数据 JSON" in html
-    assert 'class="json-dump"' in html
-    assert "<details>" in html and "<summary>" in html
-    # 附录内容与 detail 同源（含关键字段原始值），且经 esc 转义
-    assert "热点精选" in html
-    assert "&quot;record&quot;" in html or "record" in html
+    assert "附录 · 原始数据 JSON" not in html
+    assert 'class="json-dump"' not in html
 
 
-def test_appendix_escapes_html_in_payload():
-    """附录 JSON 中的 HTML 特殊字符必须转义（防 XSS）。"""
-    detail = _detail()
-    detail["record"]["name"] = '<script>alert("x")</script>'
-    html = build_html_report(detail)
-    assert '<script>alert("x")</script>' not in html.split(
-        'class="json-dump"', 1)[1]
+def _rb():
+    return {
+        "monthly_matrix": {
+            "years": [2024, 2025], "months": ["1月", "2月"],
+            "matrix": [[1.5, -0.8], [2.0, 0.6]],
+            "text": [["+1.50%", "-0.80%"], ["+2.00%", "+0.60%"]],
+        },
+        "yearly": [
+            {"year": 2024, "daily_returns": [0.01, -0.02, 0.03, 0.005, -0.01, 0.02],
+             "monthly_returns": [0.05, -0.03, 0.02, 0.01, -0.01], "annual_return": 0.25},
+            {"year": 2025, "daily_returns": [0.02, 0.01, -0.01, 0.03, -0.02],
+             "monthly_returns": [0.03, 0.04, -0.02, 0.01, 0.005], "annual_return": 0.08},
+        ],
+    }
+
+
+def test_heatmap_labels_show_values_on_blocks():
+    """月度收益热力图条块上常驻显示数值（带 % 符号）。
+
+    ECharts 数值模板在本报告内联运行时下不解析，故每个数据项自带字面量 formatter；
+    同时深浅底色对应白/深灰字，保证可读。
+    """
+    out = _hr._monthly_heat_chart(_rb())
+    assert out is not None
+    _, opt = out
+    series = opt["series"][0]
+    assert series["label"]["show"] is True
+    items = series["data"]
+    assert items
+    for it in items:
+        assert "%" in it["label"]["formatter"]
+        assert it["label"]["color"] in ("#ffffff", "#111827")
+        # value 必须保持 [x, y, 数值] 三维：多加一维文本会让 visualMap 取错维度而不着色
+        assert len(it["value"]) == 3
+    # visualMap 显式取数值维 index=2，tooltip 直接引用同一维
+    assert opt["visualMap"]["dimension"] == 2
+    assert "{@[2]}" in opt["tooltip"]["formatter"]
+
+
+def test_box_chart_has_zero_axis_and_mean_markers():
+    """箱线图含零轴虚线、金色菱形均值点、中位数富 tooltip。"""
+    out = _hr._box_chart(_rb(), "daily_returns", "日")
+    assert out is not None
+    _, opt = out
+    series_types = [s["type"] for s in opt["series"]]
+    assert "boxplot" in series_types
+    assert "scatter" in series_types  # 均值菱形
+    markline = next(s for s in opt["series"] if s.get("markLine"))
+    assert markline["markLine"]["data"][0] == {"yAxis": 0}
+    assert "{c3}" in opt["tooltip"]["formatter"]  # 中位数
+
+
+def test_box_stats_table_renders_per_year():
+    """箱线图下方常驻统计表：每年一行，含均值/中位/Q1/Q3/极值/正值占比。"""
+    table = _hr._box_stats_table(_rb(), "daily_returns")
+    assert table
+    assert "样本数" in table
+    assert "正值占比" in table
 
 
 def test_signal_preflight_warnings_render_at_top():
@@ -393,8 +485,37 @@ def test_echarts_source_all_candidates_missing_raises_clear(monkeypatch, tmp_pat
     hr._echarts_source.cache_clear()
     try:
         with pytest.raises(FileNotFoundError) as ei:
-            hr._echarts_source()
+            _hr._echarts_source()
         assert "echarts.min.js" in str(ei.value)
         assert "已尝试" in str(ei.value)
     finally:
         hr._echarts_source.cache_clear()
+
+
+def test_boxplot_data_requires_min_5_samples():
+    """样本 <5 无法构成箱体（与前端 boxplotData 同口径），返回 None。"""
+    assert _hr._boxplot_data([]) is None
+    assert _hr._boxplot_data([0.1, -0.2, 0.3, 0.05]) is None
+    five = _hr._boxplot_data([0.1, -0.2, 0.3, 0.05, 0.0])
+    assert five is not None and len(five) == 5
+
+
+def test_box_chart_drops_sparse_year_without_axis_misalignment():
+    """<5 样本年份整年剔除，且年份轴与箱体一一对齐（不错位）。
+
+    回归：旧实现先对全量年份生成 categories、再过滤 box_data 空值，
+    中间年份缺箱体时后续箱体整体左移，与年份标签错位。
+    """
+    yearly = [
+        {"year": 2022, "daily_returns": [0.001 * i for i in range(10)]},
+        # 3 个样本（夹在中间）→ 整年剔除
+        {"year": 2023, "daily_returns": [0.001, -0.002, 0.003]},
+        {"year": 2024, "daily_returns": [-0.001 * i for i in range(8)]},
+    ]
+    out = _hr._box_chart({"yearly": yearly}, "daily_returns", "日")
+    assert out is not None
+    _, option = out
+    cats = option["xAxis"]["data"]
+    boxes = option["series"][0]["data"]
+    assert cats == ["2022", "2024"]
+    assert len(boxes) == len(cats) == 2

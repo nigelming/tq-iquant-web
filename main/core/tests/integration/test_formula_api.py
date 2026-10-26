@@ -289,6 +289,24 @@ def test_update_formula_not_found(client):
 
 
 # ---------------------------------------------------------------------------
+# W4：已移除未来函数关键字预检（strict_future_check）。公式内容原样入库，
+# 是否使用未来函数由用户自行判断。
+# ---------------------------------------------------------------------------
+def test_create_formula_no_future_check(client):
+    """含 ZIG 的内容原样入库，不再做未来函数拦截（含旧 strict_future_check 键也忽略）。"""
+    c, Session = client
+    payload = {
+        "name": "FUT_OK", "content": "A:ZIG(3,5);", "signals": [],
+        "strict_future_check": True,
+    }
+    resp = c.post("/api/formulas", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["content"] == "A:ZIG(3,5);"
+
+
+# ---------------------------------------------------------------------------
 # formula_count 字段（任务 #27：注入历史根数，按公式配）
 # ---------------------------------------------------------------------------
 def test_create_formula_with_formula_count(client):
@@ -557,3 +575,193 @@ def test_delete_formula_referenced_by_strategy(client):
     db = Session()
     assert db.get(Formula, fid) is not None
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# engine 字段（内置公式子集解释器，默认 tq 行为不变）
+# ---------------------------------------------------------------------------
+def test_create_formula_engine_default_tq(client):
+    """POST 不带 engine → 默认 "tq"。"""
+    c, Session = client
+    resp = c.post("/api/formulas", json={"name": "E1", "content": "X", "signals": []})
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["engine"] == "tq"
+
+    db = Session()
+    assert db.get(Formula, resp.json()["data"]["id"]).engine == "tq"
+    db.close()
+
+
+def test_create_formula_with_engine_builtin(client):
+    """POST engine=builtin → 落库。"""
+    c, Session = client
+    resp = c.post("/api/formulas", json={
+        "name": "E2", "content": "SIG:IF(C>O,1,0);", "signals": [],
+        "engine": "builtin",
+    })
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["engine"] == "builtin"
+
+    db = Session()
+    assert db.get(Formula, resp.json()["data"]["id"]).engine == "builtin"
+    db.close()
+
+
+def test_create_formula_invalid_engine_rejected(client):
+    """engine 不在 {tq, builtin} → code 400。"""
+    c, Session = client
+    resp = c.post("/api/formulas", json={
+        "name": "E3", "content": "X", "signals": [], "engine": "foo",
+    })
+    assert resp.json()["code"] == 400
+    assert "engine" in resp.json()["message"]
+
+
+def test_update_formula_changes_engine(client):
+    """PUT 改 engine → 落库更新。"""
+    c, Session = client
+    db = Session()
+    fid = _seed_formula(db)
+    db.close()
+
+    resp = c.put(f"/api/formulas/{fid}", json={
+        "name": "E4", "content": "X", "signals": [], "engine": "builtin",
+    })
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["engine"] == "builtin"
+
+    db = Session()
+    assert db.get(Formula, fid).engine == "builtin"
+    db.close()
+
+
+def test_list_formula_includes_engine(client):
+    """GET 列表每条含 engine（seed 不带 → 默认 tq）。"""
+    c, Session = client
+    db = Session()
+    fid = _seed_formula(db)
+    db.close()
+
+    resp = c.get("/api/formulas")
+    item = next(x for x in resp.json()["data"] if x["id"] == fid)
+    assert item["engine"] == "tq"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/formulas/precheck — 内置引擎语法预检（无数据干跑）
+# ---------------------------------------------------------------------------
+def test_precheck_ok(client):
+    """合法公式 → ok=true，errors 空，outputs 含输出线名。"""
+    c, _ = client
+    resp = c.post("/api/formulas/precheck", json={
+        "content": "SIG:IF(C>O,1,0),NODRAW;",
+    })
+    assert resp.json()["code"] == 0
+    data = resp.json()["data"]
+    assert data["ok"] is True
+    assert data["errors"] == []
+    assert data["outputs"] == ["SIG"]
+    assert isinstance(data["issues"], list)
+
+
+def test_precheck_future_function_error(client):
+    """ZIG → future error 级 issue，ok=false。"""
+    c, _ = client
+    resp = c.post("/api/formulas/precheck", json={"content": "X:ZIG(C,5);"})
+    data = resp.json()["data"]
+    assert data["ok"] is False
+    assert any(
+        i["rule"] == "future" and i["level"] == "error" and i["name"] == "ZIG"
+        for i in data["issues"]
+    )
+
+
+def test_precheck_syntax_error(client):
+    """括号未闭合 → errors 首条为 lint 精确行列提示，解析错误仍含定义名。"""
+    c, _ = client
+    resp = c.post("/api/formulas/precheck", json={"content": "X:(C+1;"})
+    data = resp.json()["data"]
+    assert data["ok"] is False
+    assert data["errors"]
+    # lint 先报：精确到行列的人话提示
+    assert "未闭合" in data["errors"][0]
+    # 解析层错误仍在列表中（含定义名）
+    assert any("X" in e for e in data["errors"])
+
+
+def test_precheck_unimplemented_function(client):
+    """内置引擎未实现函数 → 致命错误（词典层 unknown 仅 warning）。"""
+    c, _ = client
+    resp = c.post("/api/formulas/precheck", json={"content": "X:FOO(C,5);"})
+    data = resp.json()["data"]
+    assert data["ok"] is False
+    assert any("FOO" in e for e in data["errors"])
+
+
+# ---------------------------------------------------------------------------
+# POST /api/formulas/normalize-preview — 0016 信号标准化向导预览（不落库）
+# ---------------------------------------------------------------------------
+def test_normalize_preview_cross_zero_pair(client):
+    """合法预览 → `:` 线降级 `:=` + 尾部 XG/XD 双线，output_lines 含含义说明。"""
+    c, _ = client
+    resp = c.post("/api/formulas/normalize-preview", json={
+        "content": "M:CLOSE;",
+        "plans": [{"line": "M", "rule": "cross_zero", "params": {"direction": "both"}}],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["new_content"] == "M:=CLOSE;\nXG:CROSS(M,0);\nXD:CROSS(0,M);"
+    assert [o["name"] for o in data["output_lines"]] == ["XG", "XD"]
+    assert data["output_lines"][0]["source_line"] == "M"
+    assert isinstance(data["warnings"], list)
+
+
+def test_normalize_preview_bad_line_returns_400(client):
+    """line 不是 `:` 输出线 → code 400 带原因。"""
+    c, _ = client
+    resp = c.post("/api/formulas/normalize-preview", json={
+        "content": "M:CLOSE;",
+        "plans": [{"line": "NOPE", "rule": "cross_zero", "params": {}}],
+    })
+    assert resp.json()["code"] == 400
+    assert "NOPE" in resp.json()["message"]
+
+
+def test_normalize_preview_empty_plans_returns_400(client):
+    c, _ = client
+    resp = c.post("/api/formulas/normalize-preview", json={"content": "M:CLOSE;", "plans": []})
+    assert resp.json()["code"] == 400
+
+
+def test_normalize_preview_then_create_signal_ready(client):
+    """端到端：预览生成 → 保存为新公式（带预填信号）→ 源公式内容零变化。"""
+    c, Session = client
+    # 源公式落库
+    r = c.post("/api/formulas", json={"name": "SRC", "content": "M:CLOSE;", "signals": []})
+    assert r.json()["code"] == 0
+    src_id = r.json()["data"]["id"]
+
+    preview = c.post("/api/formulas/normalize-preview", json={
+        "content": "M:CLOSE;",
+        "plans": [{"line": "M", "rule": "cross_zero", "params": {"direction": "both"}}],
+    }).json()["data"]
+
+    r2 = c.post("/api/formulas", json={
+        "name": "SRC-STD",
+        "content": preview["new_content"],
+        "signals": [{"signal_name": "XG", "signal_type": "OPEN", "trigger_value": 1}],
+    })
+    assert r2.json()["code"] == 0
+    new_id = r2.json()["data"]["id"]
+    assert new_id != src_id
+
+    items = c.get("/api/formulas").json()["data"]
+    src = next(x for x in items if x["id"] == src_id)
+    std = next(x for x in items if x["id"] == new_id)
+    # 源公式内容零变化（A3）
+    assert src["content"] == "M:CLOSE;"
+    # 新公式内容为标准化源码，信号可配置
+    assert std["content"] == "M:=CLOSE;\nXG:CROSS(M,0);\nXD:CROSS(0,M);"
+    assert std["signals"][0]["signal_name"] == "XG"

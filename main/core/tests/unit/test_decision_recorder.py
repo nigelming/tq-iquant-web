@@ -10,6 +10,7 @@ from core.engine.decision import (
     NULL_RECORDER,
     DecisionEvent,
     summarize_decisions,
+    summarize_decisions_yearly,
 )
 
 
@@ -138,3 +139,65 @@ class TestSummarize:
         assert len(summary) == 1
         assert summary[0]["count"] == 1
         assert summary[0]["gate"] == "stop_loss"
+
+
+class TestSummarizeYearly:
+    """C9 年度归因：按年聚合风控触发率与槽位拦截量。"""
+
+    def _events(self):
+        def ev(year, gate, action="trigger", month=1):
+            return DecisionEvent(
+                gate=gate, layer="strategy_risk", action=action,
+                portfolio_id=1, bar_time=datetime(year, month, 15, 10, 0),
+            )
+        return [
+            ev(2023, "stop_loss"),
+            ev(2023, "max_positions_full", action="block"),
+            ev(2024, "stop_loss"), ev(2024, "stop_loss"), ev(2024, "stop_loss"),
+            ev(2024, "trailing_stop"),
+            ev(2024, "take_profit"),
+            ev(2024, "max_positions_full", action="block"),
+            ev(2024, "max_positions_full", action="block"),
+            ev(2024, "max_positions_full", action="block"),
+        ]
+
+    def test_groups_by_year_ascending(self):
+        yearly = summarize_decisions_yearly(self._events())
+        assert [y["year"] for y in yearly] == ["2023", "2024"]
+        assert yearly[0]["total"] == 2
+        assert yearly[1]["total"] == 8
+
+    def test_by_gate_counts(self):
+        yearly = summarize_decisions_yearly(self._events())
+        y2024 = yearly[1]
+        assert y2024["by_gate"]["stop_loss"]["trigger"] == 3
+        assert y2024["by_gate"]["max_positions_full"]["block"] == 3
+
+    def test_risk_and_block_rollup(self):
+        yearly = summarize_decisions_yearly(self._events())
+        y2023, y2024 = yearly
+        assert y2023["stop_loss_triggers"] == 1
+        assert y2023["trailing_stop_triggers"] == 0
+        assert y2023["risk_triggers"] == 1
+        assert y2023["max_positions_full_blocks"] == 1
+        # 2024：止损率↑ + 拦截↑ 的归因场景
+        assert y2024["stop_loss_triggers"] == 3
+        assert y2024["trailing_stop_triggers"] == 1
+        assert y2024["take_profit_triggers"] == 1
+        assert y2024["risk_triggers"] == 5
+        assert y2024["max_positions_full_blocks"] == 3
+
+    def test_skips_events_without_bar_time(self):
+        evs = [DecisionEvent(gate="stop_loss", layer="x", action="trigger",
+                             portfolio_id=1, bar_time=None)]
+        assert summarize_decisions_yearly(evs) == []
+
+    def test_accepts_dicts(self):
+        evs = [{"gate": "trailing_stop", "layer": "strategy_risk", "action": "trigger",
+                "portfolio_id": 1, "bar_time": datetime(2025, 6, 1, 14, 0)}]
+        yearly = summarize_decisions_yearly(evs)
+        assert yearly[0]["year"] == "2025"
+        assert yearly[0]["trailing_stop_triggers"] == 1
+
+    def test_empty(self):
+        assert summarize_decisions_yearly([]) == []
