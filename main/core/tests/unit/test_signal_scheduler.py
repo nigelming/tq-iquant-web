@@ -95,6 +95,20 @@ def test_weekly_holiday_shifts_to_next_trading_day():
     assert batches[0].data_end_date == date(2026, 10, 23)
 
 
+def test_weekly_wednesday_uses_previous_week_end():
+    days = [date(2026, 10, 19), date(2026, 10, 20), date(2026, 10, 21),
+            date(2026, 10, 22), date(2026, 10, 23),
+            date(2026, 10, 26), date(2026, 10, 27), date(2026, 10, 28),
+            date(2026, 10, 29), date(2026, 10, 30)]
+    s = _scheduler(days, _strategy(signal_weekday=3))
+    assert s.due(datetime(2026, 10, 26, 9, 0)) == []
+    assert s.due(datetime(2026, 10, 27, 9, 0)) == []
+    batches = s.due(datetime(2026, 10, 28, 9, 0))
+    assert len(batches) == 1
+    assert batches[0].data_end_date == date(2026, 10, 23)
+    assert batches[0].bar_time == datetime(2026, 10, 23, 15, 0)
+
+
 def test_daily_1430_is_inject():
     days = [date(2026, 10, 26)]
     s = _scheduler(days, _strategy(signal_frequency="1d", signal_at="14:30",

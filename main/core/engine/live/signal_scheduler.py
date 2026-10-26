@@ -112,7 +112,9 @@ class SignalScheduler:
                 due_date += timedelta(days=1)
             else:
                 return None, None, None
-            end = self._last_trading_before(due_date)
+            # 周信号固定用上一个完整周（与 signal_weekday 无关）：以本周一为界
+            # 回溯上一交易日，避免周三/周五触发时误取本周未完成 bar。
+            end = self._last_trading_before(monday)
             return (
                 datetime.combine(due_date, at_time), end,
                 datetime.combine(end, time(15, 0)),
@@ -258,7 +260,9 @@ class SignalScheduler:
                 self.alert.send_message(text)
             except Exception:  # noqa: BLE001
                 pass
-        if self.monitor is not None:
+        if self.monitor is not None and hasattr(
+            self.monitor, "report_runtime_error"
+        ):
             self.monitor.report_runtime_error(
                 batch.portfolio, st, formula_name, message
             )
