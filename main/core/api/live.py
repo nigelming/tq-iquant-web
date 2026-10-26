@@ -138,6 +138,37 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
+@router.get("/sessions/{session_id}/signals")
+def session_signals(
+    session_id: int,
+    strategy_id: Optional[int] = None,
+    stock_code: Optional[str] = None,
+    signal_type: Optional[str] = None,
+    execution_mode: Optional[str] = None,
+    alert_status: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    def _dt(value):
+        return datetime.fromisoformat(value) if value else None
+
+    try:
+        data = svc.session_signals(
+            db, session_id, strategy_id=strategy_id, stock_code=stock_code,
+            signal_type=signal_type, execution_mode=execution_mode,
+            alert_status=alert_status, start=_dt(start), end=_dt(end),
+            limit=limit, offset=offset,
+        )
+    except ValueError:
+        return err(400, "start/end 必须为 ISO 时间")
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
 @router.post("/sessions/{session_id}/start")
 async def start_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()

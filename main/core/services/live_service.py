@@ -30,6 +30,7 @@ from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
+    LiveSignal,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -1061,3 +1062,52 @@ def session_decisions(db: Session, session_id: int) -> Optional[dict]:
         "summary": summarize_decisions(rows),
         "events": [serialize_decision(d) for d in rows],
     }
+
+
+def serialize_signal(s: LiveSignal) -> dict:
+    return {
+        "id": s.id,
+        "portfolio_id": s.portfolio_strategy_id,
+        "strategy_id": s.strategy_id,
+        "stock_code": s.stock_code,
+        "period": s.period,
+        "bar_time": s.bar_time.isoformat() if s.bar_time else None,
+        "formula_name": s.formula_name,
+        "signal_name": s.signal_name,
+        "signal_type": s.signal_type,
+        "trigger_value": s.trigger_value,
+        "price": str(s.price) if s.price is not None else None,
+        "execution_mode": s.execution_mode,
+        "status": s.status,
+        "alert_status": s.alert_status,
+        "alert_error": s.alert_error,
+        "tdx_run_id": s.tdx_run_id,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "alerted_at": s.alerted_at.isoformat() if s.alerted_at else None,
+    }
+
+
+def session_signals(db, session_id, strategy_id=None, stock_code=None,
+                    signal_type=None, execution_mode=None, alert_status=None,
+                    start=None, end=None, limit=100, offset=0):
+    if db.query(LiveSession).filter(LiveSession.id == session_id).first() is None:
+        return None
+    q = db.query(LiveSignal).filter(LiveSignal.live_session_id == session_id)
+    if strategy_id is not None:
+        q = q.filter(LiveSignal.strategy_id == strategy_id)
+    if stock_code:
+        q = q.filter(LiveSignal.stock_code == stock_code)
+    if signal_type:
+        q = q.filter(LiveSignal.signal_type == signal_type)
+    if execution_mode:
+        q = q.filter(LiveSignal.execution_mode == execution_mode)
+    if alert_status:
+        q = q.filter(LiveSignal.alert_status == alert_status)
+    if start is not None:
+        q = q.filter(LiveSignal.bar_time >= start)
+    if end is not None:
+        q = q.filter(LiveSignal.bar_time <= end)
+    total = q.count()
+    rows = (q.order_by(LiveSignal.bar_time.desc(), LiveSignal.id.desc())
+            .offset(offset).limit(min(max(limit, 1), 500)).all())
+    return {"items": [serialize_signal(r) for r in rows], "total": total}
