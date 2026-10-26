@@ -57,8 +57,6 @@ from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
 from core.tq.alert import TQAlert
 from core.engine.live.alert_dispatcher import AlertDataDispatcher
-from core.engine.live.signal_monitor import SignalMonitor
-from core.engine.live.signal_scheduler import SignalScheduler
 from core.engine.live.market_data import MarketDataService
 from core.engine.live.timing import now_shanghai
 from core.services.signal_schedule import (
@@ -389,16 +387,20 @@ def _smoke_formula_outputs(db: Session, session_id: int):
         code = sorted(codes)[0]
         # 至少拉 200 根，避免周线 MACD 等长周期输出线因历史不足变 NaN
         count = max(f.formula_count or 200, 200)
-        raw = formula.compute(
-            f.name, "", [code], period=st.period,
-            count=count, end_time=now_shanghai().strftime("%Y%m%d"),
-        )
-        if (not isinstance(raw, dict)
-                or str(raw.get("ErrorId", "0")) not in ("0", "19")):
-            detail = raw.get("Error") if isinstance(raw, dict) else "无返回"
-            return (503, "公式 %s 试算失败：%s" % (f.name, detail or "无返回"))
-        produced = MarketDataService._extract_latest_signal(raw, code)
-        names = {o["name"] for o in produced}
+        try:
+            raw = formula.compute(
+                f.name, "", [code], period=st.period,
+                count=count, end_time=now_shanghai().strftime("%Y%m%d"),
+            )
+            if (not isinstance(raw, dict)
+                    or str(raw.get("ErrorId", "0")) not in ("0", "19")):
+                detail = raw.get("Error") if isinstance(raw, dict) else "无返回"
+                return (503, "公式 %s 试算失败：%s" % (
+                    f.name, detail or "无返回"))
+            produced = MarketDataService._extract_latest_signal(raw, code)
+            names = {o["name"] for o in produced}
+        except Exception as exc:
+            return (503, "公式 %s 试算失败：%s" % (f.name, exc))
         missing = [s.signal_name for s in signals if s.signal_name not in names]
         if missing:
             return (503, "公式 %s 输出缺少信号线：%s" % (

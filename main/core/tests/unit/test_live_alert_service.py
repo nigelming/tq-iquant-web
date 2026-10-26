@@ -1,5 +1,4 @@
 from decimal import Decimal
-from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -71,3 +70,18 @@ def test_preflight_alert_passes_with_fake_tq(monkeypatch):
     monkeypatch.setattr(live_service, "_smoke_formula_outputs",
                         lambda *a, **kw: None)
     assert live_service.preflight_signal_config(db, 1, "alert") is None
+
+
+def test_preflight_alert_returns_503_when_formula_smoke_raises(monkeypatch):
+    db = _db()
+    _seed(db)
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", lambda: None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("tq disconnected")
+
+    monkeypatch.setattr(live_service.TQFormula, "compute", boom)
+    status, msg = live_service.preflight_signal_config(db, 1, "alert")
+    assert status == 503
+    assert "momentum" in msg
+    assert "试算失败" in msg
