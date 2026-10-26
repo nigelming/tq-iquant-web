@@ -101,6 +101,10 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         return err(400, "engine 非法，仅支持 %s" % " / ".join(svc.ENGINES_META))
     data["name"] = name
     data["engine"] = engine
+    execution_mode = str(data.get("execution_mode") or "alert")
+    if execution_mode not in ("alert", "auto"):
+        return err(400, "execution_mode 非法，仅支持 alert(半自动) / auto(全自动)")
+    data["execution_mode"] = execution_mode
     # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
     # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
     pids = data.get("portfolio_ids") or []
@@ -146,7 +150,10 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     engine, _session, error = svc.start_session(
         db, session_id, _ENGINES, session.mode,
         db_session_factory=SessionLocal,
-        dispatcher_cls=_dispatcher_cls_for(session),
+        dispatcher_cls=(
+            None if (session.execution_mode or "auto") == "alert"
+            else _dispatcher_cls_for(session)
+        ),
     )
     if error is not None:
         status, message = error

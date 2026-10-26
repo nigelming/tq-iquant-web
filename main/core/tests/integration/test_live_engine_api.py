@@ -118,8 +118,12 @@ def mock_bridge(monkeypatch):
     return rec
 
 
-def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation"):
-    resp = c.post("/api/live/sessions", json={"name": name, "portfolio_ids": list(portfolio_ids), "mode": mode})
+def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation",
+                    execution_mode="auto"):
+    resp = c.post("/api/live/sessions", json={
+        "name": name, "portfolio_ids": list(portfolio_ids), "mode": mode,
+        "execution_mode": execution_mode,
+    })
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0

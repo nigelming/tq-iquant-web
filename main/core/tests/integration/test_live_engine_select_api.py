@@ -31,9 +31,14 @@ def client():
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    from core.api import live as live_api
+    live_api.SessionLocal = Session
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c
     app.dependency_overrides.clear()
+    live_api._ENGINES.clear()
+    import core.db as db_mod
+    live_api.SessionLocal = db_mod.SessionLocal
 
 
 @pytest.mark.parametrize("engine_key", ["iquant", "tdx", "ths", "qmt"])
@@ -91,8 +96,11 @@ def test_start_tdx_session_reports_not_ready(client, monkeypatch):
 
     monkeypatch.setattr(svc, "TdxTqDispatcher", OfflineTdx)
 
-    body = client.post("/api/live/sessions",
-                       json={"name": "tdx", "mode": "simulation", "engine": "tdx"}).json()
+    body = client.post(
+        "/api/live/sessions",
+        json={"name": "tdx", "mode": "simulation", "engine": "tdx",
+              "execution_mode": "auto"},
+    ).json()
     sid = body["data"]["id"]
     resp = client.post("/api/live/sessions/%d/start" % sid).json()
     assert resp["code"] == 503
@@ -123,8 +131,11 @@ def test_start_qmt_session_reports_not_ready(client, monkeypatch):
 
     monkeypatch.setattr(svc, "QmtDispatcher", OfflineQmt)
 
-    sid = client.post("/api/live/sessions",
-                      json={"name": "qmt", "mode": "live", "engine": "qmt"}).json()["data"]["id"]
+    sid = client.post(
+        "/api/live/sessions",
+        json={"name": "qmt", "mode": "live", "engine": "qmt",
+              "execution_mode": "auto"},
+    ).json()["data"]["id"]
     resp = client.post("/api/live/sessions/%d/start" % sid).json()
     assert resp["code"] == 503
     assert "QMT 交易未就绪" in resp["message"]

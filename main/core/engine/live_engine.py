@@ -116,11 +116,6 @@ class LiveEngine:
         formula_id_by_strategy: Optional[Dict[int, int]] = None,
         enable_signal_monitor: bool = False,
     ):
-        # alert/auto mode
-        self.execution_mode = execution_mode
-        self._signal_monitor = signal_monitor
-        self._signal_scheduler = signal_scheduler
-        self._formula_id_by_strategy = formula_id_by_strategy or {}
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
         self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
@@ -136,6 +131,19 @@ class LiveEngine:
             code_period_count=code_period_count,
             clock=now_shanghai,
         )
+        # alert/auto mode
+        self.execution_mode = execution_mode
+        self._formula_id_by_strategy = formula_id_by_strategy or {}
+        self._tq_alert = None
+        self._signal_monitor = signal_monitor
+        if enable_signal_monitor and signal_monitor is None:
+            from ..tq.alert import TQAlert
+            from .live.signal_monitor import SignalMonitor
+            self._tq_alert = TQAlert()
+            self._signal_monitor = SignalMonitor(
+                session_id, db_session_factory, self._tq_alert, self._emit,
+                execution_mode,
+            )
         # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
         # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
         self._recorder = DecisionRecorder()
@@ -177,6 +185,17 @@ class LiveEngine:
             formula_count=formula_count,
             formula_count_by_name=formula_count_by_name,
         )
+        self._signal_scheduler = signal_scheduler
+        if (enable_signal_monitor and execution_mode == "alert"
+                and signal_scheduler is None):
+            from .live.signal_scheduler import SignalScheduler
+            self._signal_scheduler = SignalScheduler(
+                self.ctx, self.market_data, lambda: self._calendar,
+                self.market_data._formula_by_strategy,
+                self.market_data._formula_count_by_name,
+                self._formula_id_by_strategy,
+                self._signal_monitor, self._tq_alert,
+            )
         # 委托状态机/成交回填协作者（0010 步骤 3）：order_ref 匹配、/deals 轮询回填、
         # 终态同步、陈旧单失效、filled apply 归 OrderStateMachine。持有 _pending_orders/
         # _last_backfill_time。事件发射经 self._emit 回调注入（不反向 import LiveEngine）。

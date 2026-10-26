@@ -29,7 +29,7 @@ from core.config import load_config
 from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
-    StockPoolStock, Formula, LiveOrder, LiveTrade, LiveDecisionEvent,
+    StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -55,6 +55,15 @@ from core.engine.decision import summarize_decisions
 from core.engine.crisis_alpha import DEFAULT_BENCHMARK_CODE
 from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
+from core.tq.alert import TQAlert
+from core.engine.live.alert_dispatcher import AlertDataDispatcher
+from core.engine.live.signal_monitor import SignalMonitor
+from core.engine.live.signal_scheduler import SignalScheduler
+from core.engine.live.market_data import MarketDataService
+from core.engine.live.timing import now_shanghai
+from core.services.signal_schedule import (
+    effective_signal_frequency, validate_signal_config,
+)
 from tq_iquant_shared.constants import TradeType
 
 logger = logging.getLogger(__name__)
@@ -336,6 +345,107 @@ def resolve_stock_codes(db: Session, portfolio_strategy_id: int) -> list:
     return [s.stock_code for s in stocks if s.stock_code]
 
 
+def _session_strategies(db: Session, session_id: int):
+    links = (
+        db.query(LiveSessionPortfolio)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    rows = []
+    for link in links:
+        strategies = (
+            db.query(Strategy)
+            .filter(Strategy.portfolio_id == link.portfolio_strategy_id)
+            .order_by(Strategy.id)
+            .all()
+        )
+        rows.extend((link.portfolio_strategy_id, st) for st in strategies)
+    return rows
+
+
+def _preflight_tq_alert():
+    msg = TQAlert().preflight()
+    return (503, msg) if msg else None
+
+
+def _smoke_formula_outputs(db: Session, session_id: int):
+    """alert 启动前用 1 只股票试算公式，确认输出线覆盖 FormulaSignal。"""
+    formula = TQFormula()
+    seen = set()
+    for pid, st in _session_strategies(db, session_id):
+        smoke_key = (st.formula_id, st.period)
+        if st.formula_id is None or smoke_key in seen:
+            continue
+        seen.add(smoke_key)
+        f = db.query(Formula).filter_by(id=st.formula_id).first()
+        if f is None:
+            return (503, "策略 %s 引用的公式不存在" % st.name)
+        signals = db.query(FormulaSignal).filter_by(formula_id=f.id).all()
+        if not signals:
+            return (503, "公式 %s 未配置信号输出线" % f.name)
+        codes = resolve_stock_codes(db, pid)
+        if not codes:
+            continue
+        code = sorted(codes)[0]
+        # 至少拉 200 根，避免周线 MACD 等长周期输出线因历史不足变 NaN
+        count = max(f.formula_count or 200, 200)
+        raw = formula.compute(
+            f.name, "", [code], period=st.period,
+            count=count, end_time=now_shanghai().strftime("%Y%m%d"),
+        )
+        if (not isinstance(raw, dict)
+                or str(raw.get("ErrorId", "0")) not in ("0", "19")):
+            detail = raw.get("Error") if isinstance(raw, dict) else "无返回"
+            return (503, "公式 %s 试算失败：%s" % (f.name, detail or "无返回"))
+        produced = MarketDataService._extract_latest_signal(raw, code)
+        names = {o["name"] for o in produced}
+        missing = [s.signal_name for s in signals if s.signal_name not in names]
+        if missing:
+            return (503, "公式 %s 输出缺少信号线：%s" % (
+                f.name, "、".join(missing)))
+    return None
+
+
+def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
+    """启动前检查；返回 None 或 (http_status, message)。
+
+    alert: TQ-only + 频率规则 + send_warn 可用 + 公式试算输出线。
+    auto（P0 兼容）: 只查 TQ engine + 频率规则，不做 TQ 试算/告警探测，
+    避免历史自动会话因客户端未就绪而无法启动。
+    """
+    if execution_mode not in ("alert", "auto"):
+        return (400, "execution_mode 必须为 alert/auto")
+    for pid, st in _session_strategies(db, session_id):
+        if st.formula_id is None:
+            if execution_mode == "alert":
+                return (503, "策略 %s 未绑定公式" % st.name)
+            continue
+        f = db.query(Formula).filter_by(id=st.formula_id).first()
+        if f is None:
+            return (503, "策略 %s 引用的公式不存在" % st.name)
+        if f.engine != "tq":
+            return (503, "实盘只支持通达信导入公式（%s.engine=%s）" % (
+                f.name, f.engine))
+        msg = validate_signal_config(
+            st.period, st.signal_frequency, st.signal_at,
+            st.signal_weekday, st.signal_data_end,
+        )
+        if msg:
+            return (503, msg)
+        freq = effective_signal_frequency(st.period, st.signal_frequency)
+        if execution_mode == "auto" and freq != st.period:
+            return (503, "全自动 P0 仅支持 signal_frequency == period；"
+                         "请改用 alert 或等待 P2（策略 %s）" % st.name)
+    if execution_mode == "alert":
+        err = _preflight_tq_alert()
+        if err:
+            return err
+        err = _smoke_formula_outputs(db, session_id)
+        if err:
+            return err
+    return None
+
+
 def build_engine(
     session_id: int,
     db: Session,
@@ -343,6 +453,7 @@ def build_engine(
     db_session_factory=SessionLocal,
     dispatcher_cls=None,
     engine: Optional[str] = None,
+    execution_mode: str = "auto",
 ) -> LiveEngine:
     """组装一个 session 的 LiveEngine：各组合 Portfolio + dispatcher + BarPoller。
 
@@ -353,8 +464,13 @@ def build_engine(
     dispatcher_cls：注入 dispatcher 类（测试 monkeypatch 用）；None 时按 engine 选：
     engine=None → 沿用旧行为（ths_ui.enabled → 同花顺，否则 iQuant 桥）；
     engine=tdx/qmt → 通达信 TQ / miniQMT。
+
+    execution_mode=alert 时固定使用 AlertDataDispatcher（TQ 行情、禁止下单），
+    优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
     """
-    if dispatcher_cls is None:
+    if execution_mode == "alert":
+        dispatcher = AlertDataDispatcher()
+    elif dispatcher_cls is None:
         dispatcher = make_dispatcher(engine or default_engine(), mode, session_id)
     elif dispatcher_cls is ThsUiDispatcher:
         ths_cfg = load_config().get("ths_ui", {})
@@ -436,6 +552,11 @@ def build_engine(
                     formula_count_by_name[f.name] = f.formula_count
                     formula_count_by_id[fid] = f.formula_count
 
+    for port in portfolios:
+        for ctx in port.strategies:
+            ctx.formula_name = formula_by_strategy.get(ctx.strategy_id, "")
+            ctx.formula_id = strategy_formula.get(ctx.strategy_id)
+
     # (code, period) -> 该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
     # formula_id 为 None 的策略（无公式）兜底 DEFAULT_COUNT。预热/分发按此拉，按需不浪费。
     for (code, period), fids in code_period_formula_ids.items():
@@ -473,6 +594,9 @@ def build_engine(
         code_period_count=code_period_count,
         regime_provider=_regime_provider,
         benchmark_codes=benchmark_codes,
+        execution_mode=execution_mode,
+        formula_id_by_strategy=strategy_formula,
+        enable_signal_monitor=True,
     )
 
 
@@ -495,6 +619,7 @@ def list_sessions(db: Session) -> list:
             "name": s.name,
             "mode": s.mode,
             "engine": session_engine(s),
+            "execution_mode": s.execution_mode,
             "status": s.status,
             "started_at": s.started_at,
             "stopped_at": s.stopped_at,
@@ -506,10 +631,12 @@ def list_sessions(db: Session) -> list:
 
 
 def create_session(db: Session, data: dict, mode: str) -> dict:
-    """创建 session。mode 已由路由校验为 simulation|live，engine 已校验为合法 key。"""
+    """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
+    execution_mode = data.get("execution_mode") or "alert"
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or "iquant",
+        execution_mode=execution_mode,
     )
     db.add(session)
     db.flush()
@@ -518,7 +645,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         db.add(link)
     db.commit()
     return {"id": session.id, "status": session.status,
-            "engine": session_engine(session)}
+            "engine": session_engine(session),
+            "execution_mode": session.execution_mode}
 
 
 def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = None) -> Optional[dict]:
@@ -535,6 +663,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "name": session.name,
         "mode": session.mode,
         "engine": session_engine(session),
+        "execution_mode": session.execution_mode,
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -609,10 +738,12 @@ def start_session(
         running_id = next(iter(engines))
         return None, session, (409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
 
+    execution_mode = getattr(session, "execution_mode", None) or "auto"
     engine = build_engine(
         session_id, db, mode,
         db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
         engine=session_engine(session),
+        execution_mode=execution_mode,
     )
     # 启动前探测通道在线：客户端未起/未登录直接拒绝，不建引擎、不置 running，
     # 避免「一点就成功、通道离线却无告警」。heartbeat() 本地 loopback 瞬时失败，
@@ -620,6 +751,12 @@ def start_session(
     if not engine.dispatcher.heartbeat():
         channel = getattr(engine.dispatcher, "channel", "")
         detail = getattr(engine.dispatcher, "last_error", "") or ""
+        if channel == "alert":
+            return None, session, (
+                503,
+                "通达信行情未就绪：请先启动并登录通达信客户端（%s）"
+                % (detail or "未取到行情"),
+            )
         if channel == "ths_ui":
             ths = ths_ui_config()
             return None, session, (
@@ -652,8 +789,12 @@ def start_session(
             503,
             "同花顺复制表格会触发验证码：请先在系统配置启用「验证码 OCR」再启动实盘",
         )
-    # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金
-    engine.recover(db)
+    preflight_err = preflight_signal_config(db, session_id, execution_mode)
+    if preflight_err is not None:
+        return None, session, preflight_err
+    if execution_mode != "alert":
+        # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）
+        engine.recover(db)
     return engine, session, None
 
 
