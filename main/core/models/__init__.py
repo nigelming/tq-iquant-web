@@ -16,6 +16,7 @@ from .live_session import LiveSession
 from .live_session_portfolio import LiveSessionPortfolio
 from .live_order import LiveOrder
 from .live_trade import LiveTrade
+from .live_signal import LiveSignal
 from .decision_event import BacktestDecisionEvent, LiveDecisionEvent
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "LiveSessionPortfolio",
     "LiveOrder",
     "LiveTrade",
+    "LiveSignal",
     "BacktestDecisionEvent",
     "LiveDecisionEvent",
 ]

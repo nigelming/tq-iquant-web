@@ -12,6 +12,14 @@ class Strategy(Base):
     name = Column(String(100), nullable=False)
     formula_id = Column(Integer, ForeignKey("formulas.id", ondelete="RESTRICT"), nullable=False, index=True)
     period = Column(String(5), nullable=False)
+    # 信号推送频率（可等于或粗于 period）；NULL = 使用 period。
+    signal_frequency = Column(String(10), nullable=True)
+    # HH:MM；NULL = 按频率默认（1d=14:30，1w/1mon=09:00）。
+    signal_at = Column(String(5), nullable=True)
+    # 1-5，仅 1w 使用；NULL = 周一。
+    signal_weekday = Column(Integer, nullable=True)
+    # completed / current；NULL = 1w/1mon 用 completed，其余 current。
+    signal_data_end = Column(String(10), nullable=True)
     role = Column(String(15), nullable=False)
     # 自引用：slave 指向同组合 master。ondelete=RESTRICT（审计 #18）——业务规则禁止
     # "slave 无 master"的孤儿行，delete_strategy 已有 app 层预检，DB 层 RESTRICT 兜底。
