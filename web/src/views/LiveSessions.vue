@@ -30,7 +30,7 @@ const showCreate = ref(false)
 // 默认与后端 create_session 对齐：新会话默认 alert（半自动预警，仅 TQ 行情+send_warn，不下单）
 const form = ref({
   name: '', mode: 'simulation',
-  engine: 'iquant' as LiveEngineKey,
+  engine: 'tdx' as LiveEngineKey,
   execution_mode: 'alert' as LiveExecutionMode,
   portfolio_ids: [] as number[],
 })
@@ -50,6 +50,20 @@ function executionModeLabel(m?: string): string {
 }
 function isAlert(s: LiveSessionItem): boolean {
   return (s.execution_mode || 'auto') === 'alert'
+}
+
+// 通道条前缀：有运行中会话=运行中通道（跟随该会话引擎）；否则=默认引擎（default_engine）
+const runningEngine = ref<LiveEngineKey | null>(null)
+const channelLabelPrefix = computed(() => (runningEngine.value ? '运行中通道' : '默认引擎'))
+// 引擎清单去掉默认引擎（首徽章已展示，避免重复渲染两个相同徽章）
+const otherEngines = computed(
+  () => (channel.value?.engines || []).filter((e) => e.key !== channel.value?.engine),
+)
+const channelBadgeTitle =
+  '默认引擎：新建实盘（自动模式）默认使用；可在 系统设置 → 通达信 TQ 交易通道 → 默认交易引擎 修改'
+// 新建实盘默认引擎：跟随后端 default_engine（SystemConfig 可配，当前默认 tdx）
+function defaultEngineKey(): LiveEngineKey {
+  return (channel.value?.engine as LiveEngineKey) || 'tdx'
 }
 
 // B6 全局限 1：已有运行中会话时，其它行的「启动」按钮禁用（UI 层预防，后端 409 兜底）
@@ -309,13 +323,14 @@ async function load() {
   portfolios.value = await getPortfolios().catch(() => [])
   // B6 全局限 1 个运行 session,自动接它的流
   const running = sessions.value.find((s) => s.status === 'running')
+  runningEngine.value = (running?.engine as LiveEngineKey) || null
   if (running) startEventStream(running.id)
   // 通道条跟随运行中 session 的引擎；无运行会话时跟随默认引擎
   loadChannel(running?.engine)
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: 'iquant', execution_mode: 'alert', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [] }
   showCreate.value = true
 }
 
@@ -326,7 +341,7 @@ async function create() {
   }
   await createLiveSession(form.value)
   showCreate.value = false
-  form.value = { name: '', mode: 'simulation', engine: 'iquant', execution_mode: 'alert', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [] }
   load()
 }
 
@@ -393,13 +408,14 @@ onUnmounted(closeEventStream)
   </PageHeader>
 
   <div class="card channel-bar">
-    <span class="channel-label">执行引擎</span>
-    <span class="badge" :class="channel?.online ? 'badge-green' : 'badge-gray'">
+    <span class="channel-label">{{ channelLabelPrefix }}</span>
+    <span class="badge" :class="channel?.online ? 'badge-green' : 'badge-gray'"
+      :title="channelBadgeTitle">
       {{ channel?.label || '未知' }}
     </span>
-    <span v-for="e in channel?.engines || []" :key="e.key" class="badge"
-      :class="e.key === channel?.engine ? 'badge-blue' : (e.configured ? 'badge-gray' : 'badge-red')"
-      :title="e.detail">{{ e.label }}{{ e.configured ? '' : '（未配置）' }}</span>
+    <span v-for="e in otherEngines" :key="e.key" class="badge"
+      :class="e.configured ? 'badge-gray' : 'badge-red'"
+      :title="`${e.detail}（自动模式可在新建实盘时另选）`">{{ e.label }}{{ e.configured ? '' : '（未配置）' }}</span>
     <span
       v-if="channel?.online !== null && channel?.online !== undefined"
       class="badge" :class="channel.online ? 'badge-green' : 'badge-red'"
@@ -411,6 +427,7 @@ onUnmounted(closeEventStream)
       v-if="channelTestMsg"
       :style="{ color: channelTestMsg.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }"
     >{{ channelTestMsg.text }}</span>
+    <span class="channel-hint">自动模式可在「新建实盘」时另选引擎；默认引擎在 系统设置 → 通达信 TQ 交易通道 修改</span>
     <router-link to="/system" style="margin-left:auto;font-size:13px">通道配置 →</router-link>
   </div>
 
@@ -678,6 +695,7 @@ onUnmounted(closeEventStream)
   margin-bottom: 12px;
 }
 .channel-label { font-size: 13px; color: var(--ink-soft); }
+.channel-hint { font-size: 12px; color: var(--ink-faint); }
 .event-log {
   max-height: 420px;
   overflow-y: auto;

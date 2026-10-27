@@ -549,6 +549,60 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     w.unmount()
   })
 
+  it('新建实盘切 auto：引擎默认跟随后端 default_engine（通道条 engine）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
+    await execSelect!.setValue('auto')
+    await flushPromises()
+
+    // beforeEach mock 的 channel.engine='iquant' → 引擎 select 默认选中 iQuant（而非硬编码）
+    const engineSelect = w.findAll('select').find((s) => s.html().includes('iQuant HTTP 桥'))
+    expect((engineSelect!.element as HTMLSelectElement).value).toBe('iquant')
+    w.unmount()
+  })
+
+  it('通道条消重：默认引擎徽章只出现一次，前缀为「默认引擎」', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // beforeEach mock engine='iquant' 且 engines 清单含同名项 → 消重后首徽章唯一
+    const badges = w.find('.channel-bar').findAll('.badge').map((b) => b.text())
+    expect(badges.filter((t) => t === 'iQuant HTTP 桥').length).toBe(1)
+    expect(w.text()).toContain('默认引擎')
+    w.unmount()
+  })
+
+  it('运行中会话时通道条前缀切为「运行中通道」且同样消重', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, engine: 'tdx' }])
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'tdx',
+      active: 'tdx_tq',
+      label: '通达信 TQ 交易',
+      online: true,
+      engines: [
+        { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+        { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
+      ],
+      ths_ui: { enabled: false, available: false, window_title: '', client_exe_path: '', driver: 'clipboard' },
+      bridge: { simulation: '', live: '' },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('运行中通道')
+    const badges = w.find('.channel-bar').findAll('.badge').map((b) => b.text())
+    expect(badges.filter((t) => t === '通达信 TQ 交易').length).toBe(1)
+    w.unmount()
+  })
+
   it('预警信号 tab → 加载信号列表，显示 alert_status/alert_error', async () => {
     ;(getLiveSessions as any).mockResolvedValue([
       { ...runningSession, execution_mode: 'alert' },
