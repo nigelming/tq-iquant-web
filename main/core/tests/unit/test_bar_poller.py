@@ -462,3 +462,111 @@ def test_empty_quote_no_trigger():
     assert result == []
     # 空数据不建立基线
     assert poller._initialized is False
+
+
+# ---------------- TQ 1.3.1 批量行情路径 ----------------
+class BatchDispatcher:
+    """支持批量行情的假 dispatcher(TdxTqDispatcher 同形状)。
+
+    batches:每次 query_quotes_batch 依次弹出的返回值(Exception 元素 → 抛出模拟故障);
+    per_code:回退路径下每 code 的 query_quote 响应队列(同 _QuoteRecorder 语义)。
+    """
+
+    supports_batch_quote = True
+
+    def __init__(self, batches=None, per_code=None):
+        self._batches = list(batches or [])
+        self._per_code = {c: list(seq) for c, seq in (per_code or {}).items()}
+        self.batch_calls = []
+        self.quote_calls = []
+
+    def query_quotes_batch(self, codes, period="1m", count=10):
+        self.batch_calls.append(list(codes))
+        item = self._batches.pop(0) if self._batches else {}
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def query_quote(self, code, period="1m", count=10):
+        self.quote_calls.append(code)
+        seq = self._per_code.get(code) or []
+        return seq.pop(0) if seq else []
+
+
+def test_batch_path_triggers_same_as_per_code():
+    """批量命中:每轮一次批量拉取,多股合并触发行为与逐只路径一致。"""
+    base = {
+        "600000.SH": [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+        "000001.SZ": [_bar("20260805100800", 18.40), _bar("20260805100900", 18.50)],
+    }
+    nxt = {
+        "600000.SH": [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+                      _bar("20260805101000", 9.40)],
+        "000001.SZ": [_bar("20260805100800", 18.40), _bar("20260805100900", 18.50),
+                      _bar("20260805101000", 18.60)],
+    }
+    disp = BatchDispatcher(batches=[base, nxt])
+    poller = BarPoller(disp, ["600000.SH", "000001.SZ"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                       # 基线
+    result = poller.poll()              # 两股的 10:09 均完成 → 合并触发
+
+    # 每轮恰好一次批量调用,零逐只调用
+    assert disp.batch_calls == [["600000.SH", "000001.SZ"], ["600000.SH", "000001.SZ"]]
+    assert disp.quote_calls == []
+    assert len(result) == 1
+    assert result[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert set(result[0].stocks.keys()) == {"600000.SH", "000001.SZ"}
+    assert result[0].stocks["600000.SH"]["close"] == Decimal("9.32")
+    assert result[0].stocks["000001.SZ"]["close"] == Decimal("18.50")
+    # bars_by_code 透传与逐只路径一致
+    assert set(result[0].bars_by_code.keys()) == {"600000.SH", "000001.SZ"}
+
+
+def test_batch_empty_result_falls_back_to_per_code():
+    """批量返回空({})→ 回退逐只路径,触发行为与逐只完全一致。"""
+    disp = BatchDispatcher(
+        batches=[{}, {}],
+        per_code={"600000.SH": [
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+             _bar("20260805101000", 9.40)],
+        ]})
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()
+    result = poller.poll()
+
+    assert disp.quote_calls == ["600000.SH", "600000.SH"]
+    assert len(result) == 1
+    assert result[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert result[0].stocks["600000.SH"]["close"] == Decimal("9.32")
+
+
+def test_batch_exception_falls_back_and_warns_once(caplog):
+    """批量抛异常 → 回退逐只;回退 warning 只记一次(防刷屏)。"""
+    import logging
+    disp = BatchDispatcher(
+        batches=[RuntimeError("batch boom"), RuntimeError("batch boom")],
+        per_code={"600000.SH": [
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+             _bar("20260805101000", 9.40)],
+        ]})
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    with caplog.at_level(logging.WARNING, logger="core.engine.bar_poller"):
+        poller.poll()
+        poller.poll()
+
+    assert len(fired) == 1
+    assert fired[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert disp.quote_calls == ["600000.SH", "600000.SH"]
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warns) == 1

@@ -536,6 +536,15 @@ class LiveEngine:
         # 不阻塞 stop；任务已 cancel，不会再提交新 tick。
         if self._executor is not None:
             self._executor.shutdown(wait=False)
+        # TQ 1.3.1：停止时释放 dispatcher 资源（TdxTqDispatcher.close 做行情退订
+        # 对账；其余通道 close 为轻量/无操作；iQuant 桥无 close 则跳过）。
+        # best-effort：失败仅告警，不阻断停止流程。
+        close = getattr(self._dispatcher, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                logger.warning("dispatcher close failed on stop", exc_info=True)
 
     async def _loop(self) -> None:
         """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。

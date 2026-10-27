@@ -27,8 +27,8 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
 from core.tq.utils import TDXConnectionError, get_tdx_lock, get_tq, inject_tqcenter_path, _tdx_path
@@ -37,6 +37,7 @@ from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
 from .http_bridge_dispatcher import BridgeOrderRejected, BridgeUnavailableError
 from .live.timing import now_shanghai
+from .market_rules import _limit_ratio_for
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,8 @@ class TdxTqDispatcher(OrderDispatcher):
     channel = "tdx_tq"
     #: 通达信委托表无备注列，Core 不能按 remark 认领，只能走 legacy 模糊匹配。
     supports_remark = False
+    #: 支持批量行情（query_quotes_batch）：BarPoller 一轮一次批量拉取替代逐只。
+    supports_batch_quote = True
 
     def __init__(self, account: str = "", account_type: str = "stock",
                  price_mode: str = "my", client_path: str = "", **_kwargs):
@@ -233,8 +236,23 @@ class TdxTqDispatcher(OrderDispatcher):
         return True
 
     def close(self) -> None:
-        # TQ 连接归 tqcenter 单例持有（行情模块共用），此处不关闭。
+        """停止时退订对账：把当前 TQ 行情订阅整表退订。
+
+        前提：平台全局同时只允许 1 个运行中的 live session（B6），当前通达信上的
+        行情订阅必属本会话，整表退订不会误伤其它会话。TQ 连接归 tqcenter 单例
+        持有（行情模块共用），此处仍不关闭连接，只退订行情。best-effort：
+        查订阅/退订失败仅记日志，不影响停止流程。
+        """
         self._connected = False
+        try:
+            subscribed = _call(get_tq().get_subscribe_hq_stock_list) or []
+            subscribed = [str(s).strip() for s in subscribed if str(s).strip()]
+            if subscribed:
+                from core.tq.data import TQData
+                TQData().unsubscribe_bars(subscribed)
+                logger.info("已退订 %d 只行情订阅（session 停止退订对账）", len(subscribed))
+        except Exception as e:
+            logger.debug("退订对账失败（忽略）：%s", e)
 
     def _ensure(self) -> None:
         if not (self._connected and self._account_id >= 0):
@@ -416,7 +434,28 @@ class TdxTqDispatcher(OrderDispatcher):
         return out
 
     def query_calendar(self) -> list:
-        """用 TQ 上证指数日线反推交易日，失败返回 [] 走 fail-open。"""
+        """交易日历：优先 TQ get_trading_dates（权威口径，约近 600 个交易日），
+
+        空/异常回退 000001.SH 日线反推（1.3.1 前的既有路径，原样保留），
+        再失败返回 [] 走 fail-open。元素保持 'YYYYMMDD' 字符串
+        （TradingCalendar provider 契约）；alert/qmt/ths 均委托本方法。
+        """
+        try:
+            from core.tq.data import TQData
+            today = now_shanghai()
+            start = (today - timedelta(days=900)).strftime("%Y%m%d")
+            end = (today + timedelta(days=1)).strftime("%Y%m%d")
+            dates = TQData().get_trading_dates(market="SH", start=start, end=end)
+            out = []
+            for d in dates or []:
+                digits = re.sub(r"\D", "", str(d))
+                if len(digits) >= 8:
+                    out.append(digits[:8])
+            if out:
+                return out
+        except Exception:
+            pass
+        # 回退：上证指数日线反推（原口径）
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(["000001.SH"], ["1d"], count=600)
@@ -433,6 +472,51 @@ class TdxTqDispatcher(OrderDispatcher):
                 out.append(digits[:8])
         return out
 
+    def _raw_to_bars(self, raw: dict, period: str) -> Dict[str, list]:
+        """TQ get_history_raw 原始数据 → {code: [bar, ...]}。
+
+        query_quote（单股）与 query_quotes_batch（批量）共用的转换逻辑，
+        bar 字段规则与原 query_quote 逐字一致：无该周期 Close/空 → {}；
+        单字段缺帧按 0.0；stime 非 14 位丢弃。
+        """
+        out: Dict[str, list] = {}
+        block = raw.get(period) or {}
+        close = block.get("Close")
+        if close is None or getattr(close, "empty", True):
+            return out
+
+        def _value(field: str, code: str, ts) -> float:
+            frame = block.get(field)
+            if frame is None:
+                return 0.0
+            try:
+                return float(frame.at[ts, code])
+            except Exception:
+                return 0.0
+
+        for col in getattr(close, "columns", []):
+            code = str(col)
+            bars = []
+            for ts in close.index:
+                try:
+                    stime = ts.strftime("%Y%m%d%H%M%S")
+                except Exception:
+                    digits = re.sub(r"\D", "", str(ts))
+                    stime = digits[:14] if len(digits) >= 14 else ""
+                if len(stime) != 14:
+                    continue
+                bars.append({
+                    "stime": stime,
+                    "open": _value("Open", code, ts),
+                    "high": _value("High", code, ts),
+                    "low": _value("Low", code, ts),
+                    "close": _value("Close", code, ts),
+                    "volume": _value("Volume", code, ts),
+                    "amount": _value("Amount", code, ts),
+                })
+            out[code] = bars
+        return out
+
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。"""
         tq_code = normalize_symbol(code)
@@ -446,41 +530,40 @@ class TdxTqDispatcher(OrderDispatcher):
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
             return []
-        block = raw.get(period) or {}
-        close = block.get("Close")
-        if close is None or getattr(close, "empty", True):
-            return []
-        if tq_code not in getattr(close, "columns", []):
-            return []
+        return self._raw_to_bars(raw, period).get(tq_code, [])
 
-        def _value(field: str, ts) -> float:
-            frame = block.get(field)
-            if frame is None:
-                return 0.0
-            try:
-                return float(frame.at[ts, tq_code])
-            except Exception:
-                return 0.0
+    def query_quotes_batch(
+        self, codes, period: str = "1m", count: int = 10,
+    ) -> Dict[str, list]:
+        """批量行情：一次 get_history_raw 取多只，{原始入参 code: [bar, ...]}。
 
-        bars = []
-        for ts in close.index:
-            try:
-                stime = ts.strftime("%Y%m%d%H%M%S")
-            except Exception:
-                digits = re.sub(r"\D", "", str(ts))
-                stime = digits[:14] if len(digits) >= 14 else ""
-            if len(stime) != 14:
-                continue
-            bars.append({
-                "stime": stime,
-                "open": _value("Open", ts),
-                "high": _value("High", ts),
-                "low": _value("Low", ts),
-                "close": _value("Close", ts),
-                "volume": _value("Volume", ts),
-                "amount": _value("Amount", ts),
-            })
-        return bars
+        仅本通道提供（supports_batch_quote=True），BarPoller 据此一轮一次
+        SDK 调用替代逐只拉取，后续判定逻辑与逐只路径完全一致。
+        无效代码剔除（结果键保留原始入参）；异常返回 {} 并记 last_error
+        （BarPoller 据此回退逐只路径）。
+        """
+        try:
+            pairs = []
+            seen = set()
+            for code in codes or []:
+                code6 = re.sub(r"\D", "", str(code or ""))[:6]
+                if len(code6) != 6:
+                    continue
+                tq_code = normalize_symbol(code)
+                if tq_code in seen:
+                    continue
+                seen.add(tq_code)
+                pairs.append((str(code), tq_code))
+            if not pairs:
+                return {}
+            from core.tq.data import TQData
+            raw = TQData().get_history_raw(
+                [tq for _, tq in pairs], [period], count=max(int(count or 10), 2))
+            converted = self._raw_to_bars(raw, period)
+            return {orig: converted.get(tq, []) for orig, tq in pairs}
+        except Exception as e:
+            self._last_error = "batch quote unavailable: %s" % e
+            return {}
 
     # ---- 下单 ----
 
@@ -511,6 +594,70 @@ class TdxTqDispatcher(OrderDispatcher):
                 time.sleep(0.35)
         return ""
 
+    def _is_limit_order(self, price: float) -> bool:
+        """是否限价单：price>0 且 price_mode 映射为自填价（PRICE_MY）。
+
+        市价单（price<=0，或 price_mode 映射 PRICE_SJ/ZTJ/DTJ）的成交价由
+        交易所/客户端决定，不做涨跌停前置校验。
+        """
+        if price is None or price <= 0:
+            return False
+        return PRICE_MODE_MAP.get(self._price_mode, "PRICE_MY") == "PRICE_MY"
+
+    def _prev_close_for_limit_check(self, symbol: str) -> Optional[Decimal]:
+        """取前收盘价（1d 最近 2 根里最早的一根），无有效数据返回 None。
+
+        取最早一根：count=2 时首根即前一交易日；两根日期相同取该值（同值）；
+        仅 1 根用其自身。校验自身异常一并吞为 None（宁宽勿错）。
+        """
+        try:
+            from core.tq.data import TQData
+            raw = TQData().get_history_raw([symbol], ["1d"], count=2)
+            close = (raw.get("1d") or {}).get("Close")
+            if close is None or getattr(close, "empty", True):
+                return None
+            if symbol not in getattr(close, "columns", []):
+                return None
+            series = close[symbol].dropna().sort_index()
+            if series.empty:
+                return None
+            value = float(series.iloc[0])
+            if value != value:  # NaN 防御
+                return None
+            return Decimal(str(value))
+        except Exception as e:
+            logger.warning("涨跌停校验取前收失败，跳过检查：%s", e)
+            return None
+
+    def _check_limit_price(self, symbol: str, direction: str, price: float) -> None:
+        """涨跌停前置校验（仅限价单）：买 ≥ 涨停价 / 卖 ≤ 跌停价 → 拒单。
+
+        口径与回测一致（_limit_ratio_for + 前收四舍五入到分）。get_zdt_data
+        只有涨跌停状态无价格，不采用。取不到有效前收（无数据 / 前复权早期
+        失真 <1 元）跳过；整个校验块 fail-open——校验自身故障绝不阻断下单。
+        """
+        try:
+            prev_close = self._prev_close_for_limit_check(symbol)
+            if prev_close is None or prev_close < Decimal("1"):
+                return
+            ratio = _limit_ratio_for(symbol)
+            cent = Decimal("0.01")
+            limit_up = (prev_close * (1 + ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+            limit_down = (prev_close * (1 - ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+            order_price = Decimal(str(price))
+            if direction == "buy" and order_price >= limit_up:
+                raise BridgeOrderRejected(
+                    "委托买价 %s ≥ 涨停价 %s（前收 %s ×%s），已拦截"
+                    % (price, limit_up, prev_close, ratio))
+            if direction == "sell" and order_price <= limit_down:
+                raise BridgeOrderRejected(
+                    "委托卖价 %s ≤ 跌停价 %s（前收 %s ×%s），已拦截"
+                    % (price, limit_down, prev_close, ratio))
+        except BridgeOrderRejected:
+            raise
+        except Exception as e:
+            logger.warning("涨跌停前置校验异常，跳过检查继续下单：%s", e)
+
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         self._ensure()
         symbol = normalize_symbol(order.stock_code)
@@ -523,6 +670,8 @@ class TdxTqDispatcher(OrderDispatcher):
             raise BridgeOrderRejected("invalid order volume/price %s/%s" % (vol, price))
 
         direction = "buy" if order.trade_type.value == "BUY" else "sell"
+        if self._is_limit_order(price):
+            self._check_limit_price(symbol, direction, price)
         const = _tqconst()
         order_type = (const.STOCK_BUY if direction == "buy" else const.STOCK_SELL)
         try:

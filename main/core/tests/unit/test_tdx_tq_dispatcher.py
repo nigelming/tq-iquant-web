@@ -4,10 +4,12 @@
 下单链路（order_stock → 回查 Wtbh 认领）、无 remark 时的 legacy 匹配所需插入时间，
 以及下单失败/半自动确认模式的明确报错。
 """
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from core.engine.http_bridge_dispatcher import BridgeOrderRejected
@@ -34,18 +36,25 @@ class FakeTq:
     """假 tqcenter.tq：记录调用、返回预置数据。"""
 
     def __init__(self, account_id=1, asset=None, positions=None, orders=None,
-                 order_result=0, msg=""):
+                 order_result=0, msg="", subscribed=None):
         self.account_id = account_id
         self.asset = asset or {}
         self.positions = positions or []
         self.orders = orders or []
         self.order_result = order_result
         self.msg = msg
+        self.subscribed = subscribed
         self.calls = []
 
     def stock_account(self, account="", account_type=""):
         self.calls.append(("stock_account", account, account_type))
         return self.account_id
+
+    def get_subscribe_hq_stock_list(self):
+        self.calls.append(("get_subscribe_hq_stock_list",))
+        if isinstance(self.subscribed, Exception):
+            raise self.subscribed
+        return list(self.subscribed or [])
 
     def query_stock_asset(self, aid):
         self.calls.append(("query_stock_asset", aid))
@@ -75,6 +84,16 @@ def fake(monkeypatch):
     monkeypatch.setattr("core.engine.tdx_tq_dispatcher.get_tq", lambda: tq)
     monkeypatch.setattr("core.engine.tdx_tq_dispatcher._tqconst", lambda: CONST)
     return tq
+
+
+@pytest.fixture
+def no_quote(monkeypatch):
+    """隔离真实 TQ 行情：涨跌停校验取不到前收 → fail-open 跳过。
+
+    本机通达信可能正在运行，不隔离会让 place_order 单测依赖真实行情
+    （前收恰在涨跌停边界时机器相关地失败）。
+    """
+    monkeypatch.setattr("core.tq.data.TQData", lambda: FakeQuoteData(raw={}))
 
 
 def test_normalize_symbol_exchange_suffix():
@@ -152,7 +171,7 @@ def test_query_orders_maps_status_and_skips_cancel_rows(fake):
     assert rows[0]["insert_date"] == "" and rows[0]["insert_time"] == ""
 
 
-def test_place_order_resolves_ref_and_enables_legacy_match(fake):
+def test_place_order_resolves_ref_and_enables_legacy_match(fake, no_quote):
     d = TdxTqDispatcher(account="123456")
     fake.orders = [_order(status=1, ref="W900")]
     order = SimpleNamespace(
@@ -190,7 +209,7 @@ def test_place_order_resolves_ref_and_enables_legacy_match(fake):
     assert OrderStateMachine.match_legacy_fuzzy(live_order, [row], set()) == "W900"
 
 
-def test_place_order_rejects_when_order_not_in_orders_table(fake):
+def test_place_order_rejects_when_order_not_in_orders_table(fake, no_quote):
     d = TdxTqDispatcher()
     fake.orders = []
     order = SimpleNamespace(
@@ -205,7 +224,7 @@ def test_place_order_rejects_when_order_not_in_orders_table(fake):
     assert "委托列表未见该单" in str(ei.value)
 
 
-def test_place_order_flags_half_auto_confirm_mode(fake):
+def test_place_order_flags_half_auto_confirm_mode(fake, no_quote):
     d = TdxTqDispatcher()
     fake.orders = []
     fake.msg = "待用户确认"
@@ -219,7 +238,7 @@ def test_place_order_flags_half_auto_confirm_mode(fake):
     assert "下单确认" in str(ei.value)
 
 
-def test_place_order_failure_returns_rejected(fake):
+def test_place_order_failure_returns_rejected(fake, no_quote):
     d = TdxTqDispatcher()
     fake.order_result = -1
     order = SimpleNamespace(
@@ -231,7 +250,7 @@ def test_place_order_failure_returns_rejected(fake):
         d.place_order(order)
 
 
-def test_place_order_error_id_raises(monkeypatch):
+def test_place_order_error_id_raises(monkeypatch, no_quote):
     tq = FakeTq(order_result={"ErrorId": "5", "Error": "资金不足"})
     monkeypatch.setattr("core.engine.tdx_tq_dispatcher.get_tq", lambda: tq)
     monkeypatch.setattr("core.engine.tdx_tq_dispatcher._tqconst", lambda: CONST)
@@ -256,3 +275,306 @@ def test_query_calendar_and_quote_degrade_to_empty(monkeypatch):
     assert d.query_calendar() == []
     assert d.query_quote("000001") == []
     assert "unavailable" in d.last_error
+
+
+# ---------------- TQ 1.3.1：交易日历（权威 get_trading_dates + 日线反推回退） ----------------
+
+class FakeTQData:
+    """假 TQData：预置 get_trading_dates / get_history_raw / unsubscribe_bars 行为。"""
+
+    def __init__(self, trading_dates=None, history_raw=None,
+                 raise_dates=False, raise_history=False):
+        self._trading_dates = trading_dates
+        self._history_raw = history_raw
+        self._raise_dates = raise_dates
+        self._raise_history = raise_history
+        self.cal_args = None
+        self.history_calls = []
+        self.unsub_calls = []
+
+    def get_trading_dates(self, market="SH", start="", end=""):
+        self.cal_args = (market, start, end)
+        if self._raise_dates:
+            raise RuntimeError("calendar boom")
+        return list(self._trading_dates or [])
+
+    def get_history_raw(self, stocks, periods, **kw):
+        self.history_calls.append((list(stocks), list(periods), kw))
+        if self._raise_history:
+            raise RuntimeError("history boom")
+        return self._history_raw or {}
+
+    def unsubscribe_bars(self, stocks):
+        self.unsub_calls.append(list(stocks))
+
+
+class FakeQuoteData:
+    """假 TQData（仅行情）：get_history_raw 返回预置 raw 或抛错。"""
+
+    def __init__(self, raw=None, error=None):
+        self._raw = raw
+        self._error = error
+        self.history_calls = []
+
+    def get_history_raw(self, stocks, periods, **kw):
+        self.history_calls.append((list(stocks), list(periods), kw))
+        if self._error is not None:
+            raise self._error
+        return self._raw or {}
+
+
+def test_query_calendar_prefers_trading_dates(monkeypatch):
+    """get_trading_dates 命中 → 直接返回，不再走 000001.SH 日线反推。"""
+    tqd = FakeTQData(trading_dates=["20261023", "20261026"], raise_history=True)
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    assert d.query_calendar() == ["20261023", "20261026"]
+    assert tqd.history_calls == []          # 未走日线反推回退
+    market, start, end = tqd.cal_args
+    assert market == "SH"
+    assert len(start) == 8 and len(end) == 8 and start < end
+
+
+def test_query_calendar_falls_back_to_daily_index(monkeypatch):
+    """get_trading_dates 空 → 回退 000001.SH 日线反推（1.3.1 前口径）。"""
+    idx = [pd.Timestamp("2026-10-21"), pd.Timestamp("2026-10-22"),
+           pd.Timestamp("2026-10-23")]
+    raw = {"1d": {"Close": pd.DataFrame({"000001.SH": [1.0, 1.1, 1.2]}, index=idx)}}
+    tqd = FakeTQData(trading_dates=[], history_raw=raw)
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    assert d.query_calendar() == ["20261021", "20261022", "20261023"]
+    assert tqd.history_calls and tqd.history_calls[0][0] == ["000001.SH"]
+
+
+def test_query_calendar_all_fail_returns_empty(monkeypatch):
+    """两层都失败 → [] 且 last_error（fail-open 契约不变）。"""
+    tqd = FakeTQData(raise_dates=True, raise_history=True)
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    assert d.query_calendar() == []
+    assert "unavailable" in d.last_error
+
+
+# ---------------- TQ 1.3.1：close() 退订对账 ----------------
+
+def test_close_unsubscribes_current_subscriptions(fake, monkeypatch, caplog):
+    """订阅列表非空 → 整表退订 + info 日志。
+
+    前提：平台全局限 1 个运行 session（B6），当前订阅必属本会话，不会误伤。
+    """
+    fake.subscribed = ["000001.SZ", "600000.SH"]
+    tqd = FakeTQData()
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    d._connected = True
+    with caplog.at_level(logging.INFO, logger="core.engine.tdx_tq_dispatcher"):
+        d.close()
+    assert tqd.unsub_calls == [["000001.SZ", "600000.SH"]]
+    assert d._connected is False
+    assert any(r.levelno == logging.INFO and "退订" in r.message
+               for r in caplog.records)
+
+
+def test_close_empty_subscription_skips_unsubscribe(fake, monkeypatch):
+    """订阅列表空 → 不调 unsubscribe_bars。"""
+    fake.subscribed = []
+    tqd = FakeTQData()
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    d.close()
+    assert tqd.unsub_calls == []
+    assert d._connected is False
+
+
+def test_close_swallows_subscription_query_error(fake, monkeypatch):
+    """查订阅列表异常 → 吞并（debug 日志），不抛、不退订。"""
+    fake.subscribed = RuntimeError("bridge down")
+    tqd = FakeTQData()
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    d._connected = True
+    d.close()  # 不抛
+    assert tqd.unsub_calls == []
+    assert d._connected is False
+
+
+def test_close_swallows_unsubscribe_error(fake, monkeypatch):
+    """unsubscribe_bars 异常 → 吞并，不抛。"""
+    fake.subscribed = ["000001.SZ"]
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: SimpleNamespace(
+            unsubscribe_bars=lambda stocks: (_ for _ in ()).throw(RuntimeError("unsub boom"))),
+    )
+    d = TdxTqDispatcher()
+    d.close()  # 不抛
+
+
+# ---------------- TQ 1.3.1：place_order 涨跌停前置校验 ----------------
+
+def _raw_1d_close(symbol, closes):
+    """1d 原始行情（仅 Close 帧，prev_close 计算够用）。"""
+    idx = [pd.Timestamp("2026-10-23"), pd.Timestamp("2026-10-24")]
+    return {"1d": {"Close": pd.DataFrame({symbol: closes}, index=idx)}}
+
+
+def _limit_order(code="000001", trade_type=TradeType.BUY, price=Decimal("11.00")):
+    return SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code=code,
+        trade_type=trade_type, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=price, bar_time=None,
+    )
+
+
+def test_place_order_blocks_buy_at_limit_up(fake, monkeypatch):
+    """限价买 ≥ 涨停价（前收 10 × 1.10 = 11.00）→ 拒单，不触 order_stock。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    d = TdxTqDispatcher()
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d.place_order(_limit_order(price=Decimal("11.00")))
+    assert "涨停价" in str(ei.value)
+    assert "11.00" in str(ei.value)
+    assert not [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_blocks_sell_at_limit_down(fake, monkeypatch):
+    """限价卖 ≤ 跌停价（前收 10 × 0.90 = 9.00）→ 拒单，不触 order_stock。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    d = TdxTqDispatcher()
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d.place_order(_limit_order(trade_type=TradeType.SELL, price=Decimal("9.00")))
+    assert "跌停价" in str(ei.value)
+    assert "9.00" in str(ei.value)
+    assert not [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_buy_below_limit_up_passes(fake, monkeypatch):
+    """限价买 < 涨停价 → 正常下单。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    fake.orders = [_order(price=10.99, ref="W801")]
+    d = TdxTqDispatcher()
+    trade = d.place_order(_limit_order(price=Decimal("10.99")))
+    assert trade is not None
+    assert [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_sell_above_limit_down_passes(fake, monkeypatch):
+    """限价卖 > 跌停价 → 正常下单。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    fake.orders = [_order(flag=1, price=9.01, ref="W802")]
+    d = TdxTqDispatcher()
+    trade = d.place_order(
+        _limit_order(trade_type=TradeType.SELL, price=Decimal("9.01")))
+    assert trade is not None
+    assert [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_market_mode_skips_limit_check(fake, monkeypatch):
+    """市价通道（price_mode=latest → PRICE_SJ）不做涨跌停校验。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    fake.orders = [_order(price=11.00, ref="W803")]
+    d = TdxTqDispatcher(price_mode="latest")
+    trade = d.place_order(_limit_order(price=Decimal("11.00")))
+    assert trade is not None
+    assert [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_quote_error_fail_open(fake, monkeypatch):
+    """行情查询异常 → 跳过校验（fail-open），正常下单。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(error=RuntimeError("no tdx")))
+    fake.orders = [_order(price=11.00, ref="W804")]
+    d = TdxTqDispatcher()
+    trade = d.place_order(_limit_order(price=Decimal("11.00")))
+    assert trade is not None
+
+
+def test_place_order_distorted_prev_close_fail_open(fake, monkeypatch):
+    """前复权早期失真（前收 < 1 元）→ 跳过校验（与回测同口径，宁宽勿错）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [0.4, 0.5])))
+    fake.orders = [_order(price=11.00, ref="W805")]
+    d = TdxTqDispatcher()
+    trade = d.place_order(_limit_order(price=Decimal("11.00")))
+    assert trade is not None
+
+
+# ---------------- TQ 1.3.1：批量行情 query_quotes_batch ----------------
+
+def _raw_1m_multi():
+    """1m 原始行情：两股票 × Close/Open/Volume 帧。"""
+    idx = [pd.Timestamp("2026-10-24 09:31:00"), pd.Timestamp("2026-10-24 09:32:00")]
+
+    def frame(data):
+        return pd.DataFrame(data, index=idx)
+
+    return {"1m": {
+        "Close": frame({"000001.SZ": [10.0, 10.1], "600000.SH": [8.0, 8.1]}),
+        "Open": frame({"000001.SZ": [9.9, 10.0], "600000.SH": [7.9, 8.0]}),
+        "Volume": frame({"000001.SZ": [100, 200], "600000.SH": [300, 400]}),
+    }}
+
+
+def test_supports_batch_quote_flag():
+    """仅 TdxTqDispatcher 声明 supports_batch_quote=True。"""
+    assert TdxTqDispatcher.supports_batch_quote is True
+
+
+def test_query_quotes_batch_shape(monkeypatch):
+    tqd = FakeQuoteData(_raw_1m_multi())
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    out = d.query_quotes_batch(["000001.SZ", "600000.SH"], period="1m", count=10)
+    assert set(out.keys()) == {"000001.SZ", "600000.SH"}
+    b = out["000001.SZ"]
+    assert [x["stime"] for x in b] == ["20261024093100", "20261024093200"]
+    assert b[0]["close"] == pytest.approx(10.0)
+    assert b[1]["close"] == pytest.approx(10.1)
+    assert b[0]["open"] == pytest.approx(9.9)
+    assert b[0]["volume"] == pytest.approx(100)
+    assert out["600000.SH"][1]["close"] == pytest.approx(8.1)
+    # 一次批量 SDK 调用，两只股票一起取
+    assert tqd.history_calls[0][0] == ["000001.SZ", "600000.SH"]
+    assert tqd.history_calls[0][1] == ["1m"]
+
+
+def test_query_quotes_batch_filters_invalid_codes(monkeypatch):
+    """无效代码剔除（不进 SDK 调用），结果键保留原始入参。"""
+    tqd = FakeQuoteData(_raw_1m_multi())
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    out = d.query_quotes_batch(["000001", "12", "xyz"], period="1m")
+    assert set(out.keys()) == {"000001"}
+    assert tqd.history_calls[0][0] == ["000001.SZ"]
+
+
+def test_query_quotes_batch_error_returns_empty(monkeypatch):
+    """批量查询异常 → {} + last_error（BarPoller 据此回退逐只）。"""
+    tqd = FakeQuoteData(error=RuntimeError("no tdx"))
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    assert d.query_quotes_batch(["000001.SZ"]) == {}
+    assert "batch" in d.last_error
+
+
+def test_query_quote_consistent_with_batch(monkeypatch):
+    """单股 query_quote 与批量结果同转换规则（共用 _raw_to_bars）。"""
+    tqd = FakeQuoteData(_raw_1m_multi())
+    monkeypatch.setattr("core.tq.data.TQData", lambda: tqd)
+    d = TdxTqDispatcher()
+    one = d.query_quote("000001", period="1m", count=10)
+    batch = d.query_quotes_batch(["000001"], period="1m", count=10)
+    assert one == batch["000001"]

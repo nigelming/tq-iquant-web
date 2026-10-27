@@ -8,20 +8,10 @@ from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1C
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
+# 涨跌停幅度口径迁至 market_rules（实盘 TdxTqDispatcher 涨跌停前置校验共用）；
+# 此处 re-export 保持既有 import 路径不破。
+from .market_rules import _limit_ratio_for  # noqa: F401
 from tq_iquant_shared.constants import TradeType
-
-
-def _limit_ratio_for(stock_code: str) -> Decimal:
-    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8 前缀) 30%，其余 10%。
-
-    ST 5% 不特判（v1 偏宽松可接受：对 ST 股拦截区间偏宽，少拦不错拦）。
-    """
-    prefix = stock_code.split(".")[0]
-    if prefix.startswith(("300", "301", "688")):
-        return Decimal("0.20")
-    if prefix[:1] in ("4", "8"):
-        return Decimal("0.30")
-    return Decimal("0.10")
 
 
 # W4 按周期路由：同一时间戳可能同时存在多个周期（1d/1w/1mon 均为 00:00）。

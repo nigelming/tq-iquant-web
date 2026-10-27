@@ -30,11 +30,15 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional
 
+import logging
+
 from .event import BarEvent
 try:
     from .http_bridge_dispatcher import HttpBridgeDispatcher
 except Exception:
     HttpBridgeDispatcher = Any  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 # Asia/Shanghai 固定时区(时间戳路径显式转换用,不依赖本机时区)
 _CST = timezone(timedelta(hours=8))
@@ -180,6 +184,8 @@ class BarPoller:
         self._initialized: bool = False
         # 每 code 已见过的最高【完成】bar 时间(防重复触发 + 标记进度)
         self._last_completed: Dict[str, Optional[datetime]] = {}
+        # TQ 1.3.1:批量行情回退 warning 只记一次(防刷屏)
+        self._batch_fallback_warned: bool = False
         # 回调:每根新完成 bar 触发一次,参数为 BarEvent
         self.on_bar: Callable[[BarEvent], None] = lambda bar: None
 
@@ -200,12 +206,38 @@ class BarPoller:
         vals = [t for t in self._last_completed.values() if t is not None]
         return max(vals) if vals else None
 
+    def _fetch_bars_by_code(self) -> Dict[str, list]:
+        """一轮行情拉取：dispatcher 支持批量（supports_batch_quote，仅 TdxTqDispatcher）
+        时一次 query_quotes_batch 取全部股票；否则逐只 query_quote。
+
+        返回 {code: [bar, ...]}。批量调用异常/返回空 → 回退逐只路径（与逐只
+        100% 等价，iQuant/ths/qmt 行为不变），warning 只记一次防刷屏。
+        """
+        if getattr(self._dispatcher, "supports_batch_quote", False):
+            try:
+                batch = self._dispatcher.query_quotes_batch(
+                    self._stock_codes, self._period, self._count)
+                if batch:
+                    return batch
+                reason = "批量返回空"
+            except Exception as e:  # noqa: BLE001
+                reason = "批量拉取异常：%s" % e
+            if not self._batch_fallback_warned:
+                self._batch_fallback_warned = True
+                logger.warning("批量行情不可用（%s），回退逐只拉取（仅提示一次）", reason)
+        bars_by_code: Dict[str, list] = {}
+        for code in self._stock_codes:
+            bars_by_code[code] = self._dispatcher.query_quote(
+                code, period=self._period, count=self._count)
+        return bars_by_code
+
     def poll(self) -> List[BarEvent]:
-        """拉一次 /quote,触发所有新完成的 bar,返回触发的 BarEvent 列表。
+        """拉一次行情,触发所有新完成的 bar,返回触发的 BarEvent 列表。
 
         无 now 参数(不依赖任何绝对时钟)。bar 完成 = 它不再是该股票最新 bar。
         多股票按 code 独立判定完成,同一时间戳的已完成 bar 合并为一根 BarEvent。
         桥不可用 → 抛 BridgeUnavailableError(交上层暂停交易,不吞异常)。
+        dispatcher 支持批量时一轮一次批量拉取(TQ 1.3.1),后续处理与逐只一致。
         """
         # 本轮新完成 bar,按时间合并:stime -> {code: ohlcv}
         new_by_time: Dict[datetime, Dict[str, dict]] = {}
@@ -214,8 +246,11 @@ class BarPoller:
         raw_by_code: Dict[str, list] = {}
         any_data = False
 
+        # 一轮行情拉取:批量或逐只(见 _fetch_bars_by_code),后续处理两条路径完全一致
+        fetched = self._fetch_bars_by_code()
+
         for code in self._stock_codes:
-            bars = self._dispatcher.query_quote(code, period=self._period, count=self._count)
+            bars = fetched.get(code, [])
             raw_by_code[code] = bars
             # 该 code 的 stime -> ohlcv
             stime_map: Dict[datetime, dict] = {}

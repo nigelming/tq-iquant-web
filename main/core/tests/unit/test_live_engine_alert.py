@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -41,6 +42,9 @@ class FakeDispatcher:
     def query_deals(self):
         self.calls.append("deals")
         return []
+
+    def close(self):
+        self.calls.append("close")
 
 
 class FakeMonitor:
@@ -104,3 +108,34 @@ def test_handle_alert_bar_fills_and_notifies_without_orders(monkeypatch):
     eng._handle_alert_bar(port, bar)
     assert called == {"fill": 1, "on_bar": 0}
     assert mon.calls
+
+
+# ---------------- TQ 1.3.1：stop() 释放 dispatcher 资源 ----------------
+def test_stop_calls_dispatcher_close():
+    """stop() 在 executor shutdown 后调用 dispatcher.close()（退订对账入口）。"""
+    eng, disp = _engine()
+    asyncio.run(eng.stop())
+    assert "close" in disp.calls
+
+
+def test_stop_swallows_dispatcher_close_error():
+    """close() 抛异常 → 吞并记 warning，不阻断停止流程。"""
+    eng, disp = _engine()
+
+    def boom():
+        raise RuntimeError("close failed")
+
+    disp.close = boom
+    asyncio.run(eng.stop())  # 不抛
+
+
+def test_stop_tolerates_dispatcher_without_close():
+    """无 close 的通道（如 iQuant HttpBridgeDispatcher）→ 跳过，不抛。"""
+    disp = FakeDispatcher()
+    disp.close = None  # 模拟无 close 的通道
+    eng = LiveEngine(
+        session_id=1, portfolios=[], dispatcher=disp,
+        bar_poller=FakePoller(), db_session_factory=lambda: None,
+        execution_mode="alert", signal_scheduler=FakeScheduler(),
+    )
+    asyncio.run(eng.stop())  # 不抛
