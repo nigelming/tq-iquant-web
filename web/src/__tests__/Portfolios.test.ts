@@ -850,3 +850,28 @@ describe('Portfolios.vue — 实盘预警调度（提交校验）', () => {
     vi.unstubAllGlobals()
   })
 })
+
+describe('Portfolios.vue — 子策略列表行预警调度摘要', () => {
+  it('展开后子行显示「信号 1d@15:05」与「信号 1w@09:00 周一 已完成」', async () => {
+    ;(getStrategies as any).mockResolvedValue([
+      { ...mockStrategies[0], signal_frequency: '1d', signal_at: '15:05', signal_weekday: null, signal_data_end: 'current' },
+      { ...mockStrategies[1], signal_frequency: '1w', signal_at: '09:00', signal_weekday: 1, signal_data_end: 'completed' },
+    ])
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('信号 1d@15:05')
+    expect(w.text()).toContain('信号 1w@09:00 周一 已完成')
+  })
+
+  it('未配置调度 → 「信号 5m」（跟随周期，无 @ 标注）', async () => {
+    ;(getStrategies as any).mockResolvedValue([{ ...mockStrategies[0], period: '5m' }])
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('信号 5m')
+    expect(w.text()).not.toContain('信号 5m@')
+  })
+})

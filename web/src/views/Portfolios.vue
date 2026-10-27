@@ -613,6 +613,24 @@ function optionsOf(src: string | undefined, pid?: number) {
   return []
 }
 
+// 子策略列表行的预警调度摘要：「信号 1d@15:05」「信号 1w@09:00 周一 已完成」；未配置=跟随周期
+function signalScheduleLabel(s: {
+  period: string
+  signal_frequency?: string | null
+  signal_at?: string | null
+  signal_weekday?: number | null
+  signal_data_end?: string | null
+}): string {
+  const freq = s.signal_frequency || s.period
+  let label = `信号 ${freq}`
+  if (s.signal_at) label += `@${s.signal_at}`
+  if (freq === '1w' && s.signal_weekday) {
+    label += ` ${WEEKDAY_LABELS[s.signal_weekday] || `周${s.signal_weekday}`}`
+  }
+  if (s.signal_data_end === 'completed') label += ' 已完成'
+  return label
+}
+
 onMounted(loadPortfolios)
 </script>
 
@@ -650,7 +668,7 @@ onMounted(loadPortfolios)
               <td colspan="5">
                 <div class="sub-strategy-row">
                   <span class="sub-strategy-name">{{ ROLES.find(r => r.value === s.role)?.label || s.role }} · {{ s.name }}</span>
-                  <span class="sub-strategy-meta">{{ formulaName(s.formula_id) }} · {{ s.period }} · 资金 {{ (s.capital_ratio * 100).toFixed(0) }}%</span>
+                  <span class="sub-strategy-meta">{{ formulaName(s.formula_id) }} · {{ s.period }} · 资金 {{ (s.capital_ratio * 100).toFixed(0) }}% · {{ signalScheduleLabel(s) }}</span>
                   <span class="sub-strategy-actions">
                     <button @click="openEditStrategy(p.id, s)" class="btn btn-sm btn-primary">编辑</button>
                     <button @click="removeStrategy(p.id, s)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
