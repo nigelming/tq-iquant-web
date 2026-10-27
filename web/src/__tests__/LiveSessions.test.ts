@@ -23,6 +23,7 @@ vi.mock('../api', () => ({
   getLiveDecisions: vi.fn(),
   getLiveSignals: vi.fn(),
   getPortfolios: vi.fn(),
+  sendUserBlock: vi.fn(),
 }))
 
 // happy-dom 无 EventSource,用可手动 emit 的 fake
@@ -50,7 +51,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -675,6 +676,78 @@ describe('LiveSessions.vue SSE signal → 预警信号 tab 节流重拉', () => 
     await flushPromises()
     // 初始 loadHistory 1 次 + 节流合并后 1 次
     expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 预警信号同步自选（1.3.1）', () => {
+  const signalTabItems = {
+    total: 3,
+    items: [
+      { id: 1, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'BUY', signal_type: 'OPEN', trigger_value: 1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+      { id: 2, portfolio_id: 1, strategy_id: 10, stock_code: '000001.SZ', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'SELL', signal_type: 'CLOSE', trigger_value: -1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+      { id: 3, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'BUY', signal_type: 'OPEN', trigger_value: 1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+    ],
+  }
+
+  it('信号 tab 无信号 → 点同步按钮 alert「暂无信号股票」且不调 sendUserBlock', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    await flushPromises()
+
+    expect(alert).toHaveBeenCalledWith(expect.stringContaining('暂无信号股票'))
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('有信号 → prompt 确认后调 sendUserBlock（codes 去重），成功 alert 写入数', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    ;(sendUserBlock as any).mockResolvedValue({ block_code: '创懿预警', count: 2 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿预警'))
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿预警')
+    expect(sendUserBlock).toHaveBeenCalledWith({
+      block_code: '创懿预警', block_name: '创懿预警',
+      stock_codes: ['600000.SH', '000001.SZ'],
+    })
+    expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 2 只'))
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('prompt 取消 → 不调用 sendUserBlock', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    vi.stubGlobal('prompt', () => null)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
     w.unmount()
   })
 })

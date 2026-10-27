@@ -5,6 +5,7 @@ import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
   recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  sendUserBlock,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -1040,6 +1041,25 @@ async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
     detail.value = await getBacktestDetail(currentRecord.value.id, p)
   } catch (e) {
     alert(`切换口径失败：${errMsg(e)}`)
+  }
+}
+
+// ===== 1.3.1 同步持仓股到通达信自选 =====
+// 口径：详情载荷无最终持仓快照，退而用交易明细涉及的股票代码去重代替（按钮 title 注明）
+const detailStockCodes = computed(() =>
+  Array.from(new Set((detail.value?.trades || []).map((t) => t.stock_code).filter(Boolean))))
+
+async function syncPositionsBlock() {
+  if (!detailStockCodes.value.length) return
+  const name = window.prompt('通达信自选板块名', '创懿回测')
+  if (!name) return
+  try {
+    const r = await sendUserBlock({
+      block_code: name, block_name: name, stock_codes: detailStockCodes.value,
+    })
+    alert(`已写入 ${r.count} 只到「${r.block_code}」`)
+  } catch (e) {
+    alert(errMsg(e))
   }
 }
 
@@ -3198,6 +3218,12 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+      <button @click="syncPositionsBlock" class="btn btn-sm"
+              style="margin-top:8px;display:inline-block;margin-left:6px"
+              :disabled="detailStockCodes.length === 0"
+              title="口径：本次回测交易明细涉及的股票（去重）——详情无最终持仓快照；写入通达信自选板块">
+        🔗 同步持仓股到通达信自选
+      </button>
     </div>
 
     <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->

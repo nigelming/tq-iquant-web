@@ -3,9 +3,9 @@ import { ref, computed, watch, onMounted } from 'vue'
 import {
   getFormulas, createFormula, updateFormula, deleteFormula,
   getTdxFormulas, getTdxInfo, importTdxFormula, precheckFormula,
-  normalizePreview,
+  normalizePreview, testRunFormula,
   type SignalItem, type FormulaItem, type TdxFormulaListItem, type PrecheckResult,
-  type NormalizePlan, type NormalizePreviewResult,
+  type NormalizePlan, type NormalizePreviewResult, type TestRunResult,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { buildPinyinIndex, matchTdx, type TdxPinyin } from '../utils/tdxSearch'
@@ -347,6 +347,60 @@ async function remove(id: number) {
   load()
 }
 
+// ---------------------------------------------------------------------------
+// 1.3.1 公式试算：任选股票/周期/bar 数 → POST /formulas/test-run → 结果小表
+// ---------------------------------------------------------------------------
+const TEST_PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
+const TEST_RUN_MAX_CODES = 20
+
+const showTestRun = ref(false)
+const testRunning = ref(false)
+const testRunSource = ref<FormulaItem | null>(null)
+const testResult = ref<TestRunResult | null>(null)
+const testRunForm = ref({ codes: '', period: '1d', count: 20 })
+
+// 解析股票代码：每行一个或逗号/分号/空白分隔，去重（保序）
+function parseTestRunCodes(raw: string): string[] {
+  return Array.from(new Set(
+    raw.split(/[\n\r,，;；\s]+/).map((s) => s.trim()).filter(Boolean),
+  ))
+}
+
+function openTestRun(f: FormulaItem) {
+  testRunSource.value = f
+  testRunForm.value = { codes: '', period: '1d', count: 20 }
+  testResult.value = null
+  showTestRun.value = true
+}
+
+async function doTestRun() {
+  if (!testRunSource.value || testRunning.value) return
+  // 参数错误前端快速失败，不发请求
+  const codes = parseTestRunCodes(testRunForm.value.codes)
+  if (!codes.length) {
+    alert('请先填写至少一个股票代码（每行一个或逗号分隔）')
+    return
+  }
+  if (codes.length > TEST_RUN_MAX_CODES) {
+    alert(`股票代码最多 ${TEST_RUN_MAX_CODES} 只（当前 ${codes.length} 只）`)
+    return
+  }
+  testRunning.value = true
+  try {
+    testResult.value = await testRunFormula({
+      content: testRunSource.value.content,
+      stock_codes: codes,
+      period: testRunForm.value.period,
+      count: testRunForm.value.count || 20,
+    })
+  } catch (e) {
+    // 失败提示后弹窗保留，供修正后重试
+    alert(`试算失败：${errMsg(e)}`)
+  } finally {
+    testRunning.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -374,6 +428,7 @@ onMounted(load)
           <td><span class="badge badge-blue">{{ f.signals.length }} 个信号</span></td>
           <td>
             <button @click="openEdit(f)" class="btn btn-sm btn-primary">编辑</button>
+            <button @click="openTestRun(f)" class="btn btn-sm" style="margin-left:6px" title="任选股票/周期/bar 数跑一遍公式，看各输出线的触发统计">试算</button>
             <button @click="openNorm(f)" class="btn btn-sm norm-entry" style="margin-left:6px" title="改造为回测平台可接收的信号标识（±1/±2/0 离散输出线）">信号标准化</button>
             <button @click="remove(f.id)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
           </td>
@@ -604,6 +659,54 @@ onMounted(load)
           {{ normSaving ? '保存中…' : '保存为新公式' }}
         </button>
         <button @click="showNorm = false" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1.3.1 公式试算：任选股票/周期/bar 数 → 结果按股票分组小表 -->
+  <div v-if="showTestRun" class="modal-overlay modal-lg" @click.self="showTestRun = false">
+    <div class="modal-content">
+      <h3>
+        公式试算
+        <span style="color:var(--ink-soft);font-size:13px;margin-left:8px">公式：{{ testRunSource?.name }}</span>
+      </h3>
+      <div class="modal-body">
+        <div class="field-row field-span-2">
+          <span class="field-label">股票代码</span>
+          <textarea v-model="testRunForm.codes" rows="3" placeholder="每行一个或逗号分隔，如 000001.SZ（最多 20 只）"></textarea>
+        </div>
+        <div class="field-row field-span-2">
+          <span class="field-label">周期</span>
+          <select v-model="testRunForm.period">
+            <option v-for="p in TEST_PERIODS" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <span class="field-label" style="margin-left:8px">bar 数</span>
+          <input v-model.number="testRunForm.count" type="number" min="1" style="width:100px" />
+        </div>
+        <div v-if="testResult" class="field-span-2">
+          <p v-if="testResult.warning" style="color:var(--red);font-size:13px;margin:0 0 6px">⚠️ {{ testResult.warning }}</p>
+          <div v-for="(lines, code) in testResult.results" :key="code" style="margin-bottom:10px">
+            <h4 style="margin:6px 0 2px">{{ code }}</h4>
+            <table class="norm-out-table">
+              <thead><tr><th>线名</th><th>n</th><th>值=1 次数</th><th>末 3 值</th></tr></thead>
+              <tbody>
+                <tr v-for="(line, name) in lines" :key="name">
+                  <td><code>{{ name }}</code></td>
+                  <td>{{ line.n }}</td>
+                  <td>{{ line.ones }}</td>
+                  <td style="font-size:12px;color:var(--ink-soft)">{{ (line.last_values || []).join(', ') }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="Object.keys(testResult.results).length === 0" class="empty-state"><p>无结果</p></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button @click="doTestRun" class="btn btn-primary" :disabled="testRunning">
+          {{ testRunning ? '试算中…' : '试算' }}
+        </button>
+        <button @click="showTestRun = false" class="btn">关闭</button>
       </div>
     </div>
   </div>

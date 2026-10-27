@@ -13,13 +13,14 @@ vi.mock('../api', () => ({
   importTdxFormula: vi.fn(),
   precheckFormula: vi.fn(),
   normalizePreview: vi.fn(),
+  testRunFormula: vi.fn(),
 }))
 
 import Formulas from '../views/Formulas.vue'
 import {
   getFormulas, createFormula, deleteFormula,
   getTdxFormulas, getTdxInfo, importTdxFormula,
-  precheckFormula, normalizePreview,
+  precheckFormula, normalizePreview, testRunFormula,
 } from '../api'
 
 const mockFormulas = [
@@ -59,6 +60,14 @@ beforeEach(() => {
       { name: 'XG', source_line: 'DIF', rule: 'cross_zero', expr: 'CROSS(DIF,0)', meaning: '1=上穿0轴当根，0=其他' },
     ],
     warnings: [],
+  })
+  ;(testRunFormula as any).mockResolvedValue({
+    results: {
+      '000001.SZ': {
+        DIF: { n: 20, ones: 3, last_values: ['0', '1', '0.5'] },
+        DEA: { n: 20, ones: 0, last_values: ['0.1', '0.2', '0.3'] },
+      },
+    },
   })
 })
 
@@ -517,6 +526,105 @@ describe('Formulas.vue', () => {
     await w.findAll('.modal-actions button').find(b => b.text() === '下一步')!.trigger('click')
     expect(alertMock).toHaveBeenCalled()
     expect(w.text()).toContain('第 1 / 3 步')
+    vi.unstubAllGlobals()
+  })
+
+  // -------------------------------------------------------------------------
+  // 1.3.1 公式试算：任选股票/周期/bar 数 → POST /formulas/test-run → 结果小表
+  // -------------------------------------------------------------------------
+  it('每行有[试算]按钮，点击打开试算弹窗（周期默认 1d，bar 数默认 20）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+
+    const btn = w.findAll('button').find(b => b.text() === '试算')
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    expect(w.find('.modal-overlay').exists()).toBe(true)
+    expect(w.text()).toContain('公式试算')
+    expect(w.find('textarea[placeholder*="每行"]').exists()).toBe(true)
+    expect((w.find('.modal-content select').element as HTMLSelectElement).value).toBe('1d')
+    expect((w.find('.modal-content input[type="number"]').element as HTMLInputElement).value).toBe('20')
+  })
+
+  it('填股票代码提交 → 调 testRunFormula（content 取该行公式、代码去重、period/count 正确）', async () => {
+    ;(testRunFormula as any).mockResolvedValue({ results: {} })
+    const w = mount(Formulas)
+    await flushPromises()
+
+    // 第一行 MACROSSPRO（content: REF(CLOSE,1)）
+    await w.findAll('button').find(b => b.text() === '试算')!.trigger('click')
+    await w.find('textarea[placeholder*="每行"]').setValue('000001.SZ\n600000.SH, 000001.SZ')
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    await flushPromises()
+
+    expect(testRunFormula).toHaveBeenCalledTimes(1)
+    const arg = (testRunFormula as any).mock.calls[0][0]
+    expect(arg.content).toBe('REF(CLOSE,1)')
+    expect(arg.stock_codes).toEqual(['000001.SZ', '600000.SH'])
+    expect(arg.period).toBe('1d')
+    expect(arg.count).toBe(20)
+  })
+
+  it('代码为空或超 20 只 → alert 快速失败，不发请求', async () => {
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '试算')!.trigger('click')
+
+    // 空
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    expect(alertMock).toHaveBeenCalled()
+    expect(testRunFormula).not.toHaveBeenCalled()
+
+    // 超 20 只
+    const codes = Array.from({ length: 21 }, (_, i) => `${String(i).padStart(6, '0')}.SZ`).join(',')
+    await w.find('textarea[placeholder*="每行"]').setValue(codes)
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    expect(alertMock).toHaveBeenCalledTimes(2)
+    expect(testRunFormula).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('渲染结果：按股票分组小表（线名/n/值=1 次数/末 3 值）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '试算')!.trigger('click')
+    await w.find('textarea[placeholder*="每行"]').setValue('000001.SZ')
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('000001.SZ')
+    expect(w.text()).toContain('DIF')
+    expect(w.text()).toContain('DEA')
+    expect(w.text()).toContain('0, 1, 0.5')
+  })
+
+  it('返回带 warning → 顶部红字显示', async () => {
+    ;(testRunFormula as any).mockResolvedValue({ results: {}, warning: '000001.SZ 无行情数据' })
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '试算')!.trigger('click')
+    await w.find('textarea[placeholder*="每行"]').setValue('000001.SZ')
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('000001.SZ 无行情数据')
+  })
+
+  it('试算失败 → alert(errMsg)，弹窗保留', async () => {
+    ;(testRunFormula as any).mockRejectedValue({ response: { data: { message: 'TQ 行情不可用' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '试算')!.trigger('click')
+    await w.find('textarea[placeholder*="每行"]').setValue('000001.SZ')
+    await w.findAll('.modal-actions button').find(b => b.text() === '试算')!.trigger('click')
+    await flushPromises()
+
+    expect(alertMock.mock.calls[0][0]).toContain('TQ 行情不可用')
+    expect(w.find('.modal-overlay').exists()).toBe(true)
     vi.unstubAllGlobals()
   })
 })

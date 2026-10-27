@@ -12,7 +12,7 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
-  recoverLiveBreaker, getLiveChannel, testLiveChannel,
+  recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock,
   type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
   type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
 } from '../api'
@@ -124,6 +124,23 @@ function alertStatusClass(s: string | null): string {
 }
 function fmtTime(t: string | null): string {
   return t ? t.replace('T', ' ').slice(0, 19) : '—'
+}
+
+// ---- 1.3.1 预警信号股同步到通达信自选板块（当前信号列表股票代码去重）----
+async function syncSignalsBlock() {
+  const codes = Array.from(new Set(signals.value.map((s) => s.stock_code).filter(Boolean)))
+  if (codes.length === 0) {
+    alert('暂无信号股票')
+    return
+  }
+  const name = window.prompt('通达信自选板块名', '创懿预警')
+  if (!name) return
+  try {
+    const r = await sendUserBlock({ block_code: name, block_name: name, stock_codes: codes })
+    alert(`已写入 ${r.count} 只到「${r.block_code}」`)
+  } catch (e: any) {
+    alert(e?.message || '同步失败')
+  }
 }
 
 // 决策闸门阈值/实际：比率（0<|v|<1）转百分比，数量原样。
@@ -494,6 +511,10 @@ onUnmounted(closeEventStream)
 
     <!-- 预警信号：alert 模式主产物（半自动），auto 模式仅落库不上送 -->
     <div v-if="wbTab === 'signals'" class="table-wrap">
+      <div style="display:flex;justify-content:flex-end;align-items:center;margin:0 0 6px">
+        <button @click="syncSignalsBlock" class="btn btn-sm"
+                title="将当前信号列表的股票代码去重后写入通达信自选板块">同步信号股到自选</button>
+      </div>
       <p v-if="signalsTotal > signals.length" style="font-size:12px;color:var(--ink-faint);margin:0 0 6px">
         共 {{ signalsTotal }} 条，仅显示最新 {{ signals.length }} 条
       </p>

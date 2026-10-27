@@ -56,6 +56,7 @@ vi.mock('../api', () => ({
   recomputePersistenceAnalysis: vi.fn(),
   getStockPools: vi.fn(),
   compareBacktestPools: vi.fn(),
+  sendUserBlock: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -77,6 +78,7 @@ import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
   recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  sendUserBlock,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -2895,5 +2897,56 @@ describe('Backtest.vue — 年化换手显示口径', () => {
     const rowValue = (label: string) =>
       rows.find(r => r.find('.metric-label').text() === label)!.find('span:last-child').text()
     expect(rowValue('年化换手率（双边）')).toBe('34.73×/年')
+  })
+})
+
+describe('Backtest.vue — 详情页同步自选（1.3.1）', () => {
+  it('详情页头部有[同步持仓股到通达信自选]按钮，prompt 确认后调 sendUserBlock（codes 来自交易明细去重）', async () => {
+    ;(sendUserBlock as any).mockResolvedValue({ block_code: '创懿回测', count: 1 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿回测'))
+    vi.stubGlobal('alert', alertMock)
+    // mockDetail.trades 两条都是 000001.SZ → 去重后 1 只
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    await flushPromises()
+
+    expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿回测')
+    expect(sendUserBlock).toHaveBeenCalledWith({
+      block_code: '创懿回测', block_name: '创懿回测', stock_codes: ['000001.SZ'],
+    })
+    expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 1 只'))
+    vi.unstubAllGlobals()
+  })
+
+  it('prompt 取消 → 不调用 sendUserBlock', async () => {
+    vi.stubGlobal('prompt', () => null)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('交易明细为空 → 按钮禁用', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, trades: [] })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))!
+    expect((btn.element as HTMLButtonElement).disabled).toBe(true)
   })
 })

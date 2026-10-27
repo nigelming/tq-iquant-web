@@ -734,6 +734,53 @@ export async function importTdxFormula(acCode: string) {
   return res.data.data
 }
 
+// ---- 1.3.1 公式试算（POST /formulas/test-run）：任选股票/周期/bar 数跑一遍公式 ----
+// 单条输出线的统计：n=参与计算 bar 数；ones=值=1 的次数（信号触发次数）；
+// last_values=末 3 根 bar 的输出值（字符串，保留原始精度）
+export interface TestRunLine {
+  n: number
+  ones: number
+  last_values: string[]
+}
+
+// 公式试算结果：按股票代码分组，每股下按输出线名给统计
+export interface TestRunResult {
+  results: Record<string, Record<string, TestRunLine>>
+  warning?: string  // 非致命告警（如个别股票无行情数据），顶部红字提示
+}
+
+export interface TestRunRequest {
+  content: string          // 公式源码
+  stock_codes: string[]    // 股票代码（带后缀，如 000001.SZ），≤20 只
+  period: string           // 1m|5m|15m|30m|1h|1d|1w|1mon
+  count?: number           // bar 数（默认 20）
+  dividend_type?: number   // 复权类型（默认 1=前复权）
+  formula_type?: number    // 公式类型（默认 0=技术指标）
+}
+
+export async function testRunFormula(req: TestRunRequest) {
+  const res = await api.post<ApiResponse<TestRunResult>>('/formulas/test-run', req)
+  return res.data.data
+}
+
+// ---- 1.3.1 通达信用户板块写入（POST /tdx/user-block）：全量替换板块成分股 ----
+export interface UserBlockRequest {
+  block_code: string       // 板块代码（同板块名）
+  block_name?: string      // 板块显示名（缺省用 block_code）
+  stock_codes: string[]    // 成分股代码列表
+  show?: boolean           // 是否在通达信里显示该板块
+}
+
+export interface UserBlockResult {
+  block_code: string
+  count: number  // 实际写入的股票数
+}
+
+export async function sendUserBlock(req: UserBlockRequest) {
+  const res = await api.post<ApiResponse<UserBlockResult>>('/tdx/user-block', req)
+  return res.data.data
+}
+
 export async function getPortfolios() {
   const res = await api.get<ApiResponse<PortfolioItem[]>>('/portfolios')
   return res.data.data
