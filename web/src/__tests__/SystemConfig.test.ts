@@ -33,6 +33,14 @@ const mockConfig = {
     driver: 'clipboard',
     captcha_ocr: false,
   },
+  tq_trade: {
+    account: '88866666',
+    account_type: 'stock',
+    price_mode: 'my',
+    client_path: 'D:\\zd_zyb',
+    default_engine: 'tdx',
+    cancel_unfilled_minutes: 3,
+  },
 }
 
 beforeEach(() => {
@@ -89,6 +97,23 @@ describe('SystemConfig.vue', () => {
     w.unmount()
   })
 
+  it('渲染 TQ 通道默认引擎下拉与超时撤单分钟数（A-6/A-7）', async () => {
+    const w = mount(SystemConfig)
+    await flushPromises()
+
+    expect(w.text()).toContain('默认交易引擎')
+    expect(w.text()).toContain('超时撤单(分钟)')
+    // 默认引擎 select 选中 tdx
+    const selects = w.findAll('select')
+    const engineSelect = selects.find(s => s.findAll('option').some(o => o.element.value === 'tdx'))
+    expect(engineSelect).toBeTruthy()
+    expect((engineSelect!.element as HTMLSelectElement).value).toBe('tdx')
+    // 超时撤单 number 输入回显 3
+    const numInput = w.findAll('input').find(i => i.attributes('type') === 'number' && (i.element as HTMLInputElement).value === '3')
+    expect(numInput).toBeTruthy()
+    w.unmount()
+  })
+
   it('保存 → PUT 提交与 config.yaml 一致的完整配置并提示已保存', async () => {
     const w = mount(SystemConfig)
     await flushPromises()
@@ -109,6 +134,11 @@ describe('SystemConfig.vue', () => {
         enabled: false,
         window_title: '网上股票交易系统5.0',
         client_exe_path: 'D:/同花顺远航版/transaction/xiadan.exe',
+      }),
+      tq_trade: expect.objectContaining({
+        account: '88866666',
+        default_engine: 'tdx',
+        cancel_unfilled_minutes: 3,
       }),
     }))
     expect(w.text()).toContain('已保存')

@@ -1707,6 +1707,8 @@ export interface TqTradeConfig {
   account_type: string
   price_mode: string   // my|cage|latest|ztj|dtj
   client_path: string
+  default_engine: string       // tdx|iquant|ths|qmt：新建实盘会话未显式选引擎时使用
+  cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
 }
 
 export interface QmtConfig {

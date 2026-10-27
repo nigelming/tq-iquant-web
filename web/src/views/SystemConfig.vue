@@ -28,6 +28,8 @@ const DEFAULTS: SystemConfig = {
     account_type: 'stock',
     price_mode: 'my',
     client_path: '',
+    default_engine: 'tdx',
+    cancel_unfilled_minutes: 3,
   },
   qmt: {
     path: '',
@@ -79,6 +81,9 @@ onMounted(async () => {
         account_type: data.tq_trade?.account_type ?? DEFAULTS.tq_trade!.account_type,
         price_mode: data.tq_trade?.price_mode ?? DEFAULTS.tq_trade!.price_mode,
         client_path: data.tq_trade?.client_path ?? DEFAULTS.tq_trade!.client_path,
+        default_engine: data.tq_trade?.default_engine ?? DEFAULTS.tq_trade!.default_engine,
+        cancel_unfilled_minutes:
+          data.tq_trade?.cancel_unfilled_minutes ?? DEFAULTS.tq_trade!.cancel_unfilled_minutes,
       },
       qmt: {
         path: data.qmt?.path ?? DEFAULTS.qmt!.path,
@@ -253,6 +258,24 @@ function testQmt() { return testChannel('qmt') }
               <label>TQ 插件目录（留空用上方通达信目录）</label>
               <input v-model="config.tq_trade!.client_path" placeholder="D:\zd_zyb" />
             </div>
+            <div class="field">
+              <label>默认交易引擎</label>
+              <select v-model="config.tq_trade!.default_engine">
+                <option value="tdx">通达信 TQ（tdx）</option>
+                <option value="iquant">iQuant HTTP 桥（iquant）</option>
+                <option value="ths">同花顺 UI 自动化（ths）</option>
+                <option value="qmt">miniQMT（qmt）</option>
+              </select>
+              <p class="cfg-hint">新建实盘会话未显式选引擎时使用</p>
+            </div>
+            <div class="field">
+              <label>超时撤单(分钟)</label>
+              <input
+                v-model.number="config.tq_trade!.cancel_unfilled_minutes"
+                type="number" min="0" style="max-width:180px"
+              />
+              <p class="cfg-hint">&gt;0：在途单超时未成交自动撤单并释放同向闸；0=禁用</p>
+            </div>
             <div class="cfg-test">
               <button @click="testTdx" class="btn btn-sm" :disabled="testing !== ''">
                 {{ testing === 'tdx_tq' ? '测试中…' : '测试连接（只读）' }}
@@ -364,6 +387,7 @@ function testQmt() { return testChannel('qmt') }
 .cfg-h { margin: 18px 0 4px; font-size: 14px; }
 .cfg-h:first-child { margin-top: 0; }
 .cfg-desc { margin: 0 0 12px; font-size: 12px; color: var(--ink-soft); }
+.cfg-hint { margin: 4px 0 0; font-size: 12px; color: var(--ink-soft); }
 .cfg-test { display: flex; align-items: center; gap: 10px; margin: 4px 0 8px; }
 .cfg-foot {
   display: flex;
