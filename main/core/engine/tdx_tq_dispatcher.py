@@ -167,6 +167,10 @@ class TdxTqDispatcher(OrderDispatcher):
         #: order_ref -> (YYYYMMDD, HHMMSS)：本进程下单时记录的柜台插入时间。
         #: 通达信委托表无时间列，仅靠它让 Core 的 legacy 模糊匹配时间窗成立。
         self._submit_times: Dict[str, tuple] = {}
+        #: A-5（C-3）认领加固：已认领 refs（本进程单，防重复认领同一委托）与
+        #: 已知 refs（委托表见过的全部 ref，进程内防重放——connect() 重连不清空）。
+        self._claimed_refs: set = set()
+        self._known_refs: set = set()
 
     # ---- 连接 ----
 
@@ -349,6 +353,19 @@ class TdxTqDispatcher(OrderDispatcher):
                 "filled_volume": int(_num(r, _ORD_FILLED_KEYS, 0) or 0),
                 "status": _STATUS_MAP.get(status, 50),
             })
+        # A-5（C-3）：本轮见过的 refs 并入 _known_refs（供 _resolve_order_id「新增 ref
+        # 优先」做 pre 快照）；缺 _submit_times 的 ref 用当前上海时间补记——重启单/手工单
+        # 兜底认领后，状态机 legacy 匹配的时间窗（_ORDER_INSERT_TOLERANCE）才可用。
+        now = now_shanghai()
+        date_s = now.strftime("%Y%m%d")
+        time_s = now.strftime("%H%M%S")
+        for o in out:
+            ref = o.get("order_id")
+            if not ref:
+                continue
+            self._known_refs.add(ref)
+            if ref not in self._submit_times:
+                self._submit_times[ref] = (date_s, time_s)
         return out
 
     # ---- OrderDispatcher 契约 ----
@@ -580,19 +597,75 @@ class TdxTqDispatcher(OrderDispatcher):
 
         ``order_stock`` 返回值只是受理标志，不是委托编号；只有出现在
         ``query_stock_orders`` 里才算真正报单。半自动确认模式下会一直查不到。
+
+        A-5（C-3）认领加固：
+        - **去重**：候选 ref 已被本进程其它单认领（``_claimed_refs``）→ 跳过，
+          杜绝同形状多单重复绑同一委托（重复回填 → 虚拟持仓虚高）；
+        - **新增 ref 优先**：每轮回查前快照 ``_known_refs``，只认「本轮新出现」的
+          ref（最可能是刚提交的本单）；全部 attempts 无新增命中 → 放宽为
+          「形状匹配且未认领」的任意 ref（手工单/重启单兜底）→ 仍无 → 失败返回 ""。
+        - **价格过滤放宽**：price_mode 映射 PRICE_SJ/ZTJ/DTJ（市价/最新/涨停/跌停）
+          时委托表 WtPrice 可能为 0 或非传入价，跳过价格相等过滤；自填价（cage/my）
+          保持价格过滤。
+        命中即记入 ``_claimed_refs``（提交时间由 place_order 统一补记）。
         """
+        skip_price = PRICE_MODE_MAP.get(self._price_mode, "PRICE_MY") != "PRICE_MY"
+        fallback = ""
         for i in range(max(attempts, 1)):
+            pre = set(self._known_refs)
             for o in reversed(self.get_orders()):
+                ref = str(o["order_id"])
+                if not ref or ref in self._claimed_refs:
+                    continue
                 if normalize_symbol(o["symbol"]) != normalize_symbol(symbol):
                     continue
                 if o["direction"] != direction or int(o["volume"]) != int(volume):
                     continue
-                if price > 0 and abs(float(o["price"]) - price) > 1e-6:
+                if not skip_price and price > 0 and abs(float(o["price"]) - price) > 1e-6:
                     continue
-                return str(o["order_id"])
+                if ref not in pre:
+                    self._claimed_refs.add(ref)
+                    return ref
+                if not fallback:
+                    fallback = ref  # 已知 ref：先记兜底候选，本轮继续找新增
             if i < attempts - 1:
                 time.sleep(0.35)
-        return ""
+        if fallback:
+            self._claimed_refs.add(fallback)
+        return fallback
+
+    def cancel_order(self, order_ref: str, stock_code: str) -> bool:
+        """撤单（A-1）：受理成功返回 True；失败/拒单返回 False 并记 last_error。
+
+        SDK cancel_order_stock（tqcenter.py :4284，type=5）返回形态：
+        dict(ErrorId="0")=成功 / -1=失败（参数缺失、柜台错误、内部异常，错误细节走
+        控制台 print）。返回判定与 place_order 同风格。TDXConnectionError（客户端
+        离线/连接失效）向上抛，由调用方决定重试节奏。
+        """
+        self._ensure()
+        try:
+            res = _call(
+                self._tq().cancel_order_stock,
+                account_id=self._account_id,
+                stock_code=normalize_symbol(stock_code),
+                order_id=str(order_ref),
+            )
+        except TDXConnectionError:
+            raise
+        except Exception as e:
+            self._last_error = "撤单调用失败：%s" % e
+            logger.warning("tdx cancel_order failed: %s", e)
+            return False
+        if res is None or res == -1:
+            self._last_error = "通达信撤单失败，返回 %r" % (res,)
+            return False
+        if isinstance(res, dict):
+            err_id = str(res.get("ErrorId", ""))
+            if err_id not in ("", "0"):
+                self._last_error = "通达信撤单被拒：%s" % (
+                    res.get("Error") or res.get("Msg") or res)
+                return False
+        return True
 
     def _is_limit_order(self, price: float) -> bool:
         """是否限价单：price>0 且 price_mode 映射为自填价（PRICE_MY）。

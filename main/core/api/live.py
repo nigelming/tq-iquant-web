@@ -96,7 +96,9 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     mode = data.get("mode", "simulation")
     if mode not in ("simulation", "live"):
         return err(400, "mode 非法，仅支持 simulation(仿真) / live(实盘)")
-    engine = str(data.get("engine") or "iquant")
+    # A-6：未显式选引擎时用 tq_trade.default_engine（空/非法回退 ths_ui.enabled → ths
+    # 否则 iquant），值域校验沿用下方白名单。
+    engine = str(data.get("engine") or svc.default_engine())
     if engine not in svc.ENGINES_META:
         return err(400, "engine 非法，仅支持 %s" % " / ".join(svc.ENGINES_META))
     data["name"] = name

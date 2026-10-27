@@ -148,7 +148,13 @@ ENGINES_META = {
 
 
 def default_engine() -> str:
-    """未显式选引擎时的默认值：沿用旧行为（ths_ui.enabled → ths，否则 iquant）。"""
+    """未显式选引擎时的默认值：tq_trade.default_engine 优先（A-6，用户主通道 tdx）；
+    未配置/空/非法值时沿用旧行为（ths_ui.enabled → ths，否则 iquant）。"""
+    cfg = load_config()
+    tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
+    value = str((tq.get("default_engine") if isinstance(tq, dict) else "") or "").strip()
+    if value in ENGINES_META:
+        return value
     ths = ths_ui_config()
     return "ths" if (ths["enabled"] and ths["available"]) else "iquant"
 
@@ -638,7 +644,7 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
     execution_mode = data.get("execution_mode") or "alert"
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
-        engine=data.get("engine") or "iquant",
+        engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
     )
     db.add(session)

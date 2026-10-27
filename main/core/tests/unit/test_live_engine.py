@@ -5634,3 +5634,328 @@ def test_handle_bar_inflight_dup_open_skipped_across_bars():
     db = factory()
     assert db.query(LiveOrder).count() == 1  # 未重复下单
     db.close()
+
+
+# ===========================================================================
+# A-2/A-3/A-4：在途单超时真实撤单 / 收盘清扫撤单 / 重启恢复补记提交时间
+# （tq_trade.cancel_unfilled_minutes，I-4 + C-1/C-2/C-3 审计修复）
+# ===========================================================================
+class FakeTdxDispatcher:
+    """TDX 形状的最小 dispatcher：委托/成交/撤单 + _submit_times/_known_refs。"""
+
+    channel = "tdx_tq"
+    supports_remark = False
+
+    def __init__(self, orders=None, deals=None, cancel_ok=True):
+        self.orders = orders or []
+        self.deals = deals or []
+        self.cancel_ok = cancel_ok
+        self.cancel_calls = []
+        self._submit_times = {}
+        self._known_refs = set()
+
+    def heartbeat(self):
+        return True
+
+    def query_orders(self):
+        return list(self.orders)
+
+    def query_deals(self):
+        return list(self.deals)
+
+    def query_quote(self, *a, **kw):
+        return []
+
+    def query_calendar(self):
+        return []
+
+    def get_positions(self):
+        return []
+
+    def query_positions(self):
+        return []
+
+    def cancel_order(self, ref, code):
+        self.cancel_calls.append((ref, code))
+        return self.cancel_ok
+
+
+def _bridge_row(ref, status=50, traded_volume=0, volume=600):
+    """dispatcher.query_orders 的 BRIDGE 行（W001 在途单）。"""
+    return {
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": volume, "order_ref": ref,
+        "remark": "", "status": status, "traded_volume": traded_volume,
+    }
+
+
+def _pending_order_with_ref(db, ref="W001", created_at=None, status="submitted",
+                            quantity=600):
+    """预置一笔有 order_ref 的在途单（created_at 缺省 = 10 分钟前，UTC naive）。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
+        stock_code="600000.SH", trade_type="buy", order_type="limit",
+        price=Decimal("9.3"), quantity=quantity, filled_quantity=0,
+        filled_price=None, status=status, signal_name="open_sig",
+        signal_type="OPEN", bar_time=datetime(2026, 8, 5, 10, 0),
+        order_ref=ref,
+        created_at=created_at or (
+            datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)),
+    )
+    db.add(lo)
+    db.flush()
+    return lo
+
+
+def _cfg_minutes(minutes):
+    """monkeypatch 用：core.engine.live.order_machine.load_config → 固定配置。"""
+    return lambda: {"tq_trade": {"cancel_unfilled_minutes": minutes}}
+
+
+_CANCEL_TAG = "超时撤单请求中："  # 与 order_machine._CANCEL_REQUESTED_TAG 一致
+
+
+def test_cancel_unfilled_timeout_requests_cancel_and_tags(monkeypatch):
+    """A-2：超时命中 → cancel_order(ref, code)；成功后打 cancel_requested 标记，
+    不立即标 canceled（等 5s 终态同步收敛，防丢已成交量）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert disp.cancel_calls == [("W001", "600000.SH")]
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "submitted"  # 不立即 canceled
+    assert (lo2.error_message or "").startswith(_CANCEL_TAG)
+    db.close()
+
+
+def test_cancel_unfilled_converges_when_ref_vanished(monkeypatch):
+    """A-2：已请求撤单、委托表已查不到该单（撤单且无成交）→ 直接标 canceled。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[])  # 委托表已无此单
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo.error_message = _CANCEL_TAG + "超时未成交已撤单（阈值 3 分钟）"
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert disp.cancel_calls == []  # 已请求过，不重复撤
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "canceled"
+    assert "超时未成交已撤单" in (lo2.error_message or "")
+    db.close()
+
+
+def test_cancel_unfilled_harvests_partial_fill_on_cancel(monkeypatch):
+    """A-2：撤单成功后立即按既有 backfill 收割已成交量（不丢部分成交）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    disp = FakeTdxDispatcher(
+        orders=[_bridge_row("W001", status=55, traded_volume=300)],
+        deals=[{
+            "order_ref": "W001", "price": 9.25, "volume": 300,
+            "amount": 2775.0, "commission": 0.7,
+            "trade_time": "100001", "trade_date": "20260805",
+        }],
+    )
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert int(lo2.filled_quantity) == 300   # 已成交量收割
+    assert lo2.status == "partial"           # 剩余待终态同步收敛（53/54）
+    assert db.query(LiveTrade).count() == 1
+    db.close()
+    assert len(disp.cancel_calls) == 1
+
+
+def test_cancel_unfilled_disabled_when_zero(monkeypatch):
+    """A-2：cancel_unfilled_minutes<=0 → 完全跳过（禁用）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(0))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert disp.cancel_calls == []
+
+
+def test_cancel_unfilled_below_threshold_skips(monkeypatch):
+    """A-2：未达阈值（< cancel_unfilled_minutes）不撤。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(30))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db)  # created_at = 10 分钟前 < 30 分钟
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert disp.cancel_calls == []
+
+
+def test_cancel_unfilled_invalid_config_falls_back_to_default(monkeypatch):
+    """A-2：配置非法（非整数）→ 回退默认 3 分钟（10 分钟前的单命中撤单）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes("abc"))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert len(disp.cancel_calls) == 1
+
+
+def test_cancel_unfilled_failure_alerts_risk_once(monkeypatch):
+    """A-2：撤单连续失败 ≥3 次经 risk 事件告警一次（不刷屏），继续重试、单保持 submitted。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")], cancel_ok=False)
+    engine = _make_engine(disp, factory, port)
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    for _ in range(4):  # 4 轮失败
+        db = factory()
+        engine._cancel_unfilled_orders(db)
+        db.commit()
+        db.close()
+
+    assert len(disp.cancel_calls) == 4  # 每轮都重试
+    risks = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.get("type") == "risk":
+            risks.append(ev)
+    assert len(risks) == 1  # 只告警一次
+    db = factory()
+    assert db.get(LiveOrder, lo_id).status == "submitted"  # 保留 submitted 继续重试
+    db.close()
+
+
+def test_close_sweep_cancels_real_order_before_marking(monkeypatch):
+    """A-3：收盘清扫标 canceled 前 best-effort 撤真实单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[], deals=[])  # 实时表已无此单
+    engine = _make_engine(disp, factory, port)
+    from core.engine.trading_calendar import TradingCalendar
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+    db = factory()
+    _pending_order_with_ref(db, ref="ref-tdx-1")
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    assert disp.cancel_calls == [("ref-tdx-1", "600000.SH")]
+    db = factory()
+    lo = db.query(LiveOrder).first()
+    assert lo.status == "canceled"
+    db.close()
+
+
+def test_close_sweep_cancel_failure_does_not_block_sweep():
+    """A-3：撤单失败（best-effort）仅告警，不阻断清扫终态（收盘后当日单自然失效）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[], deals=[], cancel_ok=False)
+    engine = _make_engine(disp, factory, port)
+    from core.engine.trading_calendar import TradingCalendar
+    engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
+    db = factory()
+    _pending_order_with_ref(db, ref="ref-tdx-1")
+    db.commit()
+    db.close()
+
+    engine._maybe_close_sweep(now=datetime(2026, 8, 24, 15, 5))
+
+    db = factory()
+    assert db.query(LiveOrder).first().status == "canceled"  # 清扫不被阻断
+    db.close()
+
+
+def test_recover_backfills_submit_times_and_known_refs():
+    """A-4（C-2）：重启恢复挂回在途单时，ref 并入 _known_refs、按 created_at(UTC)
+    换算上海时间补记 _submit_times（通达信委托表无时间列，不补记则窗口匹配哑火）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher()
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo1 = _pending_order_with_ref(db, ref="W001",
+                                  created_at=datetime(2026, 10, 26, 2, 0))  # UTC 02:00
+    _pending_order_with_ref(db, ref=None)  # 无 ref 的单：不补记，也不崩
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert disp._known_refs == {"W001"}
+    assert disp._submit_times["W001"] == ("20261026", "100000")  # UTC+8 → 上海 10:00

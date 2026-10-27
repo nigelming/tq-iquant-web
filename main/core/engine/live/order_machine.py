@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from ..position import Position
 from ..event import OrderEvent, TradeEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
+from ...config import load_config
 from ...models import LiveOrder, LiveTrade
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -54,6 +55,10 @@ _ORDER_STATUS_JUNK = 57               # 废单：柜台拒单，终态
 _ORDER_STATUS_TERMINAL_CANCELED = (53, 54)
 _ORDER_STATUS_TERMINAL_REJECTED = (57,)
 
+# A-2：cancel_unfilled_orders 撤单成功后在 error_message 打的「已请求撤单」标记前缀。
+# 不加模型列——DB 持久化，Core 重启后仍可识别（区别于进程内 set）。
+_CANCEL_REQUESTED_TAG = "超时撤单请求中："
+
 
 class OrderStateMachine:
     """委托状态机：持久化 → 匹配 order_ref → 轮询 /deals 回填 → 终态/超时收口。
@@ -73,6 +78,9 @@ class OrderStateMachine:
         self.pending_orders: Dict[int, LiveOrder] = {}
         # G7（0011 §5.11）：最近一次 /deals 成交回报回填时点（None=尚无回填）。
         self.last_backfill_time: Optional[datetime] = None
+        # A-2：在途单超时撤单的连续失败计数与已告警标记（进程内，重启归零可接受）。
+        self._cancel_fail_counts: Dict[int, int] = {}
+        self._cancel_alerted: set = set()
 
     # ------------------------------------------------------------------
     # 持久化 / 匹配
@@ -513,6 +521,176 @@ class OrderStateMachine:
                 "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
                 "error_message": lo.error_message,
             })
+
+    # ------------------------------------------------------------------
+    # A-2：在途单超时自动撤单（I-4 + C-1 主路径）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cancel_unfilled_minutes() -> int:
+        """A-2 配置：tq_trade.cancel_unfilled_minutes（int，默认 3；<=0 禁用；非法回退默认）。"""
+        try:
+            tq = load_config().get("tq_trade") or {}
+            return int(tq.get("cancel_unfilled_minutes", 3))
+        except (TypeError, ValueError):
+            return 3
+        except Exception:  # noqa: BLE001 — 配置读取故障不阻断主 tick
+            return 3
+
+    def cancel_unfilled_orders(self, db: Session, pending: Optional[list] = None) -> None:
+        """A-2（I-4 + C-1 主路径）：在途单超时未成交 → 真实撤单（每轮主 tick 调用）。
+
+        对 submitted/partial 且**已有 order_ref** 的单：now - created_at ≥
+        ``tq_trade.cancel_unfilled_minutes``（默认 3 分钟；<=0 完全跳过=禁用）→
+        ``dispatcher.cancel_order(ref, code)``。通道无 cancel_order（如 iQuant 桥）→ 跳过。
+        partial 单同样适用（撤剩余量，已成交部分由回填收割）。
+
+        cancel 成功后的收敛顺序（**绝不立即标 canceled 丢已成交量**）：
+          1. error_message 打「超时撤单请求中：」标记（不加模型列，DB 持久化，重启后仍可识别）；
+          2. 立即调一次既有 backfill（query_deals 按 order_ref 过滤）收割已成交量；
+          3. 剩余量由 5s 轮询的终态同步收敛：委托表 53部撤/54全撤 → canceled；
+             委托表已查不到该 ref（撤单且无成交）→ 本方法下一轮直接标 canceled。
+        cancel 失败：保留 submitted 下轮重试；连续失败 ≥3 次经 _emit("risk") 告警一次
+        （不刷屏），继续下轮重试。
+        created_at 为 UTC naive（SQLite CURRENT_TIMESTAMP），与 expire_stale_orders
+        同用 utcnow 比较。调用方负责 commit（_tick_main 与 expire 同块提交）。
+        """
+        minutes = self._cancel_unfilled_minutes()
+        if minutes <= 0:
+            return
+        cancel = getattr(self._ctx.dispatcher, "cancel_order", None)
+        if not callable(cancel):
+            return  # 通道不支持撤单（iQuant 桥等）：完全跳过
+        if pending is None:
+            pending = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self._ctx.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        threshold = timedelta(minutes=minutes)
+        targets = [
+            lo for lo in pending
+            if lo.status in ("submitted", "partial")
+            and lo.order_ref is not None
+            and lo.created_at is not None
+            and (now_utc - lo.created_at) >= threshold
+        ]
+        if not targets:
+            return
+        # 已请求撤单的单：委托表已查不到该 ref（撤单且无成交）→ 直接标 canceled；
+        # 委托表仍在 → 53部撤/54全撤终态由 5s 轮询 sync_terminal_order_status 收敛。
+        tagged = [
+            lo for lo in targets
+            if (lo.error_message or "").startswith(_CANCEL_REQUESTED_TAG)
+        ]
+        if tagged:
+            try:
+                table_refs = {
+                    o.get("order_ref") for o in self._ctx.dispatcher.query_orders()
+                }
+            except Exception as e:  # noqa: BLE001 — 桥离线等：本轮跳过收敛，下轮再判
+                table_refs = None
+                logger.debug("cancel_unfilled: query_orders failed: %s", e)
+            if table_refs is not None:
+                for lo in tagged:
+                    if lo.order_ref in table_refs:
+                        continue
+                    self._finalize_timeout_canceled(db, lo)
+        for lo in targets:
+            if lo.status not in ("submitted", "partial"):
+                continue  # 本轮已收敛（_finalize_timeout_canceled 标 canceled 等）
+            if (lo.error_message or "").startswith(_CANCEL_REQUESTED_TAG):
+                continue  # 已请求过撤单，等终态收敛（或委托表消失后下一轮收口）
+            try:
+                ok = bool(cancel(lo.order_ref, lo.stock_code))
+            except Exception as e:  # noqa: BLE001 — 单笔失败计数重试，不阻断其余单
+                logger.warning(
+                    "cancel_unfilled: order %s ref %s cancel error: %s",
+                    lo.id, lo.order_ref, e,
+                )
+                ok = False
+            if ok:
+                self._cancel_fail_counts.pop(lo.id, None)
+                self._cancel_alerted.discard(lo.id)
+                lo.error_message = (
+                    _CANCEL_REQUESTED_TAG + "超时未成交已撤单（阈值 %d 分钟）" % minutes
+                )
+                logger.info(
+                    "cancel_unfilled: order %s %s %s cancel requested (ref=%s, "
+                    "age>=%dmin, filled=%s)",
+                    lo.id, lo.trade_type, lo.stock_code, lo.order_ref, minutes,
+                    int(lo.filled_quantity or 0),
+                )
+                # 实现取简：cancel 成功即按既有 backfill 收割一次已成交量（撤单前可能
+                # 已有部分成交）；剩余量按委托表状态（53部撤/54全撤）由 5s 轮询
+                # sync_terminal_order_status 自然收敛（含 partial 先 apply 再 cancel）。
+                try:
+                    deals = self._ctx.dispatcher.query_deals()
+                except Exception as e:  # noqa: BLE001
+                    deals = None
+                    logger.debug("cancel_unfilled: query_deals failed: %s", e)
+                if deals is not None:
+                    matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                    if matched:
+                        self.backfill_order(db, lo, matched)
+            else:
+                n = self._cancel_fail_counts.get(lo.id, 0) + 1
+                self._cancel_fail_counts[lo.id] = n
+                if n >= 3 and lo.id not in self._cancel_alerted:
+                    self._cancel_alerted.add(lo.id)
+                    self._emit("risk", {
+                        "rule": "cancel_unfilled_timeout",
+                        "portfolio_id": lo.portfolio_strategy_id,
+                        "order_id": lo.id,
+                        "stock_code": lo.stock_code,
+                        "message": (
+                            "在途单 %s（%s %s）超时撤单连续失败 %d 次，"
+                            "请人工检查交易客户端/柜台" % (
+                                lo.order_ref, lo.stock_code,
+                                (lo.trade_type or "").upper(), n)
+                        ),
+                    })
+                    logger.warning(
+                        "cancel_unfilled: order %s ref %s cancel failed %d times "
+                        "(risk alerted once)",
+                        lo.id, lo.order_ref, n,
+                    )
+
+    def _finalize_timeout_canceled(self, db: Session, lo: LiveOrder) -> None:
+        """A-2 收敛：撤单请求后委托表已查不到该单 → 标 canceled（有部分成交先 apply）。"""
+        if int(lo.filled_quantity or 0) > 0 and lo.status == "partial":
+            trade = (
+                db.query(LiveTrade)
+                .filter(LiveTrade.live_order_id == lo.id)
+                .first()
+            )
+            if trade is not None:
+                self.apply_filled_trade(
+                    lo, trade.price, trade.quantity, trade.amount, trade.commission
+                )
+        lo.status = "canceled"
+        lo.error_message = "超时未成交已撤单（撤单后委托表已查不到该单）"
+        self.pending_orders.pop(lo.id, None)
+        logger.info(
+            "cancel_unfilled: order %s %s %s finalized canceled (ref=%s vanished "
+            "from order table, filled=%s)",
+            lo.id, lo.trade_type, lo.stock_code, lo.order_ref,
+            int(lo.filled_quantity or 0),
+        )
+        self._emit("order", {
+            "portfolio_id": lo.portfolio_strategy_id,
+            "order_id": lo.id,
+            "status": "canceled",
+            "stock_code": lo.stock_code,
+            "trade_type": (lo.trade_type or "").upper(),
+            "quantity": lo.quantity,
+            "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
+            "filled_quantity": int(lo.filled_quantity or 0),
+            "error_message": lo.error_message,
+        })
 
     def sync_pending_orders(self, db: Session) -> None:
         """重查 DB 剩余 submitted/partial 同步在途集合（G7 计数）。

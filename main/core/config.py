@@ -54,6 +54,10 @@ def _defaults() -> dict:
             "account_type": "stock",
             "price_mode": "my",
             "client_path": "",
+            # A-6：新建实盘会话未显式选引擎时的默认交易引擎（用户主通道 tdx）。
+            "default_engine": "tdx",
+            # A-2：在途单超时未成交自动撤单（分钟）；<=0 = 禁用。
+            "cancel_unfilled_minutes": 3,
         },
         "qmt": {
             "path": "",

@@ -13,7 +13,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
@@ -606,6 +606,9 @@ class LiveEngine:
             db_tick = self._db_session_factory()
             try:
                 self._expire_stale_orders(db_tick)
+                # A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（与 expire 同块提交；
+                # 配置 cancel_unfilled_minutes<=0 或通道不支持撤单时内部直接跳过）。
+                self._cancel_unfilled_orders(db_tick)
                 db_tick.commit()
             except Exception:  # noqa: BLE001
                 db_tick.rollback()
@@ -1263,6 +1266,10 @@ class LiveEngine:
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         self._order_machine.expire_stale_orders(db, pending)
 
+    def _cancel_unfilled_orders(self, db: Session) -> None:
+        """A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（薄委托 → OrderStateMachine）。"""
+        self._order_machine.cancel_unfilled_orders(db)
+
     def _sync_pending_orders(self, db: Session) -> None:
         self._order_machine.sync_pending_orders(db)
 
@@ -1338,6 +1345,24 @@ class LiveEngine:
             .all()
         )
         self._pending_orders = {lo.id: lo for lo in pending}
+        # A-4（C-2）：重启恢复单的 ref 并入 dispatcher 的 _known_refs（A-5 防重放基线），
+        # 并按 created_at（UTC naive）换算上海时间补记 _submit_times——通达信委托表
+        # 无时间列，重启后不补记则 legacy 窗口匹配（_ORDER_INSERT_TOLERANCE）不可用，
+        # 挂回单的成交回填/认领会全部哑火。
+        submit_times = getattr(self._dispatcher, "_submit_times", None)
+        known_refs = getattr(self._dispatcher, "_known_refs", None)
+        for lo in pending:
+            ref = lo.order_ref
+            if not ref:
+                continue
+            if known_refs is not None:
+                known_refs.add(ref)
+            if submit_times is not None and ref not in submit_times:
+                if lo.created_at is not None:
+                    sh = lo.created_at + timedelta(hours=8)  # UTC naive → 上海 naive
+                else:
+                    sh = now_shanghai()
+                submit_times[ref] = (sh.strftime("%Y%m%d"), sh.strftime("%H%M%S"))
         if pending:
             logger.info(
                 "recover: %d pending live orders to backfill (session %s)",

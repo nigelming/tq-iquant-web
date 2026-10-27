@@ -334,6 +334,10 @@ class DailyCloser:
                         self._orders.apply_filled_trade(
                             lo, trade.price, trade.quantity, trade.amount, trade.commission
                         )
+                # A-3：标 canceled 前 best-effort 撤真实单（通道无 cancel_order 跳过；
+                # 异常/失败仅 warning，不阻断清扫终态——收盘后当日单自然失效）。
+                if lo.order_ref is not None:
+                    self._best_effort_cancel(lo)
                 lo.status = "canceled"
                 if not lo.error_message:
                     lo.error_message = "close sweep: unfilled remainder canceled after market close"
@@ -369,3 +373,30 @@ class DailyCloser:
             logger.exception("close sweep error (session %s)", self._ctx.session_id)
         finally:
             db.close()
+
+    def _best_effort_cancel(self, lo) -> None:
+        """A-3：清扫终态前 best-effort 撤真实委托。
+
+        通道无 cancel_order（如 iQuant 桥）→ 跳过；异常/失败仅 warning——收盘后
+        交易所/券商对当日单自动失效，撤单失败不阻断清扫终态。
+        """
+        cancel = getattr(self._ctx.dispatcher, "cancel_order", None)
+        if not callable(cancel):
+            return
+        try:
+            if cancel(lo.order_ref, lo.stock_code):
+                logger.info(
+                    "close sweep: cancel_order ok (order %s ref %s)",
+                    lo.id, lo.order_ref,
+                )
+            else:
+                logger.warning(
+                    "close sweep: cancel_order failed (order %s ref %s): %s",
+                    lo.id, lo.order_ref,
+                    getattr(self._ctx.dispatcher, "last_error", ""),
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "close sweep: cancel_order error (order %s ref %s): %s",
+                lo.id, lo.order_ref, e,
+            )

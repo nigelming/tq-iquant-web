@@ -241,6 +241,52 @@ def test_create_session_persists_engine(db_session):
     assert listed[0]["engine"] == "tdx"
 
 
-def test_create_session_defaults_engine_to_iquant(db_session):
+# ---------------- A-6：create_session 默认引擎（tq_trade.default_engine 覆盖） ----------------
+
+def test_default_engine_prefers_tq_trade_override(monkeypatch):
+    """A-6：tq_trade.default_engine 优先（用户主通道 tdx）。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "tdx"}))
+    assert svc.default_engine() == "tdx"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "qmt"}))
+    assert svc.default_engine() == "qmt"
+
+
+def test_default_engine_empty_or_invalid_falls_back_to_legacy(monkeypatch):
+    """A-6：未配置/空/非法 → 沿用旧行为（ths_ui.enabled → ths，否则 iquant）。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    assert svc.default_engine() == "iquant"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": ""}))
+    assert svc.default_engine() == "iquant"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "xyz"}))
+    assert svc.default_engine() == "iquant"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(True, tq_trade={"default_engine": ""}))
+    monkeypatch.setattr(svc, "ThsUiDispatcher", object)
+    assert svc.default_engine() == "ths"
+
+
+def test_create_session_defaults_engine_to_iquant(db_session, monkeypatch):
+    """无显式引擎且配置无 default_engine → 旧行为默认 iquant。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
     data = svc.create_session(db_session, {"name": "s2"}, "live")
     assert data["engine"] == "iquant"
+
+
+def test_create_session_uses_configured_default_engine(db_session, monkeypatch):
+    """A-6：create_session 未显式选引擎时用 tq_trade.default_engine。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "tdx"}))
+    data = svc.create_session(db_session, {"name": "s3"}, "live")
+    assert data["engine"] == "tdx"
+
+
+def test_config_defaults_carry_new_tq_trade_keys():
+    """A-7：core.config._defaults 与 SystemConfig TQ 通道段新键一一对应。"""
+    from core.config import _defaults
+    tq = _defaults()["tq_trade"]
+    assert tq["default_engine"] == "tdx"
+    assert tq["cancel_unfilled_minutes"] == 3

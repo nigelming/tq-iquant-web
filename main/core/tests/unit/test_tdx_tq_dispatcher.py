@@ -37,7 +37,7 @@ class FakeTq:
     """假 tqcenter.tq：记录调用、返回预置数据。"""
 
     def __init__(self, account_id=1, asset=None, positions=None, orders=None,
-                 order_result=0, msg="", subscribed=None):
+                 order_result=0, msg="", subscribed=None, cancel_result=None):
         self.account_id = account_id
         self.asset = asset or {}
         self.positions = positions or []
@@ -45,6 +45,11 @@ class FakeTq:
         self.order_result = order_result
         self.msg = msg
         self.subscribed = subscribed
+        # A-1：撤单返回值（SDK 形态：dict ErrorId="0"=成功 / -1=失败）
+        self.cancel_result = cancel_result if cancel_result is not None else {"ErrorId": "0"}
+        # A-5：按轮返回委托表（模拟「下单后新单延迟出现在委托表」）；None=用 self.orders
+        self.orders_rounds = None
+        self._round = 0
         self.calls = []
 
     def stock_account(self, account="", account_type=""):
@@ -67,7 +72,17 @@ class FakeTq:
 
     def query_stock_orders(self, aid):
         self.calls.append(("query_stock_orders", aid))
+        if self.orders_rounds is not None:
+            rows = self.orders_rounds[min(self._round, len(self.orders_rounds) - 1)]
+            self._round += 1
+            return rows
         return self.orders
+
+    def cancel_order_stock(self, **kwargs):
+        self.calls.append(("cancel_order_stock", kwargs))
+        if isinstance(self.cancel_result, Exception):
+            raise self.cancel_result
+        return self.cancel_result
 
     def order_stock(self, **kwargs):
         self.calls.append(("order_stock", kwargs))
@@ -168,8 +183,9 @@ def test_query_orders_maps_status_and_skips_cancel_rows(fake):
     assert o["filled_volume"] == 1000
     assert rows[1]["direction"] == 49   # 卖
     assert rows[1]["status"] == 54      # 已撤
-    # 非本进程下单的委托无插入时间（状态机据此跳过，避免冒领）
-    assert rows[0]["insert_date"] == "" and rows[0]["insert_time"] == ""
+    # A-5（行为变更）：非本进程下单的委托也补记当前上海时间（重启单/手工单兜底
+    # 窗口匹配可用），不再留空——留空会让状态机永远无法绑定该 ref → 180s 超时丢单。
+    assert rows[0]["insert_date"] and rows[0]["insert_time"]
 
 
 def test_place_order_resolves_ref_and_enables_legacy_match(fake, no_quote):
@@ -611,3 +627,130 @@ def test_query_quote_consistent_with_batch(monkeypatch):
     one = d.query_quote("000001", period="1m", count=10)
     batch = d.query_quotes_batch(["000001"], period="1m", count=10)
     assert one == batch["000001"]
+
+
+# ---------------- A-1：cancel_order（真实撤单） ----------------
+
+def _connected_dispatcher(**kw):
+    """跳过 _ensure 的真连接（单测直连假 tq）。"""
+    d = TdxTqDispatcher(**kw)
+    d._connected = True
+    d._account_id = 1
+    return d
+
+
+def test_cancel_order_success_returns_true(fake):
+    """SDK 返回 dict(ErrorId="0") → True，参数带后缀代码。"""
+    d = _connected_dispatcher()
+    assert d.cancel_order("W001", "000001") is True
+    call = [c for c in fake.calls if c[0] == "cancel_order_stock"][0][1]
+    assert call == {"account_id": 1, "stock_code": "000001.SZ", "order_id": "W001"}
+
+
+def test_cancel_order_minus_one_returns_false_with_error(fake):
+    """SDK 返回 -1（柜台失败/参数缺失）→ False + last_error。"""
+    fake.cancel_result = -1
+    d = _connected_dispatcher()
+    assert d.cancel_order("W001", "000001.SZ") is False
+    assert d.last_error
+
+
+def test_cancel_order_error_id_dict_returns_false(fake):
+    """SDK 返回 dict(ErrorId≠0) → False + last_error（防 SDK 形态变化）。"""
+    fake.cancel_result = {"ErrorId": "6", "Msg": "连接已断开"}
+    d = _connected_dispatcher()
+    assert d.cancel_order("W001", "000001.SZ") is False
+    assert "连接已断开" in d.last_error
+
+
+def test_cancel_order_connection_error_propagates(monkeypatch):
+    """TDXConnectionError（客户端离线）向上抛，不吞。"""
+    from core.tq.utils import TDXConnectionError
+
+    def boom():
+        raise TDXConnectionError("无法加载 tqcenter")
+
+    monkeypatch.setattr("core.engine.tdx_tq_dispatcher.get_tq", boom)
+    d = _connected_dispatcher()
+    with pytest.raises(TDXConnectionError):
+        d.cancel_order("W001", "000001.SZ")
+
+
+# ---------------- A-5：_resolve_order_id 认领加固 ----------------
+
+def test_get_orders_merges_known_refs_and_backfills_submit_times(fake):
+    """A-5：get_orders 返回后 refs 并入 _known_refs，缺 _submit_times 的 ref 用当前上海时间补记。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W001"), _order(code="600000", ref="W002")]
+    d.get_orders()
+    assert d._known_refs == {"W001", "W002"}
+    assert set(d._submit_times) == {"W001", "W002"}
+    date_s, time_s = d._submit_times["W001"]
+    assert date_s == now_shanghai().strftime("%Y%m%d")
+    assert len(time_s) == 6
+
+
+def test_resolve_prefers_new_ref_over_known_same_shape(fake):
+    """A-5：同形状候选中优先认领本轮新增 ref（预置 known 的旧单不冒领）。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W100")]
+    d.get_orders()  # 预热：W100 进入 _known_refs（模拟此前轮询已见过）
+    fake.orders_rounds = [
+        [_order(ref="W100"), _order(ref="W200")],
+    ]
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W200"
+    assert "W200" in d._claimed_refs
+
+
+def test_resolve_skips_claimed_refs(fake):
+    """A-5：已被本进程其它单认领的 ref 不重复认领。"""
+    d = _connected_dispatcher()
+    d._claimed_refs.add("W100")
+    fake.orders = [_order(ref="W100")]
+    assert d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1) == ""
+
+
+def test_resolve_falls_back_to_known_unclaimed_ref(fake):
+    """A-5：全部 attempts 无新增 ref 命中 → 放宽为形状匹配且未认领的任意 ref（兜底）。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W100")]
+    d.get_orders()  # W100 已知（非本轮新增）
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W100"
+    assert "W100" in d._claimed_refs
+
+
+def test_resolve_market_mode_skips_price_filter(fake):
+    """A-5：市价模式（latest→PRICE_SJ）委托表 WtPrice 可能为 0/非传入价 → 跳过价格过滤。"""
+    d = _connected_dispatcher(price_mode="latest")
+    fake.orders = [_order(price=0.0, ref="W300")]
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W300"
+
+
+def test_resolve_limit_mode_keeps_price_filter(fake):
+    """A-5：自填价模式（my→PRICE_MY）保持价格相等过滤（错价旧单不认领）。"""
+    d = _connected_dispatcher(price_mode="my")
+    fake.orders = [_order(price=9.9, ref="W301")]
+    assert d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1) == ""
+
+
+def test_resolve_known_refs_survive_reconnect(fake):
+    """A-5：connect() 重连不清空 _claimed_refs/_known_refs（进程内防重放）。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W100")]
+    d.get_orders()
+    d._claimed_refs.add("W100")
+    d.connect()  # fake account_id=1 → 重连成功
+    assert d._known_refs == {"W100"}
+    assert "W100" in d._claimed_refs
+
+
+def test_query_orders_backfills_insert_time_for_foreign_refs(fake):
+    """A-5（行为变更）：非本进程下单的委托也补记当前上海时间——重启单/手工单兜底认领后
+    状态机 legacy 窗口匹配可用（旧行为留空 → 状态机永远无法绑定 → 180s 超时丢单）。"""
+    fake.orders = [_order(status=3, filled=1000, ref="W001")]
+    d = _connected_dispatcher()
+    rows = d.query_orders()
+    assert rows[0]["insert_date"] and rows[0]["insert_time"]

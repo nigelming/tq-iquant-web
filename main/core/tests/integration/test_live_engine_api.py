@@ -119,11 +119,14 @@ def mock_bridge(monkeypatch):
 
 
 def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation",
-                    execution_mode="auto"):
-    resp = c.post("/api/live/sessions", json={
+                    execution_mode="auto", engine=None):
+    payload = {
         "name": name, "portfolio_ids": list(portfolio_ids), "mode": mode,
         "execution_mode": execution_mode,
-    })
+    }
+    if engine:
+        payload["engine"] = engine
+    resp = c.post("/api/live/sessions", json=payload)
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
@@ -690,7 +693,9 @@ def test_start_session_routes_engine_to_live_bridge(client, monkeypatch):
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
 
-    sid = _create_session(c, portfolio_ids=(ps_id,), mode="live")
+    # A-6 后全局默认引擎为 tq_trade.default_engine（tdx）；本测试验证 iQuant 桥按
+    # mode 选桥址，显式指定 engine=iquant 不依赖全局默认。
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="live", engine="iquant")
     resp = c.post("/api/live/sessions/%d/start" % sid)
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
@@ -726,7 +731,8 @@ def test_start_session_rejected_when_bridge_offline(client, monkeypatch):
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
 
-    sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation")
+    # 同上（A-6）：显式 engine=iquant，验证 iQuant 桥离线 503，不依赖全局默认引擎。
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="iquant")
     resp = c.post("/api/live/sessions/%d/start" % sid)
     body = resp.json()
     assert body["code"] == 503
