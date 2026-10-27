@@ -93,6 +93,46 @@ class TQFormula:
             if code not in _FORMULA_META_KEYS
         }, None
 
+    def compute_by_src(
+        self, formula_src: str, stocks: List[str], period: str = "1d",
+        count: int = -1, dividend_type: int = 1,
+        formula_type: int = 0, return_count: int = -1, return_date: bool = True,
+    ) -> dict:
+        """临时公式源码试算（tqcenter 1.3.1 formula_by_src，不保存公式）。
+
+        formula_type：0=指标 / 1=选股；dividend_type：0=不复权 / 1=前复权 / 2=后复权。
+        SDK 内部自动分批合并，无需平台再分批。输出与 compute 同构：
+        成功 {"ErrorId": "0", code: value}（经 _FORMULA_META_KEYS 清洗），
+        失败 {"ErrorId": 非0, "Error": ...}；空股票池短路不触 SDK。
+        """
+        if not stocks:
+            return {"ErrorId": "0"}
+        with get_tdx_lock():
+            tq = get_tq()
+            raw = tq.formula_by_src(
+                formula_src=formula_src,
+                stock_list=list(stocks),
+                stock_period=period,
+                start_time="",
+                end_time="",
+                count=count,
+                return_count=return_count,
+                return_date=return_date,
+                xsflag=-1,
+                dividend_type=dividend_type,
+                formula_type=formula_type,
+            )
+        if not isinstance(raw, dict) or not raw:
+            return {"ErrorId": "1", "Error": "公式试算无返回"}
+        err = raw.get("ErrorId")
+        if err is not None and str(err) != "0":
+            return {"ErrorId": str(err), "Error": raw.get("Error")}
+        return {
+            "ErrorId": "0",
+            **{code: value for code, value in raw.items()
+               if code not in _FORMULA_META_KEYS},
+        }
+
     def compute_xg(
         self, formula_name: str, formula_arg: str,
         stocks: Optional[List[str]] = None,

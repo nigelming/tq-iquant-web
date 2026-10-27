@@ -1,3 +1,4 @@
+import json
 import logging
 
 import pandas as pd
@@ -92,6 +93,96 @@ class TQData:
                     return {"code": b.get("BlockCode"),
                             "name": b.get("BlockName")}
             return None
+
+    # --- TQ 1.3.1 轻量包装（试算/交易日历/涨跌停/自选股/退订/除权/批量） ---
+    # 最薄透传：不包大 try/except，fail-open 由调用方负责；仅 SDK 打印型失败
+    # 或测试契约要求的场景返回安全默认。
+
+    def get_trading_dates(
+        self, market: str = "SH", start: str = "", end: str = "",
+    ) -> List[str]:
+        """交易日历，归一化为 ["YYYYMMDD", ...] 字符串列表。
+
+        探针实测（1.3.1）：market 传 'SH'（'SZ'/'1'/'0'/'' 均被 SDK 宽松接受，
+        返回同样结果）。SDK 失败打印并返回 []，异常亦归一为空列表。
+        """
+        try:
+            with get_tdx_lock():
+                raw = get_tq().get_trading_dates(
+                    market=market, start_time=start, end_time=end) or []
+            return [str(d).strip() for d in raw if str(d).strip()]
+        except Exception:
+            return []
+
+    def get_zdt_data(self, stocks: List[str]) -> dict:
+        """涨跌停状态：{code: {ZDTStatusNow/ZDTStatusOri/FirstTimeZT/DT, ...}}。
+
+        仅状态无价格，原样透传 SDK 的 Value，不做价格推断；空列表短路不触 SDK。
+        """
+        if not stocks:
+            return {}
+        with get_tdx_lock():
+            return get_tq().get_zdt_data(list(stocks)) or {}
+
+    def ensure_sector(self, block_code: str, block_name: str) -> dict:
+        """创建自定义板块（已存在时 SDK 端不报错，返回带 ErrorId 的结果）。
+
+        SDK create_sector 返回 JSON 字符串（失败 None），解析为 dict 供调用方判断。
+        """
+        with get_tdx_lock():
+            raw = get_tq().create_sector(block_code=block_code, block_name=block_name)
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return {}
+        return {}
+
+    def send_user_block(
+        self, block_code: str, stocks: List[str], show: bool = False,
+    ) -> dict:
+        """添加自选股到板块（show=True 时客户端展示该板块）。"""
+        with get_tdx_lock():
+            return get_tq().send_user_block(
+                block_code=block_code, stock_list=list(stocks), show=show) or {}
+
+    def unsubscribe_bars(self, stocks: List[str]) -> None:
+        """退订行情（unsubscribe_hq）。空列表直接返回不触 SDK——SDK 对空列表
+        raise ValueError 并 close 连接，绝不能让它发生。"""
+        if not stocks:
+            return
+        with get_tdx_lock():
+            get_tq().unsubscribe_hq(list(stocks))
+
+    def get_divid_factors(
+        self, stock_code: str, start: str = "", end: str = "",
+    ) -> pd.DataFrame:
+        """除权除息数据；空代码短路返回空 DataFrame（SDK 同样返回空表）。"""
+        if not stock_code:
+            return pd.DataFrame()
+        with get_tdx_lock():
+            df = get_tq().get_divid_factors(stock_code, start_time=start, end_time=end)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    def get_market_snapshot_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量市场快照（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_market_snapshot_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
+
+    def get_stock_info_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量证券基础信息（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_stock_info_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
+
+    def get_more_info_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量股票更多信息（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_more_info_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
 
     def get_history(
         self, stocks: List[str], periods: List[str],
