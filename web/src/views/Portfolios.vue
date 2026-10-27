@@ -391,6 +391,17 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
     const n = num(p[k])
     if (n !== null && !(n >= 0 && n <= 1)) return `${label} 须在 [0,1]`
   }
+  // 实盘预警调度（与后端 validate_signal_config 同口径）
+  const freq = p.signal_frequency as string | null | undefined
+  if (freq) {
+    if (!(freq in SIGNAL_FREQ_RANK)) return '信号频率非法'
+    const periodRank = SIGNAL_FREQ_RANK[String(p.period)]
+    if (periodRank !== undefined && SIGNAL_FREQ_RANK[freq] < periodRank) return '信号频率不能比周期更细'
+  }
+  const at = p.signal_at as string | null | undefined
+  if (at && !/^\d{2}:\d{2}$/.test(String(at))) return '推送时点须为 HH:MM（如 15:05）'
+  const wd = num(p.signal_weekday)
+  if (wd !== null && !(wd >= 1 && wd <= 5)) return '周几推送须为 1-5'
   return null
 }
 
