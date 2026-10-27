@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 class AlertDataDispatcher:
     channel = "alert"
     supports_remark = False
+    supports_batch_quote = True
 
     def __init__(self, **kwargs):
         self.last_error = ""
@@ -16,6 +17,9 @@ class AlertDataDispatcher:
 
     def query_quote(self, code, period="1m", count=10):
         return self._quote.query_quote(code, period=period, count=count)
+
+    def query_quotes_batch(self, codes, period="1m", count=10):
+        return self._quote.query_quotes_batch(codes, period=period, count=count)
 
     def query_calendar(self):
         return self._quote.query_calendar()

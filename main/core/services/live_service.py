@@ -758,6 +758,26 @@ def start_session(
         running_id = next(iter(engines))
         return None, session, (409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
 
+    # 空股票池预检（audit ⑯）：空池会让 BarPoller 静默订阅占位 000001.SZ 空转，
+    # 无任何告警；alert 与 auto 两条路径都在此拦截（位于 build_engine 之前，
+    # 不依赖交易通道在线）。
+    links = (
+        db.query(LiveSessionPortfolio)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    pool_codes: set = set()
+    for link in links:
+        ps = db.query(PortfolioStrategy).filter_by(
+            id=link.portfolio_strategy_id).first()
+        if ps is not None:
+            pool_codes.update(resolve_stock_codes(db, ps.id))
+    if not pool_codes:
+        return None, session, (
+            503,
+            "股票池为空：请先在组合策略中配置股票，或检查股票池同步",
+        )
+
     execution_mode = getattr(session, "execution_mode", None) or "auto"
     engine = build_engine(
         session_id, db, mode,

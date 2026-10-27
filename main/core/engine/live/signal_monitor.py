@@ -49,6 +49,7 @@ class SignalMonitor:
     ) -> None:
         effective = frequency or bar.period or "1m"
         candidates = []
+        prev_values: Dict[tuple, Optional[int]] = {}
         for st in strategies:
             if (st.signal_frequency or st.period) != effective:
                 continue
@@ -82,11 +83,18 @@ class SignalMonitor:
                             "trigger_value": cfg["trigger_value"],
                             "price": bar.stocks[code].get("close"),
                         })
+                        # 记录推送前的水位：send_warn 失败时回滚，下轮重试
+                        prev_values[key] = previous
                     self._last_value[key] = current
         if candidates:
-            self._persist_and_alert(candidates)
+            if not self._persist_and_alert(candidates):
+                # 推送失败（alert_status=failed）：恢复推送前水位，让同电平
+                # 信号下一轮重新进入候选重试（DB 层按 bar_time 幂等去重不变，
+                # 脉冲信号天然重触发不受影响）。
+                for key, prev in prev_values.items():
+                    self._last_value[key] = prev
 
-    def _persist_and_alert(self, candidates: list) -> None:
+    def _persist_and_alert(self, candidates: list) -> bool:
         db = self._db()
         rows = []
         try:
@@ -122,7 +130,7 @@ class SignalMonitor:
                 rows.append(row)
             db.commit()
             if not rows:
-                return
+                return True
             items = [
                 WarnItem(
                     stock_code=r.stock_code,
@@ -168,9 +176,11 @@ class SignalMonitor:
                     "alert_error": r.alert_error,
                     "tdx_run_id": r.tdx_run_id,
                 })
+            return bool(result.get("ok"))
         except Exception:
             db.rollback()
             logger.exception("persist live signals failed")
+            return False
         finally:
             db.close()
 

@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from core.models import (
     Base, Formula, FormulaSignal, LiveSession, LiveSessionPortfolio,
@@ -14,6 +15,33 @@ def _db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)()
+
+
+def _factory():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)
+
+
+def _seed_empty_pool(db, execution_mode="alert"):
+    db.add(LiveSession(id=9, name="e", mode="simulation", status="stopped",
+                       engine="tdx", execution_mode=execution_mode))
+    pool = StockPool(code="E", name="e")
+    db.add(pool)
+    db.flush()
+    f = Formula(id=9, name="momentum", content="C")
+    db.add(f)
+    db.flush()
+    db.add(FormulaSignal(formula_id=9, signal_name="buy",
+                         signal_type="OPEN", trigger_value=1))
+    port = PortfolioStrategy(id=9, name="e", stock_pool_id=pool.id,
+                             initial_capital=Decimal("100000"))
+    db.add(port)
+    db.add(LiveSessionPortfolio(session_id=9, portfolio_strategy_id=9))
+    db.add(Strategy(id=9, portfolio_id=9, name="e1", formula_id=9,
+                    period="1d", role="master", signal_frequency="1d"))
+    db.commit()
 
 
 def _seed(db, execution_mode="alert"):
@@ -85,3 +113,67 @@ def test_preflight_alert_returns_503_when_formula_smoke_raises(monkeypatch):
     assert status == 503
     assert "momentum" in msg
     assert "试算失败" in msg
+
+
+def test_start_session_rejects_empty_stock_pool_alert():
+    factory = _factory()
+    db = factory()
+    _seed_empty_pool(db, execution_mode="alert")
+    engine, session, error = live_service.start_session(
+        db, 9, {}, "simulation", db_session_factory=factory)
+    assert engine is None
+    assert error is not None
+    assert error[0] == 503
+    assert "股票池为空" in error[1]
+    assert session.status == "stopped"
+    db.close()
+
+
+def test_start_session_rejects_empty_stock_pool_auto():
+    factory = _factory()
+    db = factory()
+    _seed_empty_pool(db, execution_mode="auto")
+    engine, session, error = live_service.start_session(
+        db, 9, {}, "simulation", db_session_factory=factory)
+    assert engine is None
+    assert error is not None
+    assert error[0] == 503
+    assert "股票池为空" in error[1]
+    db.close()
+
+
+def test_start_session_non_empty_pool_proceeds(monkeypatch):
+    factory = _factory()
+    db = factory()
+    _seed(db)
+
+    class FakeDispatcher:
+        channel = "alert"
+        supports_remark = False
+        supports_batch_quote = True
+
+        def __init__(self, **kwargs):
+            self.last_error = ""
+
+        def heartbeat(self):
+            return True
+
+        def query_calendar(self):
+            return []
+
+        def query_quote(self, code, period="1m", count=10):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(live_service, "AlertDataDispatcher", FakeDispatcher)
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", lambda: None)
+    monkeypatch.setattr(live_service, "_smoke_formula_outputs",
+                        lambda *a, **kw: None)
+    engine, session, error = live_service.start_session(
+        db, 1, {}, "simulation", db_session_factory=factory)
+    assert error is None
+    assert engine is not None
+    assert engine.execution_mode == "alert"
+    db.close()

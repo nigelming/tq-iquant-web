@@ -79,6 +79,13 @@ def _bar():
     )
 
 
+def _bar_at(t):
+    return BarEvent(
+        stocks={"000001.SZ": {"close": Decimal("12.34")}},
+        bar_time=t, period="1d",
+    )
+
+
 def test_monitor_persists_and_alerts(monkeypatch):
     Session, _ = _factory()
     _seed(Session)
@@ -134,4 +141,46 @@ def test_monitor_marks_failed_alert():
     assert row.status == "failed"
     assert row.alert_status == "failed"
     assert "boom" in row.alert_error
+    db.close()
+
+
+def test_monitor_failed_alert_rolls_back_last_value():
+    Session, _ = _factory()
+    _seed(Session)
+    alert = FakeAlert(ok=False)
+    mon = SignalMonitor(1, Session, alert, lambda t, p: None, "alert")
+    ctx = _ctx()
+    t1 = datetime(2026, 10, 26, 14, 30)
+    cache1 = {(1, "000001.SZ", t1): [{"name": "buy", "value": 1}]}
+    mon.evaluate(ctx, _bar_at(t1), cache1,
+                 strategies=ctx.strategies, frequency="1d")
+    key = (1, "000001.SZ", "buy")
+    assert mon._last_value.get(key) is None
+    t2 = datetime(2026, 10, 27, 14, 30)
+    cache2 = {(1, "000001.SZ", t2): [{"name": "buy", "value": 1}]}
+    mon.evaluate(ctx, _bar_at(t2), cache2,
+                 strategies=ctx.strategies, frequency="1d")
+    assert len(alert.items) == 2
+    db = Session()
+    assert db.query(LiveSignal).count() == 2
+    db.close()
+
+
+def test_monitor_success_keeps_last_value():
+    Session, _ = _factory()
+    _seed(Session)
+    alert = FakeAlert(ok=True)
+    mon = SignalMonitor(1, Session, alert, lambda t, p: None, "alert")
+    ctx = _ctx()
+    t1 = datetime(2026, 10, 26, 14, 30)
+    cache = {(1, "000001.SZ", t1): [{"name": "buy", "value": 1}]}
+    mon.evaluate(ctx, _bar_at(t1), cache,
+                 strategies=ctx.strategies, frequency="1d")
+    key = (1, "000001.SZ", "buy")
+    assert mon._last_value[key] == 1
+    mon.evaluate(ctx, _bar_at(t1), cache,
+                 strategies=ctx.strategies, frequency="1d")
+    assert len(alert.items) == 1
+    db = Session()
+    assert db.query(LiveSignal).count() == 1
     db.close()
