@@ -10,11 +10,11 @@ import {
   type OrderRow, type TradeRow, type PositionRow, type DecisionRow,
 } from '../utils/liveWorkbench'
 import {
-  getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getPortfolios,
+  getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker, getLiveChannel, testLiveChannel,
   type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
-  type LiveChannelInfo, type LiveEngineKey,
+  type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 
@@ -26,7 +26,13 @@ const channelTesting = ref(false)
 const channelTestMsg = ref<{ ok: boolean; text: string } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
-const form = ref({ name: '', mode: 'simulation', engine: 'iquant' as LiveEngineKey, portfolio_ids: [] as number[] })
+// 默认与后端 create_session 对齐：新会话默认 alert（半自动预警，仅 TQ 行情+send_warn，不下单）
+const form = ref({
+  name: '', mode: 'simulation',
+  engine: 'iquant' as LiveEngineKey,
+  execution_mode: 'alert' as LiveExecutionMode,
+  portfolio_ids: [] as number[],
+})
 // 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
 const ENGINE_LABEL: Record<string, string> = {
   iquant: 'iQuant 桥', tdx: '通达信', ths: '同花顺', qmt: 'miniQMT',
@@ -34,6 +40,15 @@ const ENGINE_LABEL: Record<string, string> = {
 function engineLabel(key?: string): string {
   if (!key) return ENGINE_LABEL.iquant
   return channel.value?.engines?.find((e) => e.key === key)?.label || ENGINE_LABEL[key] || key
+}
+
+// 执行模式中文名（alert=预警/auto=自动）；老数据缺省视作 auto
+const EXECUTION_MODE_LABEL: Record<string, string> = { alert: '预警', auto: '自动' }
+function executionModeLabel(m?: string): string {
+  return EXECUTION_MODE_LABEL[m || 'auto'] || m || '自动'
+}
+function isAlert(s: LiveSessionItem): boolean {
+  return (s.execution_mode || 'auto') === 'alert'
 }
 
 // 组合级状态列表：优先用后端 portfolios 字段，缺省时兜底 portfolio_ids(无状态视为 active)
@@ -72,15 +87,42 @@ let es: EventSource | null = null
 const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk', 'decision'] as const
 const LOG_CAP = 200
 
-// ---- B4b: 工作台（持仓/委托/成交/决策拦截）----
+// ---- B4b: 工作台（持仓/委托/成交/决策拦截/预警信号）----
 const positions = ref<PositionRow[]>([])
 const orders = ref<OrderRow[]>([])
 const trades = ref<TradeRow[]>([])
 const decisions = ref<DecisionRow[]>([])
 const decisionSummary = ref<DecisionSummaryItem[]>([])
-type WbTab = 'positions' | 'orders' | 'trades' | 'decisions'
+const signals = ref<LiveSignalItem[]>([])
+const signalsTotal = ref(0)
+type WbTab = 'positions' | 'orders' | 'trades' | 'decisions' | 'signals'
 const wbTab = ref<WbTab>('positions')
-const TAB_LABEL: Record<WbTab, string> = { positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截' }
+const TAB_LABEL: Record<WbTab, string> = {
+  positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截', signals: '预警信号',
+}
+
+// 信号类型 / 预警推送状态中文映射
+const SIGNAL_TYPE_LABEL: Record<string, string> = {
+  OPEN: '开仓', ADD: '加仓', REDUCE: '减仓', CLOSE: '清仓',
+}
+function signalTypeLabel(t: string): string {
+  return SIGNAL_TYPE_LABEL[t] || t
+}
+const ALERT_STATUS_LABEL: Record<string, string> = {
+  sent: '已发送', failed: '发送失败', skipped: '已跳过',
+}
+function alertStatusLabel(s: string | null): string {
+  if (!s) return '—'
+  return ALERT_STATUS_LABEL[s] || s
+}
+function alertStatusClass(s: string | null): string {
+  if (s === 'sent') return 'badge-green'
+  if (s === 'failed') return 'badge-red'
+  return 'badge-gray'
+}
+function fmtTime(t: string | null): string {
+  return t ? t.replace('T', ' ').slice(0, 19) : '—'
+}
 
 // 决策闸门阈值/实际：比率（0<|v|<1）转百分比，数量原样。
 function fmtGateVal(v: number | null | undefined): string {
@@ -123,9 +165,10 @@ function applyToWorkbench(type: string, data: Record<string, unknown>, time: str
 
 async function loadHistory(id: number) {
   try {
-    const [pos, ord, trd, dec] = await Promise.all([
+    const [pos, ord, trd, dec, sig] = await Promise.all([
       getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
       getLiveDecisions(id).catch(() => null),
+      getLiveSignals(id, { limit: 200 }).catch(() => null),
     ])
     positions.value = positionHistoryToRows(pos)
     orders.value = orderHistoryToRows(ord)
@@ -133,6 +176,9 @@ async function loadHistory(id: number) {
     // 决策历史：聚合统计 + 逐事件（旧库/迁移未应用时端点 404 → 兜底空）
     decisionSummary.value = dec?.summary ?? []
     decisions.value = dec ? decisionHistoryToRows(dec.events) : []
+    // 预警信号：alert 模式主产物；auto 模式下也可能有信号落库
+    signals.value = sig?.items ?? []
+    signalsTotal.value = sig?.total ?? 0
   } catch {
     // 会话已删除等 → 保持现状
   }
@@ -178,7 +224,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: 'iquant', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: 'iquant', execution_mode: 'alert', portfolio_ids: [] }
   showCreate.value = true
 }
 
@@ -189,7 +235,7 @@ async function create() {
   }
   await createLiveSession(form.value)
   showCreate.value = false
-  form.value = { name: '', mode: 'simulation', engine: 'iquant', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: 'iquant', execution_mode: 'alert', portfolio_ids: [] }
   load()
 }
 
@@ -278,7 +324,7 @@ onUnmounted(closeEventStream)
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>引擎</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:var(--ink-soft)">#{{ s.id }}</td>
@@ -291,7 +337,15 @@ onUnmounted(closeEventStream)
             </span>
             <span v-if="portfolioStatuses(s).length === 0">-</span>
           </td>
-          <td><span class="badge badge-gray">{{ engineLabel(s.engine) }}</span></td>
+          <td>
+            <span class="badge" :class="isAlert(s) ? 'badge-blue' : 'badge-purple'"
+              :title="isAlert(s) ? '半自动预警：仅 TQ 行情 + send_warn 推送预警，不下单' : '全自动：按交易引擎下单'"
+            >{{ executionModeLabel(s.execution_mode) }}</span>
+          </td>
+          <td>
+            <span v-if="isAlert(s)" class="badge badge-gray" title="预警模式不经交易引擎下单">—</span>
+            <span v-else class="badge badge-gray">{{ engineLabel(s.engine) }}</span>
+          </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
@@ -414,6 +468,44 @@ onUnmounted(closeEventStream)
         <p>暂无闸门拦截/触发记录。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
       </div>
     </div>
+
+    <!-- 预警信号：alert 模式主产物（半自动），auto 模式仅落库不上送 -->
+    <div v-if="wbTab === 'signals'" class="table-wrap">
+      <p v-if="signalsTotal > signals.length" style="font-size:12px;color:var(--ink-faint);margin:0 0 6px">
+        共 {{ signalsTotal }} 条，仅显示最新 {{ signals.length }} 条
+      </p>
+      <table>
+        <thead><tr>
+          <th>bar 时间</th><th>组合/策略</th><th>代码</th><th>公式</th><th>信号</th>
+          <th>类型</th><th>触发值</th><th>价格</th>
+          <th>预警推送</th><th>推送时间</th><th>错误</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="s in signals" :key="s.id">
+            <td style="color:var(--ink-soft)">{{ fmtTime(s.bar_time) }}</td>
+            <td style="color:var(--ink-soft);font-size:12px">
+              {{ portfolioName(s.portfolio_id) }} / {{ strategyName(s.portfolio_id, s.strategy_id) }}
+            </td>
+            <td>{{ s.stock_code }}</td>
+            <td style="color:var(--ink-soft)">{{ s.formula_name }}</td>
+            <td>{{ s.signal_name }}</td>
+            <td><span class="badge badge-blue">{{ signalTypeLabel(s.signal_type) }}</span></td>
+            <td>{{ s.trigger_value }}</td>
+            <td>{{ s.price ?? '—' }}</td>
+            <td>
+              <span class="badge" :class="alertStatusClass(s.alert_status)"
+                :title="s.tdx_run_id ? `tdx_run_id: ${s.tdx_run_id}` : ''"
+              >{{ alertStatusLabel(s.alert_status) }}</span>
+            </td>
+            <td style="color:var(--ink-soft)">{{ fmtTime(s.alerted_at) }}</td>
+            <td style="color:var(--red);font-size:11px;white-space:normal;min-width:120px">{{ s.alert_error || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="signals.length === 0" class="empty-state">
+        <p>暂无预警信号。alert（半自动预警）模式下信号触发后会落库并通过通达信 send_warn 推送；auto（全自动）模式下仅记录信号不上送。</p>
+      </div>
+    </div>
   </div>
 
   <!-- B4a: 实时事件日志 -->
@@ -437,16 +529,27 @@ onUnmounted(closeEventStream)
       <h3>新建实盘</h3>
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
       <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
-      <label>交易引擎</label>
-      <select v-model="form.engine">
-        <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
-          {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
-        </option>
+      <label>执行模式</label>
+      <select v-model="form.execution_mode">
+        <option value="alert">预警（半自动，仅 TQ 行情 + send_warn 推送，不下单）</option>
+        <option value="auto">自动（按交易引擎下单）</option>
       </select>
+      <template v-if="form.execution_mode === 'auto'">
+        <label>交易引擎</label>
+        <select v-model="form.engine">
+          <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
+            {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
+          </option>
+        </select>
+      </template>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。下单由所选引擎执行：
-        iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 与 miniQMT 直连各自客户端；
-        同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
+        仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。
+        <span v-if="form.execution_mode === 'alert'">
+          预警模式：直接使用通达信 TQ 行情计算信号并通过 send_warn 推送预警，不经过下单通道，无需选择交易引擎；启动前会校验公式绑定与 TQ 可用性。
+        </span>
+        <span v-else>
+          自动模式：下单由所选引擎执行——iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 与 miniQMT 直连各自客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
+        </span>
       </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">

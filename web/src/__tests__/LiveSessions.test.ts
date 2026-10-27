@@ -21,6 +21,7 @@ vi.mock('../api', () => ({
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
   getLiveDecisions: vi.fn(),
+  getLiveSignals: vi.fn(),
   getPortfolios: vi.fn(),
 }))
 
@@ -49,7 +50,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getPortfolios, getLiveChannel, testLiveChannel } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel } from '../api'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -67,6 +68,7 @@ beforeEach(() => {
   ;(getLiveOrders as any).mockResolvedValue([])
   ;(getLiveTrades as any).mockResolvedValue([])
   ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
+  ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
   ;(getPortfolios as any).mockResolvedValue([])
   ;(getLiveChannel as any).mockResolvedValue({
     engine: 'iquant',
@@ -489,6 +491,124 @@ describe('LiveSessions.vue 执行通道条', () => {
 
     expect(w.text()).toContain('iQuant HTTP 桥')
     expect(w.text()).toContain('同花顺独立交易（UI 自动化）（未配置）')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 执行模式 + 预警信号', () => {
+  it('会话列表按 execution_mode 显示「预警/自动」，alert 会话引擎列显示 —', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 11, name: '预警盘', mode: 'live', status: 'stopped', engine: 'iquant', execution_mode: 'alert', started_at: null, stopped_at: null, portfolio_ids: [] },
+      { id: 12, name: '自动盘', mode: 'live', status: 'stopped', engine: 'tdx', execution_mode: 'auto', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const rows = w.findAll('tbody tr')
+    expect(rows.length).toBe(2)
+    expect(rows[0].text()).toContain('预警')
+    expect(rows[0].text()).not.toContain('iQuant 桥')
+    expect(rows[1].text()).toContain('自动')
+    expect(rows[1].text()).toContain('通达信')
+    w.unmount()
+  })
+
+  it('新建表单默认 alert，切到 auto 才显示交易引擎 select；提交带 execution_mode', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+
+    // 默认 alert：只有 名称/模式/执行模式 三个 select 区域，无引擎 select
+    const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
+    expect(execSelect).toBeTruthy()
+    expect((execSelect!.element as HTMLSelectElement).value).toBe('alert')
+    // alert 模式下不渲染交易引擎 select
+    expect(w.findAll('select').some((s) => s.html().includes('iQuant HTTP 桥'))).toBe(false)
+
+    // 切到 auto：出现交易引擎 select
+    await execSelect!.setValue('auto')
+    await flushPromises()
+    expect(w.findAll('select').some((s) => s.html().includes('iQuant HTTP 桥'))).toBe(true)
+
+    // 提交：带 execution_mode=auto
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      execution_mode: 'auto', portfolio_ids: [1],
+    }))
+    w.unmount()
+  })
+
+  it('预警信号 tab → 加载信号列表，显示 alert_status/alert_error', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { ...runningSession, execution_mode: 'alert' },
+    ])
+    ;(getLiveSignals as any).mockResolvedValue({
+      total: 2,
+      items: [
+        {
+          id: 1, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d',
+          bar_time: '2026-10-26T15:00:00', formula_name: 'MACD金叉', signal_name: 'BUY',
+          signal_type: 'OPEN', trigger_value: 1, price: '10.50',
+          execution_mode: 'alert', status: 'new',
+          alert_status: 'sent', alert_error: null, tdx_run_id: 'R123',
+          created_at: '2026-10-26T15:00:01', alerted_at: '2026-10-26T15:00:02',
+        },
+        {
+          id: 2, portfolio_id: 1, strategy_id: 10, stock_code: '000001.SZ', period: '1d',
+          bar_time: '2026-10-26T15:00:00', formula_name: 'MACD金叉', signal_name: 'SELL',
+          signal_type: 'CLOSE', trigger_value: -1, price: '9.80',
+          execution_mode: 'alert', status: 'new',
+          alert_status: 'failed', alert_error: 'send_warn 返回 ErrorId=1001', tdx_run_id: null,
+          created_at: '2026-10-26T15:00:01', alerted_at: null,
+        },
+      ],
+    })
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 10, name: '日线趋势' }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 切到「预警信号」tab
+    const tab = w.findAll('button').find((b) => b.text() === '预警信号')
+    expect(tab).toBeTruthy()
+    await tab!.trigger('click')
+    await flushPromises()
+
+    expect(getLiveSignals).toHaveBeenCalledWith(7, expect.objectContaining({ limit: 200 }))
+    expect(w.text()).toContain('600000.SH')
+    expect(w.text()).toContain('MACD金叉')
+    expect(w.text()).toContain('已发送')
+    expect(w.text()).toContain('发送失败')
+    expect(w.text()).toContain('send_warn 返回 ErrorId=1001')
+    // 组合/子策略名解析
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('日线趋势')
+    w.unmount()
+  })
+
+  it('预警信号 tab 空态：无信号时给出口径说明', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { ...runningSession, execution_mode: 'alert' },
+    ])
+    ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('暂无预警信号')
+    expect(w.text()).toContain('send_warn')
     w.unmount()
   })
 })

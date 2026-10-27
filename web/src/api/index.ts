@@ -1524,6 +1524,54 @@ export async function getLiveDecisions(sessionId: number) {
   return res.data.data
 }
 
+// ---- 预警信号（alert 模式）：live.session_signals ----
+// 字段对齐 live_service.serialize_signal；alert_status: sent|failed|skipped 等
+export interface LiveSignalItem {
+  id: number
+  portfolio_id: number
+  strategy_id: number
+  stock_code: string
+  period: string
+  bar_time: string | null
+  formula_name: string
+  signal_name: string
+  signal_type: string  // OPEN|ADD|REDUCE|CLOSE|RISK_*
+  trigger_value: number
+  price: string | null
+  execution_mode: string
+  status: string  // new|notified|...
+  alert_status: string | null  // sent|failed|skipped
+  alert_error: string | null
+  tdx_run_id: string | null
+  created_at: string | null
+  alerted_at: string | null
+}
+
+export interface LiveSignalData {
+  items: LiveSignalItem[]
+  total: number
+}
+
+export interface LiveSignalFilters {
+  strategy_id?: number
+  stock_code?: string
+  signal_type?: string
+  execution_mode?: string
+  alert_status?: string
+  start?: string  // ISO 时间
+  end?: string    // ISO 时间
+  limit?: number
+  offset?: number
+}
+
+export async function getLiveSignals(sessionId: number, filters: LiveSignalFilters = {}) {
+  const res = await api.get<ApiResponse<LiveSignalData>>(
+    `/live/sessions/${sessionId}/signals`,
+    { params: filters },
+  )
+  return res.data.data
+}
+
 // ---- #27: 实盘会话 CRUD/启停（LiveSessions.vue 曾原生 axios 直连）----
 // 列表对齐 live.py list_sessions serializer；启停/create 返回 {id, status}
 
@@ -1532,6 +1580,7 @@ export interface LiveSessionItem {
   name: string
   mode: string  // simulation|live
   engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
+  execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
   started_at: string | null
   stopped_at: string | null
@@ -1542,10 +1591,14 @@ export interface LiveSessionItem {
 // 实盘交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI自动化) / qmt(miniQMT)
 export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'qmt'
 
+// 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
+export type LiveExecutionMode = 'alert' | 'auto'
+
 export interface LiveSessionCreate {
   name: string
   mode: string
   engine?: LiveEngineKey
+  execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
 }
 
