@@ -694,3 +694,98 @@ describe('Portfolios.vue — 门控条件输入留空归一为 null（不再 422
     vi.unstubAllGlobals()
   })
 })
+
+describe('Portfolios.vue — 实盘预警调度（表单）', () => {
+  async function openNewStrategy(w: any) {
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').find((b: any) => b.text().includes('新建子策略'))!.trigger('click')
+  }
+
+  it('子策略表单含「实盘预警调度」组与四个字段', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+
+    expect(w.text()).toContain('实盘预警调度')
+    expect(w.text()).toContain('信号频率')
+    expect(w.text()).toContain('推送时点')
+    expect(w.text()).toContain('周几推送')
+    expect(w.text()).toContain('数据口径')
+    const freqSel = w.find('select[data-field="signal_frequency"]')
+    expect(freqSel.exists()).toBe(true)
+    expect(freqSel.html()).toContain('跟随周期')
+    expect(w.find('input[data-field="signal_at"]').exists()).toBe(true)
+    expect(w.find('input[data-field="signal_weekday"]').exists()).toBe(true)
+    const deSel = w.find('select[data-field="signal_data_end"]')
+    expect(deSel.exists()).toBe(true)
+    expect(deSel.html()).toContain('按频率默认')
+  })
+
+  it('默认不填 → payload 四字段全 null（不发空串）', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 20 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('input[data-field="name"]').setValue('ALERT_DEFAULT')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.signal_frequency).toBeNull()
+    expect(arg.signal_at).toBeNull()
+    expect(arg.signal_weekday).toBeNull()
+    expect(arg.signal_data_end).toBeNull()
+  })
+
+  it('填写 1d@15:05 + current → payload 原样携带', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 20 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('select[data-field="signal_frequency"]').setValue('1d')
+    await w.find('input[data-field="signal_at"]').setValue('15:05')
+    await w.find('select[data-field="signal_data_end"]').setValue('current')
+    await w.find('input[data-field="name"]').setValue('ALERT_SET')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.signal_frequency).toBe('1d')
+    expect(arg.signal_at).toBe('15:05')
+    expect(arg.signal_weekday).toBeNull()
+    expect(arg.signal_data_end).toBe('current')
+  })
+
+  it('编辑回填 1w@09:00/周一/completed，提交 round-trip；清空 weekday → null', async () => {
+    ;(updateStrategy as any).mockResolvedValue({ id: 10 })
+    ;(getStrategies as any).mockResolvedValue([{
+      ...mockStrategies[0],
+      signal_frequency: '1w', signal_at: '09:00', signal_weekday: 1, signal_data_end: 'completed',
+    }])
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const editBtn = w.findAll('.strategy-sub-row button').find((b: any) => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    expect((w.find('select[data-field="signal_frequency"]').element as HTMLSelectElement).value).toBe('1w')
+    expect((w.find('input[data-field="signal_at"]').element as HTMLInputElement).value).toBe('09:00')
+    expect(Number((w.find('input[data-field="signal_weekday"]').element as HTMLInputElement).value)).toBe(1)
+
+    await w.find('input[data-field="signal_weekday"]').setValue('')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(updateStrategy).toHaveBeenCalledTimes(1)
+    const arg = (updateStrategy as any).mock.calls[0][2]
+    expect(arg.signal_frequency).toBe('1w')
+    expect(arg.signal_at).toBe('09:00')
+    expect(arg.signal_weekday).toBeNull()
+    expect(arg.signal_data_end).toBe('completed')
+  })
+})

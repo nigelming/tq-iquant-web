@@ -842,6 +842,10 @@ export interface StrategyDetail {
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
   exposure_cap_enabled: boolean
+  signal_frequency?: string | null
+  signal_at?: string | null
+  signal_weekday?: number | null
+  signal_data_end?: string | null
 }
 
 export interface StrategyRequest {
@@ -869,6 +873,10 @@ export interface StrategyRequest {
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
   exposure_cap_enabled?: boolean
+  signal_frequency?: string | null
+  signal_at?: string | null
+  signal_weekday?: number | null
+  signal_data_end?: string | null
 }
 
 // 独立子策略 CRUD（两层设计：组合下单独管理子策略）

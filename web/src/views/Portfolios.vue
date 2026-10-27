@@ -60,6 +60,13 @@ const DAILY_LOSS_BASES = [
   { value: 'initial', label: '初始资金（旧口径，阈值恒定）' },
 ]
 
+// 实盘预警调度（alert 半自动）：NULL=跟随默认；rank 与后端 validate_signal_config 同口径
+const SIGNAL_FREQUENCIES = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
+const SIGNAL_FREQ_RANK: Record<string, number> = {
+  '1m': 0, '5m': 1, '15m': 2, '30m': 3, '1h': 4, '1d': 5, '1w': 6, '1mon': 7,
+}
+const WEEKDAY_LABELS: Record<number, string> = { 1: '周一', 2: '周二', 3: '周三', 4: '周四', 5: '周五' }
+
 // 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
 const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_drawdown', 'daily_loss_limit',
@@ -81,6 +88,7 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
+  'signal_weekday',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -133,7 +141,7 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
   ]},
 ]
 
-const STRATEGY_GROUPS: { title: string; fields: FieldMeta[] }[] = [
+const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] = [
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '子策略名称' },
     { key: 'formula_id', label: '公式', span: 1, type: 'select', options: 'formulas' },
@@ -168,6 +176,12 @@ const STRATEGY_GROUPS: { title: string; fields: FieldMeta[] }[] = [
     { key: 'trend_max_positions', label: '趋势最大持仓', span: 1, type: 'number', placeholder: '5', showIf: { key: 'regime_filter_enabled', equals: true } },
     { key: 'exposure_cap_enabled', label: '策略级敞口上限', span: 2, type: 'switch', hint: '总持仓市值 ≤ capital_ratio × 初始资金' },
   ]},
+  { title: '实盘预警调度', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。', fields: [
+    { key: 'signal_frequency', label: '信号频率', span: 1, type: 'select', options: 'signalFrequencies' },
+    { key: 'signal_at', label: '推送时点', span: 1, type: 'text', placeholder: 'HH:MM，按频率默认（如 15:05）' },
+    { key: 'signal_weekday', label: '周几推送', span: 1, type: 'number', placeholder: '1-5（仅 1w，默认周一）' },
+    { key: 'signal_data_end', label: '数据口径', span: 1, type: 'select', options: 'signalDataEnds' },
+  ]},
 ]
 
 function emptyStrategyForm(): Record<string, any> {
@@ -182,6 +196,7 @@ function emptyStrategyForm(): Record<string, any> {
     rotation_enabled: false, rotation_momentum_bars: 20, rotation_hysteresis: 0.05,
     regime_filter_enabled: false, trend_trailing_stop_ratio: null, trend_max_positions: null,
     exposure_cap_enabled: false,
+    signal_frequency: null, signal_at: '', signal_weekday: null, signal_data_end: null,
   }
 }
 
@@ -303,6 +318,8 @@ function buildStrategyPayload(): StrategyRequest {
     out.master_strategy_id = null
     out.slave_exit_mode = 'independent'
   }
+  // 实盘预警调度：text 空串归一 null（后端可空字段，发 '' 会 422）
+  if (out.signal_at === '') out.signal_at = null
   return out as unknown as StrategyRequest
 }
 
@@ -497,6 +514,10 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     rotation_hysteresis: s.rotation_hysteresis, regime_filter_enabled: s.regime_filter_enabled,
     trend_trailing_stop_ratio: s.trend_trailing_stop_ratio, trend_max_positions: s.trend_max_positions,
     exposure_cap_enabled: s.exposure_cap_enabled,
+    signal_frequency: s.signal_frequency ?? null,
+    signal_at: s.signal_at ?? '',
+    signal_weekday: s.signal_weekday ?? null,
+    signal_data_end: s.signal_data_end ?? null,
   }
   for (const k of STRATEGY_RATIO_FIELDS) {
     strategyForm.value[k] = toPercent(strategyForm.value[k], true)
@@ -568,6 +589,15 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'slaveExitModes') return SLAVE_EXIT_MODES.map(m => ({ value: m.value, label: m.label }))
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
+  if (src === 'signalFrequencies') return [
+    { value: null, label: '跟随周期（period）' },
+    ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),
+  ]
+  if (src === 'signalDataEnds') return [
+    { value: null, label: '按频率默认（1d/日内=current，1w/1mon=completed）' },
+    { value: 'current', label: 'current（当前）' },
+    { value: 'completed', label: 'completed（已完成）' },
+  ]
   if (src === 'masters') return (pid ? masterOptions(pid, editingStrategyId.value) : []).map(m => ({ value: m.id, label: m.name }))
   return []
 }
@@ -775,7 +805,7 @@ onMounted(loadPortfolios)
 
         <div class="modal-body">
           <div v-for="g in STRATEGY_GROUPS" :key="g.title">
-            <label class="group-label">{{ g.title }}</label>
+            <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
             <div class="field-grid">
               <div
                 v-for="fld in g.fields" :key="fld.key"
@@ -864,4 +894,5 @@ onMounted(loadPortfolios)
 </template>
 
 <style scoped>
+.group-hint { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--ink-faint); }
 </style>
