@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
@@ -180,12 +181,18 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     if session_id in _ENGINES:
         return ok({"id": session.id, "status": "running"})
 
-    engine, _session, error = svc.start_session(
-        db, session_id, _ENGINES, session.mode,
-        db_session_factory=SessionLocal,
-        dispatcher_cls=(
-            None if (session.execution_mode or "auto") == "alert"
-            else _dispatcher_cls_for(session)
+    # I-6（audit）：同步重活（建引擎 / heartbeat 通道探测 / preflight / recover 重放）
+    # 经线程池执行——事件循环不被阻塞（TQ/桥探测失败要等超时，秒级冻结会拖垮 SSE）。
+    # 先取齐纯值，避免 worker 线程访问 loop 线程加载的 ORM 实例属性。
+    # 兜底沿用原语义：execution_mode 为空（迁移前历史会话）按 "auto" 解析。
+    mode = session.mode
+    exec_mode = session.execution_mode or "auto"
+    dispatcher_cls = None if exec_mode == "alert" else _dispatcher_cls_for(session)
+    engine, _session, error = await run_in_threadpool(
+        lambda: svc.start_session(
+            db, session_id, _ENGINES, mode,
+            db_session_factory=SessionLocal,
+            dispatcher_cls=dispatcher_cls,
         ),
     )
     if error is not None:
@@ -219,6 +226,10 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
     if engine is not None:
         if hasattr(engine, "_running"):
             engine._running = False
+        # I-5：同步置拒单闸——在途 tick 的 _handle_bar 入口即刻不再发新单
+        # （不等 engine.stop() 协程被调度）。
+        if hasattr(engine, "_stop_requested"):
+            engine._stop_requested = True
         asyncio.create_task(engine.stop())
     return ok({"id": session_id, "status": "stopped"})
 
@@ -330,13 +341,23 @@ def _sse_line(ev: dict) -> str:
     return "event: %s\ndata: %s\n\n" % (ev_type, json.dumps(data, ensure_ascii=False))
 
 
-async def _heartbeat_stream(request: Request):
-    """未运行 session 的 /stream：仅 30s ping 保活心跳（EventSource 自动重连，无需重连逻辑）。"""
+async def _heartbeat_stream(request: Request, session_id: int,
+                            ping_interval: float = 30.0):
+    """未运行 session 的 /stream：仅 ping 保活心跳（默认 30s，EventSource 自动重连）。
+
+    D-5（前端 I4）：心跳期间引擎注册（session 在别处启动/页面迟到）→ 每次 ping 前
+    先查注册表，命中则发一条 `event: reconnect` 再结束流——前端收到后关闭当前
+    EventSource 重连，落到真事件流（否则心跳流一直空转，用户看不到实时事件）。
+    _ENGINES 是进程级 dict，.get 原子读，线程安全够用。
+    """
     while True:
         if await request.is_disconnected():
             break
+        if _ENGINES.get(session_id) is not None:
+            yield _sse_line({"type": "reconnect", "session_id": session_id})
+            return
         yield _sse_line({"type": "ping", "time": datetime.now().isoformat()})
-        await asyncio.sleep(30)
+        await asyncio.sleep(ping_interval)
 
 
 @router.get("/sessions/{session_id}/stream")
@@ -366,7 +387,7 @@ async def session_stream(session_id: int, request: Request, db: Session = Depend
             finally:
                 await agen.aclose()
         else:
-            async for line in _heartbeat_stream(request):
+            async for line in _heartbeat_stream(request, session_id):
                 yield line
 
     from fastapi.responses import StreamingResponse

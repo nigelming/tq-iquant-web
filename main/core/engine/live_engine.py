@@ -236,16 +236,27 @@ class LiveEngine:
         self._dispatched_boundaries: set = set()
 
         self._running = False
+        # I-5：stop 请求标记（stop() 首行置 True、start() 重置 False）。提交链入口
+        # 据此拒新单——_running 兼作「循环是否在跑」，直调 _handle_bar 的同步路径
+        # （测试/ recover 前置）需要放行，故用独立标记表达「已请求停止」语义。
+        self._stop_requested = False
         self._task: Optional[asyncio.Task] = None
         # G5：/deals 回填轮询的独立任务（与主循环并行，见 _deals_loop）
         self._deals_task: Optional[asyncio.Task] = None
-        # 审计 #3：_loop/_deals_loop 的同步阻塞 I/O（heartbeat/poll/_poll_deals，全用同步
-        # httpx.Client）整轮丢到此单 worker 线程池执行——事件循环不再被阻塞 I/O 冻结。
-        # max_workers=1 让两循环的 tick 严格串行：共享 _pending_orders / positions /
+        # 审计 #3：_loop 的同步阻塞 I/O（heartbeat/poll/_maybe_daily_*，全用同步
+        # httpx.Client）整轮丢到此单 worker 线程执行——事件循环不再被阻塞 I/O 冻结。
+        # max_workers=1 让主循环 tick 严格串行：共享 _pending_orders / positions /
         # signal_cache 无并发竞争（沿用既有「同事件循环协作式」的串行语义，只是换到线程）。
         # 单 worker 还保证 cancel 后已排队的 tick 不与下一轮重叠（asyncio.Lock 在 cancel
         # 时会释放，无法保证；单 worker 天然排队）。
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+        # I-8（audit）：_deals_loop 的 tick 投独立单 worker 池——与主循环各自的
+        # 1-worker 池互不饿死（真机：主循环拉 ~73 只行情 50-57s/轮时，5s 节拍的
+        # deals 回填不再排队等主 tick）。共享资源由 TQ 锁 get_tdx_lock 串行化；
+        # 跨池状态访问沿用既有协作式约定（deals tick 只回填已确认成交）。
+        self._deals_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="live-deals"
+        )
         # _emit 跨线程投递用：start() 时捕获运行中的事件循环；worker 线程内 _emit 经
         # call_soon_threadsafe 回到事件线程 put_nowait（asyncio.Queue 非线程安全）。
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
@@ -269,6 +280,8 @@ class LiveEngine:
         # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
         # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
         self._reconcile_mismatches: List[dict] = []
+        # I-7：收盘复查对账的幂等日期标记（每交易日一次，见 _maybe_reconcile_after_close）
+        self._last_reconcile_date: Optional[date] = None
         # B5：SSE 事件总线（0010 步骤 1 抽到 core.engine.live.event_bus.EventBus）。
         # 持有订阅队列集合、跨线程投递、ping 心跳；引擎保留 _emit/stream_events 薄委托，
         # 并暴露 _stream_subscribers/_stream_ping_interval 兼容测试直连。
@@ -482,6 +495,7 @@ class LiveEngine:
         if self._running:
             return
         self._running = True
+        self._stop_requested = False  # 重启支持：清掉上次 stop 的拒单闸
         # 审计 #3：捕获运行中的事件循环，供 _emit 跨线程 call_soon_threadsafe 回投。
         self._loop_ref = asyncio.get_running_loop()
         self._event_bus.bind_loop(self._loop_ref)
@@ -494,26 +508,60 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 pass
         self._executor = ThreadPoolExecutor(max_workers=1)
-        # C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路）。
-        # 一次同步 TDX 计算（get_tdx_lock 串行），阻塞事件循环可接受（启动一次性）。
-        if self.execution_mode != "alert":
-            self._inject_startup_periods(
-                datetime.combine(now_shanghai().date(), datetime.min.time())
-            )
-        # 预热 1m/5m/15m/30m/1h 历史 bar 到 _preheat_cache（启动一次性同步拉取）。
-        # 运行期 _get_bars_with_increment 读缓存 + 增量拼接，省去每 bar/每边界全量重拉。
-        # 必须在 _loop 起来前完成（否则首个 bar 触发时缓存未就绪）；与 _inject_startup_periods
-        # 同为启动一次性，并列。单 (code,period) 失败不阻断，运行期自愈。
-        self._preheat()
+        # I-8：deals 独立池同理随 start 重建（stop 已 shutdown 旧池）
+        if self._deals_executor is not None:
+            try:
+                self._deals_executor.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        self._deals_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="live-deals"
+        )
+        # I-6（audit）：启动一次性同步重活（通达信 1w/1mon 注入 + 全量预热拉取）
+        # 经 executor 执行——事件循环不被 TDX 计算/桥拉取阻塞（SSE/HTTP 保持响应）。
+        # await 等其完成再起循环，时序语义与原同步内联一致。
+        await self._loop_ref.run_in_executor(self._executor, self._sync_startup)
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
         # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 60s 拉 bar 一起）
         if self.execution_mode != "alert":
             self._deals_task = asyncio.create_task(self._deals_loop())
 
+    def _sync_startup(self) -> None:
+        """start() 的一次性同步重活（I-6：在主 executor worker 线程执行）。
+
+        C6(C)：启动时通达信注入 1w/1mon 策略信号（桥端 xtdata 拉不到，仅此通路），
+        一次同步 TDX 计算（get_tdx_lock 串行）；随后预热 1m/5m/15m/30m/1h 历史 bar
+        到 _preheat_cache（运行期增量拼接，省每 bar/每边界全量重拉）。必须在 _loop
+        起来前完成（否则首个 bar 触发时缓存未就绪）；单 (code,period) 失败不阻断，
+        运行期自愈。
+        """
+        if self.execution_mode != "alert":
+            self._inject_startup_periods(
+                datetime.combine(now_shanghai().date(), datetime.min.time())
+            )
+        self._preheat()
+
+    def _dispatcher_close_safe(self) -> None:
+        """TQ 1.3.1：释放 dispatcher 资源（best-effort，可安全重复调用）。
+
+        stop() 经主 executor 执行本方法（I-5）：close 排队于在途 tick 之后——
+        在途 tick 持 get_tdx_lock 跑完后 close 自然获得锁，事件循环不被 TDX
+        退订对账阻塞。TdxTqDispatcher.close 做行情退订对账；其余通道 close 为
+        轻量/无操作；iQuant 桥无 close 则跳过。失败仅告警，不阻断停止流程。
+        """
+        close = getattr(self._dispatcher, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                logger.warning("dispatcher close failed on stop", exc_info=True)
+
     async def stop(self) -> None:
         """停循环任务。"""
         self._running = False
+        # I-5：先置拒单闸——cancel 期间在途 tick 若再走 _handle_bar 不发新单
+        self._stop_requested = True
         if self._task is not None:
             self._task.cancel()
             try:
@@ -538,20 +586,23 @@ class LiveEngine:
         self._event_bus.clear_loop()
         # B-1：停会话丢弃 deferred 日线信号订单（预期行为——未提交的信号不跨会话补发）。
         self._signal_bar_deferred.clear()
-        # 审计 #3：释放单 worker 线程（ThreadPoolExecutor 默认非 daemon，不 shutdown 会
-        # 在进程退出时挂起 join）。wait=False：正在跑的 tick 是 loopback HTTP，瞬间完成，
-        # 不阻塞 stop；任务已 cancel，不会再提交新 tick。
+        # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
+        # 跑完后 close 自然获得锁（同池 max_workers=1 串行排队），事件循环不被
+        # TDX 退订对账阻塞（原先在事件循环线程同步 close，秒级冻结）。
+        # RuntimeError = executor 已 shutdown（重复 stop）→ 同步兜底（close 幂等）。
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._dispatcher_close_safe
+            )
+        except RuntimeError:
+            self._dispatcher_close_safe()
+        # I-8：两池都 shutdown（wait=False：close 已在上方 await 完成，在途 tick
+        # 是 loopback HTTP/本地计算，瞬间完成；任务已 cancel 不会再提交新 tick）。
+        # 释放非 daemon worker 线程，防进程退出挂起。
         if self._executor is not None:
             self._executor.shutdown(wait=False)
-        # TQ 1.3.1：停止时释放 dispatcher 资源（TdxTqDispatcher.close 做行情退订
-        # 对账；其余通道 close 为轻量/无操作；iQuant 桥无 close 则跳过）。
-        # best-effort：失败仅告警，不阻断停止流程。
-        close = getattr(self._dispatcher, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:  # noqa: BLE001
-                logger.warning("dispatcher close failed on stop", exc_info=True)
+        if self._deals_executor is not None:
+            self._deals_executor.shutdown(wait=False)
 
     async def _loop(self) -> None:
         """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。
@@ -629,6 +680,9 @@ class LiveEngine:
             # 15:05 收盘清扫：交易日收盘后对仍未完结的单做确定性兜底（成交回填 +
             # 终态同步 + 剩余按 A 股收盘未成交=撤单标 canceled）。实时轮询的权威收口。
             self._maybe_close_sweep()
+            # I-7（audit）：收盘流程完成后每交易日一次对账复查（虚拟 vs 桥实际）——
+            # 此时在途单已终态收敛、成交已回填，差异最可信。
+            self._maybe_reconcile_after_close()
         except BridgeUnavailableError as e:
             self._bridge_online = False
             logger.warning("bridge unavailable: %s, skip this round", e)
@@ -639,14 +693,16 @@ class LiveEngine:
         """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
 
         成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 60s 拉 bar。
-        与主循环共用单 worker 线程池（审计 #3）：tick 串行，共享 _pending_orders /
-        positions 无并发竞争（沿用原「同事件循环协作式」串行语义）。_poll_deals 内部
+        I-8（audit）：tick 投独立单 worker 池（_deals_executor）——主循环拉全池行情
+        50-57s/轮时 deals 不再被饿死（原共享单池，deals tick 要排队等主 tick）。
+        共享资源（TQ 连接）由 get_tdx_lock 串行化；_pending_orders / positions 的
+        跨池访问沿用既有协作式约定（deals tick 只回填已确认成交）。_poll_deals 内部
         已兜底桥离线/查失败。
         """
         while self._running:
             try:
                 await asyncio.get_running_loop().run_in_executor(
-                    self._executor, self._tick_deals
+                    self._deals_executor, self._tick_deals
                 )
             except asyncio.CancelledError:
                 raise
@@ -831,6 +887,11 @@ class LiveEngine:
         submitted 阶段不 apply_trade、不写 LiveTrade，真实成交回报由 _poll_deals 回填确认后 apply。
         E5/E6：每 bar 先调 update_peak（跨日刷新 prev_close + 更新峰值 + max_drawdown 熔断检测）。
         """
+        # I-5（audit）：提交链入口拒单闸（deferred 放行与正常单共用此入口）——stop
+        # 已请求后不再发起新单。竞态窗口：stop() cancel 任务后，worker 线程在途的
+        # 最后一轮 tick 仍可能带着 bar 走进来。
+        if self._stop_requested:
+            return
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         total_value = portfolio.total_value(bar)
         # R3：每日首根 bar 补算上一日 daily_loss（与回测 enter_day 对齐，镜像回测时序——
@@ -1466,17 +1527,19 @@ class LiveEngine:
 
         recover 重建的虚拟持仓以 live_trades 为唯一源；桥 /positions 是账户真实持仓。
         比对口径：按 stock_code 聚合所有组合策略虚拟净持仓 vs 桥 volume。
-        差异只记 `_reconcile_mismatches` + 告警日志，**不自动修正账面**（首期安全：
+        差异记 `_reconcile_mismatches` + 告警日志 + risk SSE 事件（I-7：工作台事件
+        日志立即可见，无需翻 Core 日志），**不自动修正账面**（首期安全：
         在途单未回填/桥行情延迟期可能假不一致，自动修正反而引入错账；真机跑顺后
-        如需自动校准再放开）。桥离线 → 记日志跳过（不阻断 start）。
+        如需自动校准再放开）。桥离线 → 记日志跳过（保留上次差异结果，不闪空）。
         附加提示：实际有仓但虚拟无仓（如 Core 宕机期手动下单）也记录，供人工核对。
         """
-        self._reconcile_mismatches = []
         try:
             rows = self._dispatcher.query_positions()
         except BridgeUnavailableError:
             logger.warning("reconcile skipped: bridge offline (session %s)", self.session_id)
             return
+        # 查询成功才清空旧差异：桥离线跳过时保留上次结果（API 可见性不闪空）
+        self._reconcile_mismatches = []
         real: Dict[str, int] = {}
         for r in rows or []:
             inst = r.get("instrument")
@@ -1499,10 +1562,39 @@ class LiveEngine:
             self._reconcile_mismatches.append(
                 {"code": code, "virtual": v, "real": r, "diff": v - r}
             )
+            # I-7（audit）：差异推 risk 事件（形状照既有 risk：rule + message）
+            self._emit("risk", {
+                "rule": "reconcile_mismatch",
+                "stock_code": code,
+                "virtual": v,
+                "real": r,
+                "diff": v - r,
+                "message": "持仓对账差异 %s：虚拟=%d 桥实际=%d 差=%d" % (code, v, r, v - r),
+            })
             logger.warning(
                 "reconcile mismatch (session %s) %s: virtual=%d real=%d diff=%d",
                 self.session_id, code, v, r, v - r,
             )
+
+    def _maybe_reconcile_after_close(self, now: Optional[datetime] = None) -> None:
+        """I-7（audit）：每日收盘清扫完成后复查一次对账（幂等，每交易日一次）。
+
+        挂点在 _tick_main 的 _maybe_close_sweep 之后：此时在途单已终态收敛、
+        成交已回填，对账差异最可信。用 closer 的 last_close_sweep_date 判定
+        「清扫已完成」（deferred 重试轮不置位 → 顺延到清扫真正完成的那轮）。
+        """
+        today = (now or now_shanghai()).date()
+        if self._last_reconcile_date == today:
+            return
+        if self._last_close_sweep_date != today:
+            return
+        self._last_reconcile_date = today
+        self._reconcile_positions()
+
+    @property
+    def reconcile_mismatches(self) -> List[dict]:
+        """I-7：最近一次对账差异摘要（[] = 无差异/未对账），session API 序列化用。"""
+        return self._reconcile_mismatches
 
     @property
     def bridge_online(self) -> bool:

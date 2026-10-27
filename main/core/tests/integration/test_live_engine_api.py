@@ -330,6 +330,41 @@ def test_get_session_includes_bridge_status(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
+def test_get_and_list_sessions_include_reconcile_mismatches(client, mock_bridge):
+    """D-3（I-7）：session 详情/列表序列化并入 reconcile_mismatches——
+    运行中取引擎内存最近一次对账差异摘要；未运行（无引擎）为 []。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    # 未运行 → []
+    body = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert body["reconcile_mismatches"] == []
+
+    c.post("/api/live/sessions/%d/start" % sid)
+    engine = live_api._ENGINES[sid]
+    engine._reconcile_mismatches.append(
+        {"code": "600000.SH", "virtual": 1000, "real": 800, "diff": 200}
+    )
+    # 详情 → 引擎内存差异
+    body = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert body["reconcile_mismatches"] == [
+        {"code": "600000.SH", "virtual": 1000, "real": 800, "diff": 200},
+    ]
+    # 列表 → 同样并入（service 层从注册表取）
+    row = next(s for s in c.get("/api/live/sessions").json()["data"] if s["id"] == sid)
+    assert row["reconcile_mismatches"] == [
+        {"code": "600000.SH", "virtual": 1000, "real": 800, "diff": 200},
+    ]
+
+    c.post("/api/live/sessions/%d/stop" % sid)
+    # 停止（引擎已弹出注册表）→ []
+    body = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert body["reconcile_mismatches"] == []
+
+
 def test_sse_line_formats_event():
     """B5：_sse_line 把 {type, **payload} 格式化为 SSE 行（data 去掉 type 字段）。"""
     line = live_api._sse_line({"type": "signal", "portfolio_id": 1, "strategy_id": 1})
@@ -348,12 +383,41 @@ def test_heartbeat_stream_yields_ping_when_idle():
             return False
 
     async def drive():
-        gen = live_api._heartbeat_stream(_FakeRequest())
+        gen = live_api._heartbeat_stream(_FakeRequest(), 1)
         it = gen.__aiter__()
         first = await it.__anext__()
         assert first.startswith("event: ping\ndata: ")
         assert "\"time\"" in first
         await gen.aclose()
+
+    asyncio.run(drive())
+
+
+def test_heartbeat_stream_emits_reconnect_when_engine_registers():
+    """D-5（前端 I4）：心跳流在引擎注册（session 启动）后发 event: reconnect 并结束——
+    前端收到后关闭当前 EventSource 重连，落到真事件流。"""
+    import asyncio
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def drive():
+        gen = live_api._heartbeat_stream(_FakeRequest(), 4242, ping_interval=0.01)
+        it = gen.__aiter__()
+        first = await it.__anext__()
+        assert first.startswith("event: ping\ndata: ")
+        # 引擎注册（值本身不重要，非 None 即视为运行中）
+        live_api._ENGINES[4242] = object()
+        try:
+            second = await it.__anext__()
+            assert second.startswith("event: reconnect\ndata: ")
+            assert '"session_id": 4242' in second
+            # 发完 reconnect 流即结束（客户端 EventSource 触发重连）
+            with pytest.raises(StopAsyncIteration):
+                await it.__anext__()
+        finally:
+            live_api._ENGINES.pop(4242, None)
 
     asyncio.run(drive())
 
@@ -366,7 +430,7 @@ def test_stream_endpoint_pings_when_not_running(client, mock_bridge, monkeypatch
     db.close()
     sid = _create_session(c, portfolio_ids=(ps_id,))
 
-    async def fake_heartbeat(request):
+    async def fake_heartbeat(request, session_id):
         yield "event: ping\ndata: {\"time\": \"x\"}\n\n"
     monkeypatch.setattr(live_api, "_heartbeat_stream", fake_heartbeat)
 

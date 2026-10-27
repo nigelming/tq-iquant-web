@@ -4304,11 +4304,11 @@ def test_deals_loop_tick_runs_in_worker_thread():
     )
 
 
-def test_loop_and_deals_loop_ticks_serialize_via_single_worker():
-    """#3：_loop 与 _deals_loop 共享单 worker 线程池 → tick 严格串行，无并发重叠。
+def test_each_loop_ticks_serialize_within_own_worker():
+    """I-8：主循环与 deals 循环各自单 worker 池——各池内 tick 严格串行（不重叠）。
 
-    用两个带 sleep 的 spy 制造重叠窗口：若并发执行，两者会同时持有旗标；
-    单 worker 串行 → 任一时刻最多一个在跑，never overlap。
+    共享资源（TQ 锁 get_tdx_lock）由锁串行；两池独立后 deals 5s 节拍不再被
+    60s 主 tick 饿死（原共享单池的跨池串行语义由锁接管）。
     """
     import asyncio
     import threading
@@ -4326,25 +4326,27 @@ def test_loop_and_deals_loop_ticks_serialize_via_single_worker():
         poll_interval=0.005, deals_poll_interval=0.005,
     )
 
-    active = {"n": 0, "max": 0, "lock": threading.Lock()}
+    lock = threading.Lock()
+    main_active = {"n": 0, "max": 0}
+    deals_active = {"n": 0, "max": 0}
     import time
 
-    def _track(fn):
+    def _track(fn, state):
         def _w():
-            with active["lock"]:
-                active["n"] += 1
-                active["max"] = max(active["max"], active["n"])
+            with lock:
+                state["n"] += 1
+                state["max"] = max(state["max"], state["n"])
             try:
                 time.sleep(0.01)  # 制造重叠窗口
                 return fn() if fn is not None else None
             finally:
-                with active["lock"]:
-                    active["n"] -= 1
+                with lock:
+                    state["n"] -= 1
         return _w
 
-    engine._poll_deals = _track(None)
+    engine._poll_deals = _track(None, deals_active)
     orig_heartbeat = disp.heartbeat
-    disp.heartbeat = _track(orig_heartbeat)
+    disp.heartbeat = _track(orig_heartbeat, main_active)
 
     async def drive():
         await engine.start()
@@ -4353,9 +4355,12 @@ def test_loop_and_deals_loop_ticks_serialize_via_single_worker():
 
     asyncio.run(drive())
 
-    assert active["max"] <= 1, (
-        "_loop 与 _deals_loop tick 并发执行（max=%d）——共享状态竞争未消除"
-        % active["max"]
+    assert main_active["max"] <= 1, (
+        "主循环 tick 并发执行（max=%d）——主池单 worker 串行被破坏" % main_active["max"]
+    )
+    assert deals_active["max"] <= 1, (
+        "deals 循环 tick 并发执行（max=%d）——deals 池单 worker 串行被破坏"
+        % deals_active["max"]
     )
 
 
@@ -6264,3 +6269,163 @@ def test_recover_marks_pending_refs_as_claimed():
     db.close()
 
     assert "W001" in disp._claimed_refs
+
+
+# ---------------- 批次 D：实盘健壮性（I-5 stop 竞态 / I-7 对账可见 / I-8 deals 独立 worker）----------------
+def test_handle_bar_rejects_orders_after_stop():
+    """I-5：stop 请求后提交链入口拒单（deferred 放行与正常单共用入口），不再发起新单。
+
+    竞态窗口：stop() 置停止标记后，worker 线程在途的最后一轮 tick 仍可能带着
+    bar 走到 _handle_bar——入口闸保证这轮不再落单/发桥。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)  # 未 stop：正常提交（基线）
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    db.close()
+
+    asyncio.run(engine.stop())
+    # 清掉在途单，排除 F7 在途门干扰——只验证提交链入口闸本身；
+    # 换一只股票 + 新 bar，排除同股重复开仓/同 bar 去重等既有守卫。
+    engine._pending_orders.clear()
+    stock2 = "000001.SZ"
+    bar_time2 = datetime(2026, 8, 5, 10, 1)
+    engine.signal_cache = {(1, stock2, bar_time2): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(stock2, "9.3", bar_time2))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 1  # stop 后拒单，不落新单
+    db.close()
+
+
+def test_stop_closes_dispatcher_in_worker_before_pool_shutdown():
+    """I-5/I-8：stop 时 dispatcher.close 经主 executor（worker 线程）执行，
+    且发生在两池 shutdown 之前（close 排队在途 tick 之后，需主 worker 存活）。"""
+    import threading
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    observed = []
+
+    async def drive():
+        await engine.start()
+        orig = engine._dispatcher_close_safe
+
+        def spy():
+            observed.append(
+                (threading.current_thread().name, engine._executor._shutdown)
+            )
+            orig()
+
+        engine._dispatcher_close_safe = spy
+        await engine.stop()
+
+    asyncio.run(drive())
+
+    assert observed, "stop 未执行 dispatcher close"
+    assert observed[0][0] != threading.main_thread().name, (
+        "dispatcher close 在事件循环线程同步执行——TDX 退订对账会冻结事件循环"
+    )
+    assert observed[0][1] is False, "close 执行时主池已提前 shutdown（排队语义丢失）"
+    assert engine._executor._shutdown
+    assert engine._deals_executor._shutdown
+
+
+def test_deals_loop_ticks_run_in_dedicated_deals_pool():
+    """I-8：_deals_loop 的 tick 投独立单 worker 池（thread 名前缀 live-deals），
+    与主循环各自的单 worker 池互不饿死。"""
+    import threading
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        deals_poll_interval=0.01,
+    )
+    threads = set()
+    engine._poll_deals = lambda: threads.add(threading.current_thread().name)
+
+    async def drive():
+        await engine.start()
+        await asyncio.sleep(0.05)
+        await engine.stop()
+
+    asyncio.run(drive())
+
+    assert threads, "_poll_deals 未被调用"
+    assert all(t.startswith("live-deals") for t in threads), (
+        "deals tick 未投独立池（线程名=%s）" % threads
+    )
+
+
+def test_reconcile_mismatch_emits_risk_event():
+    """I-7：对账差异除日志外推 risk 事件（形状照既有 risk：rule/message），工作台可见。"""
+    factory, _ = _db_factory()
+    engine, _, ctx = _reconcile_engine(factory, 1000, respond=_positions_respond(800))
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._reconcile_positions()  # recover 已跑过一次，差异仍在，复查再推
+
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "reconcile_mismatch"
+    assert ev["stock_code"] == "600000.SH"
+    assert ev["virtual"] == 1000
+    assert ev["real"] == 800
+    assert ev["diff"] == 200
+    assert "600000.SH" in ev["message"]
+
+
+def test_reconcile_mismatches_property_exposed():
+    """I-7：引擎暴露 reconcile_mismatches 只读摘要（session API 序列化用）。"""
+    factory, _ = _db_factory()
+    engine, _, _ = _reconcile_engine(factory, 1000, respond=_positions_respond(800))
+
+    assert engine.reconcile_mismatches == [
+        {"code": "600000.SH", "virtual": 1000, "real": 800, "diff": 200},
+    ]
+
+
+def test_close_reconcile_runs_once_after_sweep_completes():
+    """I-7：收盘清扫完成后每交易日一次对账复查；清扫未完成/重复调用不触发。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    calls = []
+    engine._reconcile_positions = lambda: calls.append(1)
+
+    # 清扫未完成（closer 未置当日标记）→ 不触发
+    engine._maybe_reconcile_after_close(now=datetime(2026, 8, 5, 15, 6))
+    assert calls == []
+
+    # 清扫完成 → 触发一次
+    engine._last_close_sweep_date = date(2026, 8, 5)
+    engine._maybe_reconcile_after_close(now=datetime(2026, 8, 5, 15, 6))
+    assert len(calls) == 1
+
+    # 同日重复 tick → 幂等不再触发
+    engine._maybe_reconcile_after_close(now=datetime(2026, 8, 5, 15, 10))
+    assert len(calls) == 1

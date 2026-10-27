@@ -614,7 +614,10 @@ def build_engine(
 # session CRUD
 # ---------------------------------------------------------------------------
 
-def list_sessions(db: Session) -> list:
+def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) -> list:
+    """session 列表。engines 缺省取本模块注册表（I-7：并入引擎内存对账差异摘要）。"""
+    if engines is None:
+        engines = ENGINES
     sessions = db.query(LiveSession).all()
     # 一次取全部分组关系,避免 N+1(单用户规模可忽略,但分组写更干净)
     links = db.query(LiveSessionPortfolio).all()
@@ -635,6 +638,10 @@ def list_sessions(db: Session) -> list:
             "stopped_at": s.stopped_at,
             "portfolio_ids": sorted(p["portfolio_id"] for p in by_session.get(s.id, [])),
             "portfolios": by_session.get(s.id, []),
+            # I-7（audit）：运行中引擎最近一次对账差异摘要；未运行（无引擎）为 []
+            "reconcile_mismatches": (
+                list(engines[s.id].reconcile_mismatches) if s.id in engines else []
+            ),
         }
         for s in sessions
     ]
@@ -686,6 +693,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     # G7（0011 §5.11）：桥状态并入 session API。运行中取引擎实时态：
     # bridge_online 为实时心跳（/ping），pending_orders 在途单计数，last_backfill_time
     # 最近一次成交回报回填时点；未运行返回空值。
+    # I-7（audit）：reconcile_mismatches = 引擎内存最近一次对账差异摘要（未运行 []）。
     if engine is not None:
         data["bridge_online"] = engine.dispatcher.heartbeat()
         data["pending_orders"] = engine.pending_orders_count
@@ -693,10 +701,12 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
             engine.last_backfill_time.strftime("%Y-%m-%d %H:%M:%S")
             if engine.last_backfill_time is not None else None
         )
+        data["reconcile_mismatches"] = list(engine.reconcile_mismatches)
     else:
         data["bridge_online"] = None
         data["pending_orders"] = 0
         data["last_backfill_time"] = None
+        data["reconcile_mismatches"] = []
     return data
 
 
