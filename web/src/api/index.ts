@@ -1642,6 +1642,15 @@ export interface LiveSessionItem {
   stopped_at: string | null
   portfolio_ids: number[]
   portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
+  reconcile_mismatches?: ReconcileMismatch[]  // 最近一次虚拟持仓 vs 桥实际对账差异（未运行 []）
+}
+
+// I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
+export interface ReconcileMismatch {
+  code: string
+  virtual: number
+  real: number
+  diff: number
 }
 
 // 实盘交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI自动化) / qmt(miniQMT)

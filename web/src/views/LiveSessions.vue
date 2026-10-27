@@ -267,6 +267,15 @@ function startEventStream(id: number) {
   signalsTotal.value = 0
   events.value = []
   const source = new EventSource(`/api/live/sessions/${id}/stream`)
+  // D-5（audit 前端 I4）：心跳流升级——session 在页面未订阅时启动，后端心跳流
+  // 注册到引擎后发 reconnect 随即结束。收到后关当前 EventSource 重接真流；
+  // startEventStream 末尾 loadHistory 重拉，工作台/事件日志无缝续上。
+  // 防串台：仅当仍绑定同一 session 时才重接（旧流迟到的 reconnect 忽略）。
+  source.addEventListener('reconnect', () => {
+    if (activeSessionId !== id) return
+    closeEventStream()
+    startEventStream(id)
+  })
   EVENT_TYPES.forEach((t) => {
     source.addEventListener(t, (e: MessageEvent) => {
       const data = JSON.parse(e.data)

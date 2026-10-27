@@ -55,6 +55,13 @@ describe('formatEvent', () => {
     })).toBe('日内亏损熔断: 日内亏损熔断触发，当日暂停新开仓')
   })
 
+  it('formats risk reconcile_mismatch (audit I-7 对账差异)', () => {
+    expect(formatEvent('risk', {
+      rule: 'reconcile_mismatch', stock_code: '600000.SH',
+      message: '持仓对账差异 600000.SH：虚拟=1000 桥实际=800 差=200',
+    })).toBe('持仓对账差异: 持仓对账差异 600000.SH：虚拟=1000 桥实际=800 差=200')
+  })
+
   it('ping returns empty (skip)', () => {
     expect(formatEvent('ping', { time: '2026-08-05T14:30:00' })).toBe('')
   })

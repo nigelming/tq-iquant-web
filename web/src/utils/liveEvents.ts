@@ -128,6 +128,7 @@ export const ORDER_STATUS_LABEL: Record<string, string> = {
 const RISK_RULE_LABEL: Record<string, string> = {
   max_drawdown: '最大回撤熔断',
   daily_loss: '日内亏损熔断',
+  reconcile_mismatch: '持仓对账差异',
 }
 
 const fmt = (v: unknown): string => (v === null || v === undefined ? '' : String(v))

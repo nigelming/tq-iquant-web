@@ -755,6 +755,50 @@ describe('LiveSessions.vue loadHistory 与 SSE 竞态补拉（audit C1）', () =
   })
 })
 
+describe('LiveSessions.vue SSE 心跳流升级重接（D-5）', () => {
+  it('收到 reconnect 事件 → 关闭当前心跳流并重接同一 session 真流，历史重拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    expect(getLivePositions).toHaveBeenCalledTimes(1) // 初始 loadHistory
+
+    es.emit('reconnect', { session_id: 7 })
+    await flushPromises()
+
+    expect(es.close).toHaveBeenCalled()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/7/stream')
+    // startEventStream 末尾 loadHistory 重拉
+    expect(getLivePositions).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+
+  it('切换会话后旧流迟到的 reconnect → 不重接旧 session（防循环/串台）', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+
+    // 停止 7 → load() 切到外部已启动的 8
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([
+      { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+    expect(FakeEventSource.instances.length).toBe(2)
+
+    // 旧流（7）迟到的 reconnect：当前绑定已是 8 → 忽略
+    es7.emit('reconnect', { session_id: 7 })
+    await flushPromises()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    w.unmount()
+  })
+})
+
 describe('LiveSessions.vue 会话切换清理 + 停止时序 + 重连状态（audit M3）', () => {
   it('停止会话：先调 stop API 成功后再关事件流（接收清扫 canceled 终态）', async () => {
     const order: string[] = []
