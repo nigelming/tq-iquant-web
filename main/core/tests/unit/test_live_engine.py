@@ -242,14 +242,48 @@ def test_handle_bar_blocks_order_before_open():
 
 
 def test_handle_bar_daily_period_trading_day_at_midnight_ok():
-    """1d 周期 bar_time=00:00（14:30 驱动约定）：只判交易日，不卡时段，正常落单。"""
+    """1d 周期 bar_time=00:00（14:30 驱动约定）：只判交易日，不卡时段。
+
+    B-1 未来函数闸门：当日仅进 deferred 队列（不被收盘/时段门误杀），
+    次日首 bar 放行后正常提交。
+    """
     factory, _ = _db_factory()
     port, ctx = _portfolio_single(period="1d")
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 24, 0, 0)  # 日线约定 00:00
     rec = _Recorder()
     disp, _ = _make_dispatcher(rec)
-    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], stock)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+
+    engine._handle_bar(port, bar)
+
+    assert len(engine._signal_bar_deferred) == 1  # 当日 deferred（非时段门拦截）
+
+    # 次日首 bar 放行 → 正常提交
+    engine.signal_cache = {}
+    engine._handle_bar(port, _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    db.close()
+
+
+# ---- B-1 未来函数闸门实盘化（日线信号次日执行，对齐回测）----
+def test_handle_bar_daily_signal_deferred_same_day():
+    """B-1：日线信号当日不下单——进 deferred 队列 + 记 signal_bar_date defer 决策事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)  # 日线约定 00:00
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock
+    )
     engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
     bar = _bar(stock, "9.3", bar_time)
     bar.period = "1d"
@@ -257,8 +291,147 @@ def test_handle_bar_daily_period_trading_day_at_midnight_ok():
     engine._handle_bar(port, bar)
 
     db = factory()
+    assert db.query(LiveOrder).count() == 0  # 当日不落单
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 不发桥
+    assert len(engine._signal_bar_deferred) == 1  # 进 deferred 队列
+    deferred = engine._signal_bar_deferred[0]
+    assert deferred.signal_bar_date == date(2026, 8, 24)
+    assert deferred.bar_time == bar_time  # 生成时上下文（决策时间戳）保持
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="signal_bar_date").all()
+    assert len(evs) == 1 and evs[0].action == "defer"
+    db.close()
+
+
+def test_handle_bar_deferred_daily_signal_released_next_day():
+    """B-1：次日首 bar 到来 → deferred 订单自动放行重走提交链（bar_time 更新为当前 bar）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    day1 = datetime(2026, 8, 24, 0, 0)
+    day2 = datetime(2026, 8, 25, 9, 31)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock
+    )
+    engine.signal_cache = {(1, stock, day1): [{"name": "open_sig", "value": 1}]}
+    bar1 = _bar(stock, "9.3", day1)
+    bar1.period = "1d"
+    engine._handle_bar(port, bar1)
+    assert len(engine._signal_bar_deferred) == 1
+
+    engine.signal_cache = {}  # 次日无新信号
+    engine._handle_bar(port, _bar(stock, "9.3", day2))
+
+    db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].status == "submitted"
+    assert orders[0].bar_time == day2  # 决策时间戳 = 放行 bar
+    assert engine._signal_bar_deferred == []  # 队列清空
+    db.close()
+    assert any(r.url.path == "/order" for r in rec.requests)  # 已发桥
+
+
+def test_handle_bar_minute_signal_not_gated():
+    """B-1：分钟信号（signal_bar_date=None）不受闸门影响，当 bar 照常提交。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    assert engine._signal_bar_deferred == []  # 分钟信号不进队列
+    db.close()
+
+
+def test_stop_clears_signal_bar_deferred():
+    """B-1：stop() 丢弃 deferred 队列属预期，不报错。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine._signal_bar_deferred.append(OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=600, price=Decimal("9.3"),
+        bar_time=datetime(2026, 8, 24, 0, 0),
+        signal_bar_date=date(2026, 8, 24),
+    ))
+
+    asyncio.run(engine.stop())
+
+    assert engine._signal_bar_deferred == []
+
+
+# ---- B-2 策略级敞口上限实盘透传（对齐回测 _exposure_kwargs）----
+def _preset_position(ctx, stock, quantity, avg_cost):
+    """预置虚拟持仓（实盘每策略独立 ctx.positions）。"""
+    pos = Position(stock)
+    pos.quantity = quantity
+    pos.avg_cost = avg_cost
+    ctx.positions[stock] = pos
+
+
+def test_handle_bar_exposure_cap_rejects_buy_over_limit():
+    """B-2：exposure_cap_enabled=True + 策略持仓市值超 capital_ratio×初始资金 → 拒单+事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1m")
+    ctx.exposure_cap_enabled = True  # capital_ratio=0.6 × 100000 = 上限 60000
+    stock = "600000.SH"
+    _preset_position(ctx, "000001.SZ", 7000, Decimal("9.0"))  # 市值 63000 > 60000
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 敞口超限拒单，不落单
+    evs = db.query(LiveDecisionEvent).filter_by(gate="exposure_cap").all()
+    assert len(evs) == 1 and evs[0].action == "reject"
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_handle_bar_exposure_cap_disabled_keeps_old_behavior():
+    """B-2：exposure_cap_enabled=False（默认关）→ 不约束，同 setup 照常提交。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1m")
+    assert ctx.exposure_cap_enabled is False
+    stock = "600000.SH"
+    _preset_position(ctx, "000001.SZ", 7000, Decimal("9.0"))
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    assert not any(
+        d.gate == "exposure_cap" for d in db.query(LiveDecisionEvent).all()
+    )
     db.close()
 
 
@@ -2101,6 +2274,9 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
 
     assert (1, stock, daily_time) in engine.signal_cache
     assert engine._last_daily_bar_date == datetime(2026, 8, 10).date()
+    # B-1：日线信号当日 deferred，次日首 bar 放行后落单
+    assert len(engine._signal_bar_deferred) == 1
+    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 11, 9, 31)))
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
@@ -2212,6 +2388,9 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
 
     engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
 
+    # B-1：1w 信号当日 deferred，次日首 bar 放行后落单
+    assert len(engine._signal_bar_deferred) == 1
+    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 11, 9, 31)))
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
@@ -2240,6 +2419,9 @@ def test_maybe_daily_bars_day_rollover_reinjects_1w():
 
     # 日切补注入：新 daily_time 的 cache 已填
     assert (1, stock, new_daily_time) in engine.signal_cache
+    # B-1：1w 信号当日 deferred，次日首 bar 放行后落单
+    assert len(engine._signal_bar_deferred) == 1
+    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 12, 9, 31)))
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1

@@ -159,6 +159,11 @@ class LiveEngine:
         # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
         # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
         self._enter_day_updated: Dict[int, date] = {}
+        # B-1 未来函数闸门（对齐回测）：日线级信号当日不下单，订单暂存此内存队列，
+        # 次一交易日首 bar（bar_time.date() 严格小于当前 bar 日期）放行重走提交链。
+        # 已知限制：队列仅内存，Core 重启即丢（信号边沿去重不会重发，无感知），
+        # 持久化归 P2；stop() 时丢弃属预期。
+        self._signal_bar_deferred: List[OrderEvent] = []
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
@@ -531,6 +536,8 @@ class LiveEngine:
         # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
         self._loop_ref = None
         self._event_bus.clear_loop()
+        # B-1：停会话丢弃 deferred 日线信号订单（预期行为——未提交的信号不跨会话补发）。
+        self._signal_bar_deferred.clear()
         # 审计 #3：释放单 worker 线程（ThreadPoolExecutor 默认非 daemon，不 shutdown 会
         # 在进程退出时挂起 join）。wait=False：正在跑的 tick 是 loopback HTTP，瞬间完成，
         # 不阻塞 stop；任务已 cancel，不会再提交新 tick。
@@ -865,10 +872,17 @@ class LiveEngine:
                 inflight_opens.setdefault(lo.strategy_id, set()).add(lo.stock_code)
         # B5：每日首 bar 更新组合市场状态（未启用策略/provider 缺省 → 跳过，行为不变）
         self._maybe_update_regime(portfolio, bar.bar_time.date())
+        # B-1 未来函数闸门放行：跨日后释放 deferred 的日线信号订单（bar_time 更新为
+        # 当前 bar——决策时间戳语义），与 on_bar 新单合并重走同一提交链
+        # （approve/收盘/日历/去重/在途门全复用，且放行单先行——对齐回测
+        # 「上一 bar pending 先于本 bar 新信号成交」时序）。
+        released = self._release_signal_bar_deferred(portfolio, bar)
         orders = portfolio.on_bar(
             bar, signal_cache=self.signal_cache, period=bar.period,
             inflight_opens=inflight_opens or None,
         )
+        if released:
+            orders = list(released) + list(orders or [])
         # db 会话在 on_bar 之后即开：决策闸门事件（熔断 halt/剥 BUY/风险触发）可能在无新单
         # 时也产生，需随本 bar 落库——故不再 orders 为空就早退，drain 放 finally 收尾。
         db = self._db_session_factory()
@@ -924,6 +938,20 @@ class LiveEngine:
                         message="非交易日/非交易时段 period=%s bar=%s" % (bar.period, bt),
                     )
                     continue
+                # B-1 未来函数闸门（与回测同式判定 t.date() <= signal_bar_date）：
+                # 日线级信号（signal_bar_date 非 None，signal bar 为当日 00:00，close
+                # 未确认）当日不下单——实盘若 14:30 即真实下单、回测却次日开盘成交，
+                # 回测结果对实盘不可预测。订单进 deferred 队列，次一交易日首 bar 放行。
+                # 队列仅内存（Core 重启即丢，P2 持久化）；stop() 丢弃属预期。
+                if (order.signal_bar_date is not None and order.bar_time is not None
+                        and order.bar_time.date() <= order.signal_bar_date):
+                    self._signal_bar_deferred.append(order)
+                    self._rec_live(
+                        "signal_bar_date", "defer", portfolio, order,
+                        message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
+                                "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
+                    )
+                    continue
                 # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
                 pos = ctx.positions.get(order.stock_code)
                 if pos is None and order.trade_type == TradeType.BUY:
@@ -931,7 +959,13 @@ class LiveEngine:
                     ctx.positions[order.stock_code] = pos
                 # F5/BUY 量上限：先定最终下单量（账户资金审批 / 桥 T+1 可用）再落
                 # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
-                capped = self._engine.cap_quantity(order, portfolio.account, pos)
+                # B-2 策略级敞口上限：与回测 _exposure_kwargs 完全同式透传
+                # （strategy_position_value/strategy_capital_limit），多策略上限之和
+                # 可超 100% 时实盘敞口不再系统性大于回测。
+                capped = self._engine.cap_quantity(
+                    order, portfolio.account, pos,
+                    **self._exposure_kwargs(portfolio, ctx),
+                )
                 if capped is None:
                     logger.info(
                         "skip order %s %s %s: cap_quantity None（资金/持仓上限拦截，不下单）",
@@ -1017,7 +1051,12 @@ class LiveEngine:
                 db.commit()
                 try:
                     # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
-                    trade = self._engine.execute(order, portfolio.account, pos, apply=False)
+                    # B-2：execute 内部二次 cap_quantity/approve 同样透传敞口上限
+                    # （跳空/价格变动后的重批与首审同口径）。
+                    trade = self._engine.execute(
+                        order, portfolio.account, pos, apply=False,
+                        **self._exposure_kwargs(portfolio, ctx),
+                    )
                 except BridgeUnavailableError:
                     # 桥离线：标 rejected + 置离线暂停（_on_bar 上层心跳循环据此暂停下单）
                     live_order.status = "rejected"
@@ -1105,6 +1144,48 @@ class LiveEngine:
             raise
         finally:
             db.close()
+
+    def _release_signal_bar_deferred(
+        self, portfolio: Portfolio, bar: BarEvent
+    ) -> List[OrderEvent]:
+        """B-1：跨日放行 deferred 的日线信号订单（引擎级队列，只取本组合的）。
+
+        放行条件与回测闸门同源：order.bar_time.date() < 当前 bar 日期（严格小于
+        =已跨日，同日后续 bar 不放行）。放行时把 order.bar_time 更新为当前 bar
+        时间（决策时间戳语义），随后重走完整提交链。
+        """
+        if not self._signal_bar_deferred:
+            return []
+        if bar.bar_time is None:
+            return []
+        bar_date = bar.bar_time.date()
+        released: List[OrderEvent] = []
+        remaining: List[OrderEvent] = []
+        for order in self._signal_bar_deferred:
+            if (order.portfolio_id == portfolio.portfolio_id
+                    and order.bar_time is not None
+                    and order.bar_time.date() < bar_date):
+                order.bar_time = bar.bar_time
+                released.append(order)
+            else:
+                remaining.append(order)
+        self._signal_bar_deferred = remaining
+        return released
+
+    def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:
+        """B-2 策略级敞口上限（#3，与 BacktestEngine._exposure_kwargs 完全同式）。
+
+        enabled 判定 exposure_cap_enabled；策略持仓市值口径 = portfolio.holdings_value(ctx)
+        （该策略虚拟持仓按最近已知价估值，_handle_bar 顶部 total_value(bar) 已刷新
+        价格快照，与回测「上一 bar 收盘估值」同口径）；上限 = capital_ratio × 组合
+        初始资金。关闭返回空 dict，cap_quantity/execute 走默认 None（行为不变）。
+        """
+        if not getattr(ctx, "exposure_cap_enabled", False):
+            return {}
+        return {
+            "strategy_position_value": portfolio.holdings_value(ctx),
+            "strategy_capital_limit": ctx.capital_ratio * portfolio.account.initial_capital,
+        }
 
     def _rec_live(
         self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,

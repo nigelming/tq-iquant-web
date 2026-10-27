@@ -34,7 +34,7 @@ class StrategyContext:
         trend_trailing_stop_ratio: Optional[Decimal] = None,
         trend_max_positions: Optional[int] = None,
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
-        # ≤ capital_ratio × 组合初始资金（仅回测成交步传入生效）
+        # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
         signal_frequency: Optional[str] = None,
         signal_at: Optional[str] = None,

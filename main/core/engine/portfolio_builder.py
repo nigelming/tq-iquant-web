@@ -118,7 +118,7 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
                 else None
             ),
             trend_max_positions=getattr(strat, "trend_max_positions", None),
-            # #3 策略级敞口上限（可选，默认关；仅回测成交步生效）
+            # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
             signal_frequency=strat.signal_frequency,
             signal_at=strat.signal_at,

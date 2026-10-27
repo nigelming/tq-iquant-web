@@ -324,7 +324,8 @@ class ExecutionEngine:
         避免受理即成交的近似；I4 崩溃窗口下 DB 有 submitted 记录即可）。
 
         #3 策略级敞口上限（可选）：两个 strategy_* 参数透传 cap_quantity，默认 None
-        不启用（实盘 LiveEngine 不传 → 行为不变）。
+        不启用（实盘 LiveEngine._handle_bar 按策略 exposure_cap_enabled 同式传入，
+        回测/实盘行为一致）。
         """
         capped = self.cap_quantity(
             order, account, position,

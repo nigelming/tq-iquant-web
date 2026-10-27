@@ -369,7 +369,8 @@ class BacktestEngine:
 
         上限 = capital_ratio × 组合初始资金；策略持仓市值用 _price_snapshot 估值
         （上一 bar 已刷新，口径与审批用的信号 bar 收盘一致）。关闭返回空 dict，
-        execute 走默认 None（行为与旧逻辑一致）。实盘 LiveEngine 不调此方法。
+        execute 走默认 None（行为与旧逻辑一致）。实盘 LiveEngine 不调此方法——
+        其 _handle_bar 持有同式 _exposure_kwargs 透传（B-2 敞口实盘化）。
         """
         if not getattr(ctx, "exposure_cap_enabled", False):
             return {}
