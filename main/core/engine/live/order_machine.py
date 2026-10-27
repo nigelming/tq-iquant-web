@@ -64,8 +64,11 @@ class OrderStateMachine:
     """委托状态机：持久化 → 匹配 order_ref → 轮询 /deals 回填 → 终态/超时收口。
 
     持有本 session 在途未完结单（``pending_orders``，key=LiveOrder.id）与最近一次成交
-    回填时点（``last_backfill_time``）。单 worker 线程串行调用（主循环 60s + deals 循环
-    5s 共享同一 ThreadPoolExecutor），无需加锁。
+    回填时点（``last_backfill_time``）。主池（bar/approve/submit/超时收割/收盘清扫）
+    与 deals 池（5s 回填）为两个独立单 worker 池、真并发调用本对象；跨池记账
+    （backfill/apply、pending_orders 增删与遍历）由引擎级 ``_book_lock``
+    （LiveEngine，threading.RLock）在调用点串行化——本协作者内部不加锁，
+    避免嵌套持锁语义混乱（锁序恒为 book_lock → get_tdx_lock，无死锁）。
     """
 
     def __init__(self, ctx: EngineContext, emit: Callable[[str, dict], None]):
@@ -184,6 +187,10 @@ class OrderStateMachine:
 
         仅认无 remark 的候选（带 remark 的属于已跟踪单），且柜台插入时间须落在本单
         created_at 的时间窗内，挡住跨会话遗留旧单。
+        I-2（终审）：``insert_fabricated=True`` 的候选（通达信通道 get_orders 对陌生
+        ref 补记的当前时间，非柜台真实插入时间）一律不绑——补记时间恒为 now，时间窗
+        校验对它无意义，同形态遗留单/手工单会在新单创建后的首次回查即被误绑（真钱
+        风险）。宁可留 None 下轮再找（真实时间候选出现后正常绑定）。
         """
         code = live_order.stock_code
         op_dir = 48 if live_order.trade_type == "buy" else 49
@@ -198,6 +205,9 @@ class OrderStateMachine:
                 continue
             # 带 remark 的候选属于有 bridge_order_id 的在跟踪单，遗留单不得冒领。
             if o.get("remark"):
+                continue
+            # I-2：fabricated 插入时间是补记的 now，非柜台真实值——不参与绑定。
+            if o.get("insert_fabricated"):
                 continue
             inst = o.get("instrument") or ""
             exch = o.get("exchange") or ""
@@ -660,7 +670,32 @@ class OrderStateMachine:
                     )
 
     def _finalize_timeout_canceled(self, db: Session, lo: LiveOrder) -> None:
-        """A-2 收敛：撤单请求后委托表已查不到该单 → 标 canceled（有部分成交先 apply）。"""
+        """A-2 收敛：撤单请求后委托表已查不到该单 → 标 canceled（有部分成交先 apply）。
+
+        I-1（终审）：撤单**受理**与柜台**生效**之间存在窗口，残余成交可能仍落在
+        /deals（委托表已无此单≠无成交）。finalize 前对该 ref 补一次 query_deals
+        收割（与撤单成功后的即时收割同款逻辑），收割后再收口：
+        - 收割后单转 filled（残量把单补齐）→ 终态由回填路径落定，不再标 canceled；
+        - 收割后仍 submitted/partial → 走原有 partial apply + canceled 收口。
+        """
+        if lo.order_ref:
+            try:
+                deals = self._ctx.dispatcher.query_deals()
+            except Exception as e:  # noqa: BLE001 — 桥离线：跳过收割按原逻辑收口，下轮不再重试
+                deals = None
+                logger.debug("finalize_timeout: query_deals failed: %s", e)
+            if deals is not None:
+                matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                if matched:
+                    self.backfill_order(db, lo, matched)
+        if lo.status not in ("submitted", "partial"):
+            # 残余成交已把单补齐（filled）：终态/持仓由 backfill 路径落定
+            logger.info(
+                "cancel_unfilled: order %s ref %s finalized filled after residual "
+                "deal harvest (%s fills) — not canceled",
+                lo.id, lo.order_ref, int(lo.filled_quantity or 0),
+            )
+            return
         if int(lo.filled_quantity or 0) > 0 and lo.status == "partial":
             trade = (
                 db.query(LiveTrade)

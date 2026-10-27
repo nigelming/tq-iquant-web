@@ -25,6 +25,12 @@ from core.services import live_service as svc
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/live", tags=["live"])
 
+# C1（终审）：start 的 check-then-act 竞态闸。`if session_id in _ENGINES` 检查与
+# `_ENGINES[session_id]=engine` 注册之间隔了 `await run_in_threadpool(svc.start_session)`
+# （heartbeat/preflight/recover，秒级窗口）——并发两次 start 都见空注册表 → 双引擎
+# 并发真实下单（同 session 重复下单 / 跨 session 击穿 B6）。启动稀有，临界区串行可接受。
+_START_LOCK = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # 兼容 re-export：集成测试 test_live_engine_api.py 直接引用以下 live.py 符号
@@ -177,39 +183,44 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return err(404, "资源不存在")
-    # 幂等：已在跑直接返回（service 检测 session_id in _ENGINES）
-    if session_id in _ENGINES:
-        return ok({"id": session.id, "status": "running"})
+    # C1（终审）：整段「幂等检查 → threadpool 启动（秒级）→ 注册」持 _START_LOCK
+    # 串行——并发的第二个 start 会等锁，进锁后见注册表已有引擎 → 幂等返回 running；
+    # 不同 session 的并发 start 也被串行化，B6 全局限 1 在锁内判定不再有竞态窗口。
+    async with _START_LOCK:
+        # 幂等：已在跑直接返回（service 检测 session_id in _ENGINES）
+        if session_id in _ENGINES:
+            return ok({"id": session.id, "status": "running"})
 
-    # I-6（audit）：同步重活（建引擎 / heartbeat 通道探测 / preflight / recover 重放）
-    # 经线程池执行——事件循环不被阻塞（TQ/桥探测失败要等超时，秒级冻结会拖垮 SSE）。
-    # 先取齐纯值，避免 worker 线程访问 loop 线程加载的 ORM 实例属性。
-    # 兜底沿用原语义：execution_mode 为空（迁移前历史会话）按 "auto" 解析。
-    mode = session.mode
-    exec_mode = session.execution_mode or "auto"
-    dispatcher_cls = None if exec_mode == "alert" else _dispatcher_cls_for(session)
-    engine, _session, error = await run_in_threadpool(
-        lambda: svc.start_session(
-            db, session_id, _ENGINES, mode,
-            db_session_factory=SessionLocal,
-            dispatcher_cls=dispatcher_cls,
-        ),
-    )
-    if error is not None:
-        status, message = error
-        return err(status, message)
-    if engine is None:
-        # 幂等路径（理论上上方已拦，兜底）
-        return ok({"id": session.id, "status": "running"})
+        # I-6（audit）：同步重活（建引擎 / heartbeat 通道探测 / preflight / recover 重放）
+        # 经线程池执行——事件循环不被阻塞（TQ/桥探测失败要等超时，秒级冻结会拖垮 SSE）。
+        # 先取齐纯值，避免 worker 线程访问 loop 线程加载的 ORM 实例属性。
+        # 兜底沿用原语义：execution_mode 为空（迁移前历史会话）按 "auto" 解析。
+        mode = session.mode
+        exec_mode = session.execution_mode or "auto"
+        dispatcher_cls = None if exec_mode == "alert" else _dispatcher_cls_for(session)
+        engine, _session, error = await run_in_threadpool(
+            lambda: svc.start_session(
+                db, session_id, _ENGINES, mode,
+                db_session_factory=SessionLocal,
+                dispatcher_cls=dispatcher_cls,
+            ),
+        )
+        if error is not None:
+            status, message = error
+            return err(status, message)
+        if engine is None:
+            # 幂等路径（service 在锁内再查一次注册表，理论上上方已拦，兜底）
+            return ok({"id": session.id, "status": "running"})
 
-    # 起 asyncio 循环任务（async 端点内直接在 FastAPI 事件循环建任务）
-    asyncio.create_task(engine.start())
-    # 注册先于 commit，闭合 B6 窗口（与重构前顺序一致）
-    _ENGINES[session_id] = engine
-    session.status = "running"
-    session.started_at = datetime.now()
-    db.commit()
-    return ok({"id": session.id, "status": "running"})
+        # 起 asyncio 循环任务（async 端点内直接在 FastAPI 事件循环建任务）
+        asyncio.create_task(engine.start())
+        # 注册先于 commit，闭合 B6 窗口（与重构前顺序一致）；注册仍在 _START_LOCK
+        # 临界区内，check-then-act 窗口已闭合（C1）。
+        _ENGINES[session_id] = engine
+        session.status = "running"
+        session.started_at = datetime.now()
+        db.commit()
+        return ok({"id": session.id, "status": "running"})
 
 
 @router.post("/sessions/{session_id}/stop")

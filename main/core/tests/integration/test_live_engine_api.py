@@ -926,3 +926,102 @@ def test_recover_breaker_portfolio_not_in_session(client, mock_bridge):
     assert resp.status_code == 200
     assert resp.json()["code"] == 404
 
+
+# ---------------- C1（终审）：start check-then-act 竞态闭合 ----------------
+
+def _conc_session_factory(tmp_path):
+    """并发 start 用文件 SQLite 工厂：两个并发请求各持独立连接（fixture 的 StaticPool
+    单连接不允许跨 session 并发事务），WAL 降低读写锁冲突。"""
+    from sqlalchemy import event as sa_event
+
+    eng = create_engine(
+        "sqlite:///%s" % (tmp_path / "conc-start.db"),
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+
+    @sa_event.listens_for(eng, "connect")
+    def _pragma(dbapi_conn, _rec):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
+
+    Base.metadata.create_all(eng)
+    return sessionmaker(bind=eng, expire_on_commit=False)
+
+
+def test_concurrent_start_same_session_registers_single_engine(
+        client, mock_bridge, monkeypatch, tmp_path):
+    """C1：并发两次 start 同一 session（threadpool 启动窗口内重叠）→ 仅一个引擎注册，
+    svc.start_session 只被调用一次，第二次得幂等 running（不产生双引擎并发下单）。"""
+    import asyncio
+    import threading
+
+    import core.services.live_service as live_svc
+
+    ConcSession = _conc_session_factory(tmp_path)
+    # 独立连接工厂供引擎组装/recover 使用（替代 fixture 的 StaticPool 单连接）
+    monkeypatch.setattr(live_api, "SessionLocal", ConcSession)
+
+    from core.models import LiveSession as _LiveSession
+
+    db = ConcSession()
+    ps_id = _seed(db)
+    session = _LiveSession(
+        name="conc-start", mode="simulation", status="stopped",
+        engine=None, execution_mode="auto",
+    )
+    db.add(session)
+    db.flush()
+    db.add(LiveSessionPortfolio(session_id=session.id, portfolio_strategy_id=ps_id))
+    db.commit()
+    sid = session.id
+    db.close()
+
+    real_start = live_svc.start_session
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def slow_start(*args, **kwargs):
+        # 复刻竞态窗口：svc.start_session 在 threadpool 里秒级阻塞（heartbeat/recover）
+        calls["n"] += 1
+        entered.set()
+        release.wait(timeout=10)
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(live_svc, "start_session", slow_start)
+
+    async def call_start(session_factory):
+        db_req = session_factory()
+        try:
+            return await live_api.start_session(sid, db_req)
+        finally:
+            db_req.close()
+
+    async def drive():
+        t1 = asyncio.create_task(call_start(ConcSession))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        # 第一个 start 仍在 threadpool 窗口内（未注册）→ 并发发起第二个
+        t2 = asyncio.create_task(call_start(ConcSession))
+        await asyncio.sleep(0.2)
+        # C1 断言：锁生效——第二个 start 在锁外等待，未进入启动临界区
+        assert calls["n"] == 1, (
+            "并发第二个 start 进入了启动临界区（_START_LOCK 未生效）"
+        )
+        release.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+        engine = live_api._ENGINES.get(sid)
+        await asyncio.sleep(0.05)  # 让 create_task(engine.start()) 推进到可停状态
+        if engine is not None:
+            await engine.stop()
+        return r1, r2
+
+    r1, r2 = asyncio.run(drive())
+
+    assert r1["code"] == 0 and r1["data"]["status"] == "running"
+    assert r2["code"] == 0 and r2["data"]["status"] == "running"  # 幂等语义
+    assert calls["n"] == 1  # 第二次 start 走幂等路径，svc.start_session 仅调用一次
+    assert list(live_api._ENGINES) == [sid]  # 仅注册一个引擎（无双引擎并发下单）
+

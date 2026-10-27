@@ -6429,3 +6429,322 @@ def test_close_reconcile_runs_once_after_sweep_completes():
     # 同日重复 tick → 幂等不再触发
     engine._maybe_reconcile_after_close(now=datetime(2026, 8, 5, 15, 10))
     assert len(calls) == 1
+
+
+# ===========================================================================
+# 终审修复批次：C2 记账锁并发回归 / I-1 撤单收口收割 / I-2 fabricated 时间窗 /
+# I-3 stop 在途单撤单
+# ===========================================================================
+def _db_factory_concurrent(tmp_path):
+    """并发回归用文件 SQLite：两线程各取独立连接（非 StaticPool 单连接），
+    WAL + busy_timeout 降低读写锁冲突。返回 (factory, engine)。"""
+    from sqlalchemy import event as sa_event
+
+    eng = create_engine(
+        "sqlite:///%s" % (tmp_path / "conc.db"),
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+
+    @sa_event.listens_for(eng, "connect")
+    def _pragma(dbapi_conn, _rec):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
+
+    Base.metadata.create_all(eng)
+    SessionLocal = sessionmaker(bind=eng, expire_on_commit=False)
+
+    def factory():
+        return SessionLocal()
+
+    return factory, eng
+
+
+def test_concurrent_sweep_and_deals_backfill_apply_once(monkeypatch, tmp_path):
+    """C2 终审回归：主池超时收割（_sweep_timeout_orders → cancel 收割 apply）与
+    deals 池回填（_tick_deals → poll_deals → backfill → apply）两线程 + Barrier
+    并发驱动同一张单，apply_filled_trade 恰好一次（不双重记账、不重复写 LiveTrade）。
+    两轮分别覆盖两种锁序：收割先进锁（cancel 恰一次）、回填先进锁（单已 filled，
+    收割路径无单可撤）——两种交错下记账结果一致。"""
+    import threading
+    import time as _time
+
+    monkeypatch.setattr(
+        "core.engine.live.order_machine.load_config", _cfg_minutes(3))
+
+    for round_no, sweep_first in enumerate((True, False), start=1):
+        subdir = tmp_path / ("round%d" % round_no)
+        subdir.mkdir()
+        factory, _ = _db_factory_concurrent(subdir)
+        port, ctx = _portfolio_single()
+        stock = "600000.SH"
+        disp = FakeTdxDispatcher(
+            orders=[_bridge_row("W001", status=55, traded_volume=300)],
+            deals=[{
+                "order_ref": "W001", "price": 9.25, "volume": 600,
+                "amount": 5550.0, "commission": 1.39,
+                "trade_time": "100001", "trade_date": "20260805",
+            }],
+        )
+        engine = _make_engine(disp, factory, port)
+        db = factory()
+        lo = _pending_order_with_ref(db)
+        db.commit()
+        db.close()
+
+        applies = []
+        orig_apply = engine._order_machine.apply_filled_trade
+
+        def counting_apply(*a, **kw):
+            applies.append(1)
+            return orig_apply(*a, **kw)
+
+        engine._order_machine.apply_filled_trade = counting_apply
+
+        poll_results = []
+        orig_poll = engine._order_machine.poll_deals
+
+        def counting_poll():
+            try:
+                orig_poll()
+                poll_results.append("ok")
+            except Exception as e:  # noqa: BLE001 — 回传给断言（防测试空转通过）
+                poll_results.append("err:%s" % e)
+                raise
+
+        engine._order_machine.poll_deals = counting_poll
+
+        barrier = threading.Barrier(2, timeout=15)
+        errors = []
+
+        def run_sweep():
+            db = factory()
+            try:
+                barrier.wait()
+                if not sweep_first:
+                    _time.sleep(0.1)  # 让 deals 路径先进锁
+                engine._sweep_timeout_orders(db)  # 真实调用点：锁内 expire+cancel+commit
+            except Exception as e:  # noqa: BLE001
+                errors.append(("sweep", e))
+            finally:
+                db.close()
+
+        def run_deals():
+            try:
+                barrier.wait()
+                if sweep_first:
+                    _time.sleep(0.1)  # 让收割路径先进锁
+                engine._tick_deals()  # 真实调用点：锁内 poll_deals
+            except Exception as e:  # noqa: BLE001
+                errors.append(("deals", e))
+
+        t1 = threading.Thread(target=run_sweep)
+        t2 = threading.Thread(target=run_deals)
+        t1.start()
+        t2.start()
+        t1.join(30)
+        t2.join(30)
+
+        tag = "round%d(sweep_first=%s)" % (round_no, sweep_first)
+        assert errors == [], "%s 并发路径出现异常：%s" % (tag, errors)
+        assert poll_results == ["ok"], "%s deals 回填未成功完成：%s" % (tag, poll_results)
+        assert len(applies) == 1, (
+            "%s apply_filled_trade 被执行 %d 次（应恰好 1 次）" % (tag, len(applies))
+        )
+        if sweep_first:
+            assert len(disp.cancel_calls) == 1  # 收割路径先进锁：cancel 恰好一次
+        else:
+            assert disp.cancel_calls == []  # 回填先进锁：单已 filled，无单可撤
+        db = factory()
+        lo2 = db.get(LiveOrder, lo.id)
+        assert lo2.status == "filled"
+        assert int(lo2.filled_quantity) == 600
+        assert db.query(LiveTrade).count() == 1
+        db.close()
+        assert ctx.positions[stock].quantity == 600  # 持仓只记一次
+        assert port.account.cash == Decimal("100000") - (
+            Decimal("5550.0") + Decimal("1.39"))
+
+
+def test_finalize_timeout_harvests_residual_deal_before_canceled(monkeypatch):
+    """I-1：撤单请求后委托表已查不到该单，但 /deals 有受理与生效间的残余成交 →
+    finalize 前先收割成 LiveTrade + apply，再标 canceled（末笔成交不丢）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    disp = FakeTdxDispatcher(
+        orders=[],  # 委托表已无此单（撤单已生效）
+        deals=[{
+            "order_ref": "W001", "price": 9.25, "volume": 200,
+            "amount": 1850.0, "commission": 0.5,
+            "trade_time": "100001", "trade_date": "20260805",
+        }],
+    )
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo.error_message = _CANCEL_TAG + "超时未成交已撤单（阈值 3 分钟）"
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    assert disp.cancel_calls == []  # 已 tag：不重复撤单
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "canceled"
+    assert int(lo2.filled_quantity) == 200  # 残余成交已收割
+    assert db.query(LiveTrade).count() == 1
+    db.close()
+    assert ctx.positions["600000.SH"].quantity == 200  # 撤单终态前 apply 落持仓
+
+
+def test_finalize_timeout_not_canceled_when_residual_deal_fills_order(monkeypatch):
+    """I-1：残余成交把单补齐（filled）→ 终态由回填路径落定，不再标 canceled。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    disp = FakeTdxDispatcher(
+        orders=[],
+        deals=[{
+            "order_ref": "W001", "price": 9.25, "volume": 600,
+            "amount": 5550.0, "commission": 1.39,
+            "trade_time": "100001", "trade_date": "20260805",
+        }],
+    )
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo.error_message = _CANCEL_TAG + "超时未成交已撤单（阈值 3 分钟）"
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine._cancel_unfilled_orders(db)
+    db.commit()
+    db.close()
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "filled"  # 残量补齐：filled 而非 canceled
+    # error_message 保持撤单 tag 原样（finalize 未改写），未追加 canceled 收口文案
+    assert (lo2.error_message or "").startswith(_CANCEL_TAG)
+    db.close()
+    assert ctx.positions["600000.SH"].quantity == 600
+
+
+def test_match_legacy_fuzzy_ignores_fabricated_candidate():
+    """I-2：fabricated 候选（陌生 ref 补记的当前时间）不参与 legacy 绑定——补记时间
+    恒为 now，时间窗校验对它无意义，同形态遗留单会在新单创建后的首次回查即被误绑。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "W100",
+         "insert_date": "20260813", "insert_time": "112200",
+         "insert_fabricated": True},  # 陌生 ref 补记的 now，非柜台真实插入时间
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None  # fabricated 候选绝不绑定
+    db.close()
+
+
+def test_match_legacy_fuzzy_prefers_real_time_over_fabricated():
+    """I-2：真实时间候选与 fabricated 候选同形状并存 → 认领真实时间的新 ref，
+    而非被补记 now 的遗留单（真机误绑形态：pre 含 W100 遗留单 + 新单 11:21）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "W100",
+         "insert_date": "20260813", "insert_time": "112200",
+         "insert_fabricated": True},
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-real",
+         "insert_date": "20260813", "insert_time": "112200"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-real"  # 认领新 ref 而非 W100
+    db.close()
+
+
+def test_stop_cancels_inflight_order_with_ref(caplog):
+    """I-3：stop 时对在途真实单 best-effort 撤单；成功且无失败/无 ref → 不发 risk。
+    deferred 队列清空条数记 info 日志。"""
+    import logging as _logging
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[], deals=[])
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db)
+    db.commit()
+    db.close()
+    engine._signal_bar_deferred.append(OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=600, price=Decimal("9.3"), bar_time=datetime(2026, 8, 5, 10, 0),
+        signal_name="open_sig", signal_bar_date=date(2026, 8, 5),
+    ))
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    with caplog.at_level(_logging.INFO, logger="core.engine.live_engine"):
+        asyncio.run(engine.stop())
+
+    assert disp.cancel_calls == [("W001", "600000.SH")]
+    assert q.empty()  # 全部撤单成功且无无-ref 单 → 不发风险汇总
+    assert engine._signal_bar_deferred == []
+    assert any(
+        "deferred daily-signal order" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_stop_emits_risk_summary_when_cancel_fails_or_no_ref():
+    """I-3：撤单失败与无 order_ref 的在途单 → 一条中文 risk 汇总（工作台可见）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher(orders=[], deals=[], cancel_ok=False)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db, ref="W001")
+    _pending_order_with_ref(db, ref=None)  # 无 ref：无法撤，计入汇总
+    db.commit()
+    db.close()
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    asyncio.run(engine.stop())
+
+    assert disp.cancel_calls == [("W001", "600000.SH")]  # 失败也尝试了
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "stop_inflight_orders"
+    assert "撤单失败" in ev["message"] and "W001" in ev["message"]
+    assert "无 order_ref" in ev["message"] and "600000.SH" in ev["message"]
+    assert q.empty()  # 只汇总一条，不刷屏

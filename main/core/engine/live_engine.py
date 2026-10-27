@@ -12,6 +12,7 @@
 """
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -245,18 +246,28 @@ class LiveEngine:
         self._deals_task: Optional[asyncio.Task] = None
         # 审计 #3：_loop 的同步阻塞 I/O（heartbeat/poll/_maybe_daily_*，全用同步
         # httpx.Client）整轮丢到此单 worker 线程执行——事件循环不再被阻塞 I/O 冻结。
-        # max_workers=1 让主循环 tick 严格串行：共享 _pending_orders / positions /
-        # signal_cache 无并发竞争（沿用既有「同事件循环协作式」的串行语义，只是换到线程）。
+        # max_workers=1 让主循环 tick 严格串行：signal_cache / 行情缓存等主池私有状态
+        # 无并发竞争（沿用既有「同事件循环协作式」的串行语义，只是换到线程）。
         # 单 worker 还保证 cancel 后已排队的 tick 不与下一轮重叠（asyncio.Lock 在 cancel
         # 时会释放，无法保证；单 worker 天然排队）。
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
         # I-8（audit）：_deals_loop 的 tick 投独立单 worker 池——与主循环各自的
         # 1-worker 池互不饿死（真机：主循环拉 ~73 只行情 50-57s/轮时，5s 节拍的
         # deals 回填不再排队等主 tick）。共享资源由 TQ 锁 get_tdx_lock 串行化；
-        # 跨池状态访问沿用既有协作式约定（deals tick 只回填已确认成交）。
+        # I-8/C2（终审）：两池**真并发**后，跨池记账（pending_orders 增删遍历、
+        # backfill/apply、持仓现金更新）不再靠协作式约定，由引擎级 _book_lock 串行化
+        # （锁序恒为 book_lock → get_tdx_lock，无反向获取，无死锁）。
         self._deals_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="live-deals"
         )
+        # C2（终审）：引擎级记账锁。主池（bar/approve/submit/超时收割/收盘清扫）与
+        # deals 池（5s 回填）独立后，三处真并发冲突点由调用点持锁串行：
+        #   ① _tick_main 超时收割段（expire 兜底 + cancel_unfilled 收割 apply）
+        #   ② 收盘清扫 apply 段（_maybe_close_sweep → DailyCloser）
+        #   ③ _tick_deals 回填段（poll_deals → backfill → apply / pending 增删）
+        #   ④ _handle_bar 遍历 _pending_orders.values()（vs 跨池 pop/整字典替换）
+        # RLock：锁内允许调 SDK（get_tdx_lock 不反向取本锁），嵌套持锁安全。
+        self._book_lock = threading.RLock()
         # _emit 跨线程投递用：start() 时捕获运行中的事件循环；worker 线程内 _emit 经
         # call_soon_threadsafe 回到事件线程 put_nowait（asyncio.Queue 非线程安全）。
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
@@ -557,6 +568,83 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.warning("dispatcher close failed on stop", exc_info=True)
 
+    def _cancel_inflight_orders_on_stop(self) -> None:
+        """I-3（终审）：stop 时对在途真实单 best-effort 撤单（主 executor worker 执行）。
+
+        在途集合以 DB 为准（submitted/partial，与 poll_deals/sync_pending_orders 同一
+        口径；_pending_orders 缓存的 ORM 实例可能已随原 session 关闭而 detached）：
+        有 order_ref → 尽力 ``dispatcher.cancel_order(ref, code)``（复用 A-1 撤单；
+        异常吞并计数）；通道不支持撤单（如 iQuant 桥）或单无 order_ref → 计入风险汇总。
+        停止后不再有轮询收敛这些单，撤单失败/无 ref 的部分汇成**一条**
+        risk 事件（中文，工作台事件日志可见），提示人工核对柜台委托。
+        """
+        factory = self._db_session_factory
+        if factory is None:
+            return
+        db = factory()
+        if db is None:
+            # alert 模式（无 DB、不下单）：无在途单可撤
+            return
+        try:
+            inflight = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+            if not inflight:
+                return
+            logger.info(
+                "stop: %d in-flight order(s) at stop, best-effort cancel (session %s)",
+                len(inflight), self.session_id,
+            )
+            cancel = getattr(self._dispatcher, "cancel_order", None)
+            failed: List[str] = []
+            no_ref: List[str] = []
+            for lo in inflight:
+                label = "%s %s" % (lo.stock_code, (lo.trade_type or "").upper())
+                ref = lo.order_ref
+                if not ref:
+                    no_ref.append(label)
+                    continue
+                if not callable(cancel):
+                    failed.append("%s（%s，通道不支持撤单）" % (ref, label))
+                    continue
+                try:
+                    if cancel(ref, lo.stock_code):
+                        logger.info(
+                            "stop: cancel requested for in-flight order %s (ref=%s)",
+                            lo.id, ref,
+                        )
+                    else:
+                        failed.append("%s（%s，撤单返回失败：%s）" % (
+                            ref, label,
+                            getattr(self._dispatcher, "last_error", "") or "无原因"))
+                except Exception as e:  # noqa: BLE001 — best-effort：单笔失败不阻断停止
+                    failed.append("%s（%s，撤单异常：%s）" % (ref, label, e))
+                    logger.warning(
+                        "stop: cancel_order error for order %s ref %s: %s", lo.id, ref, e,
+                    )
+            if not failed and not no_ref:
+                return
+            parts = []
+            if failed:
+                parts.append("撤单失败 %d 笔：%s" % (len(failed), "；".join(failed)))
+            if no_ref:
+                parts.append(
+                    "无 order_ref 在途单 %d 笔（%s），停止后无法追踪终态"
+                    % (len(no_ref), "、".join(no_ref))
+                )
+            message = (
+                "会话停止时存在未完结在途单——%s，请人工核对柜台委托与成交" % "；".join(parts)
+            )
+            self._emit("risk", {"rule": "stop_inflight_orders", "message": message})
+            logger.warning("stop: %s (session %s)", message, self.session_id)
+        finally:
+            db.close()
+
     async def stop(self) -> None:
         """停循环任务。"""
         self._running = False
@@ -580,11 +668,27 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("deals loop task ended with error on stop")
             self._deals_task = None
+        # I-3（终审）：置闸后、close 前对在途真实单 best-effort 撤单。此刻两循环任务
+        # 已 cancel，在途 tick 排在主单 worker 池里先跑完，本步经同一池串行执行——
+        # 读到的 _pending_orders 不再被并发修改。撤单走 worker 线程（SDK/HTTP 同步调），
+        # risk 汇总事件经 EventBus 跨线程回投（loop 引用尚未清空）。
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._cancel_inflight_orders_on_stop
+            )
+        except RuntimeError:
+            self._cancel_inflight_orders_on_stop()
         # 审计 #3：停止后清空 loop 引用——worker 线程已不再产生 _emit；
         # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
         self._loop_ref = None
         self._event_bus.clear_loop()
         # B-1：停会话丢弃 deferred 日线信号订单（预期行为——未提交的信号不跨会话补发）。
+        # I-3（终审）：清空条数记 info 日志，留运行痕迹。
+        if self._signal_bar_deferred:
+            logger.info(
+                "stop: drop %d deferred daily-signal order(s) (session %s)",
+                len(self._signal_bar_deferred), self.session_id,
+            )
         self._signal_bar_deferred.clear()
         # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
         # 跑完后 close 自然获得锁（同池 max_workers=1 串行排队），事件循环不被
@@ -663,11 +767,7 @@ class LiveEngine:
             # 的 db session 模式；_expire_stale_orders 自身不 commit，由本块负责。
             db_tick = self._db_session_factory()
             try:
-                self._expire_stale_orders(db_tick)
-                # A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（与 expire 同块提交；
-                # 配置 cancel_unfilled_minutes<=0 或通道不支持撤单时内部直接跳过）。
-                self._cancel_unfilled_orders(db_tick)
-                db_tick.commit()
+                self._sweep_timeout_orders(db_tick)
             except Exception:  # noqa: BLE001
                 db_tick.rollback()
                 logger.exception("expire stale orders error (session %s)", self.session_id)
@@ -689,15 +789,30 @@ class LiveEngine:
         except Exception:  # noqa: BLE001
             logger.exception("live loop unexpected error")
 
+    def _sweep_timeout_orders(self, db: Session) -> None:
+        """主循环超时收割段（P2 + A-2）：expire 兜底收割 + 超时撤单收割，同块提交。
+
+        C2（终审）：expire 的 remark 兜底回填与 cancel 成功后的即时收割都会
+        backfill/apply 持仓现金——与 deals 池 5s 回填真并发，整段（含 commit）
+        持 _book_lock 串行化。commit 必须在锁内：后进锁的 deals 回填据此看到
+        已提交的终态（filled/partial），不会对同一单重复 backfill/apply。
+        """
+        with self._book_lock:
+            self._expire_stale_orders(db)
+            # A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（与 expire 同块提交；
+            # 配置 cancel_unfilled_minutes<=0 或通道不支持撤单时内部直接跳过）。
+            self._cancel_unfilled_orders(db)
+            db.commit()
+
     async def _deals_loop(self) -> None:
         """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
 
         成交秒级回报，独立短节拍让 LiveTrade/持仓/资金反馈近实时；主循环保持 60s 拉 bar。
         I-8（audit）：tick 投独立单 worker 池（_deals_executor）——主循环拉全池行情
         50-57s/轮时 deals 不再被饿死（原共享单池，deals tick 要排队等主 tick）。
-        共享资源（TQ 连接）由 get_tdx_lock 串行化；_pending_orders / positions 的
-        跨池访问沿用既有协作式约定（deals tick 只回填已确认成交）。_poll_deals 内部
-        已兜底桥离线/查失败。
+        共享资源（TQ 连接）由 get_tdx_lock 串行化；I-8/C2（终审）：两池真并发，
+        跨池记账（backfill/apply、pending_orders 增删）由引擎级 _book_lock 在调用点
+        串行化（_tick_deals 持锁调 _poll_deals）。_poll_deals 内部已兜底桥离线/查失败。
         """
         while self._running:
             try:
@@ -714,9 +829,12 @@ class LiveEngine:
         """_deals_loop 单轮同步体（在 worker 线程执行）：查未完结单 → 回填 /deals。
 
         异常在此捕获（非 CancelledError）——与原 _deals_loop 行为一致：记日志不外抛。
+        C2（终审）：poll_deals 的回填（backfill → apply / pending 增删）与主池的超时
+        收割、收盘清扫真并发，整段记账持 _book_lock 串行化。
         """
         try:
-            self._poll_deals()
+            with self._book_lock:
+                self._poll_deals()
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
 
@@ -732,7 +850,13 @@ class LiveEngine:
         self._closer.maybe_daily_bars(now)
 
     def _maybe_close_sweep(self, now: Optional[datetime] = None) -> None:
-        self._closer.maybe_close_sweep(now)
+        """15:05 收盘清扫（薄委托 → DailyCloser）。
+
+        C2（终审）：清扫的回填/apply/终态收敛与 deals 池回填真并发，
+        整段持 _book_lock 串行化（清扫内部含自己的 session 与 commit）。
+        """
+        with self._book_lock:
+            self._closer.maybe_close_sweep(now)
 
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
@@ -927,10 +1051,13 @@ class LiveEngine:
         # （submitted/partial）尚未落持仓（submitted 只建 quantity=0 的 Position），
         # 闸门 held 只数已成交——不注入则连续 bar 齐发 OPEN 超开/同票重复开仓。
         # partial 未 apply（只记账），整单仍在途，计入正确。
+        # C2（终审）：跨池（deals 回填/超时收割）会并发 pop/替换 _pending_orders，
+        # 遍历段持 _book_lock 防 dict changed size during iteration。
         inflight_opens: Dict[int, set] = {}
-        for lo in self._pending_orders.values():
-            if lo.trade_type == "buy":
-                inflight_opens.setdefault(lo.strategy_id, set()).add(lo.stock_code)
+        with self._book_lock:
+            for lo in self._pending_orders.values():
+                if lo.trade_type == "buy":
+                    inflight_opens.setdefault(lo.strategy_id, set()).add(lo.stock_code)
         # B5：每日首 bar 更新组合市场状态（未启用策略/provider 缺省 → 跳过，行为不变）
         self._maybe_update_regime(portfolio, bar.bar_time.date())
         # B-1 未来函数闸门放行：跨日后释放 deferred 的日线信号订单（bar_time 更新为

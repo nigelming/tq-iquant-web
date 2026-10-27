@@ -10,8 +10,9 @@
   ``BSFlag`` / ``Status`` / ``WtPrice`` / ``WtVol`` / ``CjVol``，**没有委托时间列**。
   因此 ``supports_remark = False``，走 Core 的 legacy 模糊匹配（代码+方向+数量+插入
   时间窗）。为让该匹配成立，``place_order`` 成功认领委托号（Wtbh）后在本进程记录
-  提交时间；``query_orders`` 只对**本进程下过的单**回填插入时间，其余历史委托留空
-  （空时间解析为 None → 状态机跳过），避免旧单冒领新单。
+  提交时间；``query_orders`` 对本进程下过的单回填真实提交时间，对陌生 ref（遗留单/
+  手工单）补记当前时间并标记 ``insert_fabricated=True``——状态机 legacy 匹配不绑
+  fabricated 候选、_resolve_order_id 兜底将其沉底，避免同形态遗留单被新单误绑（I-2）。
 - 行情/交易日历复用 Core 同进程 TQ（通达信）模块，与回测取数口径一致。
 
 TQ 常量（手册）：STOCK_BUY=0 / STOCK_SELL=1；PRICE_MY=0 自填价 / PRICE_SJ=1
@@ -171,6 +172,13 @@ class TdxTqDispatcher(OrderDispatcher):
         #: 已知 refs（委托表见过的全部 ref，进程内防重放——connect() 重连不清空）。
         self._claimed_refs: set = set()
         self._known_refs: set = set()
+        #: I-2（终审）：get_orders 对「纯陌生 ref」补记的当前时间属 fabricated——
+        #: 补记时间不是柜台真实插入时间（通达信委托表无时间列），时间窗校验对它
+        #: 无意义。状态机 legacy 匹配一律不绑 fabricated 候选；_resolve_order_id
+        #: 兜底段把 fabricated 沉底（仅无真实候选时使用）——防同形态遗留单/手工单
+        #: 在首次回查被新单误绑（真钱风险）。A-4 recover 的补记（DB 已绑 ref，
+        #: 属真实恢复）不算 fabricated（recover 直写 _submit_times，不经本集合）。
+        self._fabricated_refs: set = set()
 
     # ---- 连接 ----
 
@@ -356,6 +364,9 @@ class TdxTqDispatcher(OrderDispatcher):
         # A-5（C-3）：本轮见过的 refs 并入 _known_refs（供 _resolve_order_id「新增 ref
         # 优先」做 pre 快照）；缺 _submit_times 的 ref 用当前上海时间补记——重启单/手工单
         # 兜底认领后，状态机 legacy 匹配的时间窗（_ORDER_INSERT_TOLERANCE）才可用。
+        # I-2（终审）：纯陌生 ref 的补记时间属 fabricated（非柜台真实插入时间），
+        # 记入 _fabricated_refs 供匹配降级；_submit_times 里已有的 ref（本进程下单
+        # place_order / A-4 recover 补记）是真实/可信时间，不算 fabricated。
         now = now_shanghai()
         date_s = now.strftime("%Y%m%d")
         time_s = now.strftime("%H%M%S")
@@ -366,6 +377,7 @@ class TdxTqDispatcher(OrderDispatcher):
             self._known_refs.add(ref)
             if ref not in self._submit_times:
                 self._submit_times[ref] = (date_s, time_s)
+                self._fabricated_refs.add(ref)
         return out
 
     # ---- OrderDispatcher 契约 ----
@@ -391,7 +403,12 @@ class TdxTqDispatcher(OrderDispatcher):
         return [self.get_asset()]
 
     def query_orders(self, order_id: Optional[str] = None) -> list:
-        """委托表 → Core /orders 形状（source=BRIDGE，remark 恒空）。"""
+        """委托表 → Core /orders 形状（source=BRIDGE，remark 恒空）。
+
+        I-2（终审）：每行带 ``insert_fabricated``——该 ref 的插入时间是否为 get_orders
+        对陌生 ref 补记的当前时间（非柜台真实值）。状态机 legacy 匹配据此拒绝
+        fabricated 候选，防同形态遗留单/手工单被新单误绑。
+        """
         out = []
         for o in self.get_orders():
             ref = str(o.get("order_id") or "").strip()
@@ -412,6 +429,7 @@ class TdxTqDispatcher(OrderDispatcher):
                 "price": float(o.get("price") or 0),
                 "insert_date": insert_date,
                 "insert_time": insert_time,
+                "insert_fabricated": ref in self._fabricated_refs,
                 "status": int(o.get("status") or 50),
             })
         return out
@@ -607,10 +625,14 @@ class TdxTqDispatcher(OrderDispatcher):
         - **价格过滤放宽**：price_mode 映射 PRICE_SJ/ZTJ/DTJ（市价/最新/涨停/跌停）
           时委托表 WtPrice 可能为 0 或非传入价，跳过价格相等过滤；自填价（cage/my）
           保持价格过滤。
+        I-2（终审）：兜底段对 fabricated 候选（get_orders 补记的当前时间，非本进程
+        真实下单/恢复单）降级——优先认领有真实时间的候选，仅当无任何真实候选时才
+        用 fabricated（同形状遗留单/手工单不被优先误绑）。
         命中即记入 ``_claimed_refs``（提交时间由 place_order 统一补记）。
         """
         skip_price = PRICE_MODE_MAP.get(self._price_mode, "PRICE_MY") != "PRICE_MY"
         fallback = ""
+        fallback_fabricated = ""
         for i in range(max(attempts, 1)):
             pre = set(self._known_refs)
             for o in reversed(self.get_orders()):
@@ -626,10 +648,16 @@ class TdxTqDispatcher(OrderDispatcher):
                 if ref not in pre:
                     self._claimed_refs.add(ref)
                     return ref
-                if not fallback:
+                # I-2：兜底候选分两档——真实时间优先，fabricated 沉底。
+                if ref in self._fabricated_refs:
+                    if not fallback_fabricated:
+                        fallback_fabricated = ref
+                elif not fallback:
                     fallback = ref  # 已知 ref：先记兜底候选，本轮继续找新增
             if i < attempts - 1:
                 time.sleep(0.35)
+        if not fallback and fallback_fabricated:
+            fallback = fallback_fabricated
         if fallback:
             self._claimed_refs.add(fallback)
         return fallback
@@ -792,6 +820,9 @@ class TdxTqDispatcher(OrderDispatcher):
 
         now = now_shanghai()
         self._submit_times[ref] = (now.strftime("%Y%m%d"), now.strftime("%H%M%S"))
+        # I-2（终审）：本进程真实下单认领的 ref 不是 fabricated（resolve 回查期间
+        # get_orders 可能已把它当陌生 ref 补记过），清除标记让状态机 legacy 匹配正常绑定。
+        self._fabricated_refs.discard(ref)
 
         fill_price = order.price if order.price is not None else Decimal(str(price))
         return TradeEvent(

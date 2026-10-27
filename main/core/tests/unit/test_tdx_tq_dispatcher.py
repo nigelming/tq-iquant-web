@@ -754,3 +754,88 @@ def test_query_orders_backfills_insert_time_for_foreign_refs(fake):
     d = _connected_dispatcher()
     rows = d.query_orders()
     assert rows[0]["insert_date"] and rows[0]["insert_time"]
+
+
+# ---------------- I-2：陌生 ref 补记时间标 fabricated，匹配降级 ----------------
+
+def test_get_orders_marks_fabricated_refs(fake):
+    """I-2：纯陌生 ref（_submit_times 没有）的补记时间标 fabricated；
+    已有时间的 ref（本进程 place_order / A-4 recover 补记）不标。"""
+    d = _connected_dispatcher()
+    d._submit_times["W900"] = ("20261027", "093000")  # 预置真实时间
+    fake.orders = [_order(ref="W001"), _order(ref="W900")]
+    d.get_orders()
+    assert d._fabricated_refs == {"W001"}
+    assert "W900" not in d._fabricated_refs
+
+
+def test_query_orders_rows_carry_insert_fabricated_flag(fake):
+    """I-2：query_orders 每行带 insert_fabricated，状态机据此拒绝 fabricated 候选。"""
+    fake.orders = [_order(status=3, filled=1000, ref="W001")]
+    d = _connected_dispatcher()
+    rows = d.query_orders()
+    assert rows[0]["insert_fabricated"] is True
+    assert rows[0]["insert_date"] and rows[0]["insert_time"]
+
+
+def test_resolve_fallback_prefers_real_time_over_fabricated(fake):
+    """I-2：兜底段真实时间候选优先，fabricated（遗留单/手工单）沉底——仅无真实候选时才用。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W100"), _order(ref="W101")]
+    d._submit_times["W101"] = ("20261027", "100000")  # 真实时间（本进程单未完结）
+    d.get_orders()  # W100 陌生 → fabricated；W101 已有真实时间
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W101"
+    assert "W100" not in d._claimed_refs
+
+
+def test_resolve_fallback_uses_fabricated_as_last_resort(fake):
+    """I-2：只有 fabricated 候选时兜底仍可用（既有行为保留，但排在真实候选之后）。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(ref="W100")]
+    d.get_orders()  # W100 fabricated
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W100"
+    assert "W100" in d._claimed_refs
+
+
+def test_place_order_clears_fabricated_flag_on_claim(fake, no_quote):
+    """I-2：place_order 认领的 ref 清除 fabricated 标记（resolve 回查期间 get_orders
+    可能已把它当陌生 ref 补记），本进程单的 legacy 匹配不受降级影响。"""
+    d = TdxTqDispatcher(account="123456")
+    fake.orders = [_order(status=1, ref="W900")]
+    order = SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=datetime(2026, 10, 27, 9, 31),
+    )
+    trade = d.place_order(order)
+    assert trade is not None
+    assert "W900" not in d._fabricated_refs
+    row = d.query_orders()[0]
+    assert row["insert_fabricated"] is False
+
+
+def test_match_legacy_fuzzy_rejects_fabricated_row():
+    """I-2：状态机 legacy 匹配拒绝 insert_fabricated 候选（时间窗校验对补记时间无意义），
+    真实时间候选正常绑定。"""
+    live_order = SimpleNamespace(
+        stock_code="000001.SZ", trade_type="buy", quantity=1000,
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=5),
+    )
+    fabricated = {
+        "source": "BRIDGE", "instrument": "000001", "exchange": "SZ",
+        "direction": 48, "volume": 1000, "order_ref": "W100",
+        "insert_date": now_shanghai().strftime("%Y%m%d"),
+        "insert_time": now_shanghai().strftime("%H%M%S"),
+        "insert_fabricated": True,
+    }
+    real = {
+        "source": "BRIDGE", "instrument": "000001", "exchange": "SZ",
+        "direction": 48, "volume": 1000, "order_ref": "W200",
+        "insert_date": now_shanghai().strftime("%Y%m%d"),
+        "insert_time": now_shanghai().strftime("%H%M%S"),
+        "insert_fabricated": False,
+    }
+    assert OrderStateMachine.match_legacy_fuzzy(live_order, [fabricated], set()) is None
+    assert OrderStateMachine.match_legacy_fuzzy(live_order, [real], set()) == "W200"
