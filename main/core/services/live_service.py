@@ -162,7 +162,8 @@ def default_engine() -> str:
 def session_engine(session) -> str:
     """session 生效引擎：显式值优先；NULL（升级前的历史会话）回退全局默认。
 
-    历史会话列在迁移中留空，正是为了不改动升级前的 ths_ui.enabled 行为。
+    全局默认自 A-6 起为 tq_trade.default_engine（SystemConfig 可配，默认 tdx）；
+    未配置时沿用旧行为（ths_ui.enabled → ths，否则 iquant）。
     """
     explicit = getattr(session, "engine", None)
     return explicit if explicit in ENGINES_META else default_engine()

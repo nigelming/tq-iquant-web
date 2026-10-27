@@ -5653,6 +5653,7 @@ class FakeTdxDispatcher:
         self.cancel_calls = []
         self._submit_times = {}
         self._known_refs = set()
+        self._claimed_refs = set()
 
     def heartbeat(self):
         return True
@@ -5959,3 +5960,23 @@ def test_recover_backfills_submit_times_and_known_refs():
 
     assert disp._known_refs == {"W001"}
     assert disp._submit_times["W001"] == ("20261026", "100000")  # UTC+8 → 上海 10:00
+
+
+def test_recover_marks_pending_refs_as_claimed():
+    """批次 A 评审：挂回单 ref 已绑定 DB 单（语义即已认领），必须同时进
+    _claimed_refs——否则重启后 fallback「形状匹配且未 claimed」可能把新单
+    绑到已恢复单的 ref，deals 按 ref 双份回填导致持仓双计。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = FakeTdxDispatcher()
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _pending_order_with_ref(db, ref="W001")
+    db.commit()
+    db.close()
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert "W001" in disp._claimed_refs

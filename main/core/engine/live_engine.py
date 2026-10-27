@@ -1351,12 +1351,18 @@ class LiveEngine:
         # 挂回单的成交回填/认领会全部哑火。
         submit_times = getattr(self._dispatcher, "_submit_times", None)
         known_refs = getattr(self._dispatcher, "_known_refs", None)
+        claimed_refs = getattr(self._dispatcher, "_claimed_refs", None)
         for lo in pending:
             ref = lo.order_ref
             if not ref:
                 continue
             if known_refs is not None:
                 known_refs.add(ref)
+            # 批次 A 评审：挂回单的 ref 已绑定 DB 单（语义即已认领），必须同时进
+            # _claimed_refs——否则重启后 _claimed_refs 为空，新单 fallback
+            # 「形状匹配且未 claimed」可能绑到已恢复单的 ref，deals 按 ref 双份回填。
+            if claimed_refs is not None:
+                claimed_refs.add(ref)
             if submit_times is not None and ref not in submit_times:
                 if lo.created_at is not None:
                     sh = lo.created_at + timedelta(hours=8)  # UTC naive → 上海 naive
