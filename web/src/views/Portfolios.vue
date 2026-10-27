@@ -318,7 +318,8 @@ function buildStrategyPayload(): StrategyRequest {
     out.master_strategy_id = null
     out.slave_exit_mode = 'independent'
   }
-  // 实盘预警调度：text 空串归一 null（后端可空字段，发 '' 会 422）
+  // 实盘预警调度：text 空串/纯空白归一 null（后端可空字段，发 '' 会 422）
+  if (typeof out.signal_at === 'string') out.signal_at = (out.signal_at as string).trim()
   if (out.signal_at === '') out.signal_at = null
   return out as unknown as StrategyRequest
 }
@@ -397,6 +398,8 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
     if (!(freq in SIGNAL_FREQ_RANK)) return '信号频率非法'
     const periodRank = SIGNAL_FREQ_RANK[String(p.period)]
     if (periodRank !== undefined && SIGNAL_FREQ_RANK[freq] < periodRank) return '信号频率不能比周期更细'
+    // 1w/1mon 只能按已完成 bar 调度（无实时 bar 可依赖 current 口径）；null=按频率默认(completed)，不拦
+    if (SIGNAL_FREQ_RANK[freq] >= 6 && p.signal_data_end === 'current') return '1w/1mon 只允许 completed 数据口径'
   }
   const at = p.signal_at as string | null | undefined
   if (at && !/^\d{2}:\d{2}$/.test(String(at))) return '推送时点须为 HH:MM（如 15:05）'

@@ -84,6 +84,8 @@ const events = ref<LiveEvent[]>([])
 const connState = ref<'closed' | 'connecting' | 'open'>('closed')
 const connLabel: Record<string, string> = { closed: '未连接', connecting: '连接中', open: '已连接' }
 let es: EventSource | null = null
+// 当前 SSE 绑定的 session id（预警信号 tab 节流重拉用；关流置 null）
+let activeSessionId: number | null = null
 const EVENT_TYPES = ['signal', 'order', 'trade', 'position', 'risk', 'decision'] as const
 const LOG_CAP = 200
 
@@ -156,11 +158,29 @@ function pushLog(type: string, data: Record<string, unknown>, time: string) {
   if (events.value.length > LOG_CAP) events.value = events.value.slice(-LOG_CAP)
 }
 
+// 预警信号节流重拉：SSE signal 事件到达后 2s 窗口内合并为一次列表重拉。
+// 不直接把 SSE payload 映射成行——payload 是精简形状（signal_id 而非 id），
+// 缺 period/formula_name/trigger_value 等列，重拉才完整。
+let signalsRefreshTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleSignalsRefresh() {
+  if (signalsRefreshTimer !== null || activeSessionId === null) return
+  signalsRefreshTimer = setTimeout(async () => {
+    signalsRefreshTimer = null
+    if (activeSessionId === null) return
+    try {
+      const sig = await getLiveSignals(activeSessionId, { limit: 200 })
+      signals.value = sig.items
+      signalsTotal.value = sig.total
+    } catch { /* 会话已删除等 → 忽略，与 loadHistory 兜底一致 */ }
+  }, 2000)
+}
+
 function applyToWorkbench(type: string, data: Record<string, unknown>, time: string) {
   if (type === 'position') positions.value = upsertPositionRows(positions.value, data)
   else if (type === 'order') orders.value = prependCapped(orders.value, orderEventToRow(data, time))
   else if (type === 'trade') trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
   else if (type === 'decision') decisions.value = prependCapped(decisions.value, decisionEventToRow(data, time), 500)
+  else if (type === 'signal') scheduleSignalsRefresh()
 }
 
 async function loadHistory(id: number) {
@@ -187,6 +207,7 @@ async function loadHistory(id: number) {
 function startEventStream(id: number) {
   closeEventStream()
   connState.value = 'connecting'
+  activeSessionId = id
   const source = new EventSource(`/api/live/sessions/${id}/stream`)
   EVENT_TYPES.forEach((t) => {
     source.addEventListener(t, (e: MessageEvent) => {
@@ -205,6 +226,8 @@ function startEventStream(id: number) {
 function closeEventStream() {
   if (es) { es.close(); es = null }
   connState.value = 'closed'
+  activeSessionId = null
+  if (signalsRefreshTimer !== null) { clearTimeout(signalsRefreshTimer); signalsRefreshTimer = null }
 }
 
 async function load() {

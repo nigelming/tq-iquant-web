@@ -612,3 +612,69 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     w.unmount()
   })
 })
+
+describe('LiveSessions.vue SSE signal → 预警信号 tab 节流重拉', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('SSE signal 事件 → 2s 节流后重拉 getLiveSignals 更新 tab（payload 不直接映射成行）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 10, name: '日线趋势' }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    // 初始 loadHistory 拉一次
+    expect(getLiveSignals).toHaveBeenCalledTimes(1)
+
+    // 只 fake setTimeout/clearTimeout（节流 timer）；flushPromises 走 setImmediate 不受影响
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    ;(getLiveSignals as any).mockResolvedValue({
+      total: 1,
+      items: [{
+        id: 5, portfolio_id: 1, strategy_id: 10, stock_code: '600519.SH', period: '1d',
+        bar_time: '2026-10-27T10:30:00', formula_name: 'MACD金叉', signal_name: 'BUY',
+        signal_type: 'OPEN', trigger_value: 1, price: '1700.00',
+        execution_mode: 'alert', status: 'new',
+        alert_status: 'sent', alert_error: null, tdx_run_id: null,
+        created_at: '2026-10-27T10:30:01', alerted_at: '2026-10-27T10:30:02',
+      }],
+    })
+
+    // SSE payload 是精简形状（signal_id 而非 id）→ 只触发重拉，不直接进表
+    const es = FakeEventSource.instances[0]
+    es.emit('signal', { signal_id: 5, signal_type: 'OPEN', stock_code: '600519.SH' })
+    await flushPromises()
+    // 节流窗口内不重拉
+    expect(getLiveSignals).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(2000)
+    await flushPromises()
+    expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    expect(getLiveSignals).toHaveBeenLastCalledWith(7, { limit: 200 })
+
+    // tab 数据来自重拉结果（完整列形状），非 SSE 精简 payload
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('600519.SH')
+    expect(w.text()).toContain('MACD金叉')
+    w.unmount()
+  })
+
+  it('节流窗口内多条 signal 事件 → 合并为一次重拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const es = FakeEventSource.instances[0]
+    es.emit('signal', { signal_id: 1 })
+    es.emit('signal', { signal_id: 2 })
+    es.emit('signal', { signal_id: 3 })
+    vi.advanceTimersByTime(2000)
+    await flushPromises()
+    // 初始 loadHistory 1 次 + 节流合并后 1 次
+    expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+})

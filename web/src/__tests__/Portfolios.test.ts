@@ -849,6 +849,34 @@ describe('Portfolios.vue — 实盘预警调度（提交校验）', () => {
     expect(createStrategy).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
+
+  it('1w@09:00 周五 completed（period=1d）→ 合法提交，payload 四字段正确', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 21 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('select[data-field="period"]').setValue('1d')
+    await w.find('select[data-field="signal_frequency"]').setValue('1w')
+    await w.find('input[data-field="signal_at"]').setValue('09:00')
+    await w.find('input[data-field="signal_weekday"]').setValue('5')
+    await w.find('select[data-field="signal_data_end"]').setValue('completed')
+    await w.find('input[data-field="name"]').setValue('ALERT_1W_OK')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    // 不弹 alert：weekday 边界 5 合法（同 1），1w + completed 数据口径合法
+    expect(alertMock).not.toHaveBeenCalled()
+    expect(createStrategy).toHaveBeenCalledTimes(1)
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.signal_frequency).toBe('1w')
+    expect(arg.signal_at).toBe('09:00')
+    expect(arg.signal_weekday).toBe(5)
+    expect(arg.signal_data_end).toBe('completed')
+    vi.unstubAllGlobals()
+  })
 })
 
 describe('Portfolios.vue — 子策略列表行预警调度摘要', () => {
