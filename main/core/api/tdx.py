@@ -33,9 +33,16 @@ def _sdk_err_msg(d: dict, default: str) -> str | None:
     return None
 
 
+def _sector_already_exists(msg: str) -> bool:
+    """ensure_sector 对「板块已存在」的重复创建报 ErrorId≠0——幂等豁免：
+    错误文案含「已存在」或 "exist"（大小写不敏感）即视为板块已在，继续写成分股。"""
+    return "已存在" in msg or "exist" in msg.lower()
+
+
 @router.post("/user-block")
 def create_user_block(req: UserBlockReq):
-    """写自选股板块：ensure_sector（不存在则创建）→ send_user_block 写入成分股。"""
+    """写自选股板块：ensure_sector（不存在则创建）→ send_user_block 写入成分股。
+    幂等：ensure_sector 报「板块已存在」视为成功，继续写入（同名板块重推不 503）。"""
     if not req.block_code.strip():
         return err(400, "block_code 不能为空")
     if not req.stock_codes:
@@ -44,7 +51,7 @@ def create_user_block(req: UserBlockReq):
         ensured = TQData().ensure_sector(
             req.block_code, req.block_name or req.block_code)
         msg = _sdk_err_msg(ensured, "创建通达信板块失败")
-        if msg:
+        if msg and not _sector_already_exists(msg):
             return err(503, msg)
         sent = TQData().send_user_block(
             req.block_code, req.stock_codes, show=req.show)

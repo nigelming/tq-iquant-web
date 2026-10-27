@@ -17,6 +17,7 @@ import {
   type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import { deriveBlockCode } from '../utils/blockCode'
 
 const sessions = ref<LiveSessionItem[]>([])
 const loading = ref(true)
@@ -136,10 +137,10 @@ async function syncSignalsBlock() {
   const name = window.prompt('通达信自选板块名', '创懿预警')
   if (!name) return
   try {
-    const r = await sendUserBlock({ block_code: name, block_name: name, stock_codes: codes })
+    const r = await sendUserBlock({ block_code: deriveBlockCode(name), block_name: name, stock_codes: codes })
     alert(`已写入 ${r.count} 只到「${r.block_code}」`)
   } catch (e: any) {
-    alert(e?.message || '同步失败')
+    alert(e?.response?.data?.message || e?.message || '同步失败')
   }
 }
 

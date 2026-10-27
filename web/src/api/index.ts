@@ -765,8 +765,8 @@ export async function testRunFormula(req: TestRunRequest) {
 
 // ---- 1.3.1 通达信用户板块写入（POST /tdx/user-block）：全量替换板块成分股 ----
 export interface UserBlockRequest {
-  block_code: string       // 板块代码（同板块名）
-  block_name?: string      // 板块显示名（缺省用 block_code）
+  block_code: string       // 板块代码：由 block_name 确定性派生的 ASCII 码（utils/blockCode deriveBlockCode），同名同码保证幂等
+  block_name: string       // 板块显示名（用户输入的中文名）
   stock_codes: string[]    // 成分股代码列表
   show?: boolean           // 是否在通达信里显示该板块
 }

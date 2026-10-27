@@ -52,6 +52,7 @@ class FakeEventSource {
 
 import LiveSessions from '../views/LiveSessions.vue'
 import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock } from '../api'
+import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -726,10 +727,30 @@ describe('LiveSessions.vue 预警信号同步自选（1.3.1）', () => {
 
     expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿预警')
     expect(sendUserBlock).toHaveBeenCalledWith({
-      block_code: '创懿预警', block_name: '创懿预警',
+      block_code: deriveBlockCode('创懿预警'), block_name: '创懿预警',
       stock_codes: ['600000.SH', '000001.SZ'],
     })
     expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 2 只'))
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('sendUserBlock 失败 → alert 提取后端 message（M5），不裸露网络层英文文案', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    ;(sendUserBlock as any).mockRejectedValue({ response: { data: { message: '通达信未启动' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿预警'))
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalledWith('通达信未启动')
     vi.unstubAllGlobals()
     w.unmount()
   })

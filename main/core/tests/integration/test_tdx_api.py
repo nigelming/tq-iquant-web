@@ -225,6 +225,48 @@ def test_user_block_ensure_error_503_no_send(client, monkeypatch):
     assert log == ["ensure"]
 
 
+def test_user_block_ensure_existing_exempt_continues_send(client, monkeypatch):
+    # SDK 对已存在板块的重复创建报 ErrorId≠0（中文「已存在」）→ 豁免，继续写入
+    log = []
+
+    def fake_ensure(self, block_code, block_name):
+        log.append("ensure")
+        return {"ErrorId": "3", "Error": "板块已存在"}
+
+    def fake_send(self, block_code, stock_codes, show=False):
+        log.append(("send", block_code, list(stock_codes)))
+        return {"ErrorId": "0"}
+
+    _patch_data(monkeypatch, "ensure_sector", fake_ensure)
+    _patch_data(monkeypatch, "send_user_block", fake_send)
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "block_name": "我的板块",
+        "stock_codes": ["000001.SZ"]}).json()
+    assert body["code"] == 0
+    assert body["data"] == {"block_code": "MYBK", "count": 1}
+    assert log == ["ensure", ("send", "MYBK", ["000001.SZ"])]
+
+
+def test_user_block_ensure_english_exist_exempt(client, monkeypatch):
+    # 英文文案 "Already exist"（大小写不敏感）同样豁免
+    log = []
+
+    def fake_ensure(self, block_code, block_name):
+        log.append("ensure")
+        return {"ErrorId": "3", "Msg": "Block Already Exist"}
+
+    def fake_send(self, block_code, stock_codes, show=False):
+        log.append("send")
+        return {"ErrorId": "0"}
+
+    _patch_data(monkeypatch, "ensure_sector", fake_ensure)
+    _patch_data(monkeypatch, "send_user_block", fake_send)
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "stock_codes": ["000001.SZ"]}).json()
+    assert body["code"] == 0
+    assert log == ["ensure", "send"]
+
+
 def test_user_block_send_empty_dict_503(client, monkeypatch):
     # SDK send_user_block 失败返回 {}（wrapper 归一）→ 503
     def fake_ensure(self, block_code, block_name):

@@ -19,6 +19,7 @@ import type {
   ValidationVerdict,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import { deriveBlockCode } from '../utils/blockCode'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
@@ -1055,7 +1056,7 @@ async function syncPositionsBlock() {
   if (!name) return
   try {
     const r = await sendUserBlock({
-      block_code: name, block_name: name, stock_codes: detailStockCodes.value,
+      block_code: deriveBlockCode(name), block_name: name, stock_codes: detailStockCodes.value,
     })
     alert(`已写入 ${r.count} 只到「${r.block_code}」`)
   } catch (e) {
