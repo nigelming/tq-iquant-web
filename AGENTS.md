@@ -73,7 +73,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 ## 并发模型
 
 - **回测**：同步内联执行（在请求处理线程内跑 `BacktestEngine.run`）+ 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个回测运行（并发启动返回 HTTP 409）。前端通过记录状态轮询获取进度。
-- **实盘**：`BarPoller` 同步轮询 iQuant 行情桥，`_loop`/`_deals_loop` 经单 worker `ThreadPoolExecutor` 转入主事件循环（非 `run_coroutine_threadsafe`——TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询）。
+- **实盘**：`BarPoller` 同步轮询 iQuant 行情桥，`_loop`（60s 主循环：bar/approve/submit/超时收割）与 `_deals_loop`（5s 成交回填）各自投**独立单 worker `ThreadPoolExecutor`**（非 `run_coroutine_threadsafe`——TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询），两池真并发。
+- **实盘记账锁**：跨池记账（`_pending_orders` 增删/遍历、backfill/apply、持仓现金更新）由引擎级 `_book_lock`（`threading.RLock`）在调用点串行化——覆盖 `_tick_main` 超时收割段（expire + cancel_unfilled + commit）、收盘清扫（`_maybe_close_sweep`）、deals 回填（`_tick_deals`）与 `_handle_bar` 的在途单遍历；锁序恒为 `_book_lock` → `get_tdx_lock`，无反向获取，无死锁。start/stop 接口另有 `_START_LOCK`（asyncio）串行化 check-then-act 窗口，防双引擎并发下单。
 - FastAPI 主事件循环不能被同步 I/O 阻塞（行情/订单轮询走线程池 worker）。
 
 ## 业务规则（容易遗漏）
@@ -103,7 +104,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 执行引擎 `ExecutionEngine` 持有这两个接口，不感知具体实现。
 
-**实盘交易引擎按会话可选**：`live_sessions.engine` ∈ `iquant` / `tdx` / `ths` / `qmt`；NULL 表示迁移前的历史会话，运行时按全局默认（`ths_ui.enabled` → ths，否则 iquant）解析以保持升级前行为。引擎未就绪（客户端未启动/未登录/依赖缺失/未配置路径账号）时 `/sessions/{id}/start` 直接返回 503 并给出可操作中文提示，**不会静默回退到其它通道**。委托认领：`supports_remark=False` 的通道（通达信、同花顺）走 legacy 模糊匹配（代码+方向+数量+提交时间窗），`supports_remark=True`（miniQMT）按 remark 精确认领。
+**实盘交易引擎按会话可选**：`live_sessions.engine` ∈ `iquant` / `tdx` / `ths` / `qmt`；NULL 表示迁移前的历史会话，运行时按全局默认解析——`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置/非法回退旧行为（`ths_ui.enabled` → ths，否则 iquant）。引擎未就绪（客户端未启动/未登录/依赖缺失/未配置路径账号）时 `/sessions/{id}/start` 直接返回 503 并给出可操作中文提示，**不会静默回退到其它通道**。委托认领：`supports_remark=False` 的通道（通达信、同花顺）走 legacy 模糊匹配（代码+方向+数量+提交时间窗；陌生 ref 补记的时间标记 `insert_fabricated`，匹配时降级排除，防遗留单误绑），`supports_remark=True`（miniQMT）按 remark 精确认领。
 
 ## 关键路径与配置文件
 

@@ -68,7 +68,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - 同花顺 UI 执行通道 `ThsUiDispatcher`（可选，`ths_ui.enabled`；UIA 切「资金股票/当日委托」+ 剪贴板取数，Windows 内置 OCR 自动过复制验证码；`query_quote/query_calendar` 复用 TQ；无备注列，Core 走 legacy 模糊匹配）
 - 通达信 TQ 交易通道 `TdxTqDispatcher`（[main/core/engine/tdx_tq_dispatcher.py](main/core/engine/tdx_tq_dispatcher.py)）：`tq.stock_account` / `query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `order_stock`，与回测取数共用同一条 TQ 连接；委托表无备注列且无时间列 → `supports_remark=False`，下单后回查 `Wtbh` 认领并在进程内记录提交时间供 legacy 模糊匹配；半自动「下单确认」模式显式拒单告警
 - miniQMT 交易通道 `QmtDispatcher`（[main/core/engine/qmt_dispatcher.py](main/core/engine/qmt_dispatcher.py)）：`xtquant.xttrader` 限价下单 + `order_remark` 写入确定性订单 ID → 走 remark 精确认领；`can_use_volume` 作 T+1 可用；xtquant 缺失/未配置路径时启动直接 503 告警，不静默换通道
-- 实盘引擎按会话可选：`live_sessions.engine`（iquant/tdx/ths/qmt，NULL=历史会话走全局默认 `ths_ui.enabled` 判定），`/api/live/channel` 返回四引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher
+- 实盘引擎按会话可选：`live_sessions.engine`（iquant/tdx/ths/qmt，NULL=历史会话按全局默认解析：`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置回退旧行为 `ths_ui.enabled` 判定），`/api/live/channel` 返回四引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher
 - 引擎层全 TDD 实现：`BacktestEngine.run` 完整逐 bar 回测；`LiveEngine` 实盘主链路（订单状态机 + /deals 回填 + 三段式周期 1m 边界/1d 14:30/1w·1mon 通达信 + B5 SSE 五类事件流 + E5/E6 熔断 + D3 对账告警）已接线。`SignalEngine` 为未接线的冗余壳（信号走 `strategy_context` + `Portfolio.on_bar` 直接求值）
 - TQ 模块（[main/core/tq/](main/core/tq/)）data/formula/utils 已对接通达信真机可用；`tdx_path` 从 config.yaml 读取
 - 前端 6 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig）
@@ -91,7 +91,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - **熔断**：max_drawdown 触发次日恢复（累计 3 次转手动）；daily_loss_limit 当日暂停次日恢复。熔断期间不清仓，仅暂停新开仓
 - **主从策略**：从策略只能买入主策略当前持有的同一只股票；主策略清仓（含该股）后从策略不可新开仓但存量可自行卖出
 - **数据库迁移**：用 Alembic，禁止手动改表结构。
-- **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘全局限 1 个 session（`_ENGINES` 非空即拒，B6）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程经 `asyncio.run_coroutine_threadsafe` 转入主事件循环，主循环不可被 TQ 回调阻塞
+- **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘全局限 1 个 session（`_ENGINES` 非空即拒，B6），start/stop 经 `_START_LOCK` 串行化防双引擎。实盘主池（bar/approve/submit/收割）与 deals 池（5s 回填）为独立单 worker 线程池，跨池记账由引擎级 `_book_lock`（RLock）串行化（锁序 `_book_lock` → `get_tdx_lock`）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询
 
 ## 开发范式
 
