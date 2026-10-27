@@ -140,6 +140,15 @@ class TQData:
                 return {}
         return {}
 
+    def delete_sector(self, block_code: str):
+        """删除自定义板块（配合 send_user_block 的追加语义实现覆盖写）。
+
+        薄透传：SDK delete_sector 返回 JSON 字符串或 dict（失败 None），原样
+        返回不解析——结果处理（best-effort 忽略）由调用方负责。
+        """
+        with get_tdx_lock():
+            return get_tq().delete_sector(block_code=block_code)
+
     def send_user_block(
         self, block_code: str, stocks: List[str], show: bool = False,
     ) -> dict:

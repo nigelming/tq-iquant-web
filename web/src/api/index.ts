@@ -769,6 +769,7 @@ export interface UserBlockRequest {
   block_name: string       // 板块显示名（用户输入的中文名）
   stock_codes: string[]    // 成分股代码列表
   show?: boolean           // 是否在通达信里显示该板块
+  mode?: 'replace' | 'append'  // replace=覆盖写（默认，后端先清空板块再写入）；append=追加（SDK 原生语义）
 }
 
 export interface UserBlockResult {

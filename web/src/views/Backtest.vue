@@ -1057,6 +1057,7 @@ async function syncPositionsBlock() {
   try {
     const r = await sendUserBlock({
       block_code: deriveBlockCode(name), block_name: name, stock_codes: detailStockCodes.value,
+      mode: 'replace',
     })
     alert(`已写入 ${r.count} 只到「${r.block_code}」`)
   } catch (e) {
@@ -3222,7 +3223,7 @@ watch(theme, () => {
       <button @click="syncPositionsBlock" class="btn btn-sm"
               style="margin-top:8px;display:inline-block;margin-left:6px"
               :disabled="detailStockCodes.length === 0"
-              title="口径：本次回测交易明细涉及的股票（去重）——详情无最终持仓快照；写入通达信自选板块">
+              title="口径：本次回测交易明细涉及的股票（去重）——详情无最终持仓快照；写入通达信自选板块；覆盖写入板块">
         🔗 同步持仓股到通达信自选
       </button>
     </div>

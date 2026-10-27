@@ -5,6 +5,8 @@ TQ 调用是阻塞 DLL 调用，FastAPI 自动丢线程池。TDXConnectionError 
 err(503, str(e))（消息已中文）；SDK 返回 dict 的 ErrorId 语义由本层判定
 （无 ErrorId 视为成功，空 dict = wrapper 归一的 SDK 失败 → 503）。
 """
+import logging
+
 import pandas as pd
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -12,6 +14,8 @@ from pydantic import BaseModel
 from core.api.response import err, ok
 from core.tq.data import TQData
 from core.tq.utils import TDXConnectionError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tdx", tags=["tdx"])
 
@@ -21,6 +25,7 @@ class UserBlockReq(BaseModel):
     block_name: str = ""
     stock_codes: list[str]
     show: bool = False
+    mode: str = "replace"  # replace=覆盖写（默认，先清空板块再写入）| append=追加
 
 
 def _sdk_err_msg(d: dict, default: str) -> str | None:
@@ -42,12 +47,24 @@ def _sector_already_exists(msg: str) -> bool:
 @router.post("/user-block")
 def create_user_block(req: UserBlockReq):
     """写自选股板块：ensure_sector（不存在则创建）→ send_user_block 写入成分股。
-    幂等：ensure_sector 报「板块已存在」视为成功，继续写入（同名板块重推不 503）。"""
+    幂等：ensure_sector 报「板块已存在」视为成功，继续写入（同名板块重推不 503）。
+
+    mode=replace（默认）：SDK send_user_block 为追加语义，先 delete_sector 清空
+    板块成分股再写入 = 覆盖；delete best-effort——结果忽略、异常 warning 不阻断。
+    mode=append：保持 SDK 原生追加语义（ensure → send）。"""
     if not req.block_code.strip():
         return err(400, "block_code 不能为空")
     if not req.stock_codes:
         return err(400, "stock_codes 不能为空")
+    if req.mode not in ("replace", "append"):
+        return err(400, "mode 仅允许 replace/append")
     try:
+        if req.mode == "replace":
+            try:
+                TQData().delete_sector(req.block_code)
+            except Exception as e:
+                logger.warning("delete_sector(%s) 失败（忽略，继续覆盖写入）：%s",
+                               req.block_code, e)
         ensured = TQData().ensure_sector(
             req.block_code, req.block_name or req.block_code)
         msg = _sdk_err_msg(ensured, "创建通达信板块失败")
@@ -60,7 +77,8 @@ def create_user_block(req: UserBlockReq):
             return err(503, msg)
     except TDXConnectionError as e:
         return err(503, str(e))
-    return ok({"block_code": req.block_code, "count": len(req.stock_codes)})
+    return ok({"block_code": req.block_code, "count": len(req.stock_codes),
+               "mode": req.mode})
 
 
 @router.get("/divid-factors")

@@ -728,7 +728,7 @@ describe('LiveSessions.vue 预警信号同步自选（1.3.1）', () => {
     expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿预警')
     expect(sendUserBlock).toHaveBeenCalledWith({
       block_code: deriveBlockCode('创懿预警'), block_name: '创懿预警',
-      stock_codes: ['600000.SH', '000001.SZ'],
+      stock_codes: ['600000.SH', '000001.SZ'], mode: 'replace',
     })
     expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 2 只'))
     vi.unstubAllGlobals()

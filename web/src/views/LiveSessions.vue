@@ -137,7 +137,7 @@ async function syncSignalsBlock() {
   const name = window.prompt('通达信自选板块名', '创懿预警')
   if (!name) return
   try {
-    const r = await sendUserBlock({ block_code: deriveBlockCode(name), block_name: name, stock_codes: codes })
+    const r = await sendUserBlock({ block_code: deriveBlockCode(name), block_name: name, stock_codes: codes, mode: 'replace' })
     alert(`已写入 ${r.count} 只到「${r.block_code}」`)
   } catch (e: any) {
     alert(e?.response?.data?.message || e?.message || '同步失败')
@@ -514,7 +514,7 @@ onUnmounted(closeEventStream)
     <div v-if="wbTab === 'signals'" class="table-wrap">
       <div style="display:flex;justify-content:flex-end;align-items:center;margin:0 0 6px">
         <button @click="syncSignalsBlock" class="btn btn-sm"
-                title="将当前信号列表的股票代码去重后写入通达信自选板块">同步信号股到自选</button>
+                title="将当前信号列表的股票代码去重后写入通达信自选板块；覆盖写入板块">同步信号股到自选</button>
       </div>
       <p v-if="signalsTotal > signals.length" style="font-size:12px;color:var(--ink-faint);margin:0 0 6px">
         共 {{ signalsTotal }} 条，仅显示最新 {{ signals.length }} 条

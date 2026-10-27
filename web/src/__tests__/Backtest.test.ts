@@ -2920,7 +2920,7 @@ describe('Backtest.vue — 详情页同步自选（1.3.1）', () => {
 
     expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿回测')
     expect(sendUserBlock).toHaveBeenCalledWith({
-      block_code: deriveBlockCode('创懿回测'), block_name: '创懿回测', stock_codes: ['000001.SZ'],
+      block_code: deriveBlockCode('创懿回测'), block_name: '创懿回测', stock_codes: ['000001.SZ'], mode: 'replace',
     })
     expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 1 只'))
     vi.unstubAllGlobals()

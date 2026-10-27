@@ -5,7 +5,9 @@ TQ 层以类方法级 monkeypatch 替换（TQFormula.compute_by_src / TQData 各
 - POST /api/formulas/test-run：摘要形状（n/ones/last_values）、参数透传与默认值、
   参数校验 400、ErrorId→503、部分股票缺失 warning、TDXConnectionError→503
 - POST /api/tdx/user-block：ensure→send 顺序断言、block_name 缺省回退 block_code、
-  ErrorId→503（ensure 失败不 send）、SDK 空 dict（失败）→503、校验 400、连接错误 503
+  ErrorId→503（ensure 失败不 send）、SDK 空 dict（失败）→503、校验 400、连接错误 503；
+  mode=replace（默认）delete→ensure→send（delete 失败 best-effort 不阻断）、
+  mode=append 无 delete、mode 非法 400
 - GET /api/tdx/divid-factors：Date 索引 DataFrame → events 记录（NaN→None）、
   stock_code 必填 400、连接错误 503
 - GET /api/tdx/trading-dates：透传、start/end 必填 400、连接错误 503
@@ -44,6 +46,11 @@ def _patch_compute_by_src(monkeypatch, result=None, error=None):
 
 def _patch_data(monkeypatch, name, fn):
     monkeypatch.setattr(TQData, name, fn)
+
+
+def _patch_delete_noop(monkeypatch):
+    """replace 模式默认先 delete_sector：不关心 delete 的用例补 no-op，避免触真实 SDK。"""
+    _patch_data(monkeypatch, "delete_sector", lambda self, c: {"ErrorId": "0"})
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +170,10 @@ def test_test_run_connection_error_503(client, monkeypatch):
 def test_user_block_success_chain(client, monkeypatch):
     log = []
 
+    def fake_delete(self, block_code):
+        log.append(("delete", block_code))
+        return {"ErrorId": "0"}
+
     def fake_ensure(self, block_code, block_name):
         log.append(("ensure", block_code, block_name))
         return {"ErrorId": "0"}
@@ -171,6 +182,7 @@ def test_user_block_success_chain(client, monkeypatch):
         log.append(("send", block_code, list(stock_codes), show))
         return {"ErrorId": "0"}
 
+    _patch_data(monkeypatch, "delete_sector", fake_delete)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     resp = client.post("/api/tdx/user-block", json={
@@ -179,8 +191,9 @@ def test_user_block_success_chain(client, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
-    assert body["data"] == {"block_code": "MYBK", "count": 2}
+    assert body["data"] == {"block_code": "MYBK", "count": 2, "mode": "replace"}
     assert log == [
+        ("delete", "MYBK"),
         ("ensure", "MYBK", "我的板块"),
         ("send", "MYBK", ["000001.SZ", "000002.SZ"], True),
     ]
@@ -197,6 +210,7 @@ def test_user_block_empty_name_falls_back_to_code(client, monkeypatch):
         log.append(("send", block_code, list(stock_codes), show))
         return {"ErrorId": "0"}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
@@ -216,6 +230,7 @@ def test_user_block_ensure_error_503_no_send(client, monkeypatch):
         log.append("send")
         return {"ErrorId": "0"}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
@@ -237,13 +252,14 @@ def test_user_block_ensure_existing_exempt_continues_send(client, monkeypatch):
         log.append(("send", block_code, list(stock_codes)))
         return {"ErrorId": "0"}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
         "block_code": "MYBK", "block_name": "我的板块",
         "stock_codes": ["000001.SZ"]}).json()
     assert body["code"] == 0
-    assert body["data"] == {"block_code": "MYBK", "count": 1}
+    assert body["data"] == {"block_code": "MYBK", "count": 1, "mode": "replace"}
     assert log == ["ensure", ("send", "MYBK", ["000001.SZ"])]
 
 
@@ -259,6 +275,7 @@ def test_user_block_ensure_english_exist_exempt(client, monkeypatch):
         log.append("send")
         return {"ErrorId": "0"}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
@@ -275,6 +292,7 @@ def test_user_block_send_empty_dict_503(client, monkeypatch):
     def fake_send(self, block_code, stock_codes, show=False):
         return {}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
@@ -290,6 +308,7 @@ def test_user_block_send_error_503(client, monkeypatch):
     def fake_send(self, block_code, stock_codes, show=False):
         return {"ErrorId": "2", "Error": "写入自选股失败"}
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
@@ -302,6 +321,7 @@ def test_user_block_connection_error_503(client, monkeypatch):
     def fake_ensure(self, block_code, block_name):
         raise TDXConnectionError("通达信未启动")
 
+    _patch_delete_noop(monkeypatch)
     _patch_data(monkeypatch, "ensure_sector", fake_ensure)
     body = client.post("/api/tdx/user-block", json={
         "block_code": "MYBK", "stock_codes": ["000001.SZ"]}).json()
@@ -321,6 +341,100 @@ def test_user_block_validation_400(client, monkeypatch):
     body = client.post("/api/tdx/user-block", json={
         "block_code": "MYBK", "stock_codes": []}).json()
     assert body["code"] == 400
+    assert calls == []
+
+
+def test_user_block_replace_mode_order_delete_ensure_send(client, monkeypatch):
+    # mode=replace：delete→ensure→send 顺序（覆盖写：先清空板块再写入）
+    log = []
+
+    def fake_delete(self, block_code):
+        log.append(("delete", block_code))
+        return {"ErrorId": "0"}
+
+    def fake_ensure(self, block_code, block_name):
+        log.append(("ensure", block_code, block_name))
+        return {"ErrorId": "0"}
+
+    def fake_send(self, block_code, stock_codes, show=False):
+        log.append(("send", block_code, list(stock_codes), show))
+        return {"ErrorId": "0"}
+
+    _patch_data(monkeypatch, "delete_sector", fake_delete)
+    _patch_data(monkeypatch, "ensure_sector", fake_ensure)
+    _patch_data(monkeypatch, "send_user_block", fake_send)
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "block_name": "我的板块",
+        "stock_codes": ["000001.SZ"], "mode": "replace"}).json()
+    assert body["code"] == 0
+    assert body["data"] == {"block_code": "MYBK", "count": 1, "mode": "replace"}
+    assert log == [("delete", "MYBK"), ("ensure", "MYBK", "我的板块"),
+                   ("send", "MYBK", ["000001.SZ"], False)]
+
+
+def test_user_block_replace_delete_failure_best_effort(client, monkeypatch):
+    # replace 模式 delete_sector 抛异常 → warning 不阻断，继续 ensure→send
+    log = []
+
+    def fake_delete(self, block_code):
+        raise TDXConnectionError("删除板块失败")
+
+    def fake_ensure(self, block_code, block_name):
+        log.append("ensure")
+        return {"ErrorId": "0"}
+
+    def fake_send(self, block_code, stock_codes, show=False):
+        log.append("send")
+        return {"ErrorId": "0"}
+
+    _patch_data(monkeypatch, "delete_sector", fake_delete)
+    _patch_data(monkeypatch, "ensure_sector", fake_ensure)
+    _patch_data(monkeypatch, "send_user_block", fake_send)
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "stock_codes": ["000001.SZ"]}).json()
+    assert body["code"] == 0
+    assert body["data"]["mode"] == "replace"
+    assert log == ["ensure", "send"]
+
+
+def test_user_block_append_mode_no_delete(client, monkeypatch):
+    # mode=append：保持 ensure→send，不触发 delete
+    log = []
+
+    def fake_delete(self, block_code):
+        log.append("delete")
+        return {"ErrorId": "0"}
+
+    def fake_ensure(self, block_code, block_name):
+        log.append("ensure")
+        return {"ErrorId": "0"}
+
+    def fake_send(self, block_code, stock_codes, show=False):
+        log.append("send")
+        return {"ErrorId": "0"}
+
+    _patch_data(monkeypatch, "delete_sector", fake_delete)
+    _patch_data(monkeypatch, "ensure_sector", fake_ensure)
+    _patch_data(monkeypatch, "send_user_block", fake_send)
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "stock_codes": ["000001.SZ"],
+        "mode": "append"}).json()
+    assert body["code"] == 0
+    assert body["data"] == {"block_code": "MYBK", "count": 1, "mode": "append"}
+    assert log == ["ensure", "send"]
+
+
+def test_user_block_invalid_mode_400(client, monkeypatch):
+    calls = []
+    _patch_data(monkeypatch, "delete_sector",
+                lambda self, c: calls.append("delete") or {"ErrorId": "0"})
+    _patch_data(monkeypatch, "ensure_sector",
+                lambda self, c, n: calls.append("ensure") or {"ErrorId": "0"})
+    body = client.post("/api/tdx/user-block", json={
+        "block_code": "MYBK", "stock_codes": ["000001.SZ"],
+        "mode": "upsert"}).json()
+    assert body["code"] == 400
+    assert "mode" in body["message"]
     assert calls == []
 
 

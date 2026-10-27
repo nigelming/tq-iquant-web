@@ -32,6 +32,7 @@ class FakeTq:
         self.trading_dates_raise = False
         self.zdt_result = {}
         self.create_sector_result = '{"ErrorId": "0"}'
+        self.delete_sector_result = '{"ErrorId": "0"}'
         self.send_user_block_result = {"ErrorId": "0"}
         self.divid_result = pd.DataFrame()
         self.batch_result = {}
@@ -57,6 +58,10 @@ class FakeTq:
     def create_sector(self, block_code="", block_name=""):
         self.calls["create_sector"] = {"block_code": block_code, "block_name": block_name}
         return self.create_sector_result
+
+    def delete_sector(self, block_code=""):
+        self.calls["delete_sector"] = {"block_code": block_code}
+        return self.delete_sector_result
 
     def send_user_block(self, block_code="", stock_list=[], show=False):
         self.calls["send_user_block"] = {
@@ -208,6 +213,18 @@ def test_ensure_sector_existing_not_error(fake_tq):
 def test_ensure_sector_none_result_to_empty(fake_tq):
     fake_tq.create_sector_result = None
     assert TQData().ensure_sector("MYBK", "我的板块") == {}
+
+
+def test_delete_sector_passthrough(fake_tq):
+    # delete_sector 薄透传：JSON str / dict 原样返回（解析由调用方负责）
+    fake_tq.delete_sector_result = {"ErrorId": "0"}
+    out = TQData().delete_sector("MYBK")
+    assert out == {"ErrorId": "0"}
+    assert fake_tq.calls["delete_sector"] == {"block_code": "MYBK"}
+
+    fake_tq.delete_sector_result = '{"ErrorId": "1"}'
+    assert TQData().delete_sector("MYBK") == '{"ErrorId": "1"}'
+    assert fake_tq.calls["delete_sector"] == {"block_code": "MYBK"}
 
 
 def test_send_user_block_show_passthrough(fake_tq):
