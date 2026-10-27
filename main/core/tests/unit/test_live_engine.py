@@ -5229,6 +5229,108 @@ def test_backfill_same_partial_does_not_spam_log(caplog):
     db.close()
 
 
+def test_backfill_no_change_repeats_emit_nothing():
+    """I2：同量同状态重复回填（5s 轮询同一 partial）→ 不重复发 order/trade 事件。"""
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf-nc",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, q = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    partial = [{"order_ref": "ref-bf-nc", "volume": 300, "amount": 2700,
+                "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    engine._backfill_order(db, lo, partial)   # 首次：order(partial) + trade 照发
+    first = [q.get_nowait(), q.get_nowait()]
+    assert first[0]["type"] == "order" and first[0]["status"] == "partial"
+    assert first[1]["type"] == "trade"
+    assert q.empty()
+    engine._backfill_order(db, lo, partial)   # 同量同状态：零 emit
+    engine._backfill_order(db, lo, partial)
+    db.commit()
+    db.close()
+    assert q.empty()
+
+
+def test_backfill_qty_change_emits_again():
+    """I2：回填量变化（300→400）→ order/trade 事件照发。"""
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf-qty",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, q = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    partial300 = [{"order_ref": "ref-bf-qty", "volume": 300, "amount": 2700,
+                   "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    engine._backfill_order(db, lo, partial300)
+    assert q.get_nowait()["type"] == "order"
+    assert q.get_nowait()["type"] == "trade"
+    assert q.empty()
+    partial400 = [{"order_ref": "ref-bf-qty", "volume": 400, "amount": 3600,
+                   "commission": 0, "trade_date": "20260805", "trade_time": "100200"}]
+    engine._backfill_order(db, lo, partial400)  # 量变：照发
+    db.commit()
+    db.close()
+    ev = [q.get_nowait(), q.get_nowait()]
+    assert ev[0]["type"] == "order" and ev[0]["filled_quantity"] == 400
+    assert ev[1]["type"] == "trade" and ev[1]["quantity"] == 400
+    assert q.empty()
+
+
+def test_backfill_status_change_emits_again():
+    """I2：状态变（prev canceled → new partial）→ 事件照发（任一变化必发）。"""
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=300, filled_price=Decimal("9.0"), status="canceled",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-bf-st",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, q = _ss_engine(factory, port)
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    partial = [{"order_ref": "ref-bf-st", "volume": 300, "amount": 2700,
+                "commission": 0, "trade_date": "20260805", "trade_time": "100100"}]
+    engine._backfill_order(db, lo, partial)  # 状态变：canceled→partial 照发
+    db.commit()
+    db.close()
+    ev = [q.get_nowait(), q.get_nowait()]
+    assert ev[0]["type"] == "order" and ev[0]["status"] == "partial"
+    assert ev[1]["type"] == "trade"
+    assert q.empty()
+
+
 def test_expire_rejected_logs_warning(caplog):
     """expire 超时真空单标 rejected -> logger.warning（此前只发 SSE）。"""
     import logging

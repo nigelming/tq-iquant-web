@@ -732,7 +732,11 @@ class OrderStateMachine:
         new_status = "filled" if total_qty >= live_order.quantity else "partial"
         live_order.status = new_status
         self.last_backfill_time = now_shanghai()  # G7：记录最近一次回填时点
-        if total_qty != prev_qty or new_status != prev_status:
+        # 量与状态均无变化 → 5s 轮询对同一 partial 的重复回填（audit I2 根因）：
+        # 不重复发 order/trade 事件（否则 SSE 流被相同事件刷屏）；任一变化照发
+        # （终态 filled 到达必发；canceled 终态由终态同步路径发射，不经本方法）。
+        changed = total_qty != prev_qty or new_status != prev_status
+        if changed:
             logger.info(
                 "backfill: order %s %s %s %s qty=%s/%s price=%.4f amount=%s commission=%s",
                 live_order.id, live_order.trade_type, live_order.stock_code, new_status,
@@ -740,17 +744,18 @@ class OrderStateMachine:
                 total_commission,
             )
         # B5：订单状态推送（filled/partial 都由成交回报回填推进）
-        self._emit("order", {
-            "portfolio_id": live_order.portfolio_strategy_id,
-            "order_id": live_order.id,
-            "status": live_order.status,
-            "stock_code": live_order.stock_code,
-            "trade_type": (live_order.trade_type or "").upper(),
-            "quantity": live_order.quantity,
-            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-            "filled_quantity": live_order.filled_quantity,
-            "filled_price": float(avg_price),
-        })
+        if changed:
+            self._emit("order", {
+                "portfolio_id": live_order.portfolio_strategy_id,
+                "order_id": live_order.id,
+                "status": live_order.status,
+                "stock_code": live_order.stock_code,
+                "trade_type": (live_order.trade_type or "").upper(),
+                "quantity": live_order.quantity,
+                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                "filled_quantity": live_order.filled_quantity,
+                "filled_price": float(avg_price),
+            })
 
         # 写/更新 LiveTrade（按 order_ref 聚合为一笔）
         trade_time = self.parse_trade_time(matched_deals[-1])
@@ -783,16 +788,17 @@ class OrderStateMachine:
             )
             db.add(trade_rec)
         db.flush()  # 取 trade_rec.id（B5 trade 事件用）
-        # B5：成交回报推送
-        self._emit("trade", {
-            "portfolio_id": live_order.portfolio_strategy_id,
-            "trade_id": trade_rec.id,
-            "stock_code": trade_rec.stock_code,
-            "trade_type": (trade_rec.trade_type or "").upper(),
-            "price": float(avg_price),
-            "quantity": total_qty,
-            "amount": float(total_amount),
-        })
+        # B5：成交回报推送（同量同状态的重复回填不重复发，见上 changed 注释）
+        if changed:
+            self._emit("trade", {
+                "portfolio_id": live_order.portfolio_strategy_id,
+                "trade_id": trade_rec.id,
+                "stock_code": trade_rec.stock_code,
+                "trade_type": (trade_rec.trade_type or "").upper(),
+                "price": float(avg_price),
+                "quantity": total_qty,
+                "amount": float(total_amount),
+            })
 
         # filled：回填确认后 apply_trade（submitted 阶段未 apply，此处首次落持仓）
         if live_order.status == "filled":
