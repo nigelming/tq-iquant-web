@@ -148,7 +148,22 @@ def test_query_quote_forwards_tq_bars(monkeypatch):
     assert bars[1]["volume"] == 2000
 
 
-def test_query_calendar_forwards_tq_daily_index(monkeypatch):
+def test_query_calendar_delegates_to_tdx_authority(monkeypatch):
+    """ths 日历委托 TdxTqDispatcher：get_trading_dates 权威口径命中 → 直接返回。"""
+    class FakeTQ:
+        def get_trading_dates(self, market="SH", start="", end=""):
+            assert market == "SH"
+            return ["20261022", "20261023"]
+
+        def get_history_raw(self, stocks, periods, **kwargs):
+            raise AssertionError("命中权威日历后不应走日线反推")
+
+    monkeypatch.setattr("core.tq.data.TQData", FakeTQ)
+    assert ThsUiDispatcher().query_calendar() == ["20261022", "20261023"]
+
+
+def test_query_calendar_falls_back_to_daily_index(monkeypatch):
+    """权威日历不可用（get_trading_dates 缺失/异常）→ 日线反推兜底仍生效。"""
     index = pd.to_datetime(["2026-10-22", "2026-10-23"])
     raw = {"1d": {"Close": pd.DataFrame({"000001.SH": [1.0, 1.1]}, index=index)}}
 

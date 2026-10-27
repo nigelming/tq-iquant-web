@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.engine.live.timing import _to_int
 from core.engine.tdx_formula import syntax_check
 from core.engine.tdx_formula.normalizer import normalize_formula
 from core.services import formula_service
@@ -205,7 +206,9 @@ class TestRunRequest(BaseModel):
 
 
 def _summarize_line(values: list) -> dict:
-    """输出线摘要：n=根数 / ones="1"信号个数 / last_values=末 3 个值的字符串形态
+    """输出线摘要：n=根数 / ones=1 信号个数（与实盘引擎信号判定同构：'1'、
+    1.0、'1.00' 均计 1；'0.00'/'0'/None 不计——真机实证 SDK 返回 '1.00' 形态
+    字符串，str 比对会系统性漏计）/ last_values=末 3 个值的字符串形态
     （None 保留为 "None"；元素兼容 {Date,Value} 字典与裸值两种形态）。"""
     vals = [
         item.get("Value") if isinstance(item, dict) else item
@@ -213,7 +216,7 @@ def _summarize_line(values: list) -> dict:
     ]
     return {
         "n": len(vals),
-        "ones": sum(1 for v in vals if str(v) == "1"),
+        "ones": sum(1 for v in vals if _to_int(v) == 1),
         "last_values": [str(v) for v in vals[-3:]],
     }
 

@@ -83,7 +83,8 @@ def create_user_block(req: UserBlockReq):
 
 @router.get("/divid-factors")
 def get_divid_factors(stock_code: str = "", start: str = "", end: str = ""):
-    """除权除息数据：Date 索引还原为普通列；NaN→null（Starlette 禁 NaN 字面量）。"""
+    """除权除息数据：Date 索引还原为普通列；NaN→null（Starlette 禁 NaN 字面量）。
+    空 events 可能是无数据或通达信不可用（SDK 层不可分）。"""
     if not stock_code.strip():
         return err(400, "stock_code 不能为空")
     try:
@@ -99,11 +100,16 @@ def get_divid_factors(stock_code: str = "", start: str = "", end: str = ""):
 
 @router.get("/trading-dates")
 def get_trading_dates(start: str = "", end: str = ""):
-    """交易日历（market 固定 SH——SDK 对 market 取值宽松，各值返回一致）。"""
+    """交易日历（market 固定 SH——SDK 对 market 取值宽松，各值返回一致）。
+
+    strict=True 取数：异常上抛 → 503（区别于真空）；SDK 打印型失败返回的
+    空列表仍按成功透传（SDK 层无法区分）。"""
     if not start.strip() or not end.strip():
         return err(400, "start 与 end 均必填（YYYYMMDD）")
     try:
-        dates = TQData().get_trading_dates(start=start, end=end)
+        dates = TQData().get_trading_dates(start=start, end=end, strict=True)
     except TDXConnectionError as e:
         return err(503, str(e))
+    except Exception as e:
+        return err(503, "交易日历获取失败：%s" % e)
     return ok({"dates": dates})

@@ -506,8 +506,8 @@ def test_divid_factors_connection_error_503(client, monkeypatch):
 def test_trading_dates_passthrough(client, monkeypatch):
     calls = {}
 
-    def fake(self, start="", end=""):
-        calls.update(start=start, end=end)
+    def fake(self, start="", end="", strict=False):
+        calls.update(start=start, end=end, strict=strict)
         return ["20240102", "20240103"]
 
     _patch_data(monkeypatch, "get_trading_dates", fake)
@@ -517,12 +517,12 @@ def test_trading_dates_passthrough(client, monkeypatch):
     body = resp.json()
     assert body["code"] == 0
     assert body["data"] == {"dates": ["20240102", "20240103"]}
-    assert calls == {"start": "20240101", "end": "20240131"}
+    assert calls == {"start": "20240101", "end": "20240131", "strict": True}
 
 
 @pytest.mark.parametrize("params", [{}, {"start": "20240101"}, {"end": "20240131"}])
 def test_trading_dates_missing_params_400(client, monkeypatch, params):
-    def fake(self, start="", end=""):
+    def fake(self, start="", end="", strict=False):
         raise AssertionError("不应触发 SDK")
 
     _patch_data(monkeypatch, "get_trading_dates", fake)
@@ -531,7 +531,7 @@ def test_trading_dates_missing_params_400(client, monkeypatch, params):
 
 
 def test_trading_dates_connection_error_503(client, monkeypatch):
-    def fake(self, start="", end=""):
+    def fake(self, start="", end="", strict=False):
         raise TDXConnectionError("通达信未启动")
 
     _patch_data(monkeypatch, "get_trading_dates", fake)
@@ -539,3 +539,15 @@ def test_trading_dates_connection_error_503(client, monkeypatch):
         "start": "20240101", "end": "20240131"}).json()
     assert body["code"] == 503
     assert body["message"] == "通达信未启动"
+
+
+def test_trading_dates_unexpected_error_503(client, monkeypatch):
+    """strict=True 上抛的非连接类异常 → 统一 503（不再归一 [] 冒充真空）。"""
+    def fake(self, start="", end="", strict=False):
+        raise RuntimeError("dll boom")
+
+    _patch_data(monkeypatch, "get_trading_dates", fake)
+    body = client.get("/api/tdx/trading-dates", params={
+        "start": "20240101", "end": "20240131"}).json()
+    assert body["code"] == 503
+    assert "交易日历获取失败" in body["message"]

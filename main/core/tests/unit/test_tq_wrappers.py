@@ -180,6 +180,19 @@ def test_get_trading_dates_exception_to_empty(fake_tq):
     assert TQData().get_trading_dates() == []
 
 
+def test_get_trading_dates_strict_reraises(fake_tq):
+    """strict=True：异常原样上抛（REST 层据此区分失败与真空）。"""
+    fake_tq.trading_dates_raise = True
+    with pytest.raises(RuntimeError):
+        TQData().get_trading_dates(strict=True)
+
+
+def test_get_trading_dates_strict_empty_still_empty(fake_tq):
+    """strict=True 只改异常语义：SDK 打印型失败（空列表）仍归一 []。"""
+    fake_tq.trading_dates_result = []
+    assert TQData().get_trading_dates(strict=True) == []
+
+
 # --- get_zdt_data：涨跌停状态 ---
 
 def test_get_zdt_data_passthrough(fake_tq):

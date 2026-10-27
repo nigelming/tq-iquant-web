@@ -978,23 +978,10 @@ class ThsUiDispatcher(OrderDispatcher):
         return out
 
     def query_calendar(self) -> list:
-        """用 TQ 上证指数日线反推交易日（同日线取数口径），失败返回 [] 走 fail-open。"""
-        try:
-            from core.tq.data import TQData
-            raw = TQData().get_history_raw(
-                ["000001.SH"], ["1d"], count=600)
-        except Exception as e:
-            self._last_error = "calendar unavailable: %s" % e
-            return []
-        close = (raw.get("1d") or {}).get("Close")
-        if close is None or getattr(close, "empty", True):
-            return []
-        out = []
-        for ts in close.index:
-            digits = re.sub(r"\D", "", str(ts))
-            if len(digits) >= 8:
-                out.append(digits[:8])
-        return out
+        """权威交易日历经 TdxTqDispatcher（get_trading_dates 优先、日线反推兜底），
+        失败 [] 走 fail-open。"""
+        from .tdx_tq_dispatcher import TdxTqDispatcher
+        return TdxTqDispatcher().query_calendar()
 
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         """行情复用 Core 同进程内嵌的 TQ（通达信）模块。

@@ -608,7 +608,9 @@ class TdxTqDispatcher(OrderDispatcher):
         """取前收盘价（1d 最近 2 根里最早的一根），无有效数据返回 None。
 
         取最早一根：count=2 时首根即前一交易日；两根日期相同取该值（同值）；
-        仅 1 根用其自身。校验自身异常一并吞为 None（宁宽勿错）。
+        仅 1 根用其自身。最新一根 bar 日期必须 == 今天（上海时区）——数据滞后
+        （客户端未启动/离线缓存/停牌补数）时前收与当前价基期脱节，视为无效
+        → None 跳过校验（fail-open 不变）。校验自身异常一并吞为 None（宁宽勿错）。
         """
         try:
             from core.tq.data import TQData
@@ -620,6 +622,11 @@ class TdxTqDispatcher(OrderDispatcher):
                 return None
             series = close[symbol].dropna().sort_index()
             if series.empty:
+                return None
+            if series.index[-1].date() != now_shanghai().date():
+                logger.warning(
+                    "涨跌停校验跳过：%s 日线最新 bar %s 非今日（数据滞后）",
+                    symbol, series.index[-1].date())
                 return None
             value = float(series.iloc[0])
             if value != value:  # NaN 防御

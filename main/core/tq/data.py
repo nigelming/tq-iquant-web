@@ -100,11 +100,14 @@ class TQData:
 
     def get_trading_dates(
         self, market: str = "SH", start: str = "", end: str = "",
+        strict: bool = False,
     ) -> List[str]:
         """交易日历，归一化为 ["YYYYMMDD", ...] 字符串列表。
 
         探针实测（1.3.1）：market 传 'SH'（'SZ'/'1'/'0'/'' 均被 SDK 宽松接受，
-        返回同样结果）。SDK 失败打印并返回 []，异常亦归一为空列表。
+        返回同样结果）。SDK 失败打印并返回 []，异常默认归一为空列表；
+        strict=True 时异常原样 re-raise（REST 层据此区分失败与真空，
+        query_calendar 消费保持默认非 strict 不变）。
         """
         try:
             with get_tdx_lock():
@@ -112,6 +115,8 @@ class TQData:
                     market=market, start_time=start, end_time=end) or []
             return [str(d).strip() for d in raw if str(d).strip()]
         except Exception:
+            if strict:
+                raise
             return []
 
     def get_zdt_data(self, stocks: List[str]) -> dict:

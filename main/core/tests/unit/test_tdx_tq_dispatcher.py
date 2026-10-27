@@ -14,6 +14,7 @@ import pytest
 
 from core.engine.http_bridge_dispatcher import BridgeOrderRejected
 from core.engine.live.order_machine import OrderStateMachine
+from core.engine.live.timing import now_shanghai
 from core.engine.tdx_tq_dispatcher import TdxTqDispatcher, normalize_symbol
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -414,8 +415,13 @@ def test_close_swallows_unsubscribe_error(fake, monkeypatch):
 # ---------------- TQ 1.3.1：place_order 涨跌停前置校验 ----------------
 
 def _raw_1d_close(symbol, closes):
-    """1d 原始行情（仅 Close 帧，prev_close 计算够用）。"""
-    idx = [pd.Timestamp("2026-10-23"), pd.Timestamp("2026-10-24")]
+    """1d 原始行情（仅 Close 帧，prev_close 计算够用）。
+
+    最新 bar 固定为今日（新鲜度校验要求最新 bar == 今天，写死历史日期会被
+    当成数据滞后跳过校验）。
+    """
+    today = now_shanghai().date()
+    idx = [pd.Timestamp(today - timedelta(days=1)), pd.Timestamp(today)]
     return {"1d": {"Close": pd.DataFrame({symbol: closes}, index=idx)}}
 
 
@@ -510,6 +516,33 @@ def test_place_order_distorted_prev_close_fail_open(fake, monkeypatch):
     d = TdxTqDispatcher()
     trade = d.place_order(_limit_order(price=Decimal("11.00")))
     assert trade is not None
+
+
+def test_place_order_stale_bar_skips_limit_check(fake, monkeypatch):
+    """最新 bar=昨日（数据滞后）→ 前收无效，跳过校验（不拒单，fail-open）。"""
+    today = now_shanghai().date()
+    idx = [pd.Timestamp(today - timedelta(days=2)),
+           pd.Timestamp(today - timedelta(days=1))]
+    raw = {"1d": {"Close": pd.DataFrame({"000001.SZ": [10.0, 10.0]}, index=idx)}}
+    monkeypatch.setattr(
+        "core.tq.data.TQData", lambda: FakeQuoteData(raw))
+    fake.orders = [_order(price=11.00, ref="W806")]
+    d = TdxTqDispatcher()
+    trade = d.place_order(_limit_order(price=Decimal("11.00")))
+    assert trade is not None
+    assert [c for c in fake.calls if c[0] == "order_stock"]
+
+
+def test_place_order_fresh_bar_still_blocks_limit_up(fake, monkeypatch):
+    """最新 bar=今日（数据新鲜）→ 涨跌停校验照常生效（拒单口径不变）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    d = TdxTqDispatcher()
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d.place_order(_limit_order(price=Decimal("11.00")))
+    assert "涨停价" in str(ei.value)
+    assert not [c for c in fake.calls if c[0] == "order_stock"]
 
 
 # ---------------- TQ 1.3.1：批量行情 query_quotes_batch ----------------
