@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { formatEvent, gateLabel, GATE_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR } from '../utils/liveEvents'
+import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR } from '../utils/liveEvents'
 
 describe('formatEvent', () => {
   it('formats signal', () => {
@@ -73,7 +73,7 @@ describe('formatEvent decision', () => {
     expect(gateLabel('some_unknown_gate')).toBe('some_unknown_gate')
   })
 
-  it('GATE_LABEL covers the full backend gate vocabulary', () => {
+  it('GATE_LABEL covers the core backend gate vocabulary（含主从/现金增强，非穷举）', () => {
     const gates = [
       'stop_loss', 'take_profit', 'trailing_stop',
       'max_drawdown', 'daily_loss', 'risk_recover', 'halted_buy_strip',
@@ -84,10 +84,25 @@ describe('formatEvent decision', () => {
       't1_clamp', 't1_insufficient',
       'after_close_block', 'non_trading_block', 'dup_skip', 'inflight_skip',
       'bridge_unavailable', 'bridge_rejected', 'approval_failed',
+      // 主从策略 / 现金增强（portfolio.py）
+      'slave_master_selling', 'cash_enhance_trigger', 'follow_master_sell',
     ]
     for (const g of gates) {
       expect(GATE_LABEL[g], `missing label for ${g}`).toBeTruthy()
     }
+  })
+
+  it('补齐词汇：主从清仓/现金增强/跟随平仓 gate + formula 层 + error 动作（audit M1）', () => {
+    // portfolio.py:246 从策略 OPEN 拦截：主策略本 bar 同步清仓，禁止同 bar 买入
+    expect(GATE_LABEL.slave_master_selling).toBe('主策略清仓禁开仓')
+    // portfolio.py:432 现金管理增强触发（预留接口）
+    expect(GATE_LABEL.cash_enhance_trigger).toBe('现金增强触发')
+    // portfolio.py:821 follow_master：master 已不再持有，slave 同步全平
+    expect(GATE_LABEL.follow_master_sell).toBe('跟随主策略平仓')
+    // signal_monitor.py:184 公式运行错误的层
+    expect(LAYER_LABEL.formula).toBe('公式计算')
+    // signal_monitor.py:185 公式运行报错动作
+    expect(ACTION_LABEL.error).toBe('运行错误')
   })
 
   it('formats insufficient_funds with blocked qty and message', () => {

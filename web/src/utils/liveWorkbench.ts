@@ -126,7 +126,8 @@ export function positionRowKey(r: Pick<PositionRow, 'stock_code' | 'portfolio_id
   return `${r.stock_code}|${r.portfolio_id ?? null}|${r.strategy_id ?? null}`
 }
 
-/** SSE position 事件 → 持仓行（按 股票+组合+子策略 复合键原地 upsert，不重复）。 */
+/** SSE position 事件 → 持仓行（按 股票+组合+子策略 复合键原地 upsert，不重复）。
+ *  清仓（quantity<=0）→ 移除该行（与历史口径 quantity!=0 一致，不留幽灵持仓行）。 */
 export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
   const row: PositionRow = {
     stock_code: (ev.stock_code as string) || '',
@@ -137,6 +138,12 @@ export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
     strategy_id: (ev.strategy_id as number) ?? null,
   }
   const idx = rows.findIndex((r) => positionRowKey(r) === positionRowKey(row))
+  if (row.quantity <= 0) {
+    if (idx < 0) return rows
+    const next = [...rows]
+    next.splice(idx, 1)
+    return next
+  }
   if (idx >= 0) {
     const next = [...rows]
     next[idx] = row

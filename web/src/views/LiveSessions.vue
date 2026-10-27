@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, type LiveEvent } from '../utils/liveEvents'
 import {
   orderEventToRow, orderHistoryToRows,
@@ -51,6 +51,9 @@ function executionModeLabel(m?: string): string {
 function isAlert(s: LiveSessionItem): boolean {
   return (s.execution_mode || 'auto') === 'alert'
 }
+
+// B6 全局限 1：已有运行中会话时，其它行的「启动」按钮禁用（UI 层预防，后端 409 兜底）
+const hasRunningSession = computed(() => sessions.value.some((s) => s.status === 'running'))
 
 // 组合级状态列表：优先用后端 portfolios 字段，缺省时兜底 portfolio_ids(无状态视为 active)
 function portfolioStatuses(s: LiveSessionItem): { portfolio_id: number; status: string }[] {
@@ -193,15 +196,30 @@ function scheduleSignalsRefresh() {
   }, 2000)
 }
 
+// loadHistory 与 SSE 竞态计数（audit C1）：五请求在途期间到达的 workbench 事件数。
+// 只计 position/order/trade——三类历史 resolve 时会整体覆盖 SSE 已插的行；
+// decision/signals 不计（signals 走节流重拉，decision 逐事件流可接受毫秒级窗口）。
+let workbenchEventsSinceLoad = 0
+
 function applyToWorkbench(type: string, data: Record<string, unknown>, time: string) {
-  if (type === 'position') positions.value = upsertPositionRows(positions.value, data)
-  else if (type === 'order') orders.value = prependCapped(orders.value, orderEventToRow(data, time))
-  else if (type === 'trade') trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
+  if (type === 'position') {
+    workbenchEventsSinceLoad += 1
+    positions.value = upsertPositionRows(positions.value, data)
+  }
+  else if (type === 'order') {
+    workbenchEventsSinceLoad += 1
+    orders.value = prependCapped(orders.value, orderEventToRow(data, time))
+  }
+  else if (type === 'trade') {
+    workbenchEventsSinceLoad += 1
+    trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
+  }
   else if (type === 'decision') decisions.value = prependCapped(decisions.value, decisionEventToRow(data, time), 500)
   else if (type === 'signal') scheduleSignalsRefresh()
 }
 
 async function loadHistory(id: number) {
+  workbenchEventsSinceLoad = 0
   try {
     const [pos, ord, trd, dec, sig] = await Promise.all([
       getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
@@ -217,6 +235,18 @@ async function loadHistory(id: number) {
     // 预警信号：alert 模式主产物；auto 模式下也可能有信号落库
     signals.value = sig?.items ?? []
     signalsTotal.value = sig?.total ?? 0
+    // 竞态补拉（audit C1）：五请求在途期间 SSE 已推过 position/order/trade 时，
+    // 上面整体覆盖会丢这些事件 → 计数 >0 则补拉一次三表历史兜底（补拉前清零；
+    // 补拉期间再进的事件仍会漏，残余窗口毫秒级可接受，不无限递归）。
+    if (workbenchEventsSinceLoad > 0) {
+      workbenchEventsSinceLoad = 0
+      const [pos2, ord2, trd2] = await Promise.all([
+        getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
+      ])
+      positions.value = positionHistoryToRows(pos2)
+      orders.value = orderHistoryToRows(ord2)
+      trades.value = tradeHistoryToRows(trd2)
+    }
   } catch {
     // 会话已删除等 → 保持现状
   }
@@ -226,6 +256,16 @@ function startEventStream(id: number) {
   closeEventStream()
   connState.value = 'connecting'
   activeSessionId = id
+  // 换会话订阅前清空工作台与事件日志（audit M3）：上一会话的持仓/委托/成交/
+  // 决策/信号不再与新会话混排。
+  positions.value = []
+  orders.value = []
+  trades.value = []
+  decisions.value = []
+  decisionSummary.value = []
+  signals.value = []
+  signalsTotal.value = 0
+  events.value = []
   const source = new EventSource(`/api/live/sessions/${id}/stream`)
   EVENT_TYPES.forEach((t) => {
     source.addEventListener(t, (e: MessageEvent) => {
@@ -236,7 +276,8 @@ function startEventStream(id: number) {
     })
   })
   source.onopen = () => { connState.value = 'open' }
-  source.onerror = () => { connState.value = 'closed' } // EventSource 自动重连,不主动 close
+  // EventSource 断线会自动重连，此间并非 closed 而是重连中
+  source.onerror = () => { connState.value = 'connecting' }
   es = source
   loadHistory(id)
 }
@@ -291,8 +332,10 @@ async function startSession(id: number) {
 }
 
 async function stopSession(id: number) {
-  closeEventStream()
+  // 先停后端成功再关流（audit M3）：stop 后端会经流推 canceled 终态事件，
+  // 先关流会错过清扫；API 失败则保持流开着（会话实际仍在运行）。
   await stopLiveSession(id)
+  closeEventStream()
   load()
 }
 
@@ -390,7 +433,9 @@ onUnmounted(closeEventStream)
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
-            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
+            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary"
+              :disabled="hasRunningSession" :title="hasRunningSession ? '已有运行中会话（全局限 1）' : ''"
+            >启动</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
             <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
           </td>
@@ -510,7 +555,7 @@ onUnmounted(closeEventStream)
       </div>
     </div>
 
-    <!-- 预警信号：alert 模式主产物（半自动），auto 模式仅落库不上送 -->
+    <!-- 预警信号：alert 模式主产物（半自动）；auto 模式信号同样落库并默认经 send_warn 推送（审计旁路） -->
     <div v-if="wbTab === 'signals'" class="table-wrap">
       <div style="display:flex;justify-content:flex-end;align-items:center;margin:0 0 6px">
         <button @click="syncSignalsBlock" class="btn btn-sm"
@@ -548,7 +593,7 @@ onUnmounted(closeEventStream)
         </tbody>
       </table>
       <div v-if="signals.length === 0" class="empty-state">
-        <p>暂无预警信号。alert（半自动预警）模式下信号触发后会落库并通过通达信 send_warn 推送；auto（全自动）模式下仅记录信号不上送。</p>
+        <p>暂无预警信号。alert（半自动）模式信号触发后落库并经通达信 send_warn 推送；auto（全自动）模式默认同样推送（审计旁路），信号均落库供本页查看。</p>
       </div>
     </div>
   </div>

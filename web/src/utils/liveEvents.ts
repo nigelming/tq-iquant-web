@@ -71,6 +71,10 @@ export const GATE_LABEL: Record<string, string> = {
   bridge_unavailable: '桥离线拒单',
   bridge_rejected: '桥业务拒单',
   approval_failed: '发单兜底失败',
+  // 主从策略 / 现金增强（portfolio.py）
+  slave_master_selling: '主策略清仓禁开仓',
+  cash_enhance_trigger: '现金增强触发',
+  follow_master_sell: '跟随主策略平仓',
 }
 
 // 闸门层 → 中文
@@ -81,6 +85,7 @@ export const LAYER_LABEL: Record<string, string> = {
   capital_gate: '资金拦截',
   t1: 'T+1',
   live_gate: '实盘闸门',
+  formula: '公式计算',
 }
 
 // 闸门动作 → 中文
@@ -93,6 +98,7 @@ export const ACTION_LABEL: Record<string, string> = {
   reject: '拒单',
   shrink: '缩量',
   clamp: '钳量',
+  error: '运行错误',
 }
 
 /** 闸门代码 → 中文标签（未知 gate 回退原代码）。 */

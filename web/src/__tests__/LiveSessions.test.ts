@@ -598,7 +598,7 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     w.unmount()
   })
 
-  it('预警信号 tab 空态：无信号时给出口径说明', async () => {
+  it('预警信号 tab 空态：无信号时给出口径说明（audit I3 准确文案）', async () => {
     ;(getLiveSessions as any).mockResolvedValue([
       { ...runningSession, execution_mode: 'alert' },
     ])
@@ -611,6 +611,11 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
 
     expect(w.text()).toContain('暂无预警信号')
     expect(w.text()).toContain('send_warn')
+    // 准确口径：alert 落库 + send_warn 推送；auto 默认同样推送（审计旁路），均落库
+    expect(w.text()).toContain('审计旁路')
+    expect(w.text()).toContain('落库')
+    // 旧失实文案（auto 仅记录不上送）不再出现
+    expect(w.text()).not.toContain('仅记录信号不上送')
     w.unmount()
   })
 })
@@ -677,6 +682,164 @@ describe('LiveSessions.vue SSE signal → 预警信号 tab 节流重拉', () => 
     await flushPromises()
     // 初始 loadHistory 1 次 + 节流合并后 1 次
     expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue loadHistory 与 SSE 竞态补拉（audit C1）', () => {
+  /** 让 getLivePositions 首次调用挂起，返回放行函数（模拟历史请求在途窗口）。
+   *  先 mockReset 清掉前一测试可能残留的 once 实现（避免 once 队列串测试），再重建默认。 */
+  function deferPositions(): () => void {
+    let resolve!: (v: unknown) => void
+    const m = getLivePositions as any
+    m.mockReset()
+    m.mockResolvedValue([])
+    m.mockImplementationOnce(() => new Promise((res) => { resolve = res }))
+    return () => resolve([])
+  }
+
+  it('五请求在途期间 SSE 推过 position/order/trade → resolve 后补拉一次三表历史', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    // 补拉（第二次调用）返回最新持仓，验证补拉结果落到工作台
+    ;(getLivePositions as any).mockResolvedValueOnce([
+      { stock_code: '600519.SH', quantity: 900, avg_cost: 10, market_value: 9000, portfolio_id: 1, strategy_id: 1 },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    es.emit('order', { trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100, price: 10.5 })
+    es.emit('trade', { trade_type: 'BUY', stock_code: '600000.SH', price: 10.5, quantity: 100, amount: 1050 })
+    es.emit('position', { stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000 })
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(2)
+    expect(getLiveOrders).toHaveBeenCalledTimes(2)
+    expect(getLiveTrades).toHaveBeenCalledTimes(2)
+    expect(w.text()).toContain('600519.SH')
+    w.unmount()
+  })
+
+  it('在途期间仅 decision/signal 事件 → 不补拉（计数只算 position/order/trade）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    es.emit('decision', { gate: 'max_positions_full', layer: 'signal_gate', action: 'block', stock_code: '600000.SH', message: 'x' })
+    es.emit('signal', { signal_id: 1, signal_type: 'OPEN', stock_code: '600000.SH' })
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(1)
+    expect(getLiveOrders).toHaveBeenCalledTimes(1)
+    expect(getLiveTrades).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
+  it('在途期间无 SSE 事件 → 不补拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    const w = mount(LiveSessions)
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(1)
+    expect(getLiveOrders).toHaveBeenCalledTimes(1)
+    expect(getLiveTrades).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 会话切换清理 + 停止时序 + 重连状态（audit M3）', () => {
+  it('停止会话：先调 stop API 成功后再关事件流（接收清扫 canceled 终态）', async () => {
+    const order: string[] = []
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    ;(stopLiveSession as any).mockImplementation(async () => {
+      order.push('api')
+      return { id: 7, status: 'stopped' }
+    })
+    ;(getLiveSessions as any).mockResolvedValueOnce([stoppedSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    ;(es as any).close = vi.fn(() => { order.push('close') })
+
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(order).toEqual(['api', 'close'])
+    w.unmount()
+  })
+
+  it('换会话订阅前清空工作台与事件日志（不与上一会话混排）', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+    es7.emit('position', { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 })
+    es7.emit('order', { trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100, price: 10.5 })
+    es7.emit('trade', { trade_type: 'BUY', stock_code: '600000.SH', price: 10.5, quantity: 100, amount: 1050 })
+    es7.emit('decision', { gate: 'max_positions_full', layer: 'signal_gate', action: 'block', stock_code: '600000.SH', message: 'x' })
+    await flushPromises()
+    expect(w.text()).toContain('600000.SH')
+
+    // 停止 7 → load() 发现 8 已在外部启动为 running → 自动切到 8 的流
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([
+      { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    // A 会话内容已清空：工作台/事件日志不再混排
+    expect(w.text()).not.toContain('600000.SH')
+    expect(w.text()).not.toContain('7350')
+    expect(w.text()).toContain('暂无持仓')
+    w.unmount()
+  })
+
+  it('SSE onerror → 状态显示「连接中」（EventSource 自动重连中，非 closed）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(w.text()).toContain('已连接')
+    const es = FakeEventSource.instances[0] as any
+    es.onerror()
+    await flushPromises()
+    expect(w.text()).toContain('连接中')
+    expect(w.text()).not.toContain('未连接')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue B6 全局限 1 UI 预防（audit M6）', () => {
+  it('存在运行中会话时，其它行的启动按钮 disabled 且 title 提示全局限 1', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, stoppedSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
+    expect(startBtn.attributes('disabled')).toBeDefined()
+    expect(startBtn.attributes('title')).toContain('已有运行中会话')
+    w.unmount()
+  })
+
+  it('无运行中会话时启动按钮正常可用', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession, { ...stoppedSession, id: 9, name: '模拟盘C' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
+    expect(startBtn.attributes('disabled')).toBeUndefined()
     w.unmount()
   })
 })

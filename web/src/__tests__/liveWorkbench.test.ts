@@ -79,6 +79,17 @@ describe('liveWorkbench', () => {
       expect(rows2).toHaveLength(1)
       expect(rows2[0].quantity).toBe(500)
     })
+
+    it('清仓（quantity=0）→ 该行从数组移除（audit I1 幽灵持仓行）', () => {
+      const rows = upsertPositionRows([], { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 })
+      const after = upsertPositionRows(rows, { stock_code: '600000.SH', quantity: 0, avg_cost: 10, market_value: 0, portfolio_id: 1, strategy_id: 1 })
+      expect(after).toHaveLength(0)
+    })
+
+    it('quantity 为 0 的新事件不入表', () => {
+      const after = upsertPositionRows([], { stock_code: '000001.SZ', quantity: 0, avg_cost: 0, market_value: 0, portfolio_id: null, strategy_id: null })
+      expect(after).toHaveLength(0)
+    })
   })
 
   it('positionHistoryToRows 映射持仓历史', () => {
