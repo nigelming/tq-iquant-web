@@ -8,6 +8,8 @@ from core.db import get_db
 from core.engine.tdx_formula import syntax_check
 from core.engine.tdx_formula.normalizer import normalize_formula
 from core.services import formula_service
+from core.tq.formula import TQFormula
+from core.tq.utils import TDXConnectionError
 from core.services.formula_service import (
     list_formulas as _svc_list_formulas,
     get_formula as _svc_get_formula,
@@ -185,6 +187,69 @@ def normalize_preview(req: NormalizePreviewRequest):
         ))
     except ValueError as e:
         return err(400, str(e))
+
+
+# ---------------------------------------------------------------------------
+# 公式源码试算（compute_by_src，不落库）
+# ---------------------------------------------------------------------------
+VALID_TEST_RUN_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"}
+
+
+class TestRunRequest(BaseModel):
+    content: str  # 公式源码（不落库）
+    stock_codes: list[str]  # 1~20 只
+    period: str = "1d"
+    count: int = 20  # 注入历史根数
+    dividend_type: int = 1  # 0=不复权 1=前复权 2=后复权
+    formula_type: int = 0  # 0=指标 1=选股
+
+
+def _summarize_line(values: list) -> dict:
+    """输出线摘要：n=根数 / ones="1"信号个数 / last_values=末 3 个值的字符串形态
+    （None 保留为 "None"；元素兼容 {Date,Value} 字典与裸值两种形态）。"""
+    vals = [
+        item.get("Value") if isinstance(item, dict) else item
+        for item in values
+    ]
+    return {
+        "n": len(vals),
+        "ones": sum(1 for v in vals if str(v) == "1"),
+        "last_values": [str(v) for v in vals[-3:]],
+    }
+
+
+@router.post("/test-run")
+def test_run_formula(req: TestRunRequest):
+    """公式源码试算：逐股逐线返回摘要（n/ones/last_values）而非全量序列，
+    供前端编辑器即时验证公式。部分股票无返回（返回数 < 请求数）附 warning。"""
+    if not req.content.strip():
+        return err(400, "content 不能为空")
+    if not 1 <= len(req.stock_codes) <= 20:
+        return err(400, "试算股票数须 1-20")
+    if req.period not in VALID_TEST_RUN_PERIODS:
+        return err(400, f"period 必须为 {'、'.join(sorted(VALID_TEST_RUN_PERIODS))} 之一，收到 {req.period}")
+    if not 1 <= req.count <= 500:
+        return err(400, "count 必须为 1-500")
+    try:
+        res = TQFormula().compute_by_src(
+            req.content, req.stock_codes, period=req.period, count=req.count,
+            dividend_type=req.dividend_type, formula_type=req.formula_type,
+        )
+    except TDXConnectionError as e:
+        return err(503, str(e))
+    if str(res.get("ErrorId", "1")) != "0":
+        return err(503, str(res.get("Error") or "公式试算失败"))
+    results = {
+        code: {line: _summarize_line(vals) for line, vals in lines.items()}
+        for code, lines in res.items()
+        if code not in ("ErrorId", "Error") and isinstance(lines, dict)
+    }
+    data: dict = {"results": results}
+    # Task1 评审：SDK 在 ErrorId="0" 但 "Error" 非空时表示部分股票失败；
+    # compute_by_src 已剥 Error 键，返回股票数 < 请求数是可靠的兜底判据。
+    if len(results) < len(req.stock_codes) or res.get("Error"):
+        data["warning"] = f"部分股票无返回（{len(results)}/{len(req.stock_codes)}）"
+    return ok(data)
 
 
 @router.delete("/{formula_id}")
