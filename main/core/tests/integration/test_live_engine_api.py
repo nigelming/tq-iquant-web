@@ -119,7 +119,10 @@ def mock_bridge(monkeypatch):
 
 
 def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation",
-                    execution_mode="auto", engine=None, live_capital=None):
+                    execution_mode="auto", engine="iquant", live_capital=None):
+    """本文件为 iQuant 桥测试（mock_bridge）——显式钉住 engine="iquant"，
+    不依赖本地 config.yaml 的 tq_trade.default_engine（批次 A 后默认 tdx，
+    落到 tdx 会走真实 TDX 预检/公式冒烟，桥 mock 完全失效）。"""
     payload = {
         "name": name, "portfolio_ids": list(portfolio_ids), "mode": mode,
         "execution_mode": execution_mode,
@@ -1043,7 +1046,7 @@ def test_concurrent_start_same_session_registers_single_engine(
     ps_id = _seed(db)
     session = _LiveSession(
         name="conc-start", mode="simulation", status="stopped",
-        engine=None, execution_mode="auto",
+        engine="iquant", execution_mode="auto",
     )
     db.add(session)
     db.flush()
