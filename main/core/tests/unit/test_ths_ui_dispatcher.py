@@ -534,15 +534,41 @@ def test_direct_mode_place_order_delegates_to_ui(tmp_path):
         monkey.undo()
 
 
-def test_execute_via_ui_keystroke_transcript_buy_and_sell(monkeypatch):
-    """键鼠序列逐键断言：F1/F2 方向、代码、**显式委托价格**（限价语义——此前
-    双 TAB 跳过价格框按对话框默认价成交的准确性缺口）、数量、ENTER。"""
+class _FakeUiaField:
+    """UIA 字段替身：记录 click_input 次数，按 control_id 匹配。"""
+
+    def __init__(self, control_id):
+        self.element_info = SimpleNamespace(control_id=control_id)
+        self.clicks = 0
+
+    def click_input(self):
+        self.clicks += 1
+
+
+class _FakeUiaWin:
+    def __init__(self):
+        self.fields = {
+            1032: _FakeUiaField(1032),   # 证券代码
+            1033: _FakeUiaField(1033),   # 委托价格
+            1034: _FakeUiaField(1034),   # 委托数量
+        }
+
+    def descendants(self, control_type="Edit"):
+        assert control_type == "Edit"
+        return list(self.fields.values())
+
+
+def test_execute_via_ui_kbsend_tab_flow_buy_and_sell(monkeypatch):
+    """kb_send TAB 焦点序逐字段键入断言（真机 GetFocusedElement/OCR/像素
+    三重探针实证）：F1/F2 方向 → TAB 代码 → TAB **显式委托价格**（限价语义）
+    → TAB 数量 → ENTER；键入全程 kb_send（不重置字段焦点）。"""
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     d._connected = True
-    transcript = []
+    kb_transcript = []
+    switches = []
     monkeypatch.setattr(d, "_gui_guard", lambda: True)
-    monkeypatch.setattr(d, "_switch", lambda k: transcript.append("switch:" + k))
-    monkeypatch.setattr(d, "_key", lambda k: transcript.append(k))
+    monkeypatch.setattr(d, "_switch", lambda k: switches.append(k))
+    monkeypatch.setattr(d, "kb_send", lambda k: kb_transcript.append(k))
     monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
     monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
     monkeypatch.setattr(d, "_find_order",
@@ -551,23 +577,24 @@ def test_execute_via_ui_keystroke_transcript_buy_and_sell(monkeypatch):
 
     d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
                              price=Decimal("1700.55")))
-    assert transcript == [
-        "switch:{F1}",           # 买入 → F1
-        "^a", "{DELETE}", "600519",
-        "{TAB}", "^a", "{DELETE}", "1700.55",   # 显式价格（限价）
-        "{TAB}", "^a", "{DELETE}", "100",       # 数量
+    assert switches == ["{F1}"]                    # 买入 → F1
+    assert kb_transcript == [
+        "{TAB}", "600519",
+        "{TAB}", "1700.55",                        # 显式价格（限价）
+        "{TAB}", "100",
         "{ENTER}",
     ]
 
-    transcript.clear()
+    switches.clear()
+    kb_transcript.clear()
     d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
                              price=Decimal("9.99"),
                              trade_type=TradeType.SELL,
                              signal_type=SignalType.CLOSE))
-    assert transcript == [
-        "switch:{F2}",           # 卖出 → F2
-        "^a", "{DELETE}", "000001",
-        "{TAB}", "^a", "{DELETE}", "9.99",
-        "{TAB}", "^a", "{DELETE}", "300",
+    assert switches == ["{F2}"]                    # 卖出 → F2
+    assert kb_transcript == [
+        "{TAB}", "000001",
+        "{TAB}", "9.99",
+        "{TAB}", "300",
         "{ENTER}",
     ]

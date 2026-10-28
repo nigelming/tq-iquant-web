@@ -314,6 +314,48 @@ class ThsUiDispatcher(OrderDispatcher):
         except Exception:
             pass
 
+    # 买入/卖出页字段 control_id（UIA 真机探针实测：代码=1032、价格=1033、
+    # 数量=1034；买卖两页镜像同 id。THS 升级若漂移，失败信息会带未定位字段名）
+    _ORDER_FIELD_IDS = {"code": 1032, "price": 1033, "quantity": 1034}
+
+    def _uia_window(self):
+        """UIA 后端窗口包装（与 win32 同窗）；pywinauto 缺失/失败 → None。"""
+        if Application is None or Desktop is None or self._win is None:
+            return None
+        try:
+            return Desktop(backend="uia").window(handle=self._win.handle)
+        except Exception:
+            return None
+
+    def _uia_field(self, uia_win, kind: str):
+        """按 control_id 定位下单页字段（可见页的 Edit），未找到 → None。"""
+        cid = self._ORDER_FIELD_IDS[kind]
+        for e in uia_win.descendants(control_type="Edit"):
+            try:
+                if getattr(e.element_info, "control_id", None) == cid:
+                    return e
+            except Exception:
+                continue
+        return None
+
+    def kb_send(self, keys: str) -> None:
+        """向当前焦点控件发送键入（SendInput）——不重置窗口焦点。
+
+        与 _key（_focus+窗口 type_keys）的区别：键入序列内多步操作必须保持
+        字段焦点不被重置，同花顺下单页键入必须走本方法。
+        """
+        if send_keys is not None:
+            try:
+                send_keys(keys)
+                return
+            except Exception:
+                pass
+        if self._win is not None:
+            try:
+                self._win.type_keys(keys)
+            except Exception:
+                pass
+
     def _switch(self, tab: str) -> None:
         self._key(tab)
         time.sleep(self._SWITCH_WAIT)
@@ -1256,9 +1298,10 @@ class ThsUiDispatcher(OrderDispatcher):
     def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
         """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。
 
-        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 键鼠 / 确认框 /
-        _find_order 回查 / 合成 TradeEvent。命中合同编号时补记
-        _last_submit_ref / _last_submit_time 供执行器记账。
+        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 切页 / **全程 kb_send（SendInput 不重置焦点）TAB 焦点序逐字段键入**
+        （代码→价格→数量）——_key 的 _focus() 会打掉字段焦点（真机 OCR 实证
+        屏幕零变化），Timings.fast() 会丢字符，均已在键入路径规避。
+        确认框 / _find_order 回查 / 合成 TradeEvent；成交时序由回填负责。
         """
         self._last_submit_ref = ""
         self._last_submit_time = ("", "")
@@ -1283,26 +1326,33 @@ class ThsUiDispatcher(OrderDispatcher):
         if not self._gui_guard():
             raise BridgeUnavailableError("ths ui busy")
         try:
+            # Timings.fast()（connect 时启用）把 SendInput 间隔压到 0ms——真机
+            # 实测自绘控件丢键入事件（代码/价格零像素变化、数量偶然成功）。
+            # 键入前恢复默认时序，操作完由下次 connect 再加速。
+            if timings is not None:
+                try:
+                    timings.Timings.defaults()
+                except Exception:
+                    pass
             self._switch(self.TAB_BUY if order.trade_type.value == "BUY" else self.TAB_SELL)
-            self._key("^a")
-            self._key("{DELETE}")
-            self._key(code)
+            # 真机实证三连（焦点探针/整窗 OCR 零新增词/像素差异）：
+            # 1) _key 每次先 _focus() 重置主窗口焦点——TAB 建立的字段焦点被
+            #    打掉、字符被吃（屏幕零变化）；字段键入必须全程 kb_send
+            #    （SendInput 直发当前焦点控件，不重置焦点）。
+            # 2) Timings.fast() 使自绘控件丢字符——键入前恢复默认时序。
+            # 3) F1 切页后焦点在页签按钮，TAB 焦点序：代码(1032)→价格(1033)
+            #    →数量(1034)（GetFocusedElement 逐键探针实测）。
+            self.kb_send("{TAB}")       # → 证券代码
+            self.kb_send(code)
             time.sleep(self._SWITCH_WAIT)
-            # 字段顺序 [代码 → 委托价格 → 委托数量]：显式输入委托价格（限价语义，
-            # 与回测审批价一致）——此前连按两个 TAB 跳过价格框，真实委托按对话框
-            # 默认价（最新价）成交，限价/涨跌停前置校验全部失真（准确性缺口）。
-            self._key("{TAB}")
-            self._key("^a")
-            self._key("{DELETE}")
-            self._key(str(price))
+            self.kb_send("{TAB}")       # → 委托价格（显式限价，与回测审批价一致）
+            self.kb_send(str(price))
             time.sleep(0.3)
-            self._key("{TAB}")
-            self._key("^a")
-            self._key("{DELETE}")
-            self._key(str(vol))
+            self.kb_send("{TAB}")       # → 委托数量
+            self.kb_send(str(vol))
             time.sleep(0.3)
             before = self._snapshot_hwnds()
-            self._key("{ENTER}")
+            self.kb_send("{ENTER}")
             time.sleep(1.5)
             confirmed = self._confirm_dialog(before, self.CONFIRM_BUTTONS)
         except BridgeOrderRejected:
@@ -1341,3 +1391,4 @@ class ThsUiDispatcher(OrderDispatcher):
             signal_type=order.signal_type,
             signal_name=order.signal_name,
         )
+
