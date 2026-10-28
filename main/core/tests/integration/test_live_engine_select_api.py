@@ -61,7 +61,7 @@ def _seed_pool(db):
     return ps.id
 
 
-@pytest.mark.parametrize("engine_key", ["iquant", "tdx", "ths", "qmt"])
+@pytest.mark.parametrize("engine_key", ["iquant", "tdx", "ths"])
 def test_create_and_list_session_engine(client, engine_key):
     c, _ = client
     r = c.post("/api/live/sessions",
@@ -88,7 +88,7 @@ def test_channel_endpoint_accepts_engine_query(client):
     assert body["code"] == 0
     assert body["data"]["engine"] == "tdx"
     assert body["data"]["active"] == "tdx_tq"
-    assert [e["key"] for e in body["data"]["engines"]] == ["iquant", "tdx", "ths", "qmt"]
+    assert [e["key"] for e in body["data"]["engines"]] == ["iquant", "tdx", "ths"]
 
 
 def test_channel_test_rejects_unknown_channel(client):
@@ -136,39 +136,3 @@ def test_start_tdx_session_reports_not_ready(client, monkeypatch):
     assert "资金账户未登录" in resp["message"]
     assert sid not in live_api._ENGINES
     assert c.get("/api/live/sessions/%d" % sid).json()["data"]["status"] != "running"
-
-
-def test_start_qmt_session_reports_not_ready(client, monkeypatch):
-    from core.services import live_service as svc
-
-    class OfflineQmt:
-        channel = "qmt"
-        last_error = "未找到 xtquant（QMT 交易依赖）"
-
-        def __init__(self, **kw):
-            pass
-
-        def heartbeat(self):
-            return False
-
-        def query_calendar(self):
-            return []
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(svc, "QmtDispatcher", OfflineQmt)
-
-    c, Session = client
-    db = Session()
-    ps_id = _seed_pool(db)
-    db.close()
-    sid = c.post(
-        "/api/live/sessions",
-        json={"name": "qmt", "mode": "live", "engine": "qmt",
-              "execution_mode": "auto", "portfolio_ids": [ps_id]},
-    ).json()["data"]["id"]
-    resp = c.post("/api/live/sessions/%d/start" % sid).json()
-    assert resp["code"] == 503
-    assert "QMT 交易未就绪" in resp["message"]
-    assert "xtquant" in resp["message"]

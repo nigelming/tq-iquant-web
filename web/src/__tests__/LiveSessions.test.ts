@@ -81,7 +81,6 @@ beforeEach(() => {
       { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
       { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
       { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
-      { key: 'qmt', channel: 'qmt', label: 'miniQMT 交易', configured: false, detail: '未配置 QMT 路径/资金账号' },
     ],
     ths_ui: { enabled: false, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
     bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
@@ -504,7 +503,6 @@ describe('LiveSessions.vue 执行通道条', () => {
         { key: 'iquant', channel: 'iquant_bridge', label: 'iQuant HTTP 桥', configured: true, detail: '' },
         { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
         { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
-        { key: 'qmt', channel: 'qmt', label: 'miniQMT 交易', configured: false, detail: '未安装 xtquant' },
       ],
       ths_ui: { enabled: true, available: true, window_title: '网上股票交易系统5.0', client_exe_path: 'D:/xiadan.exe', driver: 'clipboard' },
       bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
@@ -515,8 +513,6 @@ describe('LiveSessions.vue 执行通道条', () => {
 
     expect(getLiveChannel).toHaveBeenCalled()
     expect(w.text()).toContain('同花顺独立交易（UI 自动化）')
-    // 四个引擎全部可见，未配置的引擎带（未配置）标记
-    expect(w.text()).toContain('miniQMT 交易（未配置）')
 
     await w.findAll('button').find((b) => b.text().includes('测试连接'))!.trigger('click')
     await flushPromises()

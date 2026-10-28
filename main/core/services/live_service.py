@@ -45,10 +45,6 @@ try:
     from core.engine.tdx_tq_dispatcher import TdxTqDispatcher
 except Exception:
     TdxTqDispatcher = None  # type: ignore
-try:
-    from core.engine.qmt_dispatcher import QmtDispatcher
-except Exception:
-    QmtDispatcher = None  # type: ignore
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
 from core.engine.position import Position
@@ -123,27 +119,11 @@ def tq_trade_config() -> dict:
     }
 
 
-def qmt_config() -> dict:
-    """读 miniQMT 交易配置（config.qmt 段）。"""
-    cfg = load_config()
-    qmt = cfg.get("qmt", {}) if isinstance(cfg, dict) else {}
-    qmt = qmt if isinstance(qmt, dict) else {}
-    return {
-        "available": QmtDispatcher is not None,
-        "path": qmt.get("path") or "",
-        "account": qmt.get("account") or "",
-        "account_type": qmt.get("account_type") or "STOCK",
-        "price_mode": qmt.get("price_mode") or "fix",
-        "xtquant_path": qmt.get("xtquant_path") or "",
-    }
-
-
 #: 实盘交易引擎：key -> (渠道标识, 中文名)。渠道标识是 Core 状态机/前端识别的通道名。
 ENGINES_META = {
     "iquant": ("iquant_bridge", "iQuant HTTP 桥"),
     "tdx": ("tdx_tq", "通达信 TQ 交易"),
     "ths": ("ths_ui", "同花顺独立交易（UI 自动化）"),
-    "qmt": ("qmt", "miniQMT 交易"),
 }
 
 
@@ -164,13 +144,14 @@ def session_engine(session) -> str:
 
     全局默认自 A-6 起为 tq_trade.default_engine（SystemConfig 可配，默认 tdx）；
     未配置时沿用旧行为（ths_ui.enabled → ths，否则 iquant）。
+    qmt 通道已移除：历史 qmt 会话的显式值不再进白名单，同样回退默认引擎。
     """
     explicit = getattr(session, "engine", None)
     return explicit if explicit in ENGINES_META else default_engine()
 
 
 def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
-    """按引擎标识构造 dispatcher（三个可选引擎 + iQuant 桥）。
+    """按引擎标识构造 dispatcher（tdx/ths 两个独立通道 + iQuant 桥）。
 
     依赖缺失/未配置时抛 RuntimeError，由 start_session 转成 503 明确告警，
     绝不静默回退到别的通道（避免"以为在通达信下单、实际打到 iQuant"）。
@@ -191,15 +172,6 @@ def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
             account=cfg["account"], account_type=cfg["account_type"],
             price_mode=cfg["price_mode"], client_path=cfg["client_path"],
         )
-    if engine == "qmt":
-        if QmtDispatcher is None:
-            raise RuntimeError("miniQMT 交易通道不可用")
-        cfg = qmt_config()
-        return QmtDispatcher(
-            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
-            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
-            session_id=session_id,
-        )
     if HttpBridgeDispatcher is None:
         raise RuntimeError("HttpBridgeDispatcher not available")
     br = bridge_config()
@@ -210,7 +182,6 @@ def engine_status(engine: Optional[str]) -> dict:
     """引擎清单 + 已配置情况（前端下拉与通道条共用）。"""
     ths = ths_ui_config()
     tq = tq_trade_config()
-    qmt = qmt_config()
     items = []
     for key, (channel, label) in ENGINES_META.items():
         configured = True
@@ -221,14 +192,6 @@ def engine_status(engine: Optional[str]) -> dict:
         elif key == "tdx":
             configured = tq["available"]
             detail = "通达信 TQ（需客户端已登录资金账号）" if configured else "通道不可用"
-        elif key == "qmt":
-            configured = qmt["available"] and bool(qmt["path"]) and bool(qmt["account"])
-            if not qmt["available"]:
-                detail = "未安装 xtquant"
-            elif not qmt["path"] or not qmt["account"]:
-                detail = "未配置 QMT 路径/资金账号"
-            else:
-                detail = qmt["account"]
         elif key == "iquant":
             br = bridge_config()
             detail = "%s / %s" % (br["simulation"], br["live"])
@@ -240,7 +203,7 @@ def engine_status(engine: Optional[str]) -> dict:
     channel, label = ENGINES_META.get(current, ENGINES_META["iquant"])
     return {
         "engine": current, "active": channel, "label": label, "engines": items,
-        "ths_ui": ths, "tq_trade": tq, "qmt": qmt, "bridge": bridge_config(),
+        "ths_ui": ths, "tq_trade": tq, "bridge": bridge_config(),
     }
 
 
@@ -267,8 +230,7 @@ def test_channel(channel: str = "ths_ui", mode: str = "simulation") -> dict:
 
     ths_ui：连接 xiadan.exe 窗口并读一次持仓（只读，不下单）；
     iquant_bridge：请求对应模式桥的 /ping；
-    tdx_tq：连通达信 TQ 交易账户并读一次持仓（只读）；
-    qmt：连 miniQMT 并读一次持仓（只读）。
+    tdx_tq：连通达信 TQ 交易账户并读一次持仓（只读）。
     """
     if channel == "tdx_tq":
         if TdxTqDispatcher is None:
@@ -286,22 +248,6 @@ def test_channel(channel: str = "ths_ui", mode: str = "simulation") -> dict:
             if dispatcher.last_error:
                 return {"ok": False, "channel": "tdx_tq", "error": dispatcher.last_error}
             return {"ok": True, "channel": "tdx_tq", "positions": len(rows)}
-        finally:
-            dispatcher.close()
-    if channel == "qmt":
-        if QmtDispatcher is None:
-            return {"ok": False, "channel": "qmt", "error": "miniQMT 交易通道不可用"}
-        cfg = qmt_config()
-        dispatcher = QmtDispatcher(
-            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
-            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
-        )
-        try:
-            if not dispatcher.heartbeat():
-                return {"ok": False, "channel": "qmt",
-                        "error": dispatcher.last_error or "QMT 交易未就绪"}
-            rows = dispatcher.query_positions()
-            return {"ok": True, "channel": "qmt", "positions": len(rows)}
         finally:
             dispatcher.close()
     if channel == "ths_ui":
@@ -473,7 +419,7 @@ def build_engine(
 
     dispatcher_cls：注入 dispatcher 类（测试 monkeypatch 用）；None 时按 engine 选：
     engine=None → 沿用旧行为（ths_ui.enabled → 同花顺，否则 iQuant 桥）；
-    engine=tdx/qmt → 通达信 TQ / miniQMT。
+    engine=tdx → 通达信 TQ。
 
     execution_mode=alert 时固定使用 AlertDataDispatcher（TQ 行情、禁止下单），
     优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
@@ -495,13 +441,6 @@ def build_engine(
         dispatcher = dispatcher_cls(
             account=cfg["account"], account_type=cfg["account_type"],
             price_mode=cfg["price_mode"], client_path=cfg["client_path"],
-        )
-    elif dispatcher_cls is QmtDispatcher and QmtDispatcher is not None:
-        cfg = qmt_config()
-        dispatcher = dispatcher_cls(
-            path=cfg["path"], account=cfg["account"], account_type=cfg["account_type"],
-            price_mode=cfg["price_mode"], xtquant_path=cfg["xtquant_path"],
-            session_id=session_id,
         )
     else:
         br = bridge_config()
@@ -823,12 +762,6 @@ def start_session(
                 503,
                 "通达信交易未就绪：请先启动并登录通达信交易客户端（%s）"
                 % (detail or "未获取到资金账号"),
-            )
-        if channel == "qmt":
-            return None, session, (
-                503,
-                "QMT 交易未就绪：请先启动 QMT 客户端并开启极简模式（%s）"
-                % (detail or "未连接"),
             )
         mode_label = "实盘" if mode == "live" else "仿真"
         br = bridge_config()

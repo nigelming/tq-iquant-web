@@ -99,12 +99,12 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 | 接口 | 回测实现 | 实盘实现 |
 |------|----------|----------|
-| `OrderDispatcher` | `SimulatedDispatcher` 按 next_bar.open 模拟成交 | `HttpBridgeDispatcher`（iQuant HTTP 桥）/ `TdxTqDispatcher`（通达信 TQ）/ `QmtDispatcher`（miniQMT）/ `ThsUiDispatcher`（同花顺 UI 自动化），按 `live_sessions.engine` 选择 |
-| `T1Checker` | `SimulatedT1Checker` 直接返回持仓量 | `LiveT1Checker` 查实际可用股数（四种通道同一口径：持仓表的「可用」列，0 为合法锁定值） |
+| `OrderDispatcher` | `SimulatedDispatcher` 按 next_bar.open 模拟成交 | `HttpBridgeDispatcher`（iQuant HTTP 桥）/ `TdxTqDispatcher`（通达信 TQ）/ `ThsUiDispatcher`（同花顺 UI 自动化），按 `live_sessions.engine` 选择 |
+| `T1Checker` | `SimulatedT1Checker` 直接返回持仓量 | `LiveT1Checker` 查实际可用股数（三种通道同一口径：持仓表的「可用」列，0 为合法锁定值） |
 
 执行引擎 `ExecutionEngine` 持有这两个接口，不感知具体实现。
 
-**实盘交易引擎按会话可选**：`live_sessions.engine` ∈ `iquant` / `tdx` / `ths` / `qmt`；NULL 表示迁移前的历史会话，运行时按全局默认解析——`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置/非法回退旧行为（`ths_ui.enabled` → ths，否则 iquant）。引擎未就绪（客户端未启动/未登录/依赖缺失/未配置路径账号）时 `/sessions/{id}/start` 直接返回 503 并给出可操作中文提示，**不会静默回退到其它通道**。委托认领：`supports_remark=False` 的通道（通达信、同花顺）走 legacy 模糊匹配（代码+方向+数量+提交时间窗；陌生 ref 补记的时间标记 `insert_fabricated`，匹配时降级排除，防遗留单误绑），`supports_remark=True`（miniQMT）按 remark 精确认领。
+**实盘交易引擎按会话可选**：`live_sessions.engine` ∈ `iquant` / `tdx` / `ths`（miniQMT 通道已移除，历史 qmt 会话经 `session_engine` 白名单回退到默认引擎）；NULL 表示迁移前的历史会话，运行时按全局默认解析——`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置/非法回退旧行为（`ths_ui.enabled` → ths，否则 iquant）。引擎未就绪（客户端未启动/未登录/依赖缺失/未配置路径账号）时 `/sessions/{id}/start` 直接返回 503 并给出可操作中文提示，**不会静默回退到其它通道**。委托认领：`supports_remark=False` 的通道（通达信、同花顺）走 legacy 模糊匹配（代码+方向+数量+提交时间窗；陌生 ref 补记的时间标记 `insert_fabricated`，匹配时降级排除，防遗留单误绑），iQuant 桥把确定性 bridge_order_id 写进柜台 remark，按 remark 精确认领。
 
 ## 关键路径与配置文件
 
@@ -115,11 +115,10 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/tq/` | 通达信 TQ 模块（嵌入 Core 同进程） |
 | `main/core/engine/http_bridge_dispatcher.py` | iQuant HTTP 桥下单通道 |
 | `main/core/engine/tdx_tq_dispatcher.py` | 通达信 TQ 下单通道（与回测取数同一 TQ 连接） |
-| `main/core/engine/qmt_dispatcher.py` | miniQMT 下单通道（xtquant） |
 | `main/core/engine/ths_ui_dispatcher.py` | 同花顺独立交易 UI 自动化通道 |
 | `live/bridge/` | 国信 iQuant HTTP 桥（iQuant 客户端内 Python 3.6 策略，`127.0.0.1:8790`） |
 | `web/` | Vue 3 + Vite 前端 |
-| `config.yaml` | 系统配置（TDX 路径、iQuant 路径、`ths_ui` / `tq_trade` / `qmt` 交易通道） |
+| `config.yaml` | 系统配置（TDX 路径、iQuant 路径、`ths_ui` / `tq_trade` 交易通道） |
 
 ## 测试注意事项
 

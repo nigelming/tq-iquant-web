@@ -31,13 +31,6 @@ const DEFAULTS: SystemConfig = {
     default_engine: 'tdx',
     cancel_unfilled_minutes: 3,
   },
-  qmt: {
-    path: '',
-    account: '',
-    account_type: 'STOCK',
-    price_mode: 'fix',
-    xtquant_path: '',
-  },
 }
 
 const config = ref<SystemConfig>(JSON.parse(JSON.stringify(DEFAULTS)))
@@ -51,7 +44,6 @@ const GROUPS = [
   { key: 'base', label: '基础环境' },
   { key: 'ths', label: '同花顺通道' },
   { key: 'tq', label: '通达信 TQ 通道' },
-  { key: 'qmt', label: 'miniQMT 通道' },
   { key: 'misc', label: '回测与数据' },
 ] as const
 type GroupKey = (typeof GROUPS)[number]['key']
@@ -85,13 +77,6 @@ onMounted(async () => {
         cancel_unfilled_minutes:
           data.tq_trade?.cancel_unfilled_minutes ?? DEFAULTS.tq_trade!.cancel_unfilled_minutes,
       },
-      qmt: {
-        path: data.qmt?.path ?? DEFAULTS.qmt!.path,
-        account: data.qmt?.account ?? DEFAULTS.qmt!.account,
-        account_type: data.qmt?.account_type ?? DEFAULTS.qmt!.account_type,
-        price_mode: data.qmt?.price_mode ?? DEFAULTS.qmt!.price_mode,
-        xtquant_path: data.qmt?.xtquant_path ?? DEFAULTS.qmt!.xtquant_path,
-      },
     }
   } catch (e) {
     errorMsg.value = '加载配置失败: ' + (e instanceof Error ? e.message : String(e))
@@ -118,7 +103,7 @@ async function save() {
 const testing = ref('')
 const testResults = ref<Record<string, { ok: boolean; text: string }>>({})
 
-async function testChannel(channel: 'ths_ui' | 'tdx_tq' | 'qmt') {
+async function testChannel(channel: 'ths_ui' | 'tdx_tq') {
   testing.value = channel
   try {
     const r = await testLiveChannel(channel)
@@ -134,7 +119,6 @@ async function testChannel(channel: 'ths_ui' | 'tdx_tq' | 'qmt') {
 
 function testThs() { return testChannel('ths_ui') }
 function testTdx() { return testChannel('tdx_tq') }
-function testQmt() { return testChannel('qmt') }
 </script>
 
 <template>
@@ -264,7 +248,6 @@ function testQmt() { return testChannel('qmt') }
                 <option value="tdx">通达信 TQ（tdx）</option>
                 <option value="iquant">iQuant HTTP 桥（iquant）</option>
                 <option value="ths">同花顺 UI 自动化（ths）</option>
-                <option value="qmt">miniQMT（qmt）</option>
               </select>
               <p class="cfg-hint">新建实盘会话未显式选引擎时使用</p>
             </div>
@@ -282,45 +265,6 @@ function testQmt() { return testChannel('qmt') }
               </button>
               <span v-if="testResults.tdx_tq" :style="{ color: testResults.tdx_tq.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }">
                 {{ testResults.tdx_tq.text }}
-              </span>
-            </div>
-          </section>
-
-          <section v-show="activeGroup === 'qmt'">
-            <h3 class="cfg-h">miniQMT 交易通道</h3>
-            <p class="cfg-desc">
-              走迅投 QMT 的 xtquant 接口。前置条件：QMT 客户端已登录并开启「极简模式」，
-              且 xtquant 可被导入（分发包不含，需填写 xtquant 所在目录或另行安装）。
-            </p>
-            <div class="field">
-              <label>QMT userdata 路径</label>
-              <input v-model="config.qmt!.path" placeholder="C:\QMT\userdata_mini" />
-            </div>
-            <div class="field">
-              <label>资金账号</label>
-              <input v-model="config.qmt!.account" placeholder="88888888" />
-            </div>
-            <div class="field">
-              <label>账号类型</label>
-              <input v-model="config.qmt!.account_type" placeholder="STOCK" />
-            </div>
-            <div class="field">
-              <label>下单价格模式</label>
-              <select v-model="config.qmt!.price_mode">
-                <option value="fix">限价（策略价，默认）</option>
-                <option value="latest">最新价</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>xtquant 目录（含 xtquant 包的父目录）</label>
-              <input v-model="config.qmt!.xtquant_path" placeholder="C:\QMT\bin.x64\Lib\site-packages" />
-            </div>
-            <div class="cfg-test">
-              <button @click="testQmt" class="btn btn-sm" :disabled="testing !== ''">
-                {{ testing === 'qmt' ? '测试中…' : '测试连接（只读）' }}
-              </button>
-              <span v-if="testResults.qmt" :style="{ color: testResults.qmt.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }">
-                {{ testResults.qmt.text }}
               </span>
             </div>
           </section>

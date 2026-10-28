@@ -1654,8 +1654,8 @@ export interface ReconcileMismatch {
   diff: number
 }
 
-// 实盘交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI自动化) / qmt(miniQMT)
-export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'qmt'
+// 实盘交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI自动化)
+export type LiveEngineKey = 'iquant' | 'tdx' | 'ths'
 
 // 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
 export type LiveExecutionMode = 'alert' | 'auto'
@@ -1718,16 +1718,8 @@ export interface TqTradeConfig {
   account_type: string
   price_mode: string   // my|cage|latest|ztj|dtj
   client_path: string
-  default_engine: string       // tdx|iquant|ths|qmt：新建实盘会话未显式选引擎时使用
+  default_engine: string       // tdx|iquant|ths：新建实盘会话未显式选引擎时使用
   cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
-}
-
-export interface QmtConfig {
-  path: string
-  account: string
-  account_type: string
-  price_mode: string   // fix|latest
-  xtquant_path: string
 }
 
 export interface SystemConfig {
@@ -1741,12 +1733,11 @@ export interface SystemConfig {
   }
   ths_ui: ThsUiConfig
   tq_trade: TqTradeConfig
-  qmt: QmtConfig
 }
 
 export interface LiveChannelEngine {
   key: LiveEngineKey
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'qmt'
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
   label: string
   configured: boolean
   detail: string
@@ -1754,19 +1745,18 @@ export interface LiveChannelEngine {
 
 export interface LiveChannelInfo {
   engine: LiveEngineKey
-  active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'qmt'
+  active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
   label: string
   online: boolean | null
   engines: LiveChannelEngine[]
   ths_ui: ThsUiConfig
   bridge: { simulation: string; live: string }
   tq_trade?: { available: boolean; account: string; account_type: string; price_mode: string; client_path: string }
-  qmt?: { available: boolean; path: string; account: string; account_type: string; price_mode: string; xtquant_path: string }
 }
 
 export interface ChannelTestResult {
   ok: boolean
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'qmt'
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
   error?: string | null
   window_title?: string
   positions?: number
@@ -1779,7 +1769,7 @@ export async function getLiveChannel(engine?: LiveEngineKey) {
 }
 
 export async function testLiveChannel(
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'qmt', mode = 'simulation',
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq', mode = 'simulation',
 ) {
   const res = await api.post<ApiResponse<ChannelTestResult>>('/live/channel/test', { channel, mode })
   return res.data.data

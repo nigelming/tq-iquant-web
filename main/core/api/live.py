@@ -277,8 +277,8 @@ def channel_test(data: Optional[dict] = None):
     """只读连通性探测：读一次持仓 / ping 一次。不产生下单。"""
     data = data or {}
     channel = data.get("channel") or "ths_ui"
-    if channel not in ("ths_ui", "iquant_bridge", "tdx_tq", "qmt"):
-        return err(400, "channel 非法，仅支持 ths_ui / iquant_bridge / tdx_tq / qmt")
+    if channel not in ("ths_ui", "iquant_bridge", "tdx_tq"):
+        return err(400, "channel 非法，仅支持 ths_ui / iquant_bridge / tdx_tq")
     return ok(svc.test_channel(channel, data.get("mode") or "simulation"))
 
 

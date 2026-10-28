@@ -20,10 +20,6 @@ try:
     from .tdx_tq_dispatcher import TdxTqDispatcher
 except Exception:
     TdxTqDispatcher = None  # type: ignore
-try:
-    from .qmt_dispatcher import QmtDispatcher
-except Exception:
-    QmtDispatcher = None  # type: ignore
 from .evaluator import Evaluator
 from .backtest_engine import BacktestEngine
 from .live_engine import LiveEngine

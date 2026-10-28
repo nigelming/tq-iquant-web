@@ -45,7 +45,7 @@ function normalizedLiveCapital(): number | null {
 }
 // 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
 const ENGINE_LABEL: Record<string, string> = {
-  iquant: 'iQuant 桥', tdx: '通达信', ths: '同花顺', qmt: 'miniQMT',
+  iquant: 'iQuant 桥', tdx: '通达信', ths: '同花顺',
 }
 function engineLabel(key?: string): string {
   if (!key) return ENGINE_LABEL.iquant
@@ -673,7 +673,7 @@ onUnmounted(closeEventStream)
           预警模式：直接使用通达信 TQ 行情计算信号并通过 send_warn 推送预警，不经过下单通道，无需选择交易引擎；启动前会校验公式绑定与 TQ 可用性。
         </span>
         <span v-else>
-          自动模式：下单由所选引擎执行——iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 与 miniQMT 直连各自客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
+          自动模式：下单由所选引擎执行——iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 直连通达信客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
         </span>
       </p>
       <label>实盘资金基准（元）</label>

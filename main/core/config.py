@@ -59,13 +59,6 @@ def _defaults() -> dict:
             # A-2：在途单超时未成交自动撤单（分钟）；<=0 = 禁用。
             "cancel_unfilled_minutes": 3,
         },
-        "qmt": {
-            "path": "",
-            "account": "",
-            "account_type": "STOCK",
-            "price_mode": "fix",
-            "xtquant_path": "",
-        },
     }
 
 

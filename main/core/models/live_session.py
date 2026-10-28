@@ -10,9 +10,10 @@ class LiveSession(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     mode = Column(String(10), nullable=False)
-    # 交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI) / qmt(miniQMT)。
+    # 交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI)。
     # 为 NULL 表示迁移前的历史会话，运行时按全局默认引擎（ths_ui.enabled 判定）解析，
     # 保持升级前行为不变；新建会话一律显式写入。
+    # 历史 qmt 会话（通道已移除）由 session_engine 白名单回退到默认引擎。
     engine = Column(String(10), nullable=True)
     # 实盘资金基准：None=各组合用自身 initial_capital；设置=会话内所有组合以该值
     # 起账（资金占比/单仓/敞口等比率配置等比缩放），多组合各自独立记账。

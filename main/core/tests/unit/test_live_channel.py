@@ -1,7 +1,7 @@
 from core.services import live_service as svc
 
 
-def _cfg(ths_enabled=False, tq_trade=None, qmt=None):
+def _cfg(ths_enabled=False, tq_trade=None):
     cfg = {
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},
@@ -16,8 +16,6 @@ def _cfg(ths_enabled=False, tq_trade=None, qmt=None):
     }
     if tq_trade:
         cfg["tq_trade"] = tq_trade
-    if qmt:
-        cfg["qmt"] = qmt
     return cfg
 
 
@@ -129,15 +127,13 @@ def test_ths_dispatcher_reports_channel_and_error(monkeypatch):
 
 # ---------------------------------------------------------------- 三引擎可选
 
-def test_engine_status_lists_four_engines(monkeypatch):
+def test_engine_status_lists_three_engines(monkeypatch):
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
     data = svc.engine_status("iquant")
-    assert [e["key"] for e in data["engines"]] == ["iquant", "tdx", "ths", "qmt"]
+    assert [e["key"] for e in data["engines"]] == ["iquant", "tdx", "ths"]
     assert data["engine"] == "iquant"
     assert data["active"] == "iquant_bridge"
-    # 默认未配置通达信账号/QMT 路径 → qmt 标记为未配置，前端下拉禁用
-    qmt = [e for e in data["engines"] if e["key"] == "qmt"][0]
-    assert qmt["configured"] is False
+    assert data["engines"][-1]["key"] == "ths"
 
 
 def test_channel_status_uses_session_engine(monkeypatch):
@@ -152,7 +148,6 @@ def test_make_dispatcher_by_engine(monkeypatch):
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(
         False,
         tq_trade={"account": "A1", "account_type": "stock", "price_mode": "latest"},
-        qmt={"path": "C:/qmt", "account": "8888"},
     ))
     seen = {}
 
@@ -160,29 +155,18 @@ def test_make_dispatcher_by_engine(monkeypatch):
         def __init__(self, **kw):
             seen["tdx"] = kw
 
-    class FakeQmt:
-        def __init__(self, **kw):
-            seen["qmt"] = kw
-
     monkeypatch.setattr(svc, "TdxTqDispatcher", FakeTdx)
-    monkeypatch.setattr(svc, "QmtDispatcher", FakeQmt)
     assert isinstance(svc.make_dispatcher("tdx"), FakeTdx)
     assert seen["tdx"]["account"] == "A1"
     assert seen["tdx"]["price_mode"] == "latest"
-    assert isinstance(svc.make_dispatcher("qmt", session_id=7), FakeQmt)
-    assert seen["qmt"]["path"] == "C:/qmt"
-    assert seen["qmt"]["session_id"] == 7
 
 
 def test_make_dispatcher_raises_when_dependency_missing(monkeypatch):
     import pytest
 
     monkeypatch.setattr(svc, "TdxTqDispatcher", None)
-    monkeypatch.setattr(svc, "QmtDispatcher", None)
     with pytest.raises(RuntimeError):
         svc.make_dispatcher("tdx")
-    with pytest.raises(RuntimeError):
-        svc.make_dispatcher("qmt")
 
 
 def test_test_channel_tdx_reports_not_ready(monkeypatch):
@@ -211,29 +195,6 @@ def test_test_channel_tdx_reports_not_ready(monkeypatch):
     assert "请启动客户端" in out["error"]
 
 
-def test_test_channel_qmt_ok(monkeypatch):
-    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
-
-    class FakeQmt:
-        channel = "qmt"
-        last_error = ""
-
-        def __init__(self, **kw):
-            pass
-
-        def heartbeat(self):
-            return True
-
-        def query_positions(self):
-            return [{"instrument": "000001"}]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(svc, "QmtDispatcher", FakeQmt)
-    assert svc.test_channel("qmt") == {"ok": True, "channel": "qmt", "positions": 1}
-
-
 def test_create_session_persists_engine(db_session):
     data = svc.create_session(db_session, {"name": "s1", "engine": "tdx"}, "simulation")
     assert data["engine"] == "tdx"
@@ -248,9 +209,19 @@ def test_default_engine_prefers_tq_trade_override(monkeypatch):
     monkeypatch.setattr(
         svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "tdx"}))
     assert svc.default_engine() == "tdx"
+
+
+def test_session_engine_qmt_falls_back_to_default(db_session, monkeypatch):
+    """历史会话兼容：qmt 通道已移除，显式 'qmt' 不再进白名单，
+    session_engine 回退全局默认（tq_trade.default_engine），不加迁移。"""
     monkeypatch.setattr(
-        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "qmt"}))
-    assert svc.default_engine() == "qmt"
+        svc, "load_config", lambda: _cfg(False, tq_trade={"default_engine": "tdx"}))
+    from core.models import LiveSession
+    session = LiveSession(
+        name="legacy_qmt", mode="live", status="stopped", engine="qmt")
+    db_session.add(session)
+    db_session.commit()
+    assert svc.session_engine(session) == "tdx"
 
 
 def test_default_engine_empty_or_invalid_falls_back_to_legacy(monkeypatch):

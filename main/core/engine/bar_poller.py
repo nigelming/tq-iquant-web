@@ -211,7 +211,7 @@ class BarPoller:
         时一次 query_quotes_batch 取全部股票；否则逐只 query_quote。
 
         返回 {code: [bar, ...]}。批量调用异常/返回空 → 回退逐只路径（与逐只
-        100% 等价，iQuant/ths/qmt 行为不变），warning 只记一次防刷屏。
+        100% 等价，iQuant/ths 行为不变），warning 只记一次防刷屏。
         """
         if getattr(self._dispatcher, "supports_batch_quote", False):
             try:

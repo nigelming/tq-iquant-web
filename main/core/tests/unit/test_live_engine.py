@@ -3676,7 +3676,7 @@ def test_handle_bar_bridge_business_reject_surfaces_error():
 
 # ---------------- Fix1：涨跌停前置校验（price_limit_check_enabled 门控，引擎接线）----------------
 class _LimitCheckDispatcher(HttpBridgeDispatcher):
-    """测试替身：check_price_limit 可编程返回（模拟 tdx/qmt/ths 通道校验）。"""
+    """测试替身：check_price_limit 可编程返回（模拟 tdx/ths 通道校验）。"""
 
     def __init__(self, client, reason):
         super().__init__(client=client)

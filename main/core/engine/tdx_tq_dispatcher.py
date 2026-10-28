@@ -473,7 +473,7 @@ class TdxTqDispatcher(OrderDispatcher):
 
         空/异常回退 000001.SH 日线反推（1.3.1 前的既有路径，原样保留），
         再失败返回 [] 走 fail-open。元素保持 'YYYYMMDD' 字符串
-        （TradingCalendar provider 契约）；alert/qmt/ths 均委托本方法。
+        （TradingCalendar provider 契约）；alert/ths 均委托本方法。
         """
         try:
             from core.tq.data import TQData
