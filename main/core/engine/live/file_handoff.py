@@ -1,15 +1,18 @@
-"""同花顺文件交接层（THS file_builtin 模式）— JSONL 指令/事件文件读写。
+"""执行契约文件交接层 — 决策层与执行层之间的显性文件契约（通道无关）。
 
-同花顺通道是纯 UI 自动化，无法像 iQuant 桥那样秒级 HTTP 受理。file_builtin
-模式把「信号/风控事件」与「下单指令」落 JSONL 交接文件：
+决策层（信号/风控/指令）与执行层（任意通道执行器）之间的显性文件契约，
+通道无关——任何无桥执行端实现「消费指令→执行→回执」适配器即可接入。
+五个 JSONL/JSON 文件：
 
 - signals.jsonl：引擎 signal 事件（引擎 _emit 钩子写入）
 - risk.jsonl：引擎 decision/risk 事件（同上）
 - orders.jsonl：下单指令（dispatcher place_order 秒回前追加，seq 单调递增）
-- results.jsonl：执行回执（内置执行器 accepted/rejected，或通用诊断事件）
+- results.jsonl：执行回执（执行器 accepted/rejected，或通用诊断事件）
 - cursor.json：orders 消费游标 {"orders_offset": 已消费行数, "done": {order_id: 回执}}
 
 语义约定：
+- 所有写入行统一带 ``schema_version``（当前 1，见 _SCHEMA_VERSION；版本策略
+  见 docs/execution-contract.md：新增字段可选、改名/删除须升版）；
 - 所有写均为「逐行 append + flush + 实例级线程锁」，每行带 seq/ts(上海时间)/session_id；
 - read_pending_orders 按游标消费（读后游标推进到文件尾），done 表里的 order_id 跳过
   ——游标损坏重置从 0 重扫时靠 done 表保证幂等（已执行单不会重复执行）；
@@ -31,8 +34,12 @@ _ORDERS_FILE = "orders.jsonl"
 _RESULTS_FILE = "results.jsonl"
 _CURSOR_FILE = "cursor.json"
 
+#: 执行契约 schema 版本：所有 JSONL 写入行统一携带（向后兼容规则见
+#: docs/execution-contract.md —— 新增字段可选；改名/删除/语义变更须升版）。
+_SCHEMA_VERSION = 1
 
-class ThsFileHandoff:
+
+class FileHandoff:
     """一个 session 一套交接目录：{work_dir}/{session_id}/。"""
 
     def __init__(self, work_dir: str, session_id: int) -> None:
@@ -128,7 +135,7 @@ class ThsFileHandoff:
             except FileNotFoundError:
                 return []
             except OSError as e:
-                logger.warning("ths handoff read orders failed: %s", e)
+                logger.warning("file handoff read orders failed: %s", e)
                 return []
             total = len(lines)
             offset = int(self._cursor["orders_offset"])
@@ -141,7 +148,7 @@ class ThsFileHandoff:
                 try:
                     entry = json.loads(line)
                 except (ValueError, TypeError):
-                    logger.warning("ths handoff skip corrupt order line: %.80s", line)
+                    logger.warning("file handoff skip corrupt order line: %.80s", line)
                     continue
                 oid = str(entry.get("order_id") or "")
                 if not oid or oid in self._cursor["done"]:
@@ -161,7 +168,11 @@ class ThsFileHandoff:
             self._write_line(path, payload)
 
     def _write_line(self, path: str, payload: dict) -> None:
-        line = json.dumps(payload, ensure_ascii=False, default=str)
+        # schema_version 统一在行落盘点注入（signals/risk/orders/results 全覆盖）；
+        # payload 显式携带时可覆盖（向前兼容未来按行标版的场景）。
+        line = json.dumps(
+            {"schema_version": _SCHEMA_VERSION, **payload},
+            ensure_ascii=False, default=str)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
             f.flush()

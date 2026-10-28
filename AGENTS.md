@@ -118,7 +118,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/engine/http_bridge_dispatcher.py` | iQuant HTTP 桥下单通道 |
 | `main/core/engine/tdx_tq_dispatcher.py` | 通达信 TQ 下单通道（与回测取数同一 TQ 连接） |
 | `main/core/engine/ths_ui_dispatcher.py` | 同花顺独立交易 UI 自动化通道（file_builtin 文件交接层 + direct 直呼双模式） |
-| `main/core/engine/live/ths_handoff.py` | 同花顺文件交接层（signals/risk/orders/results JSONL + cursor.json 游标） |
+| `main/core/engine/live/file_handoff.py` | 执行契约文件交接层（通道无关；signals/risk/orders/results JSONL + cursor.json 游标） |
 | `live/bridge/` | 国信 iQuant HTTP 桥（iQuant 客户端内 Python 3.6 策略，`127.0.0.1:8790`） |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、iQuant 路径、`ths_ui` / `tq_trade` 交易通道） |

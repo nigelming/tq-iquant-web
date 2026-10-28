@@ -187,6 +187,7 @@ class _FakeThsDispatcher:
 
     def __init__(self, **kwargs):
         self.execute_mode = kwargs.get("execute_mode", "file_builtin")
+        self.file_handoff_enabled = self.execute_mode == "file_builtin"
         self._work_dir = kwargs.get("work_dir", "data/ths")
         self.last_error = ""
 
@@ -238,7 +239,7 @@ def test_start_session_ths_file_mode_allows_missing_ocr(monkeypatch, tmp_path):
         db, 1, {}, "simulation", db_session_factory=factory)
     assert error is None
     assert engine is not None
-    assert engine._ths_handoff is not None
+    assert engine._file_handoff is not None
     db.close()
 
 

@@ -176,18 +176,17 @@ class LiveEngine:
         # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
         self._t1_checker = LiveT1Checker()
         self._engine = ExecutionEngine(dispatcher, self._t1_checker, recorder=self._recorder)
-        # THS 文件交接层（file_builtin）：signal/decision/risk 事件同步落
-        # {work_dir}/{session_id}/ 下 signals/risk.jsonl，供外部诊断/对账。
-        # orders.jsonl 由 dispatcher 专职写（避免双写）；写失败不影响主流程。
-        self._ths_handoff = None
-        if (getattr(dispatcher, "channel", "") == "ths_ui"
-                and getattr(dispatcher, "execute_mode", "direct") == "file_builtin"):
+        # 执行契约文件交接层（file_handoff_enabled 门控，通道无关）：signal/decision/
+        # risk 事件同步落 {work_dir}/{session_id}/ 下 signals/risk.jsonl，供外部
+        # 诊断/对账。orders.jsonl 由 dispatcher 专职写（避免双写）；写失败不影响主流程。
+        self._file_handoff = None
+        if getattr(dispatcher, "file_handoff_enabled", False):
             try:
-                from .live.ths_handoff import ThsFileHandoff
-                self._ths_handoff = ThsFileHandoff(
+                from .live.file_handoff import FileHandoff
+                self._file_handoff = FileHandoff(
                     getattr(dispatcher, "_work_dir", "data/ths"), session_id)
             except Exception:  # noqa: BLE001
-                logger.warning("ths file handoff init failed", exc_info=True)
+                logger.warning("file handoff init failed", exc_info=True)
 
         # 行情/信号协作者（0010 步骤 2b）：预热/增量 bar 缓存、公式信号注入、周期边界
         # 分发、1w/1mon 通达信注入归 MarketDataService。on_bar 回调注入 self._handle_bar
@@ -476,16 +475,16 @@ class LiveEngine:
     # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
     def _emit(self, event_type: str, payload: dict) -> None:
         """向所有 SSE 订阅队列广播（委托 EventBus.emit，线程安全语义见 event_bus）。"""
-        self._emit_ths_handoff(event_type, payload)
+        self._emit_file_handoff(event_type, payload)
         self._event_bus.emit(event_type, payload)
 
-    def _emit_ths_handoff(self, event_type: str, payload: dict) -> None:
-        """THS file_builtin 会话：signal/decision/risk 事件同步写交接文件。
+    def _emit_file_handoff(self, event_type: str, payload: dict) -> None:
+        """挂了执行契约文件交接层的会话：signal/decision/risk 事件同步写交接文件。
 
         失败只 warning 不影响主流程（SSE 投递与落库是权威通道，交接文件是
         外部诊断/对账副本）。order 事件不落（orders.jsonl 由 dispatcher 专职写）。
         """
-        handoff = self._ths_handoff
+        handoff = self._file_handoff
         if handoff is None or event_type not in ("signal", "decision", "risk"):
             return
         try:
@@ -495,7 +494,7 @@ class LiveEngine:
             else:
                 handoff.write_risk(entry)
         except Exception:  # noqa: BLE001
-            logger.warning("ths handoff write failed (%s)", event_type, exc_info=True)
+            logger.warning("file handoff write failed (%s)", event_type, exc_info=True)
 
     def _emit_to_subscribers(self, ev: dict) -> None:
         """兼容旧调用/测试：直接向订阅队列投递（委托 EventBus）。"""

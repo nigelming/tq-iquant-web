@@ -1,4 +1,4 @@
-"""ThsFileHandoff 单测 — 同花顺文件交接层（THS file_builtin）。
+"""FileHandoff 单测 — 执行契约文件交接层（通道无关）。
 
 覆盖：目录创建、orders.jsonl 追加（seq 单调）/游标消费、mark_done（results.jsonl +
 done 表）、游标损坏/JSONL 损坏行容错、signal/risk/result 通用写入。
@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from core.engine.live.ths_handoff import ThsFileHandoff
+from core.engine.live.file_handoff import FileHandoff
 
 
 def _read_lines(path):
@@ -17,13 +17,13 @@ def _read_lines(path):
 
 
 def test_init_creates_session_dir(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 7)
+    h = FileHandoff(str(tmp_path), 7)
     assert h.dir_path == os.path.join(str(tmp_path), "7")
     assert os.path.isdir(h.dir_path)
 
 
 def test_append_order_writes_seq_ts_session_and_read_roundtrip(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 1)
+    h = FileHandoff(str(tmp_path), 1)
     seq1 = h.append_order({"order_id": "a1", "stock_code": "000001.SZ"})
     seq2 = h.append_order({"order_id": "a2", "stock_code": "600000.SH"})
     assert seq1 == 1 and seq2 == 2
@@ -41,16 +41,16 @@ def test_append_order_writes_seq_ts_session_and_read_roundtrip(tmp_path):
 
 
 def test_seq_monotonic_across_instances(tmp_path):
-    h1 = ThsFileHandoff(str(tmp_path), 3)
+    h1 = FileHandoff(str(tmp_path), 3)
     h1.append_order({"order_id": "x1"})
     h1.append_order({"order_id": "x2"})
-    h2 = ThsFileHandoff(str(tmp_path), 3)
+    h2 = FileHandoff(str(tmp_path), 3)
     seq = h2.append_order({"order_id": "x3"})
     assert seq == 3
 
 
 def test_mark_done_writes_results_and_done_table(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 2)
+    h = FileHandoff(str(tmp_path), 2)
     h.append_order({"order_id": "o1"})
     h.read_pending_orders()
     h.mark_done("o1", {"status": "accepted", "ref": "100001"})
@@ -67,13 +67,13 @@ def test_mark_done_writes_results_and_done_table(tmp_path):
     h.append_order({"order_id": "o2"})
     with open(h.cursor_path, "w", encoding="utf-8") as f:
         json.dump({"orders_offset": 0, "done": {"o1": {"status": "accepted"}}}, f)
-    h2 = ThsFileHandoff(str(tmp_path), 2)
+    h2 = FileHandoff(str(tmp_path), 2)
     pending = h2.read_pending_orders()
     assert [p["order_id"] for p in pending] == ["o2"]
 
 
 def test_corrupt_jsonl_lines_skipped(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 4)
+    h = FileHandoff(str(tmp_path), 4)
     h.append_order({"order_id": "good1"})
     with open(h.orders_path, "a", encoding="utf-8") as f:
         f.write("{not json\n")
@@ -86,18 +86,18 @@ def test_corrupt_jsonl_lines_skipped(tmp_path):
 
 
 def test_corrupt_cursor_resets_from_zero(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 5)
+    h = FileHandoff(str(tmp_path), 5)
     h.append_order({"order_id": "k1"})
     with open(h.cursor_path, "w", encoding="utf-8") as f:
         f.write("garbage")
-    h2 = ThsFileHandoff(str(tmp_path), 5)
+    h2 = FileHandoff(str(tmp_path), 5)
     assert h2.cursor["orders_offset"] == 0
     assert h2.cursor["done"] == {}
     assert len(h2.read_pending_orders()) == 1
 
 
 def test_write_signal_and_risk(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 9)
+    h = FileHandoff(str(tmp_path), 9)
     h.write_signal({"type": "signal", "signal_name": "open_sig"})
     h.write_risk({"type": "risk", "rule": "stop_loss"})
     h.write_risk({"type": "decision", "gate": "capital_gate"})
@@ -111,7 +111,7 @@ def test_write_signal_and_risk(tmp_path):
 
 
 def test_write_result_generic_receipt(tmp_path):
-    h = ThsFileHandoff(str(tmp_path), 6)
+    h = FileHandoff(str(tmp_path), 6)
     h.write_result({"event": "executor_started"})
     results = _read_lines(h.results_path)
     assert results[0]["event"] == "executor_started"
@@ -120,7 +120,23 @@ def test_write_result_generic_receipt(tmp_path):
 
 def test_read_pending_missing_dir_returns_empty(tmp_path):
     # 目录被外部删除（或尚未创建）时读容错：返回空，不抛异常
-    h = ThsFileHandoff(str(tmp_path), 8)
+    h = FileHandoff(str(tmp_path), 8)
     import shutil
     shutil.rmtree(h.dir_path)
     assert h.read_pending_orders() == []
+
+
+def test_all_written_lines_carry_schema_version(tmp_path):
+    """执行契约版本策略：signals/risk/orders/results（含 mark_done 回执）
+    所有写入行统一带 schema_version=1。"""
+    h = FileHandoff(str(tmp_path), 11)
+    h.write_signal({"type": "signal"})
+    h.write_risk({"type": "risk"})
+    h.write_result({"event": "diag"})
+    h.append_order({"order_id": "o1"})
+    h.read_pending_orders()
+    h.mark_done("o1", {"status": "accepted", "ref": "R1"})
+
+    for path in (h.signals_path, h.risk_path, h.results_path, h.orders_path):
+        for line in _read_lines(path):
+            assert line["schema_version"] == 1, path

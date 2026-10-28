@@ -63,6 +63,9 @@ class ThsUiDispatcher(OrderDispatcher):
     channel = "ths_ui"
     #: 柜台不回写备注，Core 不能按 remark 精确认领，只能走 legacy 模糊匹配。
     supports_remark = False
+    #: 引擎侧文件交接层挂载门控（通道无关）：file_builtin 模式 True（构造时按
+    #: execute_mode 落实例属性），direct 模式 False。LiveEngine 据此挂 FileHandoff。
+    file_handoff_enabled = False
 
     TAB_BUY = "{F1}"
     TAB_SELL = "{F2}"
@@ -126,6 +129,7 @@ class ThsUiDispatcher(OrderDispatcher):
         self._price_map: Dict[str, float] = {}
         # ---- 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼现状）----
         self.execute_mode = "file_builtin" if str(execute_mode or "") == "file_builtin" else "direct"
+        self.file_handoff_enabled = self.execute_mode == "file_builtin"
         self._execute_interval_seconds = max(float(execute_interval_seconds or 5), 0.01)
         self._work_dir = str(work_dir or "data/ths")
         self._session_id = int(session_id or 0)
@@ -144,8 +148,8 @@ class ThsUiDispatcher(OrderDispatcher):
         self._executor_stop = threading.Event()
         self._executor_lock = threading.Lock()
         if self.execute_mode == "file_builtin":
-            from .live.ths_handoff import ThsFileHandoff
-            self._handoff = ThsFileHandoff(self._work_dir, self._session_id)
+            from .live.file_handoff import FileHandoff
+            self._handoff = FileHandoff(self._work_dir, self._session_id)
 
     @staticmethod
     def _get_ocr_engine():

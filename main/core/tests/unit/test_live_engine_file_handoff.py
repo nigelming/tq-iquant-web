@@ -1,6 +1,6 @@
-"""LiveEngine × THS 文件交接层（file_builtin）单测。
+"""LiveEngine × 执行契约文件交接层（file_builtin）单测。
 
-覆盖：引擎构造时挂 _ths_handoff（仅 ths_ui+file_builtin）、_emit 的
+覆盖：引擎构造时挂 _file_handoff（仅 file_handoff_enabled dispatcher）、_emit 的
 signal/decision/risk 事件同步落 signals/risk.jsonl（order 事件不落）、
 _handle_bar 提交链对 file 模式 place_order 秒回 None 的处理
 （订单保持 submitted，不判 approval failed）。
@@ -136,8 +136,8 @@ def test_engine_ths_file_mode_constructs_handoff(tmp_path):
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     engine, disp = _ths_engine(factory, port, tmp_path)
-    assert engine._ths_handoff is not None
-    assert engine._ths_handoff.dir_path.endswith("1")
+    assert engine._file_handoff is not None
+    assert engine._file_handoff.dir_path.endswith("1")
     disp.close()
 
 
@@ -151,7 +151,7 @@ def test_engine_non_ths_dispatcher_has_no_handoff(tmp_path):
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
     )
-    assert engine._ths_handoff is None
+    assert engine._file_handoff is None
 
 
 def test_engine_ths_direct_mode_has_no_handoff(tmp_path):
@@ -163,7 +163,7 @@ def test_engine_ths_direct_mode_has_no_handoff(tmp_path):
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
     )
-    assert engine._ths_handoff is None
+    assert engine._file_handoff is None
 
 
 def test_engine_emits_signal_and_risk_to_files(tmp_path):
@@ -175,7 +175,7 @@ def test_engine_emits_signal_and_risk_to_files(tmp_path):
     engine._emit("risk", {"rule": "stop_loss"})
     engine._emit("order", {"status": "submitted"})  # order 事件不落交接文件
 
-    h = engine._ths_handoff
+    h = engine._file_handoff
     signals = _read_lines(h.signals_path)
     assert len(signals) == 1
     assert '"open_sig"' in signals[0]
@@ -199,7 +199,7 @@ def test_engine_emit_write_failure_swallowed(tmp_path, monkeypatch):
     def _boom(entry):
         raise OSError("disk full")
 
-    monkeypatch.setattr(engine._ths_handoff, "write_signal", _boom)
+    monkeypatch.setattr(engine._file_handoff, "write_signal", _boom)
     engine._emit("signal", {"signal_name": "open_sig"})  # 不抛异常
     disp.close()
 
