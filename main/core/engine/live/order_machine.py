@@ -744,6 +744,26 @@ class OrderStateMachine:
         )
         self.pending_orders = {lo.id: lo for lo in remaining}
 
+    def _stamp_duty_for(self, live_order: LiveOrder, amount: Decimal) -> Decimal:
+        """SELL 印花税补记：按组合 stamp_duty_rate × 成交额（买入恒 0）。
+
+        口径对齐回测 SimulatedDispatcher（amount × rate，不额外取整）。
+        组合上下文缺失（历史会话/组合已删）或费率缺省 → 0（宁宽勿错）。
+        """
+        if (live_order.trade_type or "").lower() != "sell":
+            return Decimal("0")
+        portfolio = next(
+            (p for p in self._ctx.portfolios
+             if p.portfolio_id == live_order.portfolio_strategy_id),
+            None,
+        )
+        if portfolio is None:
+            return Decimal("0")
+        rate = (getattr(portfolio, "cost_params", None) or {}).get("stamp_duty_rate")
+        if not rate:
+            return Decimal("0")
+        return amount * rate
+
     def backfill_order(self, db: Session, live_order: LiveOrder, matched_deals: list) -> None:
         """据成交回报回填 LiveOrder + LiveTrade + apply_trade（G2/G6）。
 
@@ -804,6 +824,7 @@ class OrderStateMachine:
             existing.quantity = total_qty
             existing.amount = total_amount
             existing.commission = total_commission
+            existing.stamp_duty = self._stamp_duty_for(live_order, total_amount)
             existing.trade_time = trade_time
             trade_rec = existing
         else:
@@ -818,7 +839,7 @@ class OrderStateMachine:
                 quantity=total_qty,
                 amount=total_amount,
                 commission=total_commission,
-                stamp_duty=Decimal("0"),  # 首期 0：DEAL 印花税字段待真机验证
+                stamp_duty=self._stamp_duty_for(live_order, total_amount),
                 trade_time=trade_time,
             )
             db.add(trade_rec)
@@ -886,7 +907,7 @@ class OrderStateMachine:
             quantity=qty,
             amount=amount,
             commission=commission,
-            stamp_duty=Decimal("0"),
+            stamp_duty=self._stamp_duty_for(live_order, amount),
             trade_time=live_order.bar_time or now_shanghai(),
             signal_type=sig_type,
         )

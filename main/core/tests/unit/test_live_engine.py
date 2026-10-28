@@ -3891,6 +3891,93 @@ def test_handle_bar_trading_session_full_no_filter(monkeypatch):
     db.close()
 
 
+# ---------------- Fix5：SELL 回填印花税补记 ----------------
+def test_backfill_sell_records_stamp_duty():
+    """Fix5：SELL 回填 stamp_duty = 组合 stamp_duty_rate × amount，且 apply_filled
+    同口径扣费（虚拟现金回款 = amount - commission - stamp_duty）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.cost_params = {
+        "min_commission": Decimal("5"),
+        "buy_commission_rate": Decimal("0.00025"),
+        "sell_commission_rate": Decimal("0.00025"),
+        "stamp_duty_rate": Decimal("0.0005"),
+        "slippage": Decimal("0"),
+    }
+    engine, q = _ss_engine(factory, port)
+    # 预置虚拟持仓：SELL 回填 apply 需扣减（缺仓会走「SELL without virtual position」告警路径）
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("9.0"), datetime(2026, 8, 4))
+    port.strategies[0].positions["600000.SH"] = pos
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="sell", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="stop_loss", signal_type="STOP_LOSS",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-s1",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    cash_before = port.account.cash
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    deals = [{
+        "order_ref": "ref-s1", "volume": 1000, "amount": 9000,
+        "commission": 0, "trade_date": "20260805", "trade_time": "100100",
+    }]
+    engine._backfill_order(db, lo, deals)
+    db.commit()
+    trade = db.query(LiveTrade).filter_by(live_order_id=lo_id).first()
+    assert trade.stamp_duty == Decimal("9000") * Decimal("0.0005")  # 4.50
+    db.close()
+    # apply_filled_trade 同口径：现金回款扣印花税
+    assert port.account.cash == cash_before + Decimal("9000") - Decimal("4.50")
+    # 持仓清零（SELL apply 正常）
+    assert port.strategies[0].positions["600000.SH"].quantity == 0
+
+
+def test_backfill_buy_keeps_stamp_duty_zero():
+    """Fix5：买入回填印花税保持 0（仅 SELL 补记）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.cost_params = {
+        "min_commission": Decimal("5"),
+        "buy_commission_rate": Decimal("0.00025"),
+        "sell_commission_rate": Decimal("0.00025"),
+        "stamp_duty_rate": Decimal("0.0005"),
+        "slippage": Decimal("0"),
+    }
+    engine, q = _ss_engine(factory, port)
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=0, filled_price=None, status="submitted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-b1",
+    )
+    db.add(lo)
+    db.commit()
+    lo_id = lo.id
+    db.close()
+
+    db = factory()
+    lo = db.query(LiveOrder).filter_by(id=lo_id).first()
+    deals = [{
+        "order_ref": "ref-b1", "volume": 1000, "amount": 9000,
+        "commission": 0, "trade_date": "20260805", "trade_time": "100100",
+    }]
+    engine._backfill_order(db, lo, deals)
+    db.commit()
+    trade = db.query(LiveTrade).filter_by(live_order_id=lo_id).first()
+    assert trade.stamp_duty == Decimal("0")
+    db.close()
+
+
 def test_handle_bar_emits_risk_on_max_drawdown_trigger():
     """B5：max_drawdown 熔断触发（计数递增）→ risk(max_drawdown) 事件；计数未变不重发。"""
     factory, _ = _db_factory()

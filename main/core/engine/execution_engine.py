@@ -280,7 +280,9 @@ class ExecutionEngine:
 
     def _fit_buy_qty_to_cash(
         self, price: Decimal, cash: Decimal, quantity: int,
-        lot_size: int = 100,
+        lot_size: int = 100, *,
+        buy_rate: Optional[Decimal] = None,
+        min_commission: Optional[Decimal] = None,
     ) -> int:
         """费用感知缩量：返回 ≤ quantity 的最大整手倍数，使
         成交额 + 佣金 ≤ 可用现金（approve_order 只卡 price×qty，未预留佣金，
@@ -288,20 +290,26 @@ class ExecutionEngine:
 
         lot_size（可选，默认 100=股票原行为）：可转债 10 张取整时传 10。
 
+        buy_rate / min_commission（可选，显式费用口径）：实盘 dispatcher 无
+        费率属性，由调用方从组合 cost_params 传入（LiveEngine）；缺省回退
+        dispatcher 属性，再缺省用历史硬编码值。
+
         只需检查 quantity 与 quantity-lot_size：每缩一手省下的金额
         远大于该手的佣金，故最大可行量只可能是这两者之一。
         """
         if price <= 0 or cash <= 0 or quantity < lot_size:
             return 0
-        buy_rate = getattr(
-            self._dispatcher, "buy_commission_rate", Decimal("0.00025")
-        )
-        min_comm = getattr(self._dispatcher, "min_commission", Decimal("5"))
+        if buy_rate is None:
+            buy_rate = getattr(
+                self._dispatcher, "buy_commission_rate", Decimal("0.00025")
+            )
+        if min_commission is None:
+            min_commission = getattr(self._dispatcher, "min_commission", Decimal("5"))
         for q in (quantity, quantity - lot_size):
             if q < lot_size:
                 continue
             amount = price * q
-            commission = max(min_comm, amount * buy_rate)
+            commission = max(min_commission, amount * buy_rate)
             if amount + commission <= cash:
                 return q
         return 0
@@ -315,6 +323,7 @@ class ExecutionEngine:
         *,
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
+        buy_fee_cfg: Optional[tuple] = None,
     ) -> Optional[TradeEvent]:
         """执行订单。
 
@@ -326,6 +335,13 @@ class ExecutionEngine:
         #3 策略级敞口上限（可选）：两个 strategy_* 参数透传 cap_quantity，默认 None
         不启用（实盘 LiveEngine._handle_bar 按策略 exposure_cap_enabled 同式传入，
         回测/实盘行为一致）。
+
+        buy_fee_cfg（可选，(最低佣金, 买入费率)，实盘从组合 cost_params 传入）：
+        实盘 BUY 费用感知前置钳制口径——approve_order 只卡价×量，尾款不足佣金
+        会透支虚拟现金（与回测 apply 段的费用兜底同一审批正确性语义）。桥通道
+        place_order 即真实发单、无法二次改量重发，故该钳制必须在发单前按委托价
+        完成；回测（apply=True）不传，维持成交后按实际成交价（含滑点+费用）的
+        最终兜底，行为不变。
         """
         capped = self.cap_quantity(
             order, account, position,
@@ -335,6 +351,37 @@ class ExecutionEngine:
         if capped is None:
             return None
         order.quantity = capped
+
+        # 实盘（apply=False）BUY 费用感知前置钳制（发单前，防桥通道二次重发）：
+        # approve 只卡价×量，按委托价 + buy_fee_cfg 佣金口径缩到费用可覆盖的
+        # 最大整手倍数；不足一手拒单。与 apply 段的费用兜底同一审批正确性语义，
+        # 仅「落库 apply」差异保留。
+        if not apply and buy_fee_cfg is not None and order.trade_type == TradeType.BUY:
+            lot = self._lot(order.stock_code)
+            px = order.price or Decimal("0")
+            if px > 0:
+                fit_qty = self._fit_buy_qty_to_cash(
+                    px, account.cash, order.quantity, lot,
+                    buy_rate=buy_fee_cfg[1], min_commission=buy_fee_cfg[0],
+                )
+                if fit_qty < lot:
+                    self._rec_gate(
+                        "insufficient_funds", "reject", order, "capital_gate",
+                        requested=order.quantity, final=0,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="买入成本（含佣金）超可用现金：需 %s，可用 %s"
+                                % (fmt_money(px * order.quantity), fmt_money(account.cash)),
+                    )
+                    return None
+                if fit_qty < order.quantity:
+                    self._rec_gate(
+                        "order_shrunk", "shrink", order, "capital_gate",
+                        requested=order.quantity, final=fit_qty,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="买入佣金超出尾款，缩量 %d → %d @ %s"
+                                % (order.quantity, fit_qty, fmt_price(px)),
+                    )
+                    order.quantity = fit_qty
 
         trade = self._dispatcher.place_order(order)
         if not trade:

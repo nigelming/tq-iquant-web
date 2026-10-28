@@ -1281,8 +1281,12 @@ class LiveEngine:
                     # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
                     # B-2：execute 内部二次 cap_quantity/approve 同样透传敞口上限
                     # （跳空/价格变动后的重批与首审同口径）。
+                    # Fix4：buy_fee_cfg 透传组合费用口径——execute 发单前做 BUY
+                    # 费用感知前置钳制（approve 只卡价×量，尾款不足佣金会透支
+                    # 虚拟现金；桥通道无法发单后改量重发）。
                     trade = self._engine.execute(
                         order, portfolio.account, pos, apply=False,
+                        buy_fee_cfg=self._buy_fee_cfg(portfolio),
                         **self._exposure_kwargs(portfolio, ctx),
                     )
                 except BridgeUnavailableError:
@@ -1414,6 +1418,20 @@ class LiveEngine:
             "strategy_position_value": portfolio.holdings_value(ctx),
             "strategy_capital_limit": ctx.capital_ratio * portfolio.account.initial_capital,
         }
+
+    @staticmethod
+    def _buy_fee_cfg(portfolio: Portfolio) -> Optional[tuple]:
+        """Fix4：组合费用参数 → execute 费用感知钳制口径 (最低佣金, 买入费率)。
+
+        cost_params 缺项（理论不可达，assemble_portfolio 恒全量装配）→ None，
+        execute 跳过前置钳制（原行为）。
+        """
+        cp = getattr(portfolio, "cost_params", None) or {}
+        min_comm = cp.get("min_commission")
+        rate = cp.get("buy_commission_rate")
+        if min_comm is None or rate is None:
+            return None
+        return (min_comm, rate)
 
     def _rec_live(
         self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,
