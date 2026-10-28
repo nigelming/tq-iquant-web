@@ -48,6 +48,13 @@ def _defaults() -> dict:
             "client_exe_path": "D:/同花顺远航版/transaction/xiadan.exe",
             "driver": "clipboard",
             "captcha_ocr": False,
+            # 文件交接层：file_builtin=信号/风控/指令落 JSONL + 内置后台执行器按
+            # 频率执行（place_order 秒回）；direct=同步 UI 自动化直呼（原行为）。
+            "execute_mode": "file_builtin",
+            "execute_interval_seconds": 5,
+            # 交接目录（相对路径按服务进程 CWD=main/ 解析），实际文件在
+            # {work_dir}/{session_id}/ 下。
+            "work_dir": "data/ths",
         },
         "tq_trade": {
             "account": "",

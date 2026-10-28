@@ -40,7 +40,7 @@ from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
 from .http_bridge_dispatcher import BridgeOrderRejected, BridgeUnavailableError
 from .live.timing import now_shanghai
-from tq_iquant_shared.constants import TradeType
+from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +112,40 @@ class ThsUiDispatcher(OrderDispatcher):
     CANCEL_CONFIRM_BUTTONS = ("是(Y)", "是（Y）", "是")
 
     def __init__(self, window_title: str = "网上股票交易系统5.0", client_exe_path: str = None,
-                 captcha_ocr: bool = False, **kwargs):
+                 captcha_ocr: bool = False, execute_mode: str = "file_builtin",
+                 execute_interval_seconds: float = 5, work_dir: str = "data/ths",
+                 session_id: int = 0, **kwargs):
         self._window_title = window_title
         self._client_exe_path = client_exe_path
         self._captcha_ocr = bool(captcha_ocr)
         self._app = None
         self._win = None
+        self._uia_win = None
         self._connected = False
         self._last_error = ""
         self._price_map: Dict[str, float] = {}
+        # ---- 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼现状）----
+        self.execute_mode = "file_builtin" if str(execute_mode or "") == "file_builtin" else "direct"
+        self._execute_interval_seconds = max(float(execute_interval_seconds or 5), 0.01)
+        self._work_dir = str(work_dir or "data/ths")
+        self._session_id = int(session_id or 0)
+        # 批次 A 机制（与 TdxTqDispatcher 同口径）：本进程下单 ref 基线 + 提交时间。
+        # THS 委托表有「委托时间」列，_submit_times 主要供 recover 补记/对账口径统一。
+        self._submit_times: Dict[str, tuple] = {}
+        self._known_refs: set = set()
+        self._claimed_refs: set = set()
+        # file 模式执行器记账：order_id -> 最近一次执行失败原因（诊断用）。
+        self._file_rejects: Dict[str, str] = {}
+        self._last_submit_ref = ""
+        self._last_submit_time: tuple = ("", "")
+        self._last_enqueued_order_id: Optional[str] = None
+        self._handoff = None
+        self._executor_thread: Optional[threading.Thread] = None
+        self._executor_stop = threading.Event()
+        self._executor_lock = threading.Lock()
+        if self.execute_mode == "file_builtin":
+            from .live.ths_handoff import ThsFileHandoff
+            self._handoff = ThsFileHandoff(self._work_dir, self._session_id)
 
     @staticmethod
     def _get_ocr_engine():
@@ -195,6 +220,15 @@ class ThsUiDispatcher(OrderDispatcher):
     def last_error(self) -> str:
         return self._last_error
 
+    @property
+    def last_enqueued_order_id(self) -> Optional[str]:
+        """file 模式最近一次成功入队的指令 order_id（None=未入队/已重置）。
+
+        LiveEngine 据此把 place_order 的 None 返回识别为「已受理入队」，
+        订单保持 submitted 等回填，而不是走 approval failed 拒单。
+        """
+        return self._last_enqueued_order_id
+
     def heartbeat(self) -> bool:
         try:
             if self._connected and self._win is not None and self._win.exists():
@@ -204,6 +238,12 @@ class ThsUiDispatcher(OrderDispatcher):
             return False
 
     def close(self) -> None:
+        if self._handoff is not None:
+            self._executor_stop.set()
+            t = self._executor_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=3)
+            self._executor_thread = None
         self._app = None
         self._win = None
         self._uia_win = None
@@ -235,6 +275,8 @@ class ThsUiDispatcher(OrderDispatcher):
             except Exception:
                 self._win = self._app.top_window() if self._app else None
             self._connected = self._win is not None and self._win.exists()
+            if self._connected and self.execute_mode == "file_builtin":
+                self._ensure_executor()
             return self._connected
         except Exception as e:
             self._app = None
@@ -1046,7 +1088,141 @@ class ThsUiDispatcher(OrderDispatcher):
         from .tdx_tq_dispatcher import TdxTqDispatcher
         return TdxTqDispatcher().check_price_limit(stock_code, direction, price)
 
+    # ---------------- 下单（双模式） ----------------
+
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
+        """file_builtin：指令写入交接文件秒回 None（内置执行器异步执行）；
+        direct：同步执行 UI 自动化（现行为）。"""
+        if self.execute_mode == "file_builtin":
+            return self._place_order_via_file(order)
+        return self._execute_via_ui(order)
+
+    def _place_order_via_file(self, order: OrderEvent) -> Optional[TradeEvent]:
+        """file 模式 place_order：只做参数校验 + 指令入队，秒回 None。
+
+        不做 captcha/OCR 前置拒单——OCR 守卫在 _execute_via_ui（执行器）里判，
+        失败经 mark_done 落 rejected 回执。place_order 返回 None 时 LiveEngine
+        按 last_enqueued_order_id 识别「已入队」，订单保持 submitted 等回填。
+        """
+        code = re.sub(r"\D", "", str(order.stock_code))[:6]
+        if not self._CODE_RE.match(code):
+            raise BridgeOrderRejected(f"invalid code {order.stock_code}")
+        vol = int(order.quantity)
+        price = float(order.price) if order.price is not None else 0.0
+        if vol <= 0 or price <= 0:
+            raise BridgeOrderRejected(f"invalid order vol/price {vol}/{price}")
+        self._last_enqueued_order_id = None
+        oid = self.order_id(order)
+        entry = {
+            "order_id": oid,
+            "stock_code": order.stock_code,
+            "code": code,
+            "direction": order.trade_type.value,
+            "quantity": vol,
+            "price": price,
+            "strategy_id": order.strategy_id,
+            "portfolio_id": order.portfolio_id,
+            "signal_type": order.signal_type.value if order.signal_type else None,
+            "signal_name": order.signal_name,
+            "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+        }
+        self._handoff.append_order(entry)
+        self._last_enqueued_order_id = oid
+        self._ensure_executor()
+        return None
+
+    @staticmethod
+    def _entry_to_order(entry: dict) -> OrderEvent:
+        """orders.jsonl 指令行 → OrderEvent（执行器重建用）。"""
+        raw_bt = entry.get("bar_time")
+        bar_time = None
+        if raw_bt:
+            try:
+                bar_time = datetime.fromisoformat(str(raw_bt))
+            except ValueError:
+                bar_time = None
+        price = entry.get("price")
+        return OrderEvent(
+            strategy_id=int(entry.get("strategy_id") or 0),
+            portfolio_id=int(entry.get("portfolio_id") or 0),
+            stock_code=str(entry.get("stock_code") or ""),
+            trade_type=TradeType(str(entry.get("direction") or "BUY").upper()),
+            signal_type=SignalType(str(entry.get("signal_type") or "OPEN")),
+            quantity=int(entry.get("quantity") or 0),
+            price=Decimal(str(price)) if price is not None else None,
+            bar_time=bar_time,
+            signal_name=str(entry.get("signal_name") or ""),
+        )
+
+    def _ensure_executor(self) -> None:
+        """惰性启动内置执行线程（daemon）：首次 place_order 或 connect 成功时。"""
+        if self.execute_mode != "file_builtin" or self._handoff is None:
+            return
+        with self._executor_lock:
+            t = self._executor_thread
+            if t is not None and t.is_alive():
+                return
+            self._executor_stop.clear()
+            t = threading.Thread(
+                target=self._executor_loop, name="ths-file-executor", daemon=True)
+            self._executor_thread = t
+            t.start()
+
+    def _executor_loop(self) -> None:
+        """内置执行器节拍：每 execute_interval_seconds 消费一轮待执行指令。
+
+        UI 异常不杀线程（_execute_entry 全包）；读文件失败记 warning 下轮再试。
+        """
+        while not self._executor_stop.wait(self._execute_interval_seconds):
+            try:
+                pending = self._handoff.read_pending_orders()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ths file executor read pending failed: %s", e)
+                continue
+            for entry in pending:
+                if self._executor_stop.is_set():
+                    return
+                self._execute_entry(entry)
+
+    def _execute_entry(self, entry: dict) -> None:
+        """执行单条指令：成功 accepted（ref 记 _known_refs/_submit_times，批次 A
+        口径）/失败 rejected（_file_rejects + results 回执），均不抛出。"""
+        order_id = str(entry.get("order_id") or "")
+        try:
+            order = self._entry_to_order(entry)
+            self._execute_via_ui(order)
+            ref = str(self._last_submit_ref or "")
+            if ref:
+                self._known_refs.add(ref)
+                if ref not in self._submit_times:
+                    self._submit_times[ref] = self._last_submit_time or (
+                        now_shanghai().strftime("%Y%m%d"),
+                        now_shanghai().strftime("%H%M%S"),
+                    )
+            self._handoff.mark_done(order_id, {"status": "accepted", "ref": ref})
+        except (BridgeOrderRejected, BridgeUnavailableError) as e:
+            self._file_rejects[order_id] = str(e)
+            try:
+                self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
+            except Exception:  # noqa: BLE001
+                logger.warning("ths handoff mark_done failed", exc_info=True)
+        except Exception as e:  # noqa: BLE001  UI 异常不杀执行线程
+            logger.warning("ths file executor error (order %s): %s", order_id, e)
+            self._file_rejects[order_id] = str(e)
+            try:
+                self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
+            except Exception:  # noqa: BLE001
+                logger.warning("ths handoff mark_done failed", exc_info=True)
+
+    def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
+        """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。
+
+        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 键鼠 / 确认框 /
+        _find_order 回查 / 合成 TradeEvent。命中合同编号时补记
+        _last_submit_ref / _last_submit_time 供执行器记账。
+        """
+        self._last_submit_ref = ""
+        self._last_submit_time = ("", "")
         if not self._connected:
             if not self.connect():
                 raise BridgeUnavailableError("ths ui not connected")
@@ -1099,6 +1275,10 @@ class ThsUiDispatcher(OrderDispatcher):
         found = self._find_order(code, order.trade_type.value.lower(), vol)
         if found is None:
             raise BridgeOrderRejected("order not found in order list after submit")
+        ref = str(found.get("order_id") or "")
+        if ref:
+            self._last_submit_ref = ref
+            self._last_submit_time = self._split_time(found.get("time"))
         fill_price = order.price if order.price is not None else Decimal(str(price))
         amount = fill_price * vol
         return TradeEvent(

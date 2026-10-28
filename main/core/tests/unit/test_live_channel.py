@@ -261,3 +261,39 @@ def test_config_defaults_carry_new_tq_trade_keys():
     tq = _defaults()["tq_trade"]
     assert tq["default_engine"] == "tdx"
     assert tq["cancel_unfilled_minutes"] == 3
+
+
+# ---------------- THS 文件交接层（file_builtin 双模式）配置 ----------------
+
+def test_config_defaults_carry_new_ths_ui_keys():
+    """文件交接层三键默认值：file_builtin / 5s / data/ths。"""
+    from core.config import _defaults
+    ths = _defaults()["ths_ui"]
+    assert ths["execute_mode"] == "file_builtin"
+    assert ths["execute_interval_seconds"] == 5
+    assert ths["work_dir"] == "data/ths"
+
+
+def test_ths_ui_config_exposes_file_mode_keys(monkeypatch):
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(True))
+    data = svc.ths_ui_config()
+    assert data["execute_mode"] == "file_builtin"
+    assert data["execute_interval_seconds"] == 5
+    assert data["work_dir"] == "data/ths"
+
+
+def test_make_dispatcher_ths_passes_file_mode_params(monkeypatch):
+    """ths 引擎构造 dispatcher 带出执行模式/间隔/工作目录/session_id。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(True))
+    seen = {}
+
+    class FakeThs:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(svc, "ThsUiDispatcher", FakeThs)
+    svc.make_dispatcher("ths", "simulation", 7)
+    assert seen["execute_mode"] == "file_builtin"
+    assert seen["execute_interval_seconds"] == 5
+    assert seen["work_dir"] == "data/ths"
+    assert seen["session_id"] == 7

@@ -2,8 +2,11 @@
 
 覆盖 Core 契约：/orders 形状（source=BRIDGE、remark 空、order_ref=合同编号、
 整型状态码）、/deals 由委托表成交数量/均价合成、TQ 行情/日历转发、持仓 available=0
-不被回退成持仓量。
+不被回退成持仓量；file_builtin 双模式：place_order 秒回入队不触 UI、内置执行器
+消费指令（成功/失败回执）、direct 模式回归现状。
 """
+import json
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -11,10 +14,14 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from core.engine.http_bridge_dispatcher import BridgeUnavailableError
+from core.engine.event import OrderEvent
+from core.engine.http_bridge_dispatcher import (
+    BridgeOrderRejected,
+    BridgeUnavailableError,
+)
 from core.engine.live.order_machine import OrderStateMachine
 from core.engine.ths_ui_dispatcher import ThsUiDispatcher
-from tq_iquant_shared.constants import TradeType
+from tq_iquant_shared.constants import SignalType, TradeType
 
 
 ORDER_HEADER = (
@@ -282,13 +289,203 @@ def test_copy_grid_rereads_clipboard_after_captcha(monkeypatch):
     assert d._copy_grid(required=("委托时间", "合同编号")) == new
 
 
+def _order(**overrides):
+    kwargs = dict(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=100, price=Decimal("10.00"),
+        bar_time=datetime(2026, 10, 23, 9, 30), signal_name="open_sig",
+    )
+    kwargs.update(overrides)
+    return OrderEvent(**kwargs)
+
+
+def _file_dispatcher(tmp_path, **overrides):
+    kwargs = dict(
+        execute_mode="file_builtin", work_dir=str(tmp_path), session_id=42,
+        execute_interval_seconds=3600,  # 测试不启动真实节拍（需要时再覆盖）
+    )
+    kwargs.update(overrides)
+    return ThsUiDispatcher(**kwargs)
+
+
 def test_place_order_refuses_without_captcha_ocr():
-    """未启用 OCR 时必须先拒单：否则先发单再查不到合同编号会误报失败。"""
+    """direct 模式：未启用 OCR 时必须先拒单——否则先发单再查不到合同编号会误报失败。"""
     order = SimpleNamespace(
         stock_code="000001.SZ", quantity=100, price=Decimal("10.00"),
         trade_type=TradeType.BUY,
     )
-    d = ThsUiDispatcher(captcha_ocr=False)
+    d = ThsUiDispatcher(captcha_ocr=False, execute_mode="direct")
     d._connected = True
     with pytest.raises(BridgeUnavailableError):
         d.place_order(order)
+
+
+# ---------------- file_builtin 双模式 ----------------
+
+def test_file_mode_place_order_enqueues_and_returns_none_without_ui(tmp_path, monkeypatch):
+    """file 模式 place_order：指令入 orders.jsonl 并秒回 None，全程不触 UI 自动化。"""
+    d = _file_dispatcher(tmp_path)
+    d._connected = True
+
+    def _boom(order):
+        raise AssertionError("file 模式 place_order 不得直接执行 UI 自动化")
+
+    monkeypatch.setattr(d, "_execute_via_ui", _boom)
+    order = _order()
+    result = d.place_order(order)
+
+    assert result is None
+    assert d.last_enqueued_order_id == d.order_id(order)
+    with open(d._handoff.orders_path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["order_id"] == d.order_id(order)
+    assert entry["stock_code"] == "000001.SZ"
+    assert entry["direction"] == "BUY"
+    assert entry["quantity"] == 100
+    assert entry["price"] == pytest.approx(10.0)
+    assert entry["strategy_id"] == 1
+    assert entry["portfolio_id"] == 1
+    assert entry["signal_name"] == "open_sig"
+    d.close()
+
+
+def test_file_mode_place_order_does_not_preflight_ocr(tmp_path):
+    """file 模式不做 captcha/OCR 前置拒单——OCR 守卫移入执行器（失败→rejected 回执）。"""
+    d = _file_dispatcher(tmp_path, captcha_ocr=False)
+    d._connected = True
+    assert d.place_order(_order()) is None  # 不抛 BridgeUnavailableError
+    d.close()
+
+
+def test_file_mode_place_order_rejects_invalid_order(tmp_path):
+    d = _file_dispatcher(tmp_path)
+    with pytest.raises(BridgeOrderRejected):
+        d.place_order(_order(stock_code="60000X"))
+    with pytest.raises(BridgeOrderRejected):
+        d.place_order(_order(quantity=0))
+    assert d.last_enqueued_order_id is None
+    assert not any(r.get("order_id") for r in _jsonl(d._handoff.orders_path))
+
+
+def _jsonl(path):
+    import os
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def test_executor_entry_marks_accepted_with_ref(tmp_path):
+    """执行成功：results.jsonl 落 accepted+ref，_known_refs/_submit_times 补记（批次 A 口径）。"""
+    d = _file_dispatcher(tmp_path)
+    order = _order()
+    entry = {"order_id": d.order_id(order), "stock_code": "000001.SZ",
+             "direction": "BUY", "quantity": 100, "price": 10.0,
+             "strategy_id": 1, "portfolio_id": 1, "signal_name": "open_sig"}
+
+    def _fake_ui(o):
+        assert isinstance(o, OrderEvent)
+        assert o.stock_code == "000001.SZ" and o.trade_type == TradeType.BUY
+        d._last_submit_ref = "100001"
+        d._last_submit_time = ("20261023", "093001")
+        return object()
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", _fake_ui)
+    try:
+        d._execute_entry(entry)
+    finally:
+        monkey.undo()
+
+    results = _jsonl(d._handoff.results_path)
+    assert results[0] == dict(results[0], status="accepted", ref="100001",
+                              order_id=d.order_id(order))
+    assert "100001" in d._known_refs
+    assert d._submit_times["100001"] == ("20261023", "093001")
+    assert d.order_id(order) in d._handoff.cursor["done"]
+
+
+def test_executor_entry_marks_rejected_on_bridge_error(tmp_path):
+    d = _file_dispatcher(tmp_path)
+    oid = "abc123"
+    entry = {"order_id": oid, "stock_code": "000001.SZ", "direction": "BUY",
+             "quantity": 100, "price": 10.0}
+
+    def _boom(o):
+        raise BridgeOrderRejected("invalid order")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", _boom)
+    try:
+        d._execute_entry(entry)
+    finally:
+        monkey.undo()
+
+    results = _jsonl(d._handoff.results_path)
+    assert results[0]["status"] == "rejected"
+    assert "invalid order" in results[0]["error"]
+    assert d._file_rejects[oid] == "invalid order"
+    assert oid in d._handoff.cursor["done"]
+
+
+def test_executor_entry_survives_unexpected_error(tmp_path):
+    """UI 异常不杀执行线程：意外异常同样落 rejected 回执，下轮继续。"""
+    d = _file_dispatcher(tmp_path)
+    entry = {"order_id": "zzz", "stock_code": "000001.SZ", "direction": "BUY",
+             "quantity": 100, "price": 10.0}
+
+    def _boom(o):
+        raise RuntimeError("com fail")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", _boom)
+    try:
+        d._execute_entry(entry)
+    finally:
+        monkey.undo()
+
+    assert _jsonl(d._handoff.results_path)[0]["status"] == "rejected"
+    assert d._file_rejects["zzz"] == "com fail"
+
+
+def test_executor_thread_consumes_pending_and_close_stops(tmp_path):
+    """后台执行线程按频率消费指令文件；close() 停线程。"""
+    d = _file_dispatcher(tmp_path, execute_interval_seconds=0.05)
+
+    def _fake_ui(o):
+        d._last_submit_ref = "200002"
+        d._last_submit_time = ("20261023", "093005")
+        return object()
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", _fake_ui)
+    try:
+        assert d.place_order(_order()) is None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if _jsonl(d._handoff.results_path):
+                break
+            time.sleep(0.05)
+        assert any(r.get("ref") == "200002" for r in _jsonl(d._handoff.results_path))
+        assert d._executor_thread is not None and d._executor_thread.is_alive()
+    finally:
+        monkey.undo()
+    worker = d._executor_thread
+    d.close()
+    assert not worker.is_alive()
+
+
+def test_direct_mode_place_order_delegates_to_ui(tmp_path):
+    """direct 模式回归：place_order = 同步 _execute_via_ui（现行为不变）。"""
+    d = ThsUiDispatcher(execute_mode="direct")
+    d._connected = True
+    sentinel = object()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", lambda o: sentinel)
+    try:
+        assert d.place_order(_order()) is sentinel
+    finally:
+        monkey.undo()

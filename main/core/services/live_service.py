@@ -102,6 +102,10 @@ def ths_ui_config() -> dict:
         "client_exe_path": ths.get("client_exe_path") or "",
         "driver": ths.get("driver") or "clipboard",
         "captcha_ocr": bool(ths.get("captcha_ocr")),
+        # 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼）
+        "execute_mode": ths.get("execute_mode") or "file_builtin",
+        "execute_interval_seconds": int(ths.get("execute_interval_seconds") or 5),
+        "work_dir": ths.get("work_dir") or "data/ths",
     }
 
 
@@ -163,6 +167,10 @@ def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
         return ThsUiDispatcher(
             window_title=ths["window_title"], client_exe_path=ths["client_exe_path"],
             captcha_ocr=ths["captcha_ocr"],
+            execute_mode=ths["execute_mode"],
+            execute_interval_seconds=ths["execute_interval_seconds"],
+            work_dir=ths["work_dir"],
+            session_id=session_id,
         )
     if engine == "tdx":
         if TdxTqDispatcher is None:
@@ -435,6 +443,10 @@ def build_engine(
             window_title=ths_cfg.get("window_title") or "网上股票交易系统5.0",
             client_exe_path=ths_cfg.get("client_exe_path"),
             captcha_ocr=bool(ths_cfg.get("captcha_ocr")),
+            execute_mode=ths_cfg.get("execute_mode") or "file_builtin",
+            execute_interval_seconds=int(ths_cfg.get("execute_interval_seconds") or 5),
+            work_dir=ths_cfg.get("work_dir") or "data/ths",
+            session_id=session_id,
         )
     elif dispatcher_cls is TdxTqDispatcher and TdxTqDispatcher is not None:
         cfg = tq_trade_config()
@@ -771,7 +783,11 @@ def start_session(
             "桥未启动：%s（%s）— 请先在 iQuant 客户端加载并运行对应桥策略"
             % (mode_label, base_url),
         )
-    if getattr(engine.dispatcher, "channel", "") == "ths_ui" and not ths_ui_config()["captcha_ocr"]:
+    # OCR 启动闸仅 direct 模式：file_builtin 下单不做 OCR 前置拒单（OCR 守卫在
+    # 执行器 _execute_via_ui 里，失败落 results rejected 回执），无需阻断启动。
+    if (getattr(engine.dispatcher, "channel", "") == "ths_ui"
+            and getattr(engine.dispatcher, "execute_mode", "direct") == "direct"
+            and not ths_ui_config()["captcha_ocr"]):
         return None, session, (
             503,
             "同花顺复制表格会触发验证码：请先在系统配置启用「验证码 OCR」再启动实盘",

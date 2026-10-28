@@ -64,3 +64,5 @@ docs/risk/
 
 # One-off diagnostics (local only, not for commit)
 live/bridge/diag_*.py
+# THS file handoff runtime files (local only)
+data/ths/

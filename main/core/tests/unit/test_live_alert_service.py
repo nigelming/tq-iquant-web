@@ -177,3 +177,84 @@ def test_start_session_non_empty_pool_proceeds(monkeypatch):
     assert engine is not None
     assert engine.execution_mode == "alert"
     db.close()
+
+
+# ---------------- THS 文件交接层：OCR 启动闸仅 direct 模式 ----------------
+
+class _FakeThsDispatcher:
+    channel = "ths_ui"
+    supports_remark = False
+
+    def __init__(self, **kwargs):
+        self.execute_mode = kwargs.get("execute_mode", "file_builtin")
+        self._work_dir = kwargs.get("work_dir", "data/ths")
+        self.last_error = ""
+
+    def heartbeat(self):
+        return True
+
+    def query_calendar(self):
+        return []
+
+    def query_quote(self, code, period="1m", count=10):
+        return []
+
+    def query_positions(self):
+        return []
+
+    def close(self):
+        pass
+
+
+def _seed_ths_session(db):
+    # auto 模式：build_engine 才走 make_dispatcher（alert 固定 AlertDataDispatcher）；
+    # 策略频率对齐 period 过 auto preflight。
+    _seed(db)
+    db.query(LiveSession).filter_by(id=1).update(
+        {"engine": "ths", "execution_mode": "auto"})
+    db.query(Strategy).filter_by(id=1).update({"signal_frequency": "1d"})
+    db.commit()
+
+
+def _patch_ths_cfg(monkeypatch):
+    """隔离本机 config.yaml（真机 captcha_ocr=True 会穿透 OCR 闸）。"""
+    monkeypatch.setattr(live_service, "load_config",
+                        lambda: {"ths_ui": {"enabled": True, "captcha_ocr": False}})
+
+
+def test_start_session_ths_file_mode_allows_missing_ocr(monkeypatch, tmp_path):
+    """file_builtin 模式：OCR 未启用不阻断启动（守卫在执行器，失败落 rejected 回执）。"""
+    factory = _factory()
+    db = factory()
+    _seed_ths_session(db)
+    _patch_ths_cfg(monkeypatch)
+    monkeypatch.setattr(live_service, "make_dispatcher",
+                        lambda *a, **kw: _FakeThsDispatcher(
+                            execute_mode="file_builtin", work_dir=str(tmp_path)))
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", lambda: None)
+    monkeypatch.setattr(live_service, "_smoke_formula_outputs",
+                        lambda *a, **kw: None)
+    engine, session, error = live_service.start_session(
+        db, 1, {}, "simulation", db_session_factory=factory)
+    assert error is None
+    assert engine is not None
+    assert engine._ths_handoff is not None
+    db.close()
+
+
+def test_start_session_ths_direct_mode_still_requires_ocr(monkeypatch, tmp_path):
+    """direct 模式回归：OCR 未启用仍 503 拒启动。"""
+    factory = _factory()
+    db = factory()
+    _seed_ths_session(db)
+    _patch_ths_cfg(monkeypatch)
+    monkeypatch.setattr(live_service, "make_dispatcher",
+                        lambda *a, **kw: _FakeThsDispatcher(
+                            execute_mode="direct", work_dir=str(tmp_path)))
+    engine, session, error = live_service.start_session(
+        db, 1, {}, "simulation", db_session_factory=factory)
+    assert engine is None
+    assert error is not None
+    assert error[0] == 503
+    assert "验证码 OCR" in error[1]
+    db.close()

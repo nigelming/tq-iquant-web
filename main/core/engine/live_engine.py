@@ -176,6 +176,18 @@ class LiveEngine:
         # F5：t1_checker 持每 bar 刷新的桥可用表（SELL 减仓上限用 m_nCanUseVolume）
         self._t1_checker = LiveT1Checker()
         self._engine = ExecutionEngine(dispatcher, self._t1_checker, recorder=self._recorder)
+        # THS 文件交接层（file_builtin）：signal/decision/risk 事件同步落
+        # {work_dir}/{session_id}/ 下 signals/risk.jsonl，供外部诊断/对账。
+        # orders.jsonl 由 dispatcher 专职写（避免双写）；写失败不影响主流程。
+        self._ths_handoff = None
+        if (getattr(dispatcher, "channel", "") == "ths_ui"
+                and getattr(dispatcher, "execute_mode", "direct") == "file_builtin"):
+            try:
+                from .live.ths_handoff import ThsFileHandoff
+                self._ths_handoff = ThsFileHandoff(
+                    getattr(dispatcher, "_work_dir", "data/ths"), session_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("ths file handoff init failed", exc_info=True)
 
         # 行情/信号协作者（0010 步骤 2b）：预热/增量 bar 缓存、公式信号注入、周期边界
         # 分发、1w/1mon 通达信注入归 MarketDataService。on_bar 回调注入 self._handle_bar
@@ -464,7 +476,26 @@ class LiveEngine:
     # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
     def _emit(self, event_type: str, payload: dict) -> None:
         """向所有 SSE 订阅队列广播（委托 EventBus.emit，线程安全语义见 event_bus）。"""
+        self._emit_ths_handoff(event_type, payload)
         self._event_bus.emit(event_type, payload)
+
+    def _emit_ths_handoff(self, event_type: str, payload: dict) -> None:
+        """THS file_builtin 会话：signal/decision/risk 事件同步写交接文件。
+
+        失败只 warning 不影响主流程（SSE 投递与落库是权威通道，交接文件是
+        外部诊断/对账副本）。order 事件不落（orders.jsonl 由 dispatcher 专职写）。
+        """
+        handoff = self._ths_handoff
+        if handoff is None or event_type not in ("signal", "decision", "risk"):
+            return
+        try:
+            entry = {"type": event_type, **payload}
+            if event_type == "signal":
+                handoff.write_signal(entry)
+            else:
+                handoff.write_risk(entry)
+        except Exception:  # noqa: BLE001
+            logger.warning("ths handoff write failed (%s)", event_type, exc_info=True)
 
     def _emit_to_subscribers(self, ev: dict) -> None:
         """兼容旧调用/测试：直接向订阅队列投递（委托 EventBus）。"""
@@ -1268,6 +1299,9 @@ class LiveEngine:
                     "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
                 })
                 db.commit()
+                # THS file_builtin 入队标记：place_order 秒回 None 但指令已写入
+                # 交接文件时非 None（=本单确定性 order_id）。其它通道恒 None。
+                enqueued_oid: Optional[str] = None
                 try:
                     # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
                     # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
@@ -1337,30 +1371,47 @@ class LiveEngine:
                     db.commit()
                     continue
                 if trade is None:
-                    # 兜底：execute 内部审批不过（前置 cap 与 execute 间账户变化）
-                    # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
-                    live_order.status = "rejected"
-                    live_order.error_message = "approval failed"
-                    self._rec_live(
-                        "approval_failed", "reject", portfolio, order,
-                        message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
-                    )
-                    self._pending_orders.pop(live_order.id, None)
-                    self._emit("order", {
-                        "portfolio_id": portfolio.portfolio_id,
-                        "order_id": live_order.id,
-                        "status": "rejected",
-                        "stock_code": live_order.stock_code,
-                        "trade_type": (live_order.trade_type or "").upper(),
-                        "quantity": live_order.quantity,
-                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                        "error_message": live_order.error_message,
-                    })
-                    db.commit()
-                    continue
+                    # THS file_builtin：place_order 已把指令写入交接文件并秒回 None
+                    # → 本单已受理入队，保持 submitted 等内置执行器执行 + UI 回填
+                    # 链路确认成交（执行失败单由执行器落 results rejected 回执，
+                    # 残留 submitted 单由 180s expire 兜底标 rejected）。
+                    enqueued_oid = getattr(self._dispatcher, "last_enqueued_order_id", None)
+                    if enqueued_oid and enqueued_oid == self._dispatcher.order_id(order):
+                        logger.info(
+                            "order enqueued to ths handoff: id=%s %s %s qty=%s (session %s)",
+                            live_order.id, order.trade_type.value, order.stock_code,
+                            live_order.quantity, self.session_id,
+                        )
+                    else:
+                        # 兜底：execute 内部审批不过（前置 cap 与 execute 间账户变化）
+                        # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
+                        live_order.status = "rejected"
+                        live_order.error_message = "approval failed"
+                        self._rec_live(
+                            "approval_failed", "reject", portfolio, order,
+                            message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
+                        )
+                        self._pending_orders.pop(live_order.id, None)
+                        self._emit("order", {
+                            "portfolio_id": portfolio.portfolio_id,
+                            "order_id": live_order.id,
+                            "status": "rejected",
+                            "stock_code": live_order.stock_code,
+                            "trade_type": (live_order.trade_type or "").upper(),
+                            "quantity": live_order.quantity,
+                            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                            "error_message": live_order.error_message,
+                        })
+                        db.commit()
+                        continue
                 # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
                 live_order.bridge_order_id = self._dispatcher.order_id(order)
-                self._try_match_order_ref(live_order)
+                # THS file_builtin：指令刚入队、执行器尚未真正下单，立即回查只会
+                # 碰到 120s 认领窗内的同形状旧单（误绑 → 成交回填张冠李戴）。
+                # ref 留 None，执行器下单后由 /deals 回填周期再定位（彼时本单是
+                # 最新同形状行，与 direct 模式同一口径）。
+                if enqueued_oid != live_order.bridge_order_id:
+                    self._try_match_order_ref(live_order)
                 # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
                 # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
                 if order.trade_type == TradeType.SELL:

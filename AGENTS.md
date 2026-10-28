@@ -106,6 +106,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 **实盘交易引擎按会话可选**：`live_sessions.engine` ∈ `iquant` / `tdx` / `ths`（miniQMT 通道已移除，历史 qmt 会话经 `session_engine` 白名单回退到默认引擎）；NULL 表示迁移前的历史会话，运行时按全局默认解析——`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置/非法回退旧行为（`ths_ui.enabled` → ths，否则 iquant）。引擎未就绪（客户端未启动/未登录/依赖缺失/未配置路径账号）时 `/sessions/{id}/start` 直接返回 503 并给出可操作中文提示，**不会静默回退到其它通道**。委托认领：`supports_remark=False` 的通道（通达信、同花顺）走 legacy 模糊匹配（代码+方向+数量+提交时间窗；陌生 ref 补记的时间标记 `insert_fabricated`，匹配时降级排除，防遗留单误绑），iQuant 桥把确定性 bridge_order_id 写进柜台 remark，按 remark 精确认领。
 
+**同花顺文件交接层（THS file_builtin，默认）**：同花顺通道是纯 UI 自动化，`ThsUiDispatcher` 双模式 `execute_mode` ∈ `file_builtin`（默认）/ `direct`（同步直呼，原行为）。file_builtin 下：引擎 signal/decision/risk 事件同步落 `{ths_ui.work_dir}/{session_id}/` 下 `signals.jsonl`/`risk.jsonl`（LiveEngine `_emit` 钩子，写失败仅告警）；`place_order` 只做参数校验后把指令追加进 `orders.jsonl` 并**秒回 None**（LiveEngine 按 `last_enqueued_order_id` 把 None 识别为「已入队」，订单保持 submitted 等回填，不判 approval failed）；内置后台执行线程（daemon，惰性启动，`execute_interval_seconds` 默认 5s）按游标（`cursor.json`：消费行数 + done 幂等表）读指令逐单执行 UI 自动化，回执落 `results.jsonl`（accepted+合同编号 / rejected+错误详情），成功单补记 `_known_refs`/`_submit_times`（批次 A 口径）。OCR/验证码守卫移入执行器（file 模式 place_order 不做 OCR 前置拒单，direct 模式维持），OCR 未启用不再阻断 file 会话启动。THS 撤单未自动化（无 F3 自动化）：file 模式超时在途单走 180s expire rejected；读后游标即推进（at-most-once），执行前崩溃的单不重复执行，由 expire 兜底。
+
 ## 关键路径与配置文件
 
 | 路径 | 说明 |
@@ -115,7 +117,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/tq/` | 通达信 TQ 模块（嵌入 Core 同进程） |
 | `main/core/engine/http_bridge_dispatcher.py` | iQuant HTTP 桥下单通道 |
 | `main/core/engine/tdx_tq_dispatcher.py` | 通达信 TQ 下单通道（与回测取数同一 TQ 连接） |
-| `main/core/engine/ths_ui_dispatcher.py` | 同花顺独立交易 UI 自动化通道 |
+| `main/core/engine/ths_ui_dispatcher.py` | 同花顺独立交易 UI 自动化通道（file_builtin 文件交接层 + direct 直呼双模式） |
+| `main/core/engine/live/ths_handoff.py` | 同花顺文件交接层（signals/risk/orders/results JSONL + cursor.json 游标） |
 | `live/bridge/` | 国信 iQuant HTTP 桥（iQuant 客户端内 Python 3.6 策略，`127.0.0.1:8790`） |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、iQuant 路径、`ths_ui` / `tq_trade` 交易通道） |
