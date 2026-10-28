@@ -27,13 +27,25 @@ def signal_type_from_str(s: str) -> SignalType:
     raise ValueError("unknown signal_type: %s" % s)
 
 
-def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Session) -> Portfolio:
+def assemble_portfolio(
+    ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
+    initial_capital_override=None,
+) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
     cost_params 来自组合表，供 SimulatedDispatcher（回测）透传成本参数；
     实盘 HttpBridgeDispatcher 不用 cost_params（真实成本从 /deals 回报取），
     但 Portfolio 仍持有以备恢复/评估时记账。
+
+    initial_capital_override（实盘资金基准，可选）：非 None 时覆盖组合表的
+    initial_capital 起账——实盘资金与组合配置不一致时，让全部比率型配置
+    （资金占比/单仓/敞口/熔断分母）等比缩放。回测调用点不传，行为不变。
     """
+    initial_capital = (
+        Decimal(str(initial_capital_override))
+        if initial_capital_override is not None
+        else Decimal(str(ps.initial_capital))
+    )
     pm = PortfolioRiskManager(
         max_drawdown=Decimal(str(ps.max_drawdown)),
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
@@ -45,7 +57,7 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
     )
     port = Portfolio(
         portfolio_id=ps.id,
-        initial_capital=Decimal(str(ps.initial_capital)),
+        initial_capital=initial_capital,
         risk_manager=pm,
         position_sizing=getattr(ps, "position_sizing", None) or "dynamic",
         cost_params={

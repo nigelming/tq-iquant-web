@@ -511,6 +511,10 @@ def build_engine(
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
+    # 会话级实盘资金基准：非 None 时所有组合以该值起账（比率配置等比缩放）；
+    # None=各组合用自身 initial_capital（现行为）。
+    session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    live_capital = getattr(session_row, "live_capital", None)
     portfolios = []
     stock_codes: set = set()
     # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
@@ -530,7 +534,12 @@ def build_engine(
         if ps is None:
             continue
         strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
-        port = assemble_portfolio(ps, strategies, db)
+        port = assemble_portfolio(ps, strategies, db, initial_capital_override=live_capital)
+        if live_capital is not None:
+            logger.info(
+                "实盘资金基准 %s（组合 %s 配置初始资金 %s）",
+                live_capital, ps.id, ps.initial_capital,
+            )
         portfolios.append(port)
         benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
         pool_codes = resolve_stock_codes(db, ps.id)
@@ -633,6 +642,8 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "mode": s.mode,
             "engine": session_engine(s),
             "execution_mode": s.execution_mode,
+            # 会话级实盘资金基准：None=各组合用自身 initial_capital
+            "live_capital": s.live_capital,
             "status": s.status,
             "started_at": s.started_at,
             "stopped_at": s.stopped_at,
@@ -654,6 +665,7 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
+        live_capital=data.get("live_capital"),
     )
     db.add(session)
     db.flush()
@@ -681,6 +693,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "mode": session.mode,
         "engine": session_engine(session),
         "execution_mode": session.execution_mode,
+        # 会话级实盘资金基准：None=各组合用自身 initial_capital
+        "live_capital": session.live_capital,
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,

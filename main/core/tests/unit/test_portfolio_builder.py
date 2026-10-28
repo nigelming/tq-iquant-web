@@ -141,3 +141,20 @@ def test_assemble_daily_loss_basis_initial(db):
     db.commit()
     port = assemble_portfolio(ps, strategies, db)
     assert port.risk_manager.daily_loss_on_equity_enabled is False
+
+
+def test_assemble_initial_capital_override_applied(db):
+    """实盘资金基准：override 非 None → Account 以 override 起账（比率配置等比缩放基数）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    assert ps.initial_capital == Decimal("100000")  # 组合配置资金与实盘不同
+    port = assemble_portfolio(ps, strategies, db, initial_capital_override=1000000.0)
+    assert port.account.initial_capital == Decimal("1000000")
+    assert port.account.cash == Decimal("1000000")
+
+
+def test_assemble_initial_capital_override_none_keeps_ps_capital(db):
+    """override 缺省（None）→ 维持现行为：用组合自身 initial_capital。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.account.initial_capital == Decimal("100000")
+    assert port.account.cash == Decimal("100000")

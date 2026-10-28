@@ -119,13 +119,15 @@ def mock_bridge(monkeypatch):
 
 
 def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation",
-                    execution_mode="auto", engine=None):
+                    execution_mode="auto", engine=None, live_capital=None):
     payload = {
         "name": name, "portfolio_ids": list(portfolio_ids), "mode": mode,
         "execution_mode": execution_mode,
     }
     if engine:
         payload["engine"] = engine
+    if live_capital is not None:
+        payload["live_capital"] = live_capital
     resp = c.post("/api/live/sessions", json=payload)
     assert resp.status_code == 200
     body = resp.json()
@@ -774,6 +776,78 @@ def test_create_session_rejects_invalid_mode(client, mock_bridge):
     body = resp.json()
     assert body["code"] != 0
     assert "mode" in body["message"]
+
+
+# ---- 会话级实盘资金基准（live_capital）：None=组合初始资金；设置=全组合以该值起账 ----
+
+def test_create_session_persists_live_capital(client, mock_bridge):
+    """create_session 落库 live_capital；list/detail 序列化返回；未传 → None（现行为）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,), live_capital=1000000)
+    detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert float(detail["live_capital"]) == 1000000.0
+    row = next(s for s in c.get("/api/live/sessions").json()["data"] if s["id"] == sid)
+    assert float(row["live_capital"]) == 1000000.0
+
+    # 未传 → None（用组合初始资金 = 现行为）
+    sid2 = _create_session(c, portfolio_ids=(ps_id,))
+    detail2 = c.get("/api/live/sessions/%d" % sid2).json()["data"]
+    assert detail2["live_capital"] is None
+
+
+def test_create_session_rejects_non_positive_live_capital(client, mock_bridge):
+    """live_capital 提供（非 None）时须 >0：0 / 负数 / 非数值 → 400 业务错误。"""
+    c, _ = client
+    for bad in (0, -100, "abc"):
+        resp = c.post("/api/live/sessions", json={
+            "name": "bad-cap", "portfolio_ids": [], "live_capital": bad,
+        })
+        body = resp.json()
+        assert body["code"] == 400
+        assert "实盘资金基准须大于 0" in body["message"]
+
+
+def test_build_engine_applies_live_capital_override(client, monkeypatch, caplog):
+    """build_engine 把 session.live_capital 传给 assemble_portfolio：
+    override 生效 → Account 以基准资金起账；未设置 → 组合初始资金（现行为）。"""
+    import logging
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    real_cls = live_api.HttpBridgeDispatcher
+
+    def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
+        client_ = httpx.Client(transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"ok": True})))
+        return real_cls(base_url=base_url, client=client_)
+
+    monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+
+    sid = _create_session(c, portfolio_ids=(ps_id,), live_capital=500000)
+    db2 = Session()
+    try:
+        with caplog.at_level(logging.INFO, logger="core.services.live_service"):
+            engine = live_api._build_engine(sid, db2, "simulation")
+        assert engine.portfolios[0].account.initial_capital == Decimal("500000")
+        assert engine.portfolios[0].account.cash == Decimal("500000")
+        assert any("实盘资金基准" in r.getMessage() for r in caplog.records)
+    finally:
+        db2.close()
+
+    # 未设置 live_capital → 组合配置初始资金 100000（现行为不变）
+    sid2 = _create_session(c, portfolio_ids=(ps_id,))
+    db3 = Session()
+    try:
+        engine2 = live_api._build_engine(sid2, db3, "simulation")
+        assert engine2.portfolios[0].account.initial_capital == Decimal("100000")
+    finally:
+        db3.close()
 
 
 def test_start_session_rejected_when_bridge_offline(client, monkeypatch):

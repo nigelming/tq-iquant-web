@@ -114,6 +114,16 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     if execution_mode not in ("alert", "auto"):
         return err(400, "execution_mode 非法，仅支持 alert(半自动) / auto(全自动)")
     data["execution_mode"] = execution_mode
+    # 会话级实盘资金基准：None=各组合用自身 initial_capital；提供时须 >0。
+    live_capital = data.get("live_capital")
+    if live_capital is not None:
+        try:
+            live_capital = float(live_capital)
+        except (TypeError, ValueError):
+            return err(400, "实盘资金基准须大于 0")
+        if not live_capital > 0:
+            return err(400, "实盘资金基准须大于 0")
+    data["live_capital"] = live_capital
     # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
     # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
     pids = data.get("portfolio_ids") or []
