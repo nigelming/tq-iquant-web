@@ -882,8 +882,11 @@ class LiveEngine:
         事件，形状同 expire 收口）；order_id 缺失/匹配不上时回退按 entry 形状
         （stock_code+direction+quantity）匹配无 order_ref 的在途单。匹配不上 →
         记 warning 丢弃（该单由 180s expire 兜底，不阻塞后续回执）；空回执零开销。
+        通道可选能力：dispatcher 未实现 execution_receipts（duck-typed fake/旧通道）
+        视为无回执，直接跳过（与 close/cancel_order 的 getattr 模式一致）。
         """
-        receipts = self._dispatcher.execution_receipts()
+        receipts_fn = getattr(self._dispatcher, "execution_receipts", None)
+        receipts = receipts_fn() if callable(receipts_fn) else []
         if not receipts:
             return
         db = self._db_session_factory()

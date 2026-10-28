@@ -722,11 +722,15 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
         return real_cls(base_url=base_url, client=client_)
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+    # 显式钉全局通道选择：本地 config.yaml ths_ui.enabled=true 时 _dispatcher_cls()
+    # 会返回 ThsUiDispatcher，绕过上面的类属性 patch（消除对本地配置的隐性依赖）。
+    monkeypatch.setattr(live_api, "_dispatcher_cls", lambda: fake_constructor)
 
     # simulation / live：创建对应 mode 的 session 后直接调 _build_engine
+    # （显式钉 engine=iquant：消除对本地 tq_trade.default_engine 的隐性依赖）
     for mode, expected in [("simulation", "http://127.0.0.1:8790"),
                            ("live", "http://127.0.0.1:8791")]:
-        sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode)
+        sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode, engine="iquant")
         db2 = Session()
         try:
             live_api._build_engine(sid, db2, mode)
@@ -736,7 +740,7 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
 
     # unknown：create_session 白名单会拒，用已存在的 simulation session 直接调 _build_engine
     # 传 unknown mode，验证兜底走仿真桥（防误传走到真实资金桥）。
-    sim_sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation")
+    sim_sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="iquant")
     db3 = Session()
     try:
         live_api._build_engine(sim_sid, db3, "unknown")
