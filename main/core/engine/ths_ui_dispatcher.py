@@ -1288,7 +1288,14 @@ class ThsUiDispatcher(OrderDispatcher):
             self._key("{DELETE}")
             self._key(code)
             time.sleep(self._SWITCH_WAIT)
+            # 字段顺序 [代码 → 委托价格 → 委托数量]：显式输入委托价格（限价语义，
+            # 与回测审批价一致）——此前连按两个 TAB 跳过价格框，真实委托按对话框
+            # 默认价（最新价）成交，限价/涨跌停前置校验全部失真（准确性缺口）。
             self._key("{TAB}")
+            self._key("^a")
+            self._key("{DELETE}")
+            self._key(str(price))
+            time.sleep(0.3)
             self._key("{TAB}")
             self._key("^a")
             self._key("{DELETE}")

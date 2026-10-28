@@ -532,3 +532,42 @@ def test_direct_mode_place_order_delegates_to_ui(tmp_path):
         assert d.place_order(_order()) is sentinel
     finally:
         monkey.undo()
+
+
+def test_execute_via_ui_keystroke_transcript_buy_and_sell(monkeypatch):
+    """键鼠序列逐键断言：F1/F2 方向、代码、**显式委托价格**（限价语义——此前
+    双 TAB 跳过价格框按对话框默认价成交的准确性缺口）、数量、ENTER。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    transcript = []
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_switch", lambda k: transcript.append("switch:" + k))
+    monkeypatch.setattr(d, "_key", lambda k: transcript.append(k))
+    monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
+    monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
+    monkeypatch.setattr(d, "_find_order",
+                        lambda code, direction, vol: {"order_id": "200001"})
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+
+    d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
+                             price=Decimal("1700.55")))
+    assert transcript == [
+        "switch:{F1}",           # 买入 → F1
+        "^a", "{DELETE}", "600519",
+        "{TAB}", "^a", "{DELETE}", "1700.55",   # 显式价格（限价）
+        "{TAB}", "^a", "{DELETE}", "100",       # 数量
+        "{ENTER}",
+    ]
+
+    transcript.clear()
+    d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
+                             price=Decimal("9.99"),
+                             trade_type=TradeType.SELL,
+                             signal_type=SignalType.CLOSE))
+    assert transcript == [
+        "switch:{F2}",           # 卖出 → F2
+        "^a", "{DELETE}", "000001",
+        "{TAB}", "^a", "{DELETE}", "9.99",
+        "{TAB}", "^a", "{DELETE}", "300",
+        "{ENTER}",
+    ]
