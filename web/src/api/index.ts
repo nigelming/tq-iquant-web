@@ -1710,6 +1710,9 @@ export interface ThsUiConfig {
   client_exe_path: string
   driver: string
   captcha_ocr: boolean
+  execute_mode: string             // file_builtin=文件内置执行器 | direct=直接执行
+  execute_interval_seconds: number // 内置执行器轮询指令文件间隔（秒）
+  work_dir: string                 // 交接目录（相对 main/ 解析），实际文件在 {work_dir}/{session_id}/
   available?: boolean
 }
 

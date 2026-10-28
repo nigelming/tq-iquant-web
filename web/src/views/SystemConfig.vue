@@ -22,6 +22,9 @@ const DEFAULTS: SystemConfig = {
     client_exe_path: '',
     driver: 'clipboard',
     captcha_ocr: false,
+    execute_mode: 'file_builtin',
+    execute_interval_seconds: 5,
+    work_dir: 'data/ths',
   },
   tq_trade: {
     account: '',
@@ -67,6 +70,10 @@ onMounted(async () => {
         client_exe_path: data.ths_ui?.client_exe_path ?? DEFAULTS.ths_ui.client_exe_path,
         driver: data.ths_ui?.driver ?? DEFAULTS.ths_ui.driver,
         captcha_ocr: data.ths_ui?.captcha_ocr ?? DEFAULTS.ths_ui.captcha_ocr,
+        execute_mode: data.ths_ui?.execute_mode ?? DEFAULTS.ths_ui.execute_mode,
+        execute_interval_seconds:
+          data.ths_ui?.execute_interval_seconds ?? DEFAULTS.ths_ui.execute_interval_seconds,
+        work_dir: data.ths_ui?.work_dir ?? DEFAULTS.ths_ui.work_dir,
       },
       tq_trade: {
         account: data.tq_trade?.account ?? DEFAULTS.tq_trade!.account,
@@ -203,6 +210,34 @@ function testTdx() { return testChannel('tdx_tq') }
                 <input v-model="config.ths_ui.captcha_ocr" type="checkbox" style="width:auto" />
                 启用验证码 OCR（使用 Windows 内置 OCR，默认关闭）
               </label>
+            </div>
+            <div class="field">
+              <label>执行模式</label>
+              <select v-model="config.ths_ui.execute_mode">
+                <option value="file_builtin">文件内置执行器（信号/指令落 JSONL，后台按频率执行）</option>
+                <option value="direct">直接执行（同步 UI 自动化）</option>
+              </select>
+              <p class="cfg-hint">
+                file_builtin：place_order 写入指令文件秒回，内置执行器按轮询间隔执行键鼠自动化；
+                成交/持仓仍走 UI 读回回填。THS 撤单未自动化，超时在途单走 expire rejected。
+              </p>
+            </div>
+            <div class="field">
+              <label>执行器轮询间隔(秒)</label>
+              <input
+                v-model.number="config.ths_ui.execute_interval_seconds"
+                type="number" min="1" style="max-width:180px"
+              />
+              <p class="cfg-hint">内置执行器每 N 秒读一次指令文件（默认 5 秒）</p>
+            </div>
+            <div class="field">
+              <label>交接文件工作目录</label>
+              <input v-model="config.ths_ui.work_dir" placeholder="data/ths" />
+              <p class="cfg-hint">
+                相对服务进程目录解析（默认 main/data/ths），每个 session 一个子目录
+                {work_dir}/{session_id}/：signals.jsonl（信号）/ risk.jsonl（风控决策）/
+                orders.jsonl（下单指令）/ results.jsonl（执行回执）/ cursor.json（消费游标）
+              </p>
             </div>
             <div class="cfg-test">
               <button @click="testThs" class="btn btn-sm" :disabled="testing !== ''">

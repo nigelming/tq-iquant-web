@@ -32,6 +32,9 @@ const mockConfig = {
     client_exe_path: 'D:/同花顺远航版/transaction/xiadan.exe',
     driver: 'clipboard',
     captcha_ocr: false,
+    execute_mode: 'file_builtin',
+    execute_interval_seconds: 5,
+    work_dir: 'data/ths',
   },
   tq_trade: {
     account: '88866666',
@@ -114,6 +117,30 @@ describe('SystemConfig.vue', () => {
     w.unmount()
   })
 
+  it('渲染同花顺文件交接层三字段（执行模式/轮询间隔/工作目录）', async () => {
+    const w = mount(SystemConfig)
+    await flushPromises()
+
+    expect(w.text()).toContain('执行模式')
+    expect(w.text()).toContain('执行器轮询间隔')
+    expect(w.text()).toContain('交接文件工作目录')
+    // 执行模式 select 选中 file_builtin，含 direct 选项
+    const selects = w.findAll('select')
+    const modeSelect = selects.find(s => s.findAll('option').some(o => o.element.value === 'file_builtin'))
+    expect(modeSelect).toBeTruthy()
+    expect((modeSelect!.element as HTMLSelectElement).value).toBe('file_builtin')
+    expect(modeSelect!.findAll('option').map(o => o.element.value)).toContain('direct')
+    // 轮询间隔 number 回显 5；工作目录回显 data/ths
+    const intervalInput = w.findAll('input').find(
+      i => i.attributes('type') === 'number' && (i.element as HTMLInputElement).value === '5')
+    expect(intervalInput).toBeTruthy()
+    const workDirInput = w.findAll('input').find(i => (i.element as HTMLInputElement).value === 'data/ths')
+    expect(workDirInput).toBeTruthy()
+    // hint 说明 {work_dir}/{session_id}/ 目录结构
+    expect(w.text()).toContain('{work_dir}/{session_id}/')
+    w.unmount()
+  })
+
   it('保存 → PUT 提交与 config.yaml 一致的完整配置并提示已保存', async () => {
     const w = mount(SystemConfig)
     await flushPromises()
@@ -134,6 +161,9 @@ describe('SystemConfig.vue', () => {
         enabled: false,
         window_title: '网上股票交易系统5.0',
         client_exe_path: 'D:/同花顺远航版/transaction/xiadan.exe',
+        execute_mode: 'file_builtin',
+        execute_interval_seconds: 5,
+        work_dir: 'data/ths',
       }),
       tq_trade: expect.objectContaining({
         account: '88866666',
