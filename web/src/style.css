@@ -125,7 +125,7 @@ tbody tr:last-child td{border-bottom:none}
 .badge-orange{background:var(--warn-wash);color:var(--warn);border-color:var(--warn)}
 .badge-teal{background:var(--hover-bg);color:var(--ink-soft)}
 .badge-purple{background:var(--accent-light);color:var(--accent)}
-.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--line-strong);border-radius:var(--radius);background:transparent;color:var(--ink);cursor:pointer;font-size:12px;font-family:inherit;letter-spacing:.08em;transition:all .2s}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--line-strong);border-radius:var(--radius);background:transparent;color:var(--ink);cursor:pointer;font-size:12px;line-height:1.2;font-family:inherit;letter-spacing:.08em;transition:all .2s}
 .btn:hover{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 .btn-primary{background:var(--accent);color:var(--card-bg);border-color:var(--accent)}
 .btn-primary:hover{background:var(--accent);color:var(--card-bg)}
