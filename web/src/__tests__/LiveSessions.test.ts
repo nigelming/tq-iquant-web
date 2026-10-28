@@ -433,6 +433,66 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
   })
 })
 
+describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
+  it('新建弹窗渲染「实盘资金基准（元）」number 输入 + 占位符 + 说明', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+
+    const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')
+    expect(capInput).toBeTruthy()
+    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 用组合初始资金')
+    expect(w.text()).toContain('实盘资金基准（元）')
+    expect(w.text()).toContain('比率配置等比缩放')
+    expect(w.text()).toContain('多组合各自独立记账')
+    w.unmount()
+  })
+
+  it('填写 live_capital 提交 → 透传数值', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')!
+    await capInput.setValue('1000000')
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: '', mode: 'simulation', portfolio_ids: [1], live_capital: 1000000,
+    }))
+    w.unmount()
+  })
+
+  it('留空 live_capital 提交 → null（用组合初始资金）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      portfolio_ids: [1], live_capital: null,
+    }))
+    w.unmount()
+  })
+})
+
 describe('LiveSessions.vue 执行通道条', () => {
   it('显示当前引擎并支持只读测试连接', async () => {
     ;(getLiveChannel as any).mockResolvedValue({

@@ -1638,6 +1638,7 @@ export interface LiveSessionItem {
   engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
+  live_capital?: number | null  // 会话级实盘资金基准（元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
@@ -1665,6 +1666,7 @@ export interface LiveSessionCreate {
   engine?: LiveEngineKey
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
+  live_capital?: number | null  // 实盘资金基准（元）；空=null=用组合初始资金
 }
 
 export async function getLiveSessions() {

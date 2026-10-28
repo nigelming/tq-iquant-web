@@ -33,7 +33,16 @@ const form = ref({
   engine: 'tdx' as LiveEngineKey,
   execution_mode: 'alert' as LiveExecutionMode,
   portfolio_ids: [] as number[],
+  // 实盘资金基准（元）：null=用组合初始资金；number input v-model 空输入为 ''，提交前归一化
+  live_capital: null as number | string | null,
 })
+
+/** live_capital 归一化：空串/未填 → null（用组合初始资金），否则转数值透传。 */
+function normalizedLiveCapital(): number | null {
+  const v = form.value.live_capital
+  if (v === null || v === undefined || v === '') return null
+  return Number(v)
+}
 // 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
 const ENGINE_LABEL: Record<string, string> = {
   iquant: 'iQuant 桥', tdx: '通达信', ths: '同花顺', qmt: 'miniQMT',
@@ -330,7 +339,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null }
   showCreate.value = true
 }
 
@@ -339,9 +348,9 @@ async function create() {
     alert('请至少选择一个组合策略')
     return
   }
-  await createLiveSession(form.value)
+  await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
   showCreate.value = false
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [] }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null }
   load()
 }
 
@@ -666,6 +675,11 @@ onUnmounted(closeEventStream)
         <span v-else>
           自动模式：下单由所选引擎执行——iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 与 miniQMT 直连各自客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
         </span>
+      </p>
+      <label>实盘资金基准（元）</label>
+      <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 用组合初始资金" />
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        填写后会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
       </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
