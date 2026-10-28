@@ -71,6 +71,7 @@ from .live.order_machine import (
 )
 from .live.breaker import BreakerService
 from .live.daily_closer import DailyCloser
+from .market_rules import session_allows
 from .decision import DecisionRecorder
 from .regime import CausalRegimeTracker
 from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
@@ -160,6 +161,9 @@ class LiveEngine:
         # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
         # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
         self._enter_day_updated: Dict[int, date] = {}
+        # trading_session（full/am/pm）时段闸：每组合每日首次跳过记 1 条决策
+        # 事件防刷屏（内存 set 按 (portfolio_id, date)，Core 重启重记无碍）。
+        self._session_skip_recorded: set = set()
         # B-1 未来函数闸门（对齐回测）：日线级信号当日不下单，订单暂存此内存队列，
         # 次一交易日首 bar（bar_time.date() 严格小于当前 bar 日期）放行重走提交链。
         # 已知限制：队列仅内存，Core 重启即丢（信号边沿去重不会重发，无感知），
@@ -1016,6 +1020,30 @@ class LiveEngine:
         # 最后一轮 tick 仍可能带着 bar 走进来。
         if self._stop_requested:
             return
+        # trading_session（full/am/pm）组合时段闸（历史死配置首次接线）：非允许
+        # 时段整轮跳过本组合（风控/信号/下单均不执行，与回测跳过 on_bar 同语义）。
+        # 实盘按墙钟判定（日线 bar 由 14:30 closer 驱动、bar_time=00:00 不可用；
+        # pm 组合的日线单 14:30 仍在允许窗口内）。full=不筛（既有全局闸已管）。
+        # 跳过时每日首次记决策事件（gate=trading_session、layer=portfolio）防刷屏。
+        session = getattr(portfolio, "trading_session", None) or "full"
+        if session in ("am", "pm") and not session_allows(session, now_shanghai().time()):
+            key = (portfolio.portfolio_id, bar.bar_time.date())
+            if key not in self._session_skip_recorded:
+                self._session_skip_recorded.add(key)
+                self._recorder.record(
+                    gate="trading_session", layer="portfolio", action="skip",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=None, stock_code=None, bar_time=bar.bar_time,
+                    message="交易时段闸：%s 时段组合当前 %s 不在允许窗口（%s），本轮跳过"
+                            % (session, now_shanghai().strftime("%H:%M:%S"),
+                               "09:30–11:30" if session == "am" else "13:00–15:00"),
+                )
+            db = self._db_session_factory()
+            try:
+                self._drain_decisions(db, portfolio)
+            finally:
+                db.close()
+            return
         # E5：每 bar 更新峰值/回撤（分钟级 prev_close 只在跨日刷新，不误触 daily_loss）
         total_value = portfolio.total_value(bar)
         # R3：每日首根 bar 补算上一日 daily_loss（与回测 enter_day 对齐，镜像回测时序——
@@ -1238,6 +1266,18 @@ class LiveEngine:
                 })
                 db.commit()
                 try:
+                    # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
+                    # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
+                    # 返回拒绝原因 → raise BridgeOrderRejected 沿用既有拒单路径
+                    # （rejected 落库 + 决策事件 + SSE 回显原因）。配置关闭 → 完全跳过。
+                    if portfolio.price_limit_check_enabled:
+                        reason = self._dispatcher.check_price_limit(
+                            order.stock_code,
+                            "buy" if order.trade_type == TradeType.BUY else "sell",
+                            order.price,
+                        )
+                        if reason is not None:
+                            raise BridgeOrderRejected(reason)
                     # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
                     # B-2：execute 内部二次 cap_quantity/approve 同样透传敞口上限
                     # （跳空/价格变动后的重批与首审同口径）。

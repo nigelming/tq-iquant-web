@@ -58,6 +58,9 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
     )
     # #1 涨跌停约束（默认开；仅回测成交步生效）
     port.price_limit_check_enabled = bool(getattr(ps, "price_limit_check_enabled", True))
+    # 组合级 max_holdings / trading_session（历史死配置首次接线，回测/实盘共用生效）
+    port.max_holdings = int(getattr(ps, "max_holdings", 0) or 0)
+    port.trading_session = getattr(ps, "trading_session", None) or "full"
     # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
     port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
     _vol_ratio = getattr(ps, "volume_limit_ratio", None)

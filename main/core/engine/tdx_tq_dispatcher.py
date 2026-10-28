@@ -695,16 +695,6 @@ class TdxTqDispatcher(OrderDispatcher):
                 return False
         return True
 
-    def _is_limit_order(self, price: float) -> bool:
-        """是否限价单：price>0 且 price_mode 映射为自填价（PRICE_MY）。
-
-        市价单（price<=0，或 price_mode 映射 PRICE_SJ/ZTJ/DTJ）的成交价由
-        交易所/客户端决定，不做涨跌停前置校验。
-        """
-        if price is None or price <= 0:
-            return False
-        return PRICE_MODE_MAP.get(self._price_mode, "PRICE_MY") == "PRICE_MY"
-
     def _prev_close_for_limit_check(self, symbol: str) -> Optional[Decimal]:
         """取前收盘价（1d 最近 2 根里最早的一根），无有效数据返回 None。
 
@@ -737,34 +727,41 @@ class TdxTqDispatcher(OrderDispatcher):
             logger.warning("涨跌停校验取前收失败，跳过检查：%s", e)
             return None
 
-    def _check_limit_price(self, symbol: str, direction: str, price: float) -> None:
-        """涨跌停前置校验（仅限价单）：买 ≥ 涨停价 / 卖 ≤ 跌停价 → 拒单。
+    def check_price_limit(
+        self, stock_code: str, direction: str, price
+    ) -> Optional[str]:
+        """涨跌停前置校验（公共口径，通道无关）：买 ≥ 涨停价 / 卖 ≤ 跌停价 →
+        返回拒绝原因文案；通过/跳过返回 None。
 
-        口径与回测一致（_limit_ratio_for + 前收四舍五入到分）。get_zdt_data
-        只有涨跌停状态无价格，不采用。取不到有效前收（无数据 / 前复权早期
-        失真 <1 元）跳过；整个校验块 fail-open——校验自身故障绝不阻断下单。
+        引擎按组合 price_limit_check_enabled 配置门控调用（与回测同门控），
+        place_order 不再内联校验（防双查）。口径与回测一致（_limit_ratio_for +
+        前收四舍五入到分）。get_zdt_data 只有涨跌停状态无价格，不采用。
+        市价单（price 空/非正，成交价由交易所决定）与取不到有效前收（无数据 /
+        前复权早期失真 <1 元）跳过；整个校验块 fail-open——校验自身故障
+        绝不阻断下单，异常吞为 None。
         """
+        if price is None or price <= 0:
+            return None
         try:
+            symbol = normalize_symbol(stock_code)
             prev_close = self._prev_close_for_limit_check(symbol)
             if prev_close is None or prev_close < Decimal("1"):
-                return
+                return None
             ratio = _limit_ratio_for(symbol)
             cent = Decimal("0.01")
             limit_up = (prev_close * (1 + ratio)).quantize(cent, rounding=ROUND_HALF_UP)
             limit_down = (prev_close * (1 - ratio)).quantize(cent, rounding=ROUND_HALF_UP)
             order_price = Decimal(str(price))
             if direction == "buy" and order_price >= limit_up:
-                raise BridgeOrderRejected(
-                    "委托买价 %s ≥ 涨停价 %s（前收 %s ×%s），已拦截"
-                    % (price, limit_up, prev_close, ratio))
+                return ("委托买价 %s ≥ 涨停价 %s（前收 %s ×%s），已拦截"
+                        % (price, limit_up, prev_close, ratio))
             if direction == "sell" and order_price <= limit_down:
-                raise BridgeOrderRejected(
-                    "委托卖价 %s ≤ 跌停价 %s（前收 %s ×%s），已拦截"
-                    % (price, limit_down, prev_close, ratio))
-        except BridgeOrderRejected:
-            raise
+                return ("委托卖价 %s ≤ 跌停价 %s（前收 %s ×%s），已拦截"
+                        % (price, limit_down, prev_close, ratio))
+            return None
         except Exception as e:
             logger.warning("涨跌停前置校验异常，跳过检查继续下单：%s", e)
+            return None
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         self._ensure()
@@ -778,8 +775,8 @@ class TdxTqDispatcher(OrderDispatcher):
             raise BridgeOrderRejected("invalid order volume/price %s/%s" % (vol, price))
 
         direction = "buy" if order.trade_type.value == "BUY" else "sell"
-        if self._is_limit_order(price):
-            self._check_limit_price(symbol, direction, price)
+        # 涨跌停前置校验已上移引擎提交链（price_limit_check_enabled 门控，
+        # check_price_limit 公共方法，四通道同口径）；此处不再内联校验（防双查）。
         const = _tqconst()
         order_type = (const.STOCK_BUY if direction == "buy" else const.STOCK_SELL)
         try:

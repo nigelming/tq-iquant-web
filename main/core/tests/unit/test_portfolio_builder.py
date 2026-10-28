@@ -106,6 +106,25 @@ def test_portfolio_price_limit_check_defaults_on(db):
     assert port.price_limit_check_enabled is True
 
 
+def test_assemble_max_holdings_and_trading_session_wiring(db):
+    """Fix2/Fix3：组合表 max_holdings / trading_session 装配进 Portfolio
+    （历史死配置首次接线，回测/实盘共用生效）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.max_holdings == 10  # ORM/server 默认
+    assert ps.trading_session == "full"
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.max_holdings == 10
+    assert port.trading_session == "full"
+
+    ps.max_holdings = 3
+    ps.trading_session = "pm"
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.max_holdings == 3
+    assert port.trading_session == "pm"
+
+
 def test_assemble_daily_loss_basis_defaults_equity(db):
     """日内亏损分母默认 equity（昨收净值），builder 注入 risk_manager。"""
     ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])

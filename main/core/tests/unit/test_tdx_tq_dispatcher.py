@@ -428,7 +428,9 @@ def test_close_swallows_unsubscribe_error(fake, monkeypatch):
     d.close()  # 不抛
 
 
-# ---------------- TQ 1.3.1：place_order 涨跌停前置校验 ----------------
+# ---------------- TQ 1.3.1：check_price_limit 涨跌停前置校验（引擎接线口径）----------------
+# Fix1 口径统一：校验从 place_order 内联上移为公共方法（引擎按
+# price_limit_check_enabled 门控调用，四通道同签名），place_order 不再内联校验。
 
 def _raw_1d_close(symbol, closes):
     """1d 原始行情（仅 Close 帧，prev_close 计算够用）。
@@ -449,93 +451,109 @@ def _limit_order(code="000001", trade_type=TradeType.BUY, price=Decimal("11.00")
     )
 
 
-def test_place_order_blocks_buy_at_limit_up(fake, monkeypatch):
-    """限价买 ≥ 涨停价（前收 10 × 1.10 = 11.00）→ 拒单，不触 order_stock。"""
+def test_check_price_limit_blocks_buy_at_limit_up(fake, monkeypatch):
+    """限价买 ≥ 涨停价（前收 10 × 1.10 = 11.00）→ 返回拒绝原因，不触 order_stock。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
     d = TdxTqDispatcher()
-    with pytest.raises(BridgeOrderRejected) as ei:
-        d.place_order(_limit_order(price=Decimal("11.00")))
-    assert "涨停价" in str(ei.value)
-    assert "11.00" in str(ei.value)
+    reason = d.check_price_limit("000001", "buy", Decimal("11.00"))
+    assert reason is not None
+    assert "涨停价" in reason
+    assert "11.00" in reason
     assert not [c for c in fake.calls if c[0] == "order_stock"]
 
 
-def test_place_order_blocks_sell_at_limit_down(fake, monkeypatch):
-    """限价卖 ≤ 跌停价（前收 10 × 0.90 = 9.00）→ 拒单，不触 order_stock。"""
+def test_check_price_limit_blocks_sell_at_limit_down(fake, monkeypatch):
+    """限价卖 ≤ 跌停价（前收 10 × 0.90 = 9.00）→ 返回拒绝原因，不触 order_stock。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
     d = TdxTqDispatcher()
-    with pytest.raises(BridgeOrderRejected) as ei:
-        d.place_order(_limit_order(trade_type=TradeType.SELL, price=Decimal("9.00")))
-    assert "跌停价" in str(ei.value)
-    assert "9.00" in str(ei.value)
+    reason = d.check_price_limit("000001", "sell", Decimal("9.00"))
+    assert reason is not None
+    assert "跌停价" in reason
+    assert "9.00" in reason
     assert not [c for c in fake.calls if c[0] == "order_stock"]
 
 
 def test_place_order_buy_below_limit_up_passes(fake, monkeypatch):
-    """限价买 < 涨停价 → 正常下单。"""
+    """限价买 < 涨停价 → 校验通过（None）且正常下单。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
     fake.orders = [_order(price=10.99, ref="W801")]
     d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", Decimal("10.99")) is None
     trade = d.place_order(_limit_order(price=Decimal("10.99")))
     assert trade is not None
     assert [c for c in fake.calls if c[0] == "order_stock"]
 
 
 def test_place_order_sell_above_limit_down_passes(fake, monkeypatch):
-    """限价卖 > 跌停价 → 正常下单。"""
+    """限价卖 > 跌停价 → 校验通过（None）且正常下单。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
     fake.orders = [_order(flag=1, price=9.01, ref="W802")]
     d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "sell", Decimal("9.01")) is None
     trade = d.place_order(
         _limit_order(trade_type=TradeType.SELL, price=Decimal("9.01")))
     assert trade is not None
     assert [c for c in fake.calls if c[0] == "order_stock"]
 
 
-def test_place_order_market_mode_skips_limit_check(fake, monkeypatch):
-    """市价通道（price_mode=latest → PRICE_SJ）不做涨跌停校验。"""
+def test_place_order_no_inline_limit_check(fake, monkeypatch):
+    """防双查：涨停价限价单 place_order 直接放行（校验已上移引擎提交链，
+    由 price_limit_check_enabled 配置门控调用 check_price_limit）。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
-    fake.orders = [_order(price=11.00, ref="W803")]
-    d = TdxTqDispatcher(price_mode="latest")
+    fake.orders = [_order(price=11.00, ref="W807")]
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", Decimal("11.00")) is not None
     trade = d.place_order(_limit_order(price=Decimal("11.00")))
     assert trade is not None
     assert [c for c in fake.calls if c[0] == "order_stock"]
 
 
-def test_place_order_quote_error_fail_open(fake, monkeypatch):
-    """行情查询异常 → 跳过校验（fail-open），正常下单。"""
+def test_check_price_limit_market_price_skips(fake, monkeypatch):
+    """市价单（price 空/非正，成交价由交易所决定）不做涨跌停校验 → None。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", None) is None
+    assert d.check_price_limit("000001", "buy", 0) is None
+
+
+def test_check_price_limit_quote_error_fail_open(fake, monkeypatch):
+    """行情查询异常 → 返回 None（fail-open，校验故障绝不阻断下单）。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(error=RuntimeError("no tdx")))
     fake.orders = [_order(price=11.00, ref="W804")]
     d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", Decimal("11.00")) is None
     trade = d.place_order(_limit_order(price=Decimal("11.00")))
     assert trade is not None
 
 
-def test_place_order_distorted_prev_close_fail_open(fake, monkeypatch):
-    """前复权早期失真（前收 < 1 元）→ 跳过校验（与回测同口径，宁宽勿错）。"""
+def test_check_price_limit_distorted_prev_close_fail_open(fake, monkeypatch):
+    """前复权早期失真（前收 < 1 元）→ 返回 None（与回测同口径，宁宽勿错）。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [0.4, 0.5])))
     fake.orders = [_order(price=11.00, ref="W805")]
     d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", Decimal("11.00")) is None
     trade = d.place_order(_limit_order(price=Decimal("11.00")))
     assert trade is not None
 
 
-def test_place_order_stale_bar_skips_limit_check(fake, monkeypatch):
-    """最新 bar=昨日（数据滞后）→ 前收无效，跳过校验（不拒单，fail-open）。"""
+def test_check_price_limit_stale_bar_skips(fake, monkeypatch):
+    """最新 bar=昨日（数据滞后）→ 前收无效，返回 None（不拒单，fail-open）。"""
     today = now_shanghai().date()
     idx = [pd.Timestamp(today - timedelta(days=2)),
            pd.Timestamp(today - timedelta(days=1))]
@@ -544,20 +562,21 @@ def test_place_order_stale_bar_skips_limit_check(fake, monkeypatch):
         "core.tq.data.TQData", lambda: FakeQuoteData(raw))
     fake.orders = [_order(price=11.00, ref="W806")]
     d = TdxTqDispatcher()
+    assert d.check_price_limit("000001", "buy", Decimal("11.00")) is None
     trade = d.place_order(_limit_order(price=Decimal("11.00")))
     assert trade is not None
     assert [c for c in fake.calls if c[0] == "order_stock"]
 
 
-def test_place_order_fresh_bar_still_blocks_limit_up(fake, monkeypatch):
+def test_check_price_limit_fresh_bar_still_blocks_limit_up(fake, monkeypatch):
     """最新 bar=今日（数据新鲜）→ 涨跌停校验照常生效（拒单口径不变）。"""
     monkeypatch.setattr(
         "core.tq.data.TQData",
         lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
     d = TdxTqDispatcher()
-    with pytest.raises(BridgeOrderRejected) as ei:
-        d.place_order(_limit_order(price=Decimal("11.00")))
-    assert "涨停价" in str(ei.value)
+    reason = d.check_price_limit("000001", "buy", Decimal("11.00"))
+    assert reason is not None
+    assert "涨停价" in reason
     assert not [c for c in fake.calls if c[0] == "order_stock"]
 
 

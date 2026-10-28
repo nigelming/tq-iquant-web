@@ -1,4 +1,4 @@
-"""LiveEngine 单测（0009 切片4）— Mock dispatcher（httpx MockTransport）+ 内存 SQLite。
+﻿"""LiveEngine 单测（0009 切片4）— Mock dispatcher（httpx MockTransport）+ 内存 SQLite。
 
 验证实盘端到端链路：bar → 信号 → 真实下单（桥受理）→ 落 live_orders/live_trades，
 以及 Core 重启后从 live_trades 恢复虚拟持仓/虚拟现金。引擎核心（Portfolio/ExecutionEngine）
@@ -3672,6 +3672,223 @@ def test_handle_bar_bridge_business_reject_surfaces_error():
     extra = _drain_queue(q)
     assert len(extra) == 1 and extra[0]["type"] == "decision"
     assert extra[0]["gate"] == "bridge_rejected"
+
+
+# ---------------- Fix1：涨跌停前置校验（price_limit_check_enabled 门控，引擎接线）----------------
+class _LimitCheckDispatcher(HttpBridgeDispatcher):
+    """测试替身：check_price_limit 可编程返回（模拟 tdx/qmt/ths 通道校验）。"""
+
+    def __init__(self, client, reason):
+        super().__init__(client=client)
+        self.check_calls = []
+        self._reason = reason
+
+    def check_price_limit(self, stock_code, direction, price):
+        self.check_calls.append((stock_code, direction, str(price)))
+        return self._reason
+
+
+def _limit_check_engine(factory, port, reason):
+    stock = "600000.SH"
+    rec = _Recorder()
+    client = httpx.Client(transport=httpx.MockTransport(rec.handler))
+    disp = _LimitCheckDispatcher(client, reason)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    return engine, disp, rec
+
+
+def test_handle_bar_price_limit_enabled_rejects_buy_at_limit_up():
+    """Fix1：开启校验 + check_price_limit 返回原因 → BridgeOrderRejected 既有
+    拒单路径（rejected 落库回显原因 + bridge_rejected 决策事件），不发桥。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.price_limit_check_enabled = True
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    reason = "委托买价 9.30 ≥ 涨停价 9.30（前收 8.45 ×0.10），已拦截"
+    engine, disp, rec = _limit_check_engine(factory, port, reason)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._handle_bar(port, _bar(stock, "9.3", bar_time))
+
+    # 校验在发单前：桥未收到 /order
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    assert disp.check_calls and disp.check_calls[0][0] == stock
+    assert disp.check_calls[0][1] == "buy"
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert orders[0].status == "rejected"
+    assert orders[0].error_message == reason
+    db.close()
+    # 事件流：signal → order(submitted) → order(rejected 回显原因) → bridge_rejected 决策事件
+    events = [q.get_nowait(), q.get_nowait(), q.get_nowait()]
+    assert events[0]["type"] == "signal"
+    assert events[1]["type"] == "order" and events[1]["status"] == "submitted"
+    assert events[2]["type"] == "order" and events[2]["status"] == "rejected"
+    assert events[2]["error_message"] == reason
+    extra = _drain_queue(q)
+    assert len(extra) == 1 and extra[0]["type"] == "decision"
+    assert extra[0]["gate"] == "bridge_rejected"
+
+
+def test_handle_bar_price_limit_pass_through_submits():
+    """Fix1：开启校验但 check_price_limit 返回 None（通过）→ 照常发单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.price_limit_check_enabled = True
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine, disp, rec = _limit_check_engine(factory, port, None)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.3", bar_time))
+
+    assert disp.check_calls  # 校验被调用
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db = factory()
+    assert db.query(LiveOrder).first().status == "submitted"
+    db.close()
+
+
+def test_handle_bar_price_limit_disabled_skips_check():
+    """Fix1：配置关闭（直接构造 Portfolio 默认关）→ 完全不调校验（与回测门控一致）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    assert port.price_limit_check_enabled is False
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine, disp, rec = _limit_check_engine(
+        factory, port, "不应被调用")
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.3", bar_time))
+
+    assert disp.check_calls == []  # 配置关 → 校验零调用
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db = factory()
+    assert db.query(LiveOrder).first().status == "submitted"
+    db.close()
+
+
+# ---------------- Fix3：trading_session（full/am/pm）组合时段闸 ----------------
+def _session_bar(stock, bar_time):
+    return _bar(stock, "9.3", bar_time)
+
+
+def test_handle_bar_trading_session_pm_skips_morning_then_trades(monkeypatch):
+    """Fix3：pm-only 组合——上午（墙钟 10:00）整轮跳过（不落单/不发桥），记 1 条
+    trading_session 决策事件；下午 13:30 正常下单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.trading_session = "pm"
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai", lambda: datetime(2026, 8, 5, 10, 0))
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _session_bar(stock, bar_time))
+
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 不发桥
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 不落单
+    evs = db.query(LiveDecisionEvent).filter_by(gate="trading_session").all()
+    assert len(evs) == 1 and evs[0].layer == "portfolio" and evs[0].action == "skip"
+    assert "交易时段闸" in evs[0].message
+    db.close()
+    assert q.get_nowait()["type"] == "decision"  # 跳过事件即时推送
+
+    # 下午 13:30（允许窗口）→ 正常下单，无新增 trading_session 事件
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai", lambda: datetime(2026, 8, 5, 13, 30))
+    bar_time = datetime(2026, 8, 5, 13, 30)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _session_bar(stock, bar_time))
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    assert db.query(LiveOrder).first().status == "submitted"
+    assert db.query(LiveDecisionEvent).filter_by(gate="trading_session").count() == 1
+    db.close()
+
+
+def test_handle_bar_trading_session_skip_event_once_per_day(monkeypatch):
+    """Fix3：跳过事件每日首次记 1 条（内存 set 按 (portfolio_id, date)）——同日
+    多根 bar 不刷屏，跨日重记。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.trading_session = "am"  # am-only：下午跳过
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai", lambda: datetime(2026, 8, 5, 13, 30))
+    for minute in (30, 31, 32):
+        bt = datetime(2026, 8, 5, 13, minute)
+        engine.signal_cache = {(1, stock, bt): [{"name": "open_sig", "value": 1}]}
+        engine._handle_bar(port, _session_bar(stock, bt))
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    assert db.query(LiveDecisionEvent).filter_by(gate="trading_session").count() == 1
+    db.close()
+
+    # 跨日首根 bar → 再记 1 条
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai", lambda: datetime(2026, 8, 6, 13, 30))
+    bt = datetime(2026, 8, 6, 13, 30)
+    engine.signal_cache = {(1, stock, bt): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _session_bar(stock, bt))
+    db = factory()
+    assert db.query(LiveDecisionEvent).filter_by(gate="trading_session").count() == 2
+    db.close()
+
+
+def test_handle_bar_trading_session_full_no_filter(monkeypatch):
+    """Fix3：full（默认）不筛时段——任意墙钟时间照常下单（既有全局闸已管）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai", lambda: datetime(2026, 8, 5, 12, 0))
+    bt = datetime(2026, 8, 5, 12, 0)
+    engine.signal_cache = {(1, stock, bt): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _session_bar(stock, bt))
+    db = factory()
+    assert db.query(LiveOrder).count() == 1
+    assert db.query(LiveDecisionEvent).filter_by(gate="trading_session").count() == 0
+    db.close()
 
 
 def test_handle_bar_emits_risk_on_max_drawdown_trigger():

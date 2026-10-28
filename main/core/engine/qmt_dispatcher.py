@@ -376,6 +376,14 @@ class QmtDispatcher(OrderDispatcher):
         from .tdx_tq_dispatcher import TdxTqDispatcher
         return TdxTqDispatcher().query_quote(code, period, count)
 
+    def check_price_limit(self, stock_code: str, direction: str, price) -> Optional[str]:
+        """涨跌停前置校验委托 TdxTqDispatcher（与 query_calendar/query_quote 同模式）。
+
+        引擎按 price_limit_check_enabled 配置门控调用；返回拒绝原因文案，None=通过。
+        """
+        from .tdx_tq_dispatcher import TdxTqDispatcher
+        return TdxTqDispatcher().check_price_limit(stock_code, direction, price)
+
     # ---- 下单 ----
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:

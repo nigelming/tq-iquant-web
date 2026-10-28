@@ -135,6 +135,14 @@ class HttpBridgeDispatcher(OrderDispatcher):
         )
 
     # ---------------- 查询 ----------------
+    def check_price_limit(self, stock_code: str, direction: str, price) -> Optional[str]:
+        """涨跌停前置校验：桥通道暂无涨跌停校验，恒放行（返回 None）。
+
+        引擎按 price_limit_check_enabled 配置统一调用，四通道（iquant/tdx/qmt/ths）
+        同签名同语义；iQuant 桥无前收/涨跌停数据源，fail-open 放行。
+        """
+        return None
+
     def _get_json(self, path: str) -> list:
         try:
             r = self._client.get(self._base_url + path)

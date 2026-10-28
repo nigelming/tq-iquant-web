@@ -126,6 +126,14 @@ class Portfolio:
         # bond_lot_enabled：转债最小交易单位 10 张（股票仍 100 股）。
         self.bond_t0_enabled: bool = False
         self.bond_lot_enabled: bool = False
+        # 组合级最大持仓数（组合表字段，历史死配置首次接线）：OPEN 开新仓前按
+        # 组合全部策略持仓去重股票数判定，≥ 上限拒绝新开仓。0=不限（直接构造
+        # Portfolio 的引擎单测默认不受限）；builder 从组合表装配。
+        self.max_holdings: int = 0
+        # 组合交易时段（full/am/pm，组合表字段，历史死配置首次接线）：
+        # am=09:30–11:30、pm=13:00–15:00、full=不筛（默认）。回测按 bar 时间、
+        # 实盘按墙钟过滤（窗口定义见 market_rules.session_allows）。
+        self.trading_session: str = "full"
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""
@@ -524,6 +532,22 @@ class Portfolio:
                 self._rec("open_already_holding", "signal_gate", "block", ctx, sig, bar,
                           message="OPEN 信号时本票已持仓 %d 股（加仓走 ADD），忽略开仓"
                                   % pos.quantity)
+                return []
+            # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
+            # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）
+            # ≥ max_holdings → 拒绝新开仓。ADD/减仓/清仓类不受影响；
+            # max_holdings<=0 视为未启用（直接构造 Portfolio 默认不限）。
+            port_codes = {
+                code for c in self.strategies
+                for code, p in c.positions.items() if p.quantity > 0
+            }
+            if self.max_holdings and len(port_codes) >= self.max_holdings:
+                self._rec("max_holdings", "portfolio", "block", ctx, sig, bar,
+                          param_name="max_holdings",
+                          param_value=float(self.max_holdings),
+                          actual_value=float(len(port_codes)),
+                          message="组合持仓数 %d/%d 已达上限，%s 不开新仓"
+                                  % (len(port_codes), self.max_holdings, sig.stock_code))
                 return []
             # 在途单计入（max_positions 超开修复，回测 id7 实测根因）：held 只数已成交
             # 持仓，同 bar 齐发的 OPEN / 实盘 submitted 未成交单不占位 → 超开后闸门

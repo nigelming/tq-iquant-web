@@ -10,7 +10,7 @@ from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
 # 涨跌停幅度口径迁至 market_rules（实盘 TdxTqDispatcher 涨跌停前置校验共用）；
 # 此处 re-export 保持既有 import 路径不破。
-from .market_rules import _limit_ratio_for  # noqa: F401
+from .market_rules import _limit_ratio_for, session_allows  # noqa: F401
 from tq_iquant_shared.constants import TradeType
 
 
@@ -273,8 +273,16 @@ class BacktestEngine:
             # 3. portfolio.on_bar → 新订单入 pending（下一根同周期 bar 成交）
             #    period=P 只驱动 period 相同的策略，杜绝混合周期前视。
             #    deferred（未成交/未到期订单）需携带至后续 bar 合并。
-            new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
-            pending_orders = deferred + new_orders
+            #    trading_session（full/am/pm）时段闸：非允许时段的 bar 跳过本组合
+            #    本轮（风控/信号随 bar 跳过，不产生新交易；deferred/既有 pending
+            #    照常延后成交）。⚠️ 行为变更：am/pm 组合的既有回测结果会改变
+            #    （历史死配置首次接线）；full（默认）无影响。日线级 bar_time 为
+            #    00:00，am/pm 组合将跳过全部日线 bar。
+            if session_allows(portfolio.trading_session, t.time()):
+                new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
+                pending_orders = deferred + new_orders
+            else:
+                pending_orders = deferred
 
             # 4. 日终快照（W4.4：每交易日至多一行，取当日最后一根 bar 的末值）
             total_value = portfolio.total_value(bar)
