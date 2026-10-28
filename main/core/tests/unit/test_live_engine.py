@@ -3780,7 +3780,10 @@ def test_handle_bar_price_limit_disabled_skips_check():
 
 # ---------------- Fix3：trading_session（full/am/pm）组合时段闸 ----------------
 def _session_bar(stock, bar_time):
-    return _bar(stock, "9.3", bar_time)
+    """日内 bar（period=1m）——时段闸仅约束日内周期。"""
+    b = _bar(stock, "9.3", bar_time)
+    b.period = "1m"
+    return b
 
 
 def test_handle_bar_trading_session_pm_skips_morning_then_trades(monkeypatch):

@@ -71,7 +71,7 @@ from .live.order_machine import (
 )
 from .live.breaker import BreakerService
 from .live.daily_closer import DailyCloser
-from .market_rules import session_allows
+from .market_rules import session_allows_bar
 from .decision import DecisionRecorder
 from .regime import CausalRegimeTracker
 from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
@@ -1022,11 +1022,14 @@ class LiveEngine:
             return
         # trading_session（full/am/pm）组合时段闸（历史死配置首次接线）：非允许
         # 时段整轮跳过本组合（风控/信号/下单均不执行，与回测跳过 on_bar 同语义）。
-        # 实盘按墙钟判定（日线 bar 由 14:30 closer 驱动、bar_time=00:00 不可用；
-        # pm 组合的日线单 14:30 仍在允许窗口内）。full=不筛（既有全局闸已管）。
+        # 实盘按墙钟判定；时段约束仅对日内周期生效——日线及以上由 14:30 closer
+        # 驱动（am 组合的日线策略若被闸过滤会永久卡死，session_allows_bar 周期判定）。
+        # full=不筛（既有全局闸已管）。
         # 跳过时每日首次记决策事件（gate=trading_session、layer=portfolio）防刷屏。
         session = getattr(portfolio, "trading_session", None) or "full"
-        if session in ("am", "pm") and not session_allows(session, now_shanghai().time()):
+        if session in ("am", "pm") and not session_allows_bar(
+            session, now_shanghai().time(), bar.period
+        ):
             key = (portfolio.portfolio_id, bar.bar_time.date())
             if key not in self._session_skip_recorded:
                 self._session_skip_recorded.add(key)

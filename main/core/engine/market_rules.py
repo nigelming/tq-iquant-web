@@ -31,15 +31,32 @@ TRADING_SESSION_WINDOWS = {
     "pm": (dtime(13, 0), dtime(15, 0)),
 }
 
+# 时段闸仅对日内周期有意义：日线及以上 bar 的 bar_time 按约定为 00:00，
+# 落在 am/pm 窗口之外——若不加区分，am/pm 组合的日线回测会被整程跳过、
+# 实盘 am 组合的 14:30 日线驱动也永远进不来（历史陷阱，见 session_allows_bar）。
+_INTRADAY_PERIODS = {"1m", "5m", "15m", "30m", "1h", "60m"}
+
 
 def session_allows(session: Optional[str], t: dtime) -> bool:
-    """组合交易时段闸：session 非 am/pm（含 None/full/未知值）一律放行。
+    """组合交易时段闸（时间维度）：session 非 am/pm（含 None/full/未知值）一律放行。
 
     回测传 bar_time.time()、实盘传墙钟 now_shanghai().time()，判定同口径。
-    注意日线级 bar 的 bar_time 按约定是 00:00——am/pm 组合在回测中会跳过
-    全部日线 bar（实盘日线由 14:30 closer 驱动，pm 组合仍可处理）。
+    bar 维度请用 session_allows_bar（含日内周期判定）。
     """
     window = TRADING_SESSION_WINDOWS.get(session or "")
     if window is None:
         return True
     return window[0] <= t <= window[1]
+
+
+def session_allows_bar(session: Optional[str], t: dtime, period: Optional[str]) -> bool:
+    """组合交易时段闸（bar 维度）：时段约束仅对日内周期生效。
+
+    日线及以上周期（1d/1w/1mon，bar_time 约定 00:00）不受 am/pm 窗口过滤——
+    否则 am/pm 组合的日线回测会被整程跳过、实盘 am 组合的 14:30 日线驱动
+    永远进不来。日内 bar（及 period 未知的 bar，保守视为日内）按窗口判定
+    （回测传 bar_time、实盘传墙钟）。
+    """
+    if period is not None and period not in _INTRADAY_PERIODS:
+        return True
+    return session_allows(session, t)
