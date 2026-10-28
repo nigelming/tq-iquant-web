@@ -427,7 +427,8 @@ def test_executor_entry_marks_rejected_on_bridge_error(tmp_path):
     results = _jsonl(d._handoff.results_path)
     assert results[0]["status"] == "rejected"
     assert "invalid order" in results[0]["error"]
-    assert d._file_rejects[oid] == "invalid order"
+    assert d._file_rejects[oid]["error"] == "invalid order"
+    assert d._file_rejects[oid]["entry"]["stock_code"] == "000001.SZ"
     assert oid in d._handoff.cursor["done"]
 
 
@@ -448,7 +449,49 @@ def test_executor_entry_survives_unexpected_error(tmp_path):
         monkey.undo()
 
     assert _jsonl(d._handoff.results_path)[0]["status"] == "rejected"
-    assert d._file_rejects["zzz"] == "com fail"
+    assert d._file_rejects["zzz"]["error"] == "com fail"
+
+
+def test_execution_receipts_pop_file_rejects(tmp_path):
+    """execution_receipts：弹出 _file_rejects 回执（单消费者=引擎），含 entry 形状。"""
+    d = _file_dispatcher(tmp_path)
+    entry = {"order_id": "abc123", "stock_code": "000001.SZ", "direction": "BUY",
+             "quantity": 100, "price": 10.0}
+
+    def _boom(o):
+        raise BridgeOrderRejected("invalid order")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(d, "_execute_via_ui", _boom)
+    try:
+        d._execute_entry(entry)
+    finally:
+        monkey.undo()
+
+    receipts = d.execution_receipts()
+    assert len(receipts) == 1
+    r = receipts[0]
+    assert r["order_id"] == "abc123"
+    assert r["status"] == "rejected"
+    assert r["error"] == "invalid order"
+    assert r["ts"]  # 上海时间
+    assert r["entry"]["stock_code"] == "000001.SZ"
+    assert r["entry"]["direction"] == "BUY"
+    assert r["entry"]["quantity"] == 100
+    # 弹出语义：第二次调用为空（单消费者）
+    assert d.execution_receipts() == []
+    d.close()
+
+
+def test_execution_receipts_direct_mode_returns_empty(tmp_path):
+    d = ThsUiDispatcher(execute_mode="direct")
+    assert d.execution_receipts() == []
+
+
+def test_order_dispatcher_default_execution_receipts_empty():
+    """基类默认无回执（TdxTqDispatcher 等无需实现）。"""
+    from core.engine.execution_engine import SimulatedDispatcher
+    assert SimulatedDispatcher().execution_receipts() == []
 
 
 def test_executor_thread_consumes_pending_and_close_stops(tmp_path):

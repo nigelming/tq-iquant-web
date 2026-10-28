@@ -289,6 +289,25 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('SSE rejected order 事件 → 委托表错误列显示 error_message', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('order', {
+      trade_type: 'BUY', stock_code: '600000.SH', status: 'rejected',
+      quantity: 100, error_message: 'ths ui captcha_ocr disabled',
+    })
+    await flushPromises()
+
+    const ordersTab = w.findAll('button').find((b) => b.text().includes('委托'))!
+    await ordersTab.trigger('click')
+    expect(w.text()).toContain('错误')
+    expect(w.text()).toContain('ths ui captcha_ocr disabled')
+    w.unmount()
+  })
+
   it('决策/拦截 tab → 加载历史聚合+逐事件,SSE decision 实时插入', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLiveDecisions as any).mockResolvedValue({

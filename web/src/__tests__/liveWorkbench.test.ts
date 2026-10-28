@@ -29,6 +29,22 @@ describe('liveWorkbench', () => {
       expect(row.price).toBe(10.5)
       expect(row.filled_quantity).toBe(100)
     })
+
+    it('rejected 事件 → error_message 透传（委托表错误列）', () => {
+      const row = orderEventToRow({
+        trade_type: 'BUY', stock_code: '600000.SH', status: 'rejected',
+        quantity: 100, error_message: 'ths ui captcha_ocr disabled',
+      })
+      expect(row.status).toBe('rejected')
+      expect(row.error_message).toBe('ths ui captcha_ocr disabled')
+    })
+
+    it('无 error_message 的事件 → 错误列为 null', () => {
+      const row = orderEventToRow({
+        trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100,
+      })
+      expect(row.error_message).toBeNull()
+    })
   })
 
   it('orderHistoryToRows 用 -id 作 key(稳定去重)', () => {

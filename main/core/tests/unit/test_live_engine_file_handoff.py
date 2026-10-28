@@ -5,6 +5,7 @@ signal/decision/risk 事件同步落 signals/risk.jsonl（order 事件不落）�
 _handle_bar 提交链对 file 模式 place_order 秒回 None 的处理
 （订单保持 submitted，不判 approval failed）。
 """
+import asyncio
 import os
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -13,7 +14,10 @@ import httpx
 
 from core.engine.bar_poller import BarPoller
 from core.engine.event import BarEvent, OrderEvent
-from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
+from core.engine.http_bridge_dispatcher import (
+    BridgeOrderRejected,
+    HttpBridgeDispatcher,
+)
 from core.engine.live.timing import now_shanghai
 from core.engine.live_engine import LiveEngine
 from core.engine.portfolio import Portfolio
@@ -266,5 +270,140 @@ def test_handle_bar_file_mode_skips_immediate_ref_match(tmp_path):
     # 「file 模式提交时跳过立即回查」，不是「匹配不上」。
     engine._try_match_order_ref(lo)
     assert lo.order_ref == "STALE-1"
+    db.close()
+    disp.close()
+
+
+# ---------------- _tick_deals：执行回执消费（file 拒单即时可见） ----------------
+
+def _enqueue_reject(disp, entry, error="invalid order"):
+    """模拟内置执行器失败：_execute_via_ui 抛 BridgeOrderRejected 后 _execute_entry。"""
+    def _boom(o):
+        raise BridgeOrderRejected(error)
+
+    import pytest
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(disp, "_execute_via_ui", _boom)
+    try:
+        disp._execute_entry(entry)
+    finally:
+        monkey.undo()
+
+
+def _drain_order_events(engine):
+    """订阅队列快照 → order 事件列表。"""
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    return q
+
+
+def test_tick_deals_consumes_receipt_marks_rejected(tmp_path):
+    """file 执行器拒单回执 → 引擎 _tick_deals 消费：LiveOrder 即时 rejected
+    （error_message=回执 error）+ order 事件（工作台立即可见），不必等 180s expire。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "submitted"
+    oid = lo.bridge_order_id
+    db.close()
+
+    # 执行器执行失败 → rejected 回执暂存 _file_rejects
+    _enqueue_reject(disp, {
+        "order_id": oid, "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, error="ths ui captcha_ocr disabled")
+
+    q = _drain_order_events(engine)
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "rejected"
+    assert lo.error_message == "ths ui captcha_ocr disabled"
+    db.close()
+    assert engine._pending_orders == {}
+    # order 事件已广播（SSE → 工作台委托表）
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    rejected = [e for e in events
+                if e.get("type") == "order" and e.get("status") == "rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["error_message"] == "ths ui captcha_ocr disabled"
+    assert rejected[0]["stock_code"] == STOCK
+    disp.close()
+
+
+def test_tick_deals_receipt_unmatched_dropped_with_warning(tmp_path, caplog):
+    """回执匹配不上的单（乱序/已终态）：记 warning 丢弃（不阻塞消费），
+    在途单保持 submitted 由 180s expire 兜底。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    # 陌生回执：order_id 无匹配 + entry 形状（他股）也无匹配
+    _enqueue_reject(disp, {
+        "order_id": "no-such-order", "stock_code": "000001.SZ", "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    })
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "submitted"  # 未被误标 rejected
+    assert lo.error_message is None
+    db.close()
+    assert any("unmatched" in r.message for r in caplog.records)
+    disp.close()
+
+
+def test_tick_deals_receipt_matches_by_entry_shape_fallback(tmp_path):
+    """order_id 匹配不上时回退按 entry 形状（stock_code+direction+quantity）
+    匹配无 order_ref 的在途单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    # order_id 与在途单 bridge_order_id 不同，但形状相同 → 回退形状匹配
+    _enqueue_reject(disp, {
+        "order_id": "foreign-oid", "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, error="ths ui busy")
+
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "rejected"
+    assert lo.error_message == "ths ui busy"
+    db.close()
+    disp.close()
+
+
+def test_tick_deals_no_receipts_noop(tmp_path):
+    """无回执：deals 轮询零开销，在途单不受影响。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "submitted"
     db.close()
     disp.close()

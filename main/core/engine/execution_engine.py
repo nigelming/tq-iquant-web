@@ -17,6 +17,14 @@ class OrderDispatcher(ABC):
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         ...
 
+    def execution_receipts(self) -> list:
+        """执行回执通道（文件交接层执行器专用）：默认无回执（[]）。
+
+        file_builtin 类 dispatcher 覆写：弹出暂存的执行失败回执，由
+        LiveEngine 在记账锁内消费（file 拒单即时可见，不等 180s expire）。
+        """
+        return []
+
 
 class T1Checker(ABC):
     @abstractmethod

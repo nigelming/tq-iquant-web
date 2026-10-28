@@ -512,7 +512,7 @@ onUnmounted(closeEventStream)
     <!-- 委托 -->
     <div v-if="wbTab === 'orders'" class="table-wrap">
       <table>
-        <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th></tr></thead>
+        <thead><tr><th>时间</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th><th>错误</th></tr></thead>
         <tbody>
           <tr v-for="o in orders" :key="o.key">
             <td style="color:var(--ink-soft)">{{ o.time }}</td>
@@ -522,6 +522,7 @@ onUnmounted(closeEventStream)
             <td>{{ o.quantity }}</td>
             <td>{{ o.price ?? '-' }}</td>
             <td>{{ o.filled_quantity ?? '-' }}</td>
+            <td style="color:var(--red);max-width:280px;white-space:normal">{{ o.error_message ?? '-' }}</td>
           </tr>
         </tbody>
       </table>

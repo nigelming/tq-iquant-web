@@ -138,8 +138,10 @@ class ThsUiDispatcher(OrderDispatcher):
         self._submit_times: Dict[str, tuple] = {}
         self._known_refs: set = set()
         self._claimed_refs: set = set()
-        # file 模式执行器记账：order_id -> 最近一次执行失败原因（诊断用）。
-        self._file_rejects: Dict[str, str] = {}
+        # file 模式执行器记账：order_id -> {"error","ts","entry"}（诊断 + 引擎
+        # execution_receipts 消费源——file 拒单即时可见，不必等 180s expire）。
+        self._file_rejects: Dict[str, dict] = {}
+        self._rejects_lock = threading.Lock()
         self._last_submit_ref = ""
         self._last_submit_time: tuple = ("", "")
         self._last_enqueued_order_id: Optional[str] = None
@@ -1205,18 +1207,51 @@ class ThsUiDispatcher(OrderDispatcher):
                     )
             self._handoff.mark_done(order_id, {"status": "accepted", "ref": ref})
         except (BridgeOrderRejected, BridgeUnavailableError) as e:
-            self._file_rejects[order_id] = str(e)
+            self._record_file_reject(order_id, entry, e)
             try:
                 self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
             except Exception:  # noqa: BLE001
                 logger.warning("ths handoff mark_done failed", exc_info=True)
         except Exception as e:  # noqa: BLE001  UI 异常不杀执行线程
             logger.warning("ths file executor error (order %s): %s", order_id, e)
-            self._file_rejects[order_id] = str(e)
+            self._record_file_reject(order_id, entry, e)
             try:
                 self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
             except Exception:  # noqa: BLE001
                 logger.warning("ths handoff mark_done failed", exc_info=True)
+
+    def _record_file_reject(self, order_id: str, entry: dict, exc: Exception) -> None:
+        """执行失败记账（带原始指令 entry 供引擎形状匹配）。"""
+        with self._rejects_lock:
+            self._file_rejects[str(order_id)] = {
+                "error": str(exc),
+                "ts": now_shanghai().isoformat(timespec="seconds"),
+                "entry": dict(entry or {}),
+            }
+
+    def execution_receipts(self) -> List[dict]:
+        """弹出执行失败回执（file_builtin 模式；单消费者=LiveEngine deals 轮询）。
+
+        引擎在记账锁内消费：按 order_id/entry 形状匹配在途单即时标 rejected
+        （工作台立即可见），不必等 180s expire。direct 模式无执行回执（恒 []）。
+        """
+        if self.execute_mode != "file_builtin":
+            return []
+        with self._rejects_lock:
+            if not self._file_rejects:
+                return []
+            items = list(self._file_rejects.items())
+            self._file_rejects.clear()
+        return [
+            {
+                "order_id": oid,
+                "status": "rejected",
+                "error": str(rec.get("error") or ""),
+                "ts": rec.get("ts"),
+                "entry": dict(rec.get("entry") or {}),
+            }
+            for oid, rec in items
+        ]
 
     def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
         """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。

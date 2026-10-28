@@ -868,9 +868,92 @@ class LiveEngine:
         """
         try:
             with self._book_lock:
+                self._consume_execution_receipts()
                 self._poll_deals()
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
+
+    def _consume_execution_receipts(self) -> None:
+        """执行回执消费（file 交接层执行器拒单 → 工作台立即可见）。
+
+        执行器 rejected 回执经 ``dispatcher.execution_receipts()`` 弹出（单消费者
+        =引擎，deals 轮询点、记账锁内）：按 order_id（=确定性 bridge_order_id）匹配
+        在途 submitted 单 → 走既有 rejected 终态（error_message=回执 error + order
+        事件，形状同 expire 收口）；order_id 缺失/匹配不上时回退按 entry 形状
+        （stock_code+direction+quantity）匹配无 order_ref 的在途单。匹配不上 →
+        记 warning 丢弃（该单由 180s expire 兜底，不阻塞后续回执）；空回执零开销。
+        """
+        receipts = self._dispatcher.execution_receipts()
+        if not receipts:
+            return
+        db = self._db_session_factory()
+        try:
+            pending = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                )
+                .all()
+            )
+            for r in receipts:
+                lo = self._match_receipt_order(pending, r)
+                if lo is None:
+                    logger.warning(
+                        "execution receipt unmatched, dropped (expire fallback): "
+                        "order_id=%s error=%s", r.get("order_id"), r.get("error"))
+                    continue
+                lo.status = "rejected"
+                lo.error_message = str(r.get("error") or "executor rejected")
+                self._pending_orders.pop(lo.id, None)
+                logger.warning(
+                    "execution receipt: order %s %s %s rejected by executor (%s)",
+                    lo.id, lo.trade_type, lo.stock_code, lo.error_message,
+                )
+                self._emit("order", {
+                    "portfolio_id": lo.portfolio_strategy_id,
+                    "order_id": lo.id,
+                    "status": "rejected",
+                    "stock_code": lo.stock_code,
+                    "trade_type": (lo.trade_type or "").upper(),
+                    "quantity": lo.quantity,
+                    "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
+                    "error_message": lo.error_message,
+                })
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _match_receipt_order(pending: list, receipt: dict) -> Optional["LiveOrder"]:
+        """回执 → 在途单匹配：order_id（=bridge_order_id）精确优先，
+        entry 形状（stock_code+direction+quantity）回退；仅 submitted 且无 order_ref。"""
+        oid = str(receipt.get("order_id") or "")
+        if oid:
+            for lo in pending:
+                if (lo.status == "submitted" and lo.order_ref is None
+                        and lo.bridge_order_id == oid):
+                    return lo
+        entry = receipt.get("entry") or {}
+        code = str(entry.get("stock_code") or "")
+        direction = str(entry.get("direction") or "").upper()
+        volume = int(entry.get("quantity") or 0)
+        if not code or not direction:
+            return None
+        for lo in pending:
+            if lo.status != "submitted" or lo.order_ref is not None:
+                continue
+            if str(lo.stock_code or "") != code:
+                continue
+            if (lo.trade_type or "").upper() != direction:
+                continue
+            if volume and int(lo.quantity or 0) != volume:
+                continue
+            return lo
+        return None
 
     # ---------------- 日终/收盘时点编排（0010 步骤 5 转 DailyCloser）----------------
     # 14:30 日终估值/日线驱动、15:05 收盘清扫的"时点判断 + 编排"已迁入
