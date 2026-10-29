@@ -495,6 +495,11 @@ onUnmounted(closeEventStream)
 
     <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行；来源分级：策略/原有持仓） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
+        <button class="btn btn-sm" :disabled="loading || activeSessionId === null"
+          @click="loadHistory(activeSessionId!)"
+          title="重新拉取全量持仓（原有持仓服务端缓存 60s）">↻ 刷新持仓</button>
+      </div>
       <table>
         <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>来源</th></tr></thead>
         <tbody>
