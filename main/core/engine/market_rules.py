@@ -24,6 +24,18 @@ def _limit_ratio_for(stock_code: str) -> Decimal:
     return Decimal("0.10")
 
 
+def tick_size(stock_code: str) -> Decimal:
+    """最小报价单位（撤单追价重下用，批次1 3a）：ETF 0.001，其余 0.01。
+
+    ETF 代码前缀：沪 5 开头（51x/56x/58x 等）、深 1 开头（15x/16x 等）；
+    其余（沪 6 / 深 0、3 / 北 4、8）按 0.01。
+    """
+    prefix = stock_code.split(".")[0]
+    if prefix.startswith(("5", "1")):
+        return Decimal("0.001")
+    return Decimal("0.01")
+
+
 # trading_session（组合表字段，full/am/pm）允许时段（上海时间，含端点）：
 # am=09:30–11:30（早盘）、pm=13:00–15:00（午盘）、full=不筛（默认）。
 TRADING_SESSION_WINDOWS = {

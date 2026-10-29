@@ -6247,12 +6247,33 @@ class FakeTdxDispatcher:
         self.deals = deals or []
         self.cancel_ok = cancel_ok
         self.cancel_calls = []
+        self.place_calls = []
         self._submit_times = {}
         self._known_refs = set()
         self._claimed_refs = set()
 
     def heartbeat(self):
         return True
+
+    @staticmethod
+    def order_id(order):
+        return "fake-%s-%s-%s-%s" % (
+            order.strategy_id, order.stock_code, order.quantity, order.price,
+        )
+
+    def place_order(self, order):
+        """TDX 形状下单：受理即回 TradeEvent（同桥 ok:true 语义，供 requote 提交链）。"""
+        from core.engine.event import TradeEvent
+        self.place_calls.append(order)
+        price = order.price if order.price is not None else Decimal("0")
+        return TradeEvent(
+            strategy_id=order.strategy_id, portfolio_id=order.portfolio_id,
+            stock_code=order.stock_code, trade_type=order.trade_type,
+            price=price, quantity=order.quantity,
+            amount=price * order.quantity, commission=Decimal("0"),
+            stamp_duty=Decimal("0"), trade_time=order.bar_time,
+            signal_type=order.signal_type, signal_name=order.signal_name,
+        )
 
     def query_orders(self):
         return list(self.orders)
@@ -7109,5 +7130,162 @@ def test_handle_bar_risk_timing_next_day_keeps_deferred():
     assert db.query(LiveOrder).count() == 0  # 当日不落单
     db.close()
     assert len(engine._signal_bar_deferred) == 1  # 进 deferred 队列
+
+
+# ===========================================================================
+# 批次1 3a：撤单后有限追价重下（requote_enabled；挂接批次 A 超时撤单收敛点）
+# ===========================================================================
+_REQUOTE_KEY = (1, "600000.SH", "open_sig", date(2026, 8, 5))
+
+
+def _requote_engine(disp, factory, enabled=True, max_attempts=2):
+    port, ctx = _portfolio_single()
+    ctx.requote_enabled = enabled
+    ctx.requote_max_attempts = max_attempts
+    return _make_engine(disp, factory, port), port, ctx
+
+
+def _sweep_two_rounds_to_cancel(engine, disp, factory):
+    """超时撤单两轮：第 1 轮请求撤单（tagged），第 2 轮委托表无此单 → 收敛 canceled。"""
+    db = factory()
+    engine._sweep_timeout_orders(db)
+    db.close()
+    disp.orders = []  # 撤单生效：委托表已查不到该单
+    db = factory()
+    engine._sweep_timeout_orders(db)
+    db.close()
+
+
+def test_requote_after_timeout_cancel_places_better_buy(monkeypatch):
+    """撤单收敛 canceled 且策略开启重下 → BUY 按 +1 tick 追价重下剩余量，attempts 记 1。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine, _, _ = _requote_engine(disp, factory, enabled=True)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    assert len(orders) == 2
+    orig, requote = orders
+    assert orig.id == lo_id and orig.status == "canceled"
+    assert requote.status == "submitted"
+    assert requote.strategy_id == 1 and requote.stock_code == "600000.SH"
+    assert requote.trade_type == "buy"
+    assert requote.price == Decimal("9.31")  # BUY：原价 9.3 + 1 tick(0.01)
+    assert requote.quantity == 600           # 原量 − 已成交(0)
+    assert requote.bar_time == datetime(2026, 8, 5, 10, 0)
+    db.close()
+    assert engine._requote_attempts[_REQUOTE_KEY] == 1
+    # decision 事件：gate=requote，中文含追价后价格与第 N 次
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="requote").all()
+    assert len(evs) == 1
+    assert "9.31" in evs[0].message and "第 1" in evs[0].message
+    db.close()
+
+
+def test_requote_disabled_keeps_current_behavior(monkeypatch):
+    """策略未开启重下（默认）→ 撤单收敛 canceled 后维持现行为，不重下。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine, _, _ = _requote_engine(disp, factory, enabled=False)
+    db = factory()
+    _pending_order_with_ref(db)
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "canceled"  # 终态不变
+    db.close()
+    assert engine._requote_attempts == {}
+
+
+def test_requote_skips_when_attempts_exhausted(monkeypatch):
+    """已达 requote_max_attempts → 不再重下，终态 canceled。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine, _, ctx = _requote_engine(disp, factory, enabled=True, max_attempts=2)
+    engine._requote_attempts[_REQUOTE_KEY] = 2  # 前两次重下已用完额度
+    db = factory()
+    _pending_order_with_ref(db)
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "canceled"
+    db.close()
+    assert engine._requote_attempts[_REQUOTE_KEY] == 2  # 不再累加
+
+
+def test_requote_quantity_minus_filled_and_sell_price_down(monkeypatch):
+    """部分成交 SELL：重下量=原量−已成交量，价格 −1 tick（SELL 追价向下）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    engine, port, ctx = _requote_engine(disp, factory, enabled=True)
+    _preset_position(ctx, "600000.SH", 600, Decimal("9.3"))  # SELL cap 需虚拟持仓
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo.trade_type = "sell"
+    lo.status = "partial"
+    lo.filled_quantity = 300
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    requote = db.query(LiveOrder).order_by(LiveOrder.id).all()[-1]
+    assert requote.trade_type == "sell"
+    assert requote.quantity == 300           # 原量 600 − 已成交 300
+    assert requote.price == Decimal("9.29")  # SELL：原价 9.3 − 1 tick(0.01)
+    db.close()
+    assert engine._requote_attempts[_REQUOTE_KEY] == 1
+
+
+def test_requote_skips_when_fully_filled_before_cancel(monkeypatch):
+    """撤单前已全部成交（残余收割补齐）→ 剩余量 0，不重下。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(
+        orders=[_bridge_row("W001", status=55, traded_volume=600)],
+        deals=[{
+            "order_ref": "W001", "price": 9.25, "volume": 600,
+            "amount": 5550.0, "commission": 1.4,
+            "trade_time": "100001", "trade_date": "20260805",
+        }],
+    )
+    engine, _, _ = _requote_engine(disp, factory, enabled=True)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo.status = "partial"
+    lo.filled_quantity = 600
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1  # 无重下单
+    # 第 1 轮撤单成功即收割残余成交 → 终态由回填路径落定为 filled（非 canceled）
+    assert orders[0].status == "filled"
+    db.close()
+    assert engine._requote_attempts == {}
 
 

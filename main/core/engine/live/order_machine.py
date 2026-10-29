@@ -563,13 +563,17 @@ class OrderStateMachine:
         （不刷屏），继续下轮重试。
         created_at 为 UTC naive（SQLite CURRENT_TIMESTAMP），与 expire_stale_orders
         同用 utcnow 比较。调用方负责 commit（_tick_main 与 expire 同块提交）。
+
+        返回值（批次1 3a 挂点）：本轮经 _finalize_timeout_canceled 收敛为 canceled
+        的 LiveOrder 列表——LiveEngine 据此对开启 requote_enabled 的策略做有限
+        追价重下；其余调用方忽略返回值即可（行为不变）。
         """
         minutes = self._cancel_unfilled_minutes()
         if minutes <= 0:
-            return
+            return []
         cancel = getattr(self._ctx.dispatcher, "cancel_order", None)
         if not callable(cancel):
-            return  # 通道不支持撤单（iQuant 桥等）：完全跳过
+            return []  # 通道不支持撤单（iQuant 桥等）：完全跳过
         if pending is None:
             pending = (
                 db.query(LiveOrder)
@@ -589,9 +593,10 @@ class OrderStateMachine:
             and (now_utc - lo.created_at) >= threshold
         ]
         if not targets:
-            return
+            return []
         # 已请求撤单的单：委托表已查不到该 ref（撤单且无成交）→ 直接标 canceled；
         # 委托表仍在 → 53部撤/54全撤终态由 5s 轮询 sync_terminal_order_status 收敛。
+        finalized_canceled: list = []  # 本轮收敛为 canceled 的单（requote 挂点，批次1 3a）
         tagged = [
             lo for lo in targets
             if (lo.error_message or "").startswith(_CANCEL_REQUESTED_TAG)
@@ -609,6 +614,8 @@ class OrderStateMachine:
                     if lo.order_ref in table_refs:
                         continue
                     self._finalize_timeout_canceled(db, lo)
+                    if lo.status == "canceled":
+                        finalized_canceled.append(lo)
         for lo in targets:
             if lo.status not in ("submitted", "partial"):
                 continue  # 本轮已收敛（_finalize_timeout_canceled 标 canceled 等）
@@ -668,6 +675,7 @@ class OrderStateMachine:
                         "(risk alerted once)",
                         lo.id, lo.order_ref, n,
                     )
+        return finalized_canceled
 
     def _finalize_timeout_canceled(self, db: Session, lo: LiveOrder) -> None:
         """A-2 收敛：撤单请求后委托表已查不到该单 → 标 canceled（有部分成交先 apply）。

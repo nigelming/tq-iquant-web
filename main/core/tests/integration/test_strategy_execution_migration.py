@@ -25,7 +25,15 @@ _PREV_HEAD = "c3d9e7f1a5b8"
 
 @pytest.fixture
 def alembic_cfg(tmp_path, monkeypatch):
-    """指向 tmp SQLite 的 Alembic Config（load_config 打补丁喂临时库路径）。"""
+    """指向 tmp SQLite 的 Alembic Config（load_config 打补丁喂临时库路径）。
+
+    monkeypatch 掉 logging.config.fileConfig：env.py 每次跑迁移都会 fileConfig
+    重配置日志（disable_existing_loggers 默认 True）→ 全进程既有 logger 被
+    disable，污染同进程后续单测的 caplog 断言。测试不需要 alembic 日志配置。
+    """
+    monkeypatch.setattr(
+        "logging.config.fileConfig", lambda *a, **kw: None
+    )
     db_file = tmp_path / "migration.db"
     monkeypatch.setattr(
         "core.config.load_config",

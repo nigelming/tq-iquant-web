@@ -71,7 +71,7 @@ from .live.order_machine import (
 )
 from .live.breaker import BreakerService
 from .live.daily_closer import DailyCloser
-from .market_rules import session_allows_bar
+from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .regime import CausalRegimeTracker
 from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
@@ -169,6 +169,10 @@ class LiveEngine:
         # 已知限制：队列仅内存，Core 重启即丢（信号边沿去重不会重发，无感知），
         # 持久化归 P2；stop() 时丢弃属预期。
         self._signal_bar_deferred: List[OrderEvent] = []
+        # 批次1 3a 撤单追价重下：次数记账（引擎内存，重启清零可接受——
+        # requote_max_attempts 次数上限兜底，重启后最坏多追价一轮）。
+        # key=(strategy_id, stock_code, signal_name, bar_date)，value=已用重试次数。
+        self._requote_attempts: Dict[tuple, int] = {}
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
@@ -830,13 +834,107 @@ class LiveEngine:
         backfill/apply 持仓现金——与 deals 池 5s 回填真并发，整段（含 commit）
         持 _book_lock 串行化。commit 必须在锁内：后进锁的 deals 回填据此看到
         已提交的终态（filled/partial），不会对同一单重复 backfill/apply。
+
+        批次1 3a：撤单收敛 canceled 后，对开启 requote_enabled 的策略做有限
+        追价重下（重下走 _submit_one_order 同款提交链，仍持 _book_lock——
+        pending_orders 增删须与 deals 池串行；锁序恒 book_lock → 通道锁，无反向）。
         """
         with self._book_lock:
             self._expire_stale_orders(db)
             # A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（与 expire 同块提交；
             # 配置 cancel_unfilled_minutes<=0 或通道不支持撤单时内部直接跳过）。
-            self._cancel_unfilled_orders(db)
+            finalized = self._cancel_unfilled_orders(db)
             db.commit()
+            # 批次1 3a：对刚收敛 canceled 的超时单做有限追价重下（次数上限兜底）
+            if finalized:
+                self._requote_after_timeout_cancel(db, finalized)
+                db.commit()
+
+    def _requote_after_timeout_cancel(self, db: Session, finalized: list) -> None:
+        """批次1 3a：撤单收敛 canceled 后的有限追价重下（真机安全约束）。
+
+        对本轮经超时撤单收敛为 canceled 的单（_cancel_unfilled_orders 返回，
+        排除 GUI 手撤/53-54 终态同步路径——仅批次 A 超时撤单挂点）：
+        - 目标策略 requote_enabled 且 attempts < requote_max_attempts → 构造
+          追价 OrderEvent 重下剩余量（quantity = 原量 − 已成交量，=0 不重下；
+          price = 原价 ± tick_size，BUY +tick / SELL −tick；涨跌停界内不加校验，
+          ENTER 后 THS/TDX 柜台校验兜底）；
+        - 重下单 signal_bar_date 置 None（当 bar 走 _submit_one_order 同款提交链，
+          不进 deferred 闸门）；
+        - 次数记账 self._requote_attempts[(strategy_id, stock_code, signal_name,
+          bar_date)]：重下单 attempts = 旧 n + 1（重启清零可接受——上限兜底）；
+        - 非 requote 策略 / 超次数 → 维持现行为（终态 canceled），不重下。
+        调用点持 _book_lock（pending_orders 增删与 deals 池串行）。
+        """
+        for lo in finalized:
+            if lo.status != "canceled":
+                continue  # 残余成交把单补齐（filled）等：非撤单终态不重下
+            portfolio = next(
+                (p for p in self.portfolios
+                 if p.portfolio_id == lo.portfolio_strategy_id),
+                None,
+            )
+            if portfolio is None:
+                continue
+            ctx = portfolio.find_strategy(lo.strategy_id)
+            if ctx is None or not getattr(ctx, "requote_enabled", False):
+                continue
+            remaining = int(lo.quantity or 0) - int(lo.filled_quantity or 0)
+            if remaining <= 0:
+                continue  # 已全部成交（或零量）：无可追
+            if lo.signal_type is None:
+                # order_id() 需要 signal_type.value；历史 NULL 单跳过重下（保守）
+                logger.warning(
+                    "requote skip: order %s has NULL signal_type (legacy row)",
+                    lo.id,
+                )
+                continue
+            key = (
+                lo.strategy_id, lo.stock_code, lo.signal_name or "",
+                lo.bar_time.date() if lo.bar_time else None,
+            )
+            attempts = self._requote_attempts.get(key, 0)
+            max_attempts = int(getattr(ctx, "requote_max_attempts", 2) or 0)
+            if attempts >= max_attempts:
+                logger.info(
+                    "requote skip: order %s %s attempts %d >= max %d (session %s)",
+                    lo.id, lo.stock_code, attempts, max_attempts, self.session_id,
+                )
+                continue
+            step = tick_size(lo.stock_code)
+            orig_price = Decimal(str(lo.price)) if lo.price is not None else None
+            if orig_price is None:
+                continue  # 无原价依据，不盲目追价
+            price = (orig_price + step if (lo.trade_type or "").lower() == "buy"
+                     else orig_price - step)
+            requote = OrderEvent(
+                strategy_id=lo.strategy_id,
+                portfolio_id=lo.portfolio_strategy_id,
+                stock_code=lo.stock_code,
+                trade_type=TradeType(lo.trade_type.upper()),
+                signal_type=SignalType(lo.signal_type),
+                quantity=remaining,
+                price=price,
+                bar_time=lo.bar_time,
+                signal_name=lo.signal_name or "",
+                signal_bar_date=None,  # 追价单当 bar 提交，不进 deferred 闸门
+            )
+            self._requote_attempts[key] = attempts + 1
+            self._rec_live(
+                "requote", "submit", portfolio, requote,
+                message="撤单追价重下：第 %d/%d 次，%s %s 追价后价格 %s、数量 %d"
+                        % (attempts + 1, max_attempts, requote.stock_code,
+                           requote.trade_type.value, price, remaining),
+            )
+            logger.info(
+                "requote: order %s timeout-canceled → resubmit %s %s qty=%s "
+                "price=%s attempt %d/%d (session %s)",
+                lo.id, requote.trade_type.value, requote.stock_code,
+                remaining, price, attempts + 1, max_attempts, self.session_id,
+            )
+            # 重下走与 _handle_bar 相同的提交闸门链（emit_signal=False：非新信号）
+            self._submit_one_order(db, portfolio, requote, ctx.period, emit_signal=False)
+            self._drain_decisions(db, portfolio)
 
     async def _deals_loop(self) -> None:
         """G5：/deals 成交回报回填的独立轮询（deals_poll_interval，默认 5s）。
@@ -1223,294 +1321,8 @@ class LiveEngine:
         db = self._db_session_factory()
         try:
             for order in (orders or []):
-                ctx = portfolio.find_strategy(order.strategy_id)
-                if ctx is None:
-                    continue
-                # 1w/1mon 的 signal_cache 由注入路径提供、monitor 不重算，
-                # 保留旧成单 SSE 避免前端丢信号；其余周期由 monitor 统一发。
-                if self._signal_monitor is None or bar.period in ("1w", "1mon"):
-                    self._emit("signal", {
-                        "portfolio_id": portfolio.portfolio_id,
-                        "strategy_id": order.strategy_id,
-                        "stock_code": order.stock_code,
-                        "signal_name": order.signal_name,
-                        "signal_type": order.signal_type.value if order.signal_type else None,
-                        "bar_time": order.bar_time.isoformat() if order.bar_time else None,
-                    })
-                # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
-                # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
-                # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
-                # 不依赖本机时钟/时区，测试与真实部署一致；主循环 60s 延迟不影响——延迟
-                # 处理的是 15:00 前的合法 bar，其 bar_time<15:00 不被拦，正常下单）。
-                # 不写 DB、不进 pending。
-                bt = order.bar_time
-                if bt is not None and (bt.hour, bt.minute) >= _MARKET_CLOSE_TIME:
-                    logger.info(
-                        "skip after-close order %s %s %s bar=%s (bar_time >= 15:00)",
-                        order.trade_type.value, order.stock_code, order.signal_name,
-                        bt,
-                    )
-                    self._rec_live(
-                        "after_close_block", "block", portfolio, order,
-                        message="bar_time %s >= 15:00 收盘后不下单" % bt,
-                    )
-                    continue
-                # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
-                # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
-                # 周末/节假日绝不误下，真实交易日不误挡。风控 update_peak 与 signal 事件仍
-                # 照常执行（只拦落单）。
-                # 日内周期(1m/5m...)额外卡交易时段 09:30–15:00；1d/1w/1mon 的 bar_time 按
-                # 约定是当日 00:00（由 14:30 _maybe_daily_bars 统一驱动），不套时段门，
-                # 只判交易日，否则会把 14:30 合法驱动的日线单误杀。
-                if bt is not None and not self._trading_allowed_for(bt, bar.period):
-                    logger.info(
-                        "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
-                        order.trade_type.value, order.stock_code, order.signal_name,
-                        bt, bar.period,
-                    )
-                    self._rec_live(
-                        "non_trading_block", "block", portfolio, order,
-                        message="非交易日/非交易时段 period=%s bar=%s" % (bar.period, bt),
-                    )
-                    continue
-                # B-1 未来函数闸门（与回测同式判定 t.date() <= signal_bar_date）：
-                # 日线级信号（signal_bar_date 非 None，signal bar 为当日 00:00，close
-                # 未确认）当日不下单——实盘若 14:30 即真实下单、回测却次日开盘成交，
-                # 回测结果对实盘不可预测。订单进 deferred 队列，次一交易日首 bar 放行。
-                # 队列仅内存（Core 重启即丢，P2 持久化）；stop() 丢弃属预期。
-                # 批次1 risk_timing=immediate（当日确认立即执行）跳过本闸门，
-                # 当日直接提交；next_day（默认）维持次日执行。
-                if (order.signal_bar_date is not None and order.bar_time is not None
-                        and order.bar_time.date() <= order.signal_bar_date
-                        and getattr(ctx, "risk_timing", "next_day") != "immediate"):
-                    self._signal_bar_deferred.append(order)
-                    self._rec_live(
-                        "signal_bar_date", "defer", portfolio, order,
-                        message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
-                                "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
-                    )
-                    continue
-                # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
-                pos = ctx.positions.get(order.stock_code)
-                if pos is None and order.trade_type == TradeType.BUY:
-                    pos = Position(order.stock_code)
-                    ctx.positions[order.stock_code] = pos
-                # F5/BUY 量上限：先定最终下单量（账户资金审批 / 桥 T+1 可用）再落
-                # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
-                # B-2 策略级敞口上限：与回测 _exposure_kwargs 完全同式透传
-                # （strategy_position_value/strategy_capital_limit），多策略上限之和
-                # 可超 100% 时实盘敞口不再系统性大于回测。
-                capped = self._engine.cap_quantity(
-                    order, portfolio.account, pos,
-                    **self._exposure_kwargs(portfolio, ctx),
-                )
-                if capped is None:
-                    logger.info(
-                        "skip order %s %s %s: cap_quantity None（资金/持仓上限拦截，不下单）",
-                        order.trade_type.value, order.stock_code, order.signal_name,
-                    )
-                    continue
-                order.quantity = capped
-                # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
-                # 根因：14:30 后页面停止/再启动 = Core 重启 = 新 LiveEngine = 实例内存丢失，
-                # 1d/1w/1mon 会被重新驱动到同一 bar_time，且 order_id=live_order.id（自增 PK）
-                # 每次重启都新号，桥侧 _placed 幂等无效 → 重复下单。
-                # 按 (策略+股票+bar_time+方向) 去重：分钟策略不同 bar（10:00 vs 10:05）不被误杀、
-                # 同组合多策略同 bar 同股各自开仓不被误拦，仅「同策略重驱到同 bar 同方向」才拦。
-                # BUY/SELL 对称去重：重复 SELL 危害不亚于重复 BUY（已卖完再卖 → 超卖/桥拒单噪音）。
-                # 分钟策略不同 bar 的合法平仓不受影响（bar_time 不同即不拦）。
-                if order.bar_time is not None:
-                    op = "buy" if order.trade_type == TradeType.BUY else "sell"
-                    dup = db.query(LiveOrder).filter(
-                        LiveOrder.live_session_id == self.session_id,
-                        LiveOrder.portfolio_strategy_id == order.portfolio_id,
-                        LiveOrder.strategy_id == order.strategy_id,
-                        LiveOrder.stock_code == order.stock_code,
-                        LiveOrder.bar_time == order.bar_time,
-                        LiveOrder.trade_type == op,
-                        LiveOrder.status.in_(["submitted", "partial", "filled"]),
-                    ).first()
-                    if dup is not None:
-                        logger.info(
-                            "skip dup %s %s %s bar=%s already placed (order %s)",
-                            op.upper(), order.stock_code, order.signal_name,
-                            order.bar_time, dup.id,
-                        )
-                        self._rec_live(
-                            "dup_skip", "block", portfolio, order,
-                            message="同 bar 同向单已存在 order=%s" % dup.id,
-                        )
-                        continue
-                # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
-                # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
-                # 持仓未更新，连续 bar 的 OPEN/CLOSE 信号看持仓是旧的 → 同股同向重复
-                # 买单/卖单（真机 2026-08-13：159888/159929/159936 两根连续 bar 两次 OPEN）。
-                # 按「同向」拦：在途 BUY 不拦 SELL、在途 SELL 不拦 BUY——风控止损/平仓
-                # 卖出不被未确认的买入挡住。bar_time 不是放行理由（不同 bar 只是两次
-                # 信号时点，上一单未确认就再下同向单仍是重复）。回填确认（filled）后由
-                # portfolio.py 持仓守卫接管；rejected 释放门（被拒不会成交，必须允许重试）。
-                # 终态（filled/canceled/rejected）都不在 submitted/partial 内，正确释放门；
-                # 仅在途单占门。比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
-                op = "buy" if order.trade_type == TradeType.BUY else "sell"
-                inflight = db.query(LiveOrder).filter(
-                    LiveOrder.live_session_id == self.session_id,
-                    LiveOrder.portfolio_strategy_id == order.portfolio_id,
-                    LiveOrder.strategy_id == order.strategy_id,
-                    LiveOrder.stock_code == order.stock_code,
-                    LiveOrder.trade_type == op,
-                    LiveOrder.status.in_(["submitted", "partial"]),
-                ).first()
-                if inflight is not None:
-                    logger.info(
-                        "skip inflight %s %s %s bar=%s (order %s still %s)",
-                        op.upper(), order.stock_code, order.signal_name,
-                        order.bar_time, inflight.id, inflight.status,
-                    )
-                    self._rec_live(
-                        "inflight_skip", "block", portfolio, order,
-                        message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
-                    )
-                    continue
-                # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
-                live_order = self._persist_order_submitted(db, order)
-                self._pending_orders[live_order.id] = live_order
-                # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
-                self._emit("order", {
-                    "portfolio_id": portfolio.portfolio_id,
-                    "order_id": live_order.id,
-                    "strategy_id": live_order.strategy_id,
-                    "stock_code": live_order.stock_code,
-                    "trade_type": (live_order.trade_type or "").upper(),
-                    "status": "submitted",
-                    "quantity": live_order.quantity,
-                    "price": float(live_order.price) if live_order.price is not None else None,
-                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                })
-                db.commit()
-                # THS file_builtin 入队标记：place_order 秒回 None 但指令已写入
-                # 交接文件时非 None（=本单确定性 order_id）。其它通道恒 None。
-                enqueued_oid: Optional[str] = None
-                try:
-                    # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
-                    # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
-                    # 返回拒绝原因 → raise BridgeOrderRejected 沿用既有拒单路径
-                    # （rejected 落库 + 决策事件 + SSE 回显原因）。配置关闭 → 完全跳过。
-                    if portfolio.price_limit_check_enabled:
-                        reason = self._dispatcher.check_price_limit(
-                            order.stock_code,
-                            "buy" if order.trade_type == TradeType.BUY else "sell",
-                            order.price,
-                        )
-                        if reason is not None:
-                            raise BridgeOrderRejected(reason)
-                    # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
-                    # B-2：execute 内部二次 cap_quantity/approve 同样透传敞口上限
-                    # （跳空/价格变动后的重批与首审同口径）。
-                    # Fix4：buy_fee_cfg 透传组合费用口径——execute 发单前做 BUY
-                    # 费用感知前置钳制（approve 只卡价×量，尾款不足佣金会透支
-                    # 虚拟现金；桥通道无法发单后改量重发）。
-                    trade = self._engine.execute(
-                        order, portfolio.account, pos, apply=False,
-                        buy_fee_cfg=self._buy_fee_cfg(portfolio),
-                        **self._exposure_kwargs(portfolio, ctx),
-                    )
-                except BridgeUnavailableError:
-                    # 桥离线：标 rejected + 置离线暂停（_on_bar 上层心跳循环据此暂停下单）
-                    live_order.status = "rejected"
-                    live_order.error_message = "bridge unavailable"
-                    self._bridge_online = False
-                    self._rec_live(
-                        "bridge_unavailable", "reject", portfolio, order,
-                        message="桥离线（dispatcher 不可达）",
-                    )
-                    self._pending_orders.pop(live_order.id, None)
-                    self._emit("order", {
-                        "portfolio_id": portfolio.portfolio_id,
-                        "order_id": live_order.id,
-                        "status": "rejected",
-                        "stock_code": live_order.stock_code,
-                        "trade_type": (live_order.trade_type or "").upper(),
-                        "quantity": live_order.quantity,
-                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                        "error_message": live_order.error_message,
-                    })
-                    db.commit()
-                    continue
-                except BridgeOrderRejected as e:
-                    # 桥业务拒单（白名单/限额/重复）→ rejected，回显桥侧真实原因
-                    # （此前被吞成笼统 "approval failed"，真机查不了原因）。
-                    live_order.status = "rejected"
-                    live_order.error_message = str(e)
-                    self._rec_live(
-                        "bridge_rejected", "reject", portfolio, order,
-                        message="桥业务拒单: %s" % str(e),
-                    )
-                    self._pending_orders.pop(live_order.id, None)
-                    self._emit("order", {
-                        "portfolio_id": portfolio.portfolio_id,
-                        "order_id": live_order.id,
-                        "status": "rejected",
-                        "stock_code": live_order.stock_code,
-                        "trade_type": (live_order.trade_type or "").upper(),
-                        "quantity": live_order.quantity,
-                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                        "error_message": live_order.error_message,
-                    })
-                    db.commit()
-                    continue
-                if trade is None:
-                    # THS file_builtin：place_order 已把指令写入交接文件并秒回 None
-                    # → 本单已受理入队，保持 submitted 等内置执行器执行 + UI 回填
-                    # 链路确认成交（执行失败单由执行器落 results rejected 回执，
-                    # 残留 submitted 单由 180s expire 兜底标 rejected）。
-                    enqueued_oid = getattr(self._dispatcher, "last_enqueued_order_id", None)
-                    if enqueued_oid and enqueued_oid == self._dispatcher.order_id(order):
-                        logger.info(
-                            "order enqueued to ths handoff: id=%s %s %s qty=%s (session %s)",
-                            live_order.id, order.trade_type.value, order.stock_code,
-                            live_order.quantity, self.session_id,
-                        )
-                    else:
-                        # 兜底：execute 内部审批不过（前置 cap 与 execute 间账户变化）
-                        # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
-                        live_order.status = "rejected"
-                        live_order.error_message = "approval failed"
-                        self._rec_live(
-                            "approval_failed", "reject", portfolio, order,
-                            message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
-                        )
-                        self._pending_orders.pop(live_order.id, None)
-                        self._emit("order", {
-                            "portfolio_id": portfolio.portfolio_id,
-                            "order_id": live_order.id,
-                            "status": "rejected",
-                            "stock_code": live_order.stock_code,
-                            "trade_type": (live_order.trade_type or "").upper(),
-                            "quantity": live_order.quantity,
-                            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                            "error_message": live_order.error_message,
-                        })
-                        db.commit()
-                        continue
-                # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
-                live_order.bridge_order_id = self._dispatcher.order_id(order)
-                # THS file_builtin：指令刚入队、执行器尚未真正下单，立即回查只会
-                # 碰到 120s 认领窗内的同形状旧单（误绑 → 成交回填张冠李戴）。
-                # ref 留 None，执行器下单后由 /deals 回填周期再定位（彼时本单是
-                # 最新同形状行，与 direct 模式同一口径）。
-                if enqueued_oid != live_order.bridge_order_id:
-                    self._try_match_order_ref(live_order)
-                # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
-                # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
-                if order.trade_type == TradeType.SELL:
-                    self._t1_checker.consume_available(order.stock_code, order.quantity)
-                db.commit()
-                logger.info(
-                    "order accepted: id=%s %s %s %s qty=%s price=%s bar=%s (session %s)",
-                    live_order.id, order.trade_type.value, order.stock_code,
-                    order.signal_name, live_order.quantity, live_order.price,
-                    order.bar_time, self.session_id,
-                )
+                # 单笔订单走完整提交闸门链（撤单追价重下共用同一提交链，批次1 3a）
+                self._submit_one_order(db, portfolio, order, bar.period)
             # 决策闸门事件随本 bar 统一落库 + SSE 推送（含 orders 为空时的 halt/strip 事件）。
             self._drain_decisions(db, portfolio)
         except Exception:
@@ -1518,6 +1330,313 @@ class LiveEngine:
             raise
         finally:
             db.close()
+
+    def _submit_one_order(
+        self,
+        db: Session,
+        portfolio: Portfolio,
+        order: OrderEvent,
+        period: Optional[str],
+        emit_signal: bool = True,
+    ) -> None:
+        """提交单笔订单走完整闸门链（_handle_bar 与撤单追价重下共用，批次1 3a）。
+
+        闸门序（与原 _handle_bar 内联段逐字等价，continue→return）：
+        1w/1mon signal SSE → 收盘后守卫 → 交易日历总闸 → B-1 未来函数 deferred
+        （risk_timing=immediate 跳过）→ 资金/T+1 审批 → 跨重启去重（D6）→
+        在途单门（F7）→ 落 submitted → 发桥（桥离线/拒单收口）。
+        闸门拦截时静默返回（决策事件已记录）；异常向上抛由调用方回滚。
+        """
+        ctx = portfolio.find_strategy(order.strategy_id)
+        if ctx is None:
+            return
+        # 1w/1mon 的 signal_cache 由注入路径提供、monitor 不重算，
+        # 保留旧成单 SSE 避免前端丢信号；其余周期由 monitor 统一发。
+        # 追价重下单非新信号（emit_signal=False），不重复推。
+        if emit_signal and (self._signal_monitor is None or period in ("1w", "1mon")):
+            self._emit("signal", {
+                "portfolio_id": portfolio.portfolio_id,
+                "strategy_id": order.strategy_id,
+                "stock_code": order.stock_code,
+                "signal_name": order.signal_name,
+                "signal_type": order.signal_type.value if order.signal_type else None,
+                "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+            })
+        # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
+        # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
+        # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
+        # 不依赖本机时钟/时区，测试与真实部署一致；主循环 60s 延迟不影响——延迟
+        # 处理的是 15:00 前的合法 bar，其 bar_time<15:00 不被拦，正常下单）。
+        # 不写 DB、不进 pending。
+        bt = order.bar_time
+        if bt is not None and (bt.hour, bt.minute) >= _MARKET_CLOSE_TIME:
+            logger.info(
+                "skip after-close order %s %s %s bar=%s (bar_time >= 15:00)",
+                order.trade_type.value, order.stock_code, order.signal_name,
+                bt,
+            )
+            self._rec_live(
+                "after_close_block", "block", portfolio, order,
+                message="bar_time %s >= 15:00 收盘后不下单" % bt,
+            )
+            return
+        # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
+        # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
+        # 周末/节假日绝不误下，真实交易日不误挡。风控 update_peak 与 signal 事件仍
+        # 照常执行（只拦落单）。
+        # 日内周期(1m/5m...)额外卡交易时段 09:30–15:00；1d/1w/1mon 的 bar_time 按
+        # 约定是当日 00:00（由 14:30 _maybe_daily_bars 统一驱动），不套时段门，
+        # 只判交易日，否则会把 14:30 合法驱动的日线单误杀。
+        if bt is not None and not self._trading_allowed_for(bt, period):
+            logger.info(
+                "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
+                order.trade_type.value, order.stock_code, order.signal_name,
+                bt, period,
+            )
+            self._rec_live(
+                "non_trading_block", "block", portfolio, order,
+                message="非交易日/非交易时段 period=%s bar=%s" % (period, bt),
+            )
+            return
+        # B-1 未来函数闸门（与回测同式判定 t.date() <= signal_bar_date）：
+        # 日线级信号（signal_bar_date 非 None，signal bar 为当日 00:00，close
+        # 未确认）当日不下单——实盘若 14:30 即真实下单、回测却次日开盘成交，
+        # 回测结果对实盘不可预测。订单进 deferred 队列，次一交易日首 bar 放行。
+        # 队列仅内存（Core 重启即丢，P2 持久化）；stop() 丢弃属预期。
+        # 批次1 risk_timing=immediate（当日确认立即执行）跳过本闸门，
+        # 当日直接提交；next_day（默认）维持次日执行。
+        if (order.signal_bar_date is not None and order.bar_time is not None
+                and order.bar_time.date() <= order.signal_bar_date
+                and getattr(ctx, "risk_timing", "next_day") != "immediate"):
+            self._signal_bar_deferred.append(order)
+            self._rec_live(
+                "signal_bar_date", "defer", portfolio, order,
+                message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
+                        "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
+            )
+            return
+        # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
+        pos = ctx.positions.get(order.stock_code)
+        if pos is None and order.trade_type == TradeType.BUY:
+            pos = Position(order.stock_code)
+            ctx.positions[order.stock_code] = pos
+        # F5/BUY 量上限：先定最终下单量（账户资金审批 / 桥 T+1 可用）再落
+        # submitted——DB 下单量与实发一致，回填不误判 partial。None=不通过不下单。
+        # B-2 策略级敞口上限：与回测 _exposure_kwargs 完全同式透传
+        # （strategy_position_value/strategy_capital_limit），多策略上限之和
+        # 可超 100% 时实盘敞口不再系统性大于回测。
+        capped = self._engine.cap_quantity(
+            order, portfolio.account, pos,
+            **self._exposure_kwargs(portfolio, ctx),
+        )
+        if capped is None:
+            logger.info(
+                "skip order %s %s %s: cap_quantity None（资金/持仓上限拦截，不下单）",
+                order.trade_type.value, order.stock_code, order.signal_name,
+            )
+            return
+        order.quantity = capped
+        # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
+        # 根因：14:30 后页面停止/再启动 = Core 重启 = 新 LiveEngine = 实例内存丢失，
+        # 1d/1w/1mon 会被重新驱动到同一 bar_time，且 order_id=live_order.id（自增 PK）
+        # 每次重启都新号，桥侧 _placed 幂等无效 → 重复下单。
+        # 按 (策略+股票+bar_time+方向) 去重：分钟策略不同 bar（10:00 vs 10:05）不被误杀、
+        # 同组合多策略同 bar 同股各自开仓不被误拦，仅「同策略重驱到同 bar 同方向」才拦。
+        # BUY/SELL 对称去重：重复 SELL 危害不亚于重复 BUY（已卖完再卖 → 超卖/桥拒单噪音）。
+        # 分钟策略不同 bar 的合法平仓不受影响（bar_time 不同即不拦）。
+        if order.bar_time is not None:
+            op = "buy" if order.trade_type == TradeType.BUY else "sell"
+            dup = db.query(LiveOrder).filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                LiveOrder.strategy_id == order.strategy_id,
+                LiveOrder.stock_code == order.stock_code,
+                LiveOrder.bar_time == order.bar_time,
+                LiveOrder.trade_type == op,
+                LiveOrder.status.in_(["submitted", "partial", "filled"]),
+            ).first()
+            if dup is not None:
+                logger.info(
+                    "skip dup %s %s %s bar=%s already placed (order %s)",
+                    op.upper(), order.stock_code, order.signal_name,
+                    order.bar_time, dup.id,
+                )
+                self._rec_live(
+                    "dup_skip", "block", portfolio, order,
+                    message="同 bar 同向单已存在 order=%s" % dup.id,
+                )
+                return
+        # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
+        # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
+        # 持仓未更新，连续 bar 的 OPEN/CLOSE 信号看持仓是旧的 → 同股同向重复
+        # 买单/卖单（真机 2026-08-13：159888/159929/159936 两根连续 bar 两次 OPEN）。
+        # 按「同向」拦：在途 BUY 不拦 SELL、在途 SELL 不拦 BUY——风控止损/平仓
+        # 卖出不被未确认的买入挡住。bar_time 不是放行理由（不同 bar 只是两次
+        # 信号时点，上一单未确认就再下同向单仍是重复）。回填确认（filled）后由
+        # portfolio.py 持仓守卫接管；rejected 释放门（被拒不会成交，必须允许重试）。
+        # 终态（filled/canceled/rejected）都不在 submitted/partial 内，正确释放门；
+        # 仅在途单占门。比重复买入更安全（prType=14 秒成秒回填，正常路径不受影响）。
+        # 追价重下单在原单收敛 canceled 之后构造（不在途），天然过门。
+        op = "buy" if order.trade_type == TradeType.BUY else "sell"
+        inflight = db.query(LiveOrder).filter(
+            LiveOrder.live_session_id == self.session_id,
+            LiveOrder.portfolio_strategy_id == order.portfolio_id,
+            LiveOrder.strategy_id == order.strategy_id,
+            LiveOrder.stock_code == order.stock_code,
+            LiveOrder.trade_type == op,
+            LiveOrder.status.in_(["submitted", "partial"]),
+        ).first()
+        if inflight is not None:
+            logger.info(
+                "skip inflight %s %s %s bar=%s (order %s still %s)",
+                op.upper(), order.stock_code, order.signal_name,
+                order.bar_time, inflight.id, inflight.status,
+            )
+            self._rec_live(
+                "inflight_skip", "block", portfolio, order,
+                message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
+            )
+            return
+        # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
+        live_order = self._persist_order_submitted(db, order)
+        self._pending_orders[live_order.id] = live_order
+        # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
+        self._emit("order", {
+            "portfolio_id": portfolio.portfolio_id,
+            "order_id": live_order.id,
+            "strategy_id": live_order.strategy_id,
+            "stock_code": live_order.stock_code,
+            "trade_type": (live_order.trade_type or "").upper(),
+            "status": "submitted",
+            "quantity": live_order.quantity,
+            "price": float(live_order.price) if live_order.price is not None else None,
+            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+        })
+        db.commit()
+        # THS file_builtin 入队标记：place_order 秒回 None 但指令已写入
+        # 交接文件时非 None（=本单确定性 order_id）。其它通道恒 None。
+        enqueued_oid: Optional[str] = None
+        try:
+            # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
+            # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
+            # 返回拒绝原因 → raise BridgeOrderRejected 沿用既有拒单路径
+            # （rejected 落库 + 决策事件 + SSE 回显原因）。配置关闭 → 完全跳过。
+            if portfolio.price_limit_check_enabled:
+                reason = self._dispatcher.check_price_limit(
+                    order.stock_code,
+                    "buy" if order.trade_type == TradeType.BUY else "sell",
+                    order.price,
+                )
+                if reason is not None:
+                    raise BridgeOrderRejected(reason)
+            # ② 再发 passorder（apply=False：submitted 阶段不更新账户持仓）
+            # B-2：execute 内部二次 cap_quantity/approve 同样透传敞口上限
+            # （跳空/价格变动后的重批与首审同口径）。
+            # Fix4：buy_fee_cfg 透传组合费用口径——execute 发单前做 BUY
+            # 费用感知前置钳制（approve 只卡价×量，尾款不足佣金会透支
+            # 虚拟现金；桥通道无法发单后改量重发）。
+            trade = self._engine.execute(
+                order, portfolio.account, pos, apply=False,
+                buy_fee_cfg=self._buy_fee_cfg(portfolio),
+                **self._exposure_kwargs(portfolio, ctx),
+            )
+        except BridgeUnavailableError:
+            # 桥离线：标 rejected + 置离线暂停（_on_bar 上层心跳循环据此暂停下单）
+            live_order.status = "rejected"
+            live_order.error_message = "bridge unavailable"
+            self._bridge_online = False
+            self._rec_live(
+                "bridge_unavailable", "reject", portfolio, order,
+                message="桥离线（dispatcher 不可达）",
+            )
+            self._pending_orders.pop(live_order.id, None)
+            self._emit("order", {
+                "portfolio_id": portfolio.portfolio_id,
+                "order_id": live_order.id,
+                "status": "rejected",
+                "stock_code": live_order.stock_code,
+                "trade_type": (live_order.trade_type or "").upper(),
+                "quantity": live_order.quantity,
+                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                "error_message": live_order.error_message,
+            })
+            db.commit()
+            return
+        except BridgeOrderRejected as e:
+            # 桥业务拒单（白名单/限额/重复）→ rejected，回显桥侧真实原因
+            # （此前被吞成笼统 "approval failed"，真机查不了原因）。
+            live_order.status = "rejected"
+            live_order.error_message = str(e)
+            self._rec_live(
+                "bridge_rejected", "reject", portfolio, order,
+                message="桥业务拒单: %s" % str(e),
+            )
+            self._pending_orders.pop(live_order.id, None)
+            self._emit("order", {
+                "portfolio_id": portfolio.portfolio_id,
+                "order_id": live_order.id,
+                "status": "rejected",
+                "stock_code": live_order.stock_code,
+                "trade_type": (live_order.trade_type or "").upper(),
+                "quantity": live_order.quantity,
+                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                "error_message": live_order.error_message,
+            })
+            db.commit()
+            return
+        if trade is None:
+            # THS file_builtin：place_order 已把指令写入交接文件并秒回 None
+            # → 本单已受理入队，保持 submitted 等内置执行器执行 + UI 回填
+            # 链路确认成交（执行失败单由执行器落 results rejected 回执，
+            # 残留 submitted 单由 180s expire 兜底标 rejected）。
+            enqueued_oid = getattr(self._dispatcher, "last_enqueued_order_id", None)
+            if enqueued_oid and enqueued_oid == self._dispatcher.order_id(order):
+                logger.info(
+                    "order enqueued to ths handoff: id=%s %s %s qty=%s (session %s)",
+                    live_order.id, order.trade_type.value, order.stock_code,
+                    live_order.quantity, self.session_id,
+                )
+            else:
+                # 兜底：execute 内部审批不过（前置 cap 与 execute 间账户变化）
+                # 或桥返回 {ok:false} 无 error（非 JSON 故障路径，#24）→ rejected
+                live_order.status = "rejected"
+                live_order.error_message = "approval failed"
+                self._rec_live(
+                    "approval_failed", "reject", portfolio, order,
+                    message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
+                )
+                self._pending_orders.pop(live_order.id, None)
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "status": "rejected",
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "quantity": live_order.quantity,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                    "error_message": live_order.error_message,
+                })
+                db.commit()
+                return
+        # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
+        live_order.bridge_order_id = self._dispatcher.order_id(order)
+        # THS file_builtin：指令刚入队、执行器尚未真正下单，立即回查只会
+        # 碰到 120s 认领窗内的同形状旧单（误绑 → 成交回填张冠李戴）。
+        # ref 留 None，执行器下单后由 /deals 回填周期再定位（彼时本单是
+        # 最新同形状行，与 direct 模式同一口径）。
+        if enqueued_oid != live_order.bridge_order_id:
+            self._try_match_order_ref(live_order)
+        # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
+        # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
+        if order.trade_type == TradeType.SELL:
+            self._t1_checker.consume_available(order.stock_code, order.quantity)
+        db.commit()
+        logger.info(
+            "order accepted: id=%s %s %s %s qty=%s price=%s bar=%s (session %s)",
+            live_order.id, order.trade_type.value, order.stock_code,
+            order.signal_name, live_order.quantity, live_order.price,
+            order.bar_time, self.session_id,
+        )
 
     def _release_signal_bar_deferred(
         self, portfolio: Portfolio, bar: BarEvent
@@ -1735,9 +1854,12 @@ class LiveEngine:
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         self._order_machine.expire_stale_orders(db, pending)
 
-    def _cancel_unfilled_orders(self, db: Session) -> None:
-        """A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（薄委托 → OrderStateMachine）。"""
-        self._order_machine.cancel_unfilled_orders(db)
+    def _cancel_unfilled_orders(self, db: Session) -> list:
+        """A-2（I-4/C-1）：在途单超时未成交 → 真实撤单（薄委托 → OrderStateMachine）。
+
+        返回本轮收敛为 canceled 的单（批次1 3a 追价重下挂点；其余调用方忽略）。
+        """
+        return self._order_machine.cancel_unfilled_orders(db)
 
     def _sync_pending_orders(self, db: Session) -> None:
         self._order_machine.sync_pending_orders(db)
