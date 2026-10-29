@@ -759,8 +759,9 @@ onUnmounted(closeEventStream)
           <label class="group-label">一、交易通道选择（三引擎对比）</label>
           <div class="guide-block">
             <p class="guide-step"><b>通达信 TQ</b>：SDK 直调，无 UI 依赖，撤单/价格校验/大额拆单全支持——<b>无人值守首选</b>。</p>
-            <p class="guide-step"><b>同花顺</b>：UI 自动化（键鼠模拟），file_builtin 文件交接；下单键入真机校准未完成——
-              建议 alert 预警模式使用，直呼模式需人在场；撤单已自动化（F3 双击）。</p>
+            <p class="guide-step"><b>同花顺</b>：UI 自动化（键鼠模拟），file_builtin 文件交接；下单键入已真机校准
+              （2026-10-29 实证：代码/价格/数量三字段全落框、真实委托成交）——撤单已自动化（F3 双击/OCR 导航）；
+              运行期间勿触碰键鼠（UI 独占前台）。</p>
             <p class="guide-step"><b>iQuant 桥</b>：HTTP 桥接，prType 秒成场景；无撤单/无涨跌停校验（expire 兜底），需人工核对。</p>
             <p class="guide-note">· 前置条件与通道配置入口：系统设置 → 对应通道段（通达信 TQ 交易通道 / 同花顺交易通道 / iQuant 桥）。</p>
           </div>
@@ -802,7 +803,7 @@ onUnmounted(closeEventStream)
           <div class="guide-block">
             <p class="guide-step"><b>预警（alert）</b>：信号/风控全套落文件+推送，不下单——半自动。</p>
             <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行。</p>
-            <p class="guide-note" style="color:var(--red)">· THS 键入校准状态提示：下单键入真机校准未完成，THS 自动模式慎用（撤单/读回已可用）。</p>
+            <p class="guide-note">· THS 自动模式已真机验证（下单→成交→撤单全链路）；首次实盘建议小单先行；运行期间勿触碰键鼠。</p>
           </div>
         </div>
 
