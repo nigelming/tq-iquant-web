@@ -534,40 +534,42 @@ def test_direct_mode_place_order_delegates_to_ui(tmp_path):
         monkey.undo()
 
 
-class _FakeUiaField:
-    """UIA 字段替身：记录 click_input 次数，按 control_id 匹配。"""
+class _FakeField:
+    """UIA 字段替身：control_id + rect（供 _click_field 计算点击坐标）。"""
 
-    def __init__(self, control_id):
+    def __init__(self, control_id, left, top, width):
         self.element_info = SimpleNamespace(control_id=control_id)
-        self.clicks = 0
+        self._left, self._top, self._w = left, top, width
 
-    def click_input(self):
-        self.clicks += 1
-
-
-class _FakeUiaWin:
-    def __init__(self):
-        self.fields = {
-            1032: _FakeUiaField(1032),   # 证券代码
-            1033: _FakeUiaField(1033),   # 委托价格
-            1034: _FakeUiaField(1034),   # 委托数量
-        }
-
-    def descendants(self, control_type="Edit"):
-        assert control_type == "Edit"
-        return list(self.fields.values())
+    def rectangle(self):
+        return SimpleNamespace(
+            left=self._left, top=self._top,
+            right=self._left + self._w, bottom=self._top + 30,
+            width=lambda: self._w,
+        )
 
 
-def test_execute_via_ui_kbsend_tab_flow_buy_and_sell(monkeypatch):
-    """kb_send TAB 焦点序逐字段键入断言（真机 GetFocusedElement/OCR/像素
-    三重探针实证）：F1/F2 方向 → TAB 代码 → TAB **显式委托价格**（限价语义）
-    → TAB 数量 → ENTER；键入全程 kb_send（不重置字段焦点）。"""
+def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
+    """校准点击流断言：F1/F2 方向；代码框点击=rect 左起 8px（避开下拉按钮）、
+    价格/数量中心点击；键入 kb_send 序（^a 清空 + 值）；显式价格（限价语义）。"""
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     d._connected = True
+    clicks = []
     kb_transcript = []
     switches = []
+    fake_fields = {
+        "code": _FakeField(1032, 316, 141, 121),
+        "price": _FakeField(1033, 316, 205, 98),
+        "quantity": _FakeField(1034, 316, 301, 98),
+    }
+
     monkeypatch.setattr(d, "_gui_guard", lambda: True)
     monkeypatch.setattr(d, "_switch", lambda k: switches.append(k))
+    monkeypatch.setattr(d, "_uia_window", lambda: object())
+    monkeypatch.setattr(d, "_uia_field", lambda w, kind: fake_fields[kind])
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "click",
+                        lambda coords: clicks.append((coords[0], coords[1])))
     monkeypatch.setattr(d, "kb_send", lambda k: kb_transcript.append(k))
     monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
     monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
@@ -578,23 +580,30 @@ def test_execute_via_ui_kbsend_tab_flow_buy_and_sell(monkeypatch):
     d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
                              price=Decimal("1700.55")))
     assert switches == ["{F1}"]                    # 买入 → F1
+    # 代码框点击 x = 316+8 = 324（左偏 8px，避开下拉按钮）
+    assert clicks[0] == (324, 156)
+    # 价格/数量中心点击
+    assert clicks[1] == (316 + 49, 220)
+    assert clicks[2] == (316 + 49, 316)
     assert kb_transcript == [
-        "{TAB}", "600519",
-        "{TAB}", "1700.55",                        # 显式价格（限价）
-        "{TAB}", "100",
+        "^a{DELETE}", "600519",
+        "^a{DELETE}", "1700.55",                   # 显式价格（限价）
+        "^a{DELETE}", "100",
         "{ENTER}",
     ]
 
-    switches.clear()
+    clicks.clear()
     kb_transcript.clear()
+    switches.clear()
     d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
                              price=Decimal("9.99"),
                              trade_type=TradeType.SELL,
                              signal_type=SignalType.CLOSE))
     assert switches == ["{F2}"]                    # 卖出 → F2
+    assert clicks[0] == (324, 156)
     assert kb_transcript == [
-        "{TAB}", "000001",
-        "{TAB}", "9.99",
-        "{TAB}", "300",
+        "^a{DELETE}", "000001",
+        "^a{DELETE}", "9.99",
+        "^a{DELETE}", "300",
         "{ENTER}",
     ]

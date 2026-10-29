@@ -338,6 +338,18 @@ class ThsUiDispatcher(OrderDispatcher):
                 continue
         return None
 
+    @staticmethod
+    def _click_field(field, left_offset: int = None) -> None:
+        """真实鼠标点击字段区域。left_offset：代码框等「输入+下拉按钮」组合
+        必须点输入区左侧——真机校准：代码框左起 8px 落框，中心点会点到下拉
+        按钮（像素差异扫描校准，见 .superpowers/sdd/calibrate_ths_code.py）。"""
+        from pywinauto import mouse
+        r = field.rectangle()
+        x = r.left + (left_offset if left_offset is not None else r.width() // 2)
+        y = (r.top + r.bottom) // 2
+        mouse.click(coords=(x, y))
+        time.sleep(0.3)
+
     def kb_send(self, keys: str) -> None:
         """向当前焦点控件发送键入（SendInput）——不重置窗口焦点。
 
@@ -1298,9 +1310,10 @@ class ThsUiDispatcher(OrderDispatcher):
     def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
         """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。
 
-        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 切页 / **全程 kb_send（SendInput 不重置焦点）TAB 焦点序逐字段键入**
-        （代码→价格→数量）——_key 的 _focus() 会打掉字段焦点（真机 OCR 实证
-        屏幕零变化），Timings.fast() 会丢字符，均已在键入路径规避。
+        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 切页 / **鼠标点击进字段（真机校准偏移）+ kb_send 键入**——代码框
+        「输入区左起 8px」（中心点会点到下拉按钮）、价格/数量中心点击；键入
+        全程 kb_send（_key 的 _focus() 会打掉字段焦点、Timings.fast() 会丢
+        字符，均已规避）。
         确认框 / _find_order 回查 / 合成 TradeEvent；成交时序由回填负责。
         """
         self._last_submit_ref = ""
@@ -1335,20 +1348,37 @@ class ThsUiDispatcher(OrderDispatcher):
                 except Exception:
                     pass
             self._switch(self.TAB_BUY if order.trade_type.value == "BUY" else self.TAB_SELL)
-            # 真机实证三连（焦点探针/整窗 OCR 零新增词/像素差异）：
-            # 1) _key 每次先 _focus() 重置主窗口焦点——TAB 建立的字段焦点被
-            #    打掉、字符被吃（屏幕零变化）；字段键入必须全程 kb_send
-            #    （SendInput 直发当前焦点控件，不重置焦点）。
-            # 2) Timings.fast() 使自绘控件丢字符——键入前恢复默认时序。
-            # 3) F1 切页后焦点在页签按钮，TAB 焦点序：代码(1032)→价格(1033)
-            #    →数量(1034)（GetFocusedElement 逐键探针实测）。
-            self.kb_send("{TAB}")       # → 证券代码
+            # 键入三要素（真机像素差异扫描/焦点探针/整窗 OCR 实证）：
+            # 1) 代码框=「输入区+下拉按钮」组合——点击必须落在输入区**左起 8px**
+            #    （中心点会点到下拉按钮、键入丢失）；价格/数量中心点击即可。
+            # 2) _key 每次先 _focus() 重置主窗口焦点打掉字段焦点、Timings.fast()
+            #    丢字符——键入用 kb_send（SendInput 直发焦点控件）+ defaults 时序。
+            # 3) 字段定位：UIA control_id 代码=1032、价格=1033、数量=1034。
+            uia_win = self._uia_window()
+            if uia_win is None:
+                raise BridgeUnavailableError("ths UIA backend unavailable")
+            code_f = self._uia_field(uia_win, "code")
+            price_f = self._uia_field(uia_win, "price")
+            vol_f = self._uia_field(uia_win, "quantity")
+            missing = [k for k, f in
+                       (("code", code_f), ("price", price_f), ("quantity", vol_f))
+                       if f is None]
+            if missing:
+                raise BridgeUnavailableError(
+                    "ths 下单页字段未定位（UIA control_id=%s）: %s"
+                    % (self._ORDER_FIELD_IDS, ",".join(missing)))
+            self._click_field(code_f, left_offset=8)
+            self.kb_send("^a{DELETE}")
             self.kb_send(code)
-            time.sleep(self._SWITCH_WAIT)
-            self.kb_send("{TAB}")       # → 委托价格（显式限价，与回测审批价一致）
+            # 真机实证（委托价格 4.415 ≠ 键入 4.153）：代码键入后 THS 异步用
+            # 最新价覆盖价格框——必须等自动填充完成再改价格，否则键入价被覆盖。
+            time.sleep(4.0)
+            self._click_field(price_f)
+            self.kb_send("^a{DELETE}")
             self.kb_send(str(price))
             time.sleep(0.3)
-            self.kb_send("{TAB}")       # → 委托数量
+            self._click_field(vol_f)
+            self.kb_send("^a{DELETE}")
             self.kb_send(str(vol))
             time.sleep(0.3)
             before = self._snapshot_hwnds()
