@@ -388,7 +388,10 @@ async function doTestRun() {
   testRunning.value = true
   try {
     testResult.value = await testRunFormula({
-      content: testRunSource.value.content,
+      // 通达信导入公式平台库不存源码（content 空）→ 后端按 formula_id 走
+      // 公式名计算（与回测/实盘同路径）；手工新建公式有源码 → 源码试算
+      content: testRunSource.value.content || '',
+      formula_id: testRunSource.value.id,
       stock_codes: codes,
       period: testRunForm.value.period,
       count: testRunForm.value.count || 20,

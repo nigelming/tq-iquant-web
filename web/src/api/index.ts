@@ -750,10 +750,11 @@ export interface TestRunResult {
 }
 
 export interface TestRunRequest {
-  content: string          // 公式源码
-  stock_codes: string[]    // 股票代码（带后缀，如 000001.SZ），≤20 只
+  content?: string         // 公式源码（可选——通达信导入公式平台库不存源码，留空走 formula_id 按名计算）
+  formula_id?: number      // content 为空时必填：平台公式 id（按名调通达信计算，与回测/实盘同路径）
+  stock_codes: string[]    // 股票代码（含后缀格式，如 000001.SZ）最多20 只
   period: string           // 1m|5m|15m|30m|1h|1d|1w|1mon
-  count?: number           // bar 数（默认 20）
+  count?: number           // bar 根数（默认 20）
   dividend_type?: number   // 复权类型（默认 1=前复权）
   formula_type?: number    // 公式类型（默认 0=技术指标）
 }
