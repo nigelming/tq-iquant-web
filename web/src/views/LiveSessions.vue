@@ -27,6 +27,8 @@ const channelTesting = ref(false)
 const channelTestMsg = ref<{ ok: boolean; text: string } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const showCreate = ref(false)
+// M2 实盘配置指南弹窗
+const showGuide = ref(false)
 // 默认与后端 create_session 对齐：新会话默认 alert（半自动预警，仅 TQ 行情+send_warn，不下单）
 const form = ref({
   name: '', mode: 'simulation',
@@ -440,6 +442,7 @@ onUnmounted(closeEventStream)
 
 <template>
   <PageHeader title="实盘交易">
+    <button class="btn btn-sm" @click="showGuide = true" data-field="live-guide-toggle">📖 配置指南</button>
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </PageHeader>
 
@@ -740,6 +743,80 @@ onUnmounted(closeEventStream)
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
         <button @click="showCreate = false" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 实盘配置指南 Modal（M2）============ -->
+  <div v-if="showGuide" class="modal-overlay modal-lg" @click.self="showGuide = false">
+    <div class="modal-content">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <h3 style="margin:0">实盘配置指南</h3>
+        <button class="btn btn-sm" @click="showGuide = false">关闭</button>
+      </div>
+      <div class="modal-body" style="margin-top:12px">
+        <div class="form-group">
+          <label class="group-label">一、交易通道选择（三引擎对比）</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>通达信 TQ</b>：SDK 直调，无 UI 依赖，撤单/价格校验/大额拆单全支持——<b>无人值守首选</b>。</p>
+            <p class="guide-step"><b>同花顺</b>：UI 自动化（键鼠模拟），file_builtin 文件交接；下单键入真机校准未完成——
+              建议 alert 预警模式使用，直呼模式需人在场；撤单已自动化（F3 双击）。</p>
+            <p class="guide-step"><b>iQuant 桥</b>：HTTP 桥接，prType 秒成场景；无撤单/无涨跌停校验（expire 兜底），需人工核对。</p>
+            <p class="guide-note">· 前置条件与通道配置入口：系统设置 → 对应通道段（通达信 TQ 交易通道 / 同花顺交易通道 / iQuant 桥）。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">二、会话与组合</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>一个会话 = 一个引擎 + N 个组合</b>（新建实盘多选）；组合内多策略并行。</p>
+            <p class="guide-step"><b>多会话并行</b>：支持（不同引擎/不同账户）；<b>同花顺通道同时仅一个会话</b>（键鼠独占）。</p>
+            <p class="guide-step"><b>复制交易</b>：同一组合挂多个会话 = 各账户独立记账、同一信号两账户各执行一次（执行偏差自担）；
+              资金基准 live_capital 按各账户规模设置。</p>
+            <p class="guide-note" style="color:var(--red)"><b>禁止</b>：同一资金账号挂两个会话（资金竞争）。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">三、实盘执行配置（策略表单「实盘执行」分组）</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>撤单后追价重下 requote</b>：超时未成交 → 自动撤单 → 追 1 tick 重下
+              （最多 requote_max_attempts 次）；默认关。</p>
+            <p class="guide-step"><b>大额拆单（仅 TDX）</b>：单笔 ≥ split_order_threshold → 拆 N 子单，成交驱动续发；默认关。</p>
+            <p class="guide-step"><b>风控执行时点 risk_timing</b>：next_day（默认，与回测一致——日线信号次日执行）/
+              immediate（当日确认当日执行）。</p>
+            <p class="guide-note">· 上述默认关闭 = 与回测行为一致；开启后建议先仿真观察。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">四、原有持仓</label>
+          <div class="guide-block">
+            <p class="guide-step">账户存量持仓自动显示为「<b>原有持仓</b>」（灰色），仅供监视不参与策略交易。</p>
+            <p class="guide-note">· 需会话运行中才显示；与策略持仓（蓝色）分列来源；对账差异含原有持仓属正常。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">五、执行模式</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>预警（alert）</b>：信号/风控全套落文件+推送，不下单——半自动。</p>
+            <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行。</p>
+            <p class="guide-note" style="color:var(--red)">· THS 键入校准状态提示：下单键入真机校准未完成，THS 自动模式慎用（撤单/读回已可用）。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">六、风险提示</label>
+          <div class="guide-block">
+            <p class="guide-note">· 同一资金账号禁止挂两个会话。</p>
+            <p class="guide-note">· 同花顺真实账户操作请先小单验证。</p>
+            <p class="guide-note">· 佣金/印花税按柜台真实回报记账；下单前费用为估算。</p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button @click="showGuide = false" class="btn btn-primary">知道了</button>
       </div>
     </div>
   </div>

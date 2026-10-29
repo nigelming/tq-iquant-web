@@ -1231,3 +1231,56 @@ describe('LiveSessions.vue 预警信号同步自选（1.3.1）', () => {
     w.unmount()
   })
 })
+
+describe('LiveSessions.vue 实盘配置指南弹窗（M2）', () => {
+  it('页头「📖 配置指南」按钮 → 打开弹窗，含三引擎标题与关键词条', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 初始无指南弹窗
+    expect(w.find('.modal-lg').exists()).toBe(false)
+
+    await w.find('[data-field="live-guide-toggle"]').trigger('click')
+    await flushPromises()
+
+    const modal = w.find('.modal-lg')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toContain('实盘配置指南')
+    // 一、交易通道选择（三引擎对比）
+    expect(modal.text()).toContain('交易通道选择')
+    expect(modal.text()).toContain('通达信 TQ')
+    expect(modal.text()).toContain('同花顺')
+    expect(modal.text()).toContain('iQuant 桥')
+    expect(modal.text()).toContain('无人值守首选')
+    expect(modal.text()).toContain('prType')
+    // 二、会话与组合
+    expect(modal.text()).toContain('会话与组合')
+    expect(modal.text()).toContain('复制交易')
+    // 三、实盘执行配置
+    expect(modal.text()).toContain('requote')
+    expect(modal.text()).toContain('split_order_threshold')
+    expect(modal.text()).toContain('risk_timing')
+    // 四、原有持仓
+    expect(modal.text()).toContain('原有持仓')
+    // 五、执行模式
+    expect(modal.text()).toContain('执行模式')
+    // 六、风险提示
+    expect(modal.text()).toContain('风险提示')
+    expect(modal.text()).toContain('同一资金账号禁止挂两个会话')
+    w.unmount()
+  })
+
+  it('弹窗点「关闭」→ 收起', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-field="live-guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.find('.modal-lg').exists()).toBe(true)
+
+    await w.findAll('button').find((b) => b.text() === '关闭')!.trigger('click')
+    await flushPromises()
+    expect(w.find('.modal-lg').exists()).toBe(false)
+    w.unmount()
+  })
+})
