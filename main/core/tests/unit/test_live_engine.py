@@ -7055,3 +7055,59 @@ def test_stop_emits_risk_summary_when_cancel_fails_or_no_ref():
     assert "撤单失败" in ev["message"] and "W001" in ev["message"]
     assert "无 order_ref" in ev["message"] and "600000.SH" in ev["message"]
     assert q.empty()  # 只汇总一条，不刷屏
+
+
+# ===========================================================================
+# 批次1 C：风控/信号执行时点 risk_timing（immediate=当日确认立即执行 /
+# next_day=当日信号次日执行，维持 B-1 deferred 现行为）
+# ===========================================================================
+def test_handle_bar_risk_timing_immediate_skips_deferred():
+    """risk_timing=immediate：日线信号当日立即提交，跳过 deferred 闸门。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    ctx.risk_timing = "immediate"
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)  # 日线约定 00:00
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"  # 当日已提交
+    db.close()
+    assert engine._signal_bar_deferred == []  # 不进 deferred 队列
+    assert any(r.url.path == "/order" for r in rec.requests)  # 已发桥
+
+
+def test_handle_bar_risk_timing_next_day_keeps_deferred():
+    """risk_timing=next_day（默认）：维持 B-1 现行为——当日 deferred，次日放行。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    ctx.risk_timing = "next_day"
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 当日不落单
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1  # 进 deferred 队列
+
+

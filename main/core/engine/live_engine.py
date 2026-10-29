@@ -1278,8 +1278,11 @@ class LiveEngine:
                 # 未确认）当日不下单——实盘若 14:30 即真实下单、回测却次日开盘成交，
                 # 回测结果对实盘不可预测。订单进 deferred 队列，次一交易日首 bar 放行。
                 # 队列仅内存（Core 重启即丢，P2 持久化）；stop() 丢弃属预期。
+                # 批次1 risk_timing=immediate（当日确认立即执行）跳过本闸门，
+                # 当日直接提交；next_day（默认）维持次日执行。
                 if (order.signal_bar_date is not None and order.bar_time is not None
-                        and order.bar_time.date() <= order.signal_bar_date):
+                        and order.bar_time.date() <= order.signal_bar_date
+                        and getattr(ctx, "risk_timing", "next_day") != "immediate"):
                     self._signal_bar_deferred.append(order)
                     self._rec_live(
                         "signal_bar_date", "defer", portfolio, order,
