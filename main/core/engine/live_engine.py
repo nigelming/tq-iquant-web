@@ -14,8 +14,9 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -173,6 +174,13 @@ class LiveEngine:
         # requote_max_attempts 次数上限兜底，重启后最坏多追价一轮）。
         # key=(strategy_id, stock_code, signal_name, bar_date)，value=已用重试次数。
         self._requote_attempts: Dict[tuple, int] = {}
+        # 批次2：TDX 大额拆单队列（成交驱动）。key=(strategy_id, stock_code)，
+        # value={"inflight": OrderEvent 当前在途子单, "pending": [OrderEvent 未提交子单],
+        #        "portfolio": Portfolio, "period": str}。子单 1 落库提交后入队，
+        # 由 _tick_split_children（deals 回填循环末尾）在前子单成交后逐笔续发。
+        # 仅内存：Core 重启即丢（未提交子单不落库无从重建；已落库子单由 D6 去重
+        # 防重放，与 _signal_bar_deferred 同语义）。
+        self._split_children: Dict[tuple, dict] = {}
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
@@ -728,6 +736,18 @@ class LiveEngine:
                 len(self._signal_bar_deferred), self.session_id,
             )
         self._signal_bar_deferred.clear()
+        # 批次2：清空拆单队列。在途子单（已落库 submitted）由 I-3 stop 撤单与
+        # 超时撤单兜底；未提交子单不落库，随队列丢弃（预期行为，记日志留痕）。
+        if self._split_children:
+            dropped = sum(
+                len(e.get("pending") or [])
+                for e in self._split_children.values()
+            )
+            logger.info(
+                "stop: drop %d pending split child order(s) across %d queue(s) "
+                "(session %s)", dropped, len(self._split_children), self.session_id,
+            )
+        self._split_children.clear()
         # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
         # 跑完后 close 自然获得锁（同池 max_workers=1 串行排队），事件循环不被
         # TDX 退订对账阻塞（原先在事件循环线程同步 close，秒级冻结）。
@@ -968,6 +988,10 @@ class LiveEngine:
             with self._book_lock:
                 self._consume_execution_receipts()
                 self._poll_deals()
+                # 批次2：拆单队列成交驱动续发——必须在 _poll_deals 之后：
+                # 依赖本轮回填/终态同步把队首子单推进到 filled/canceled/rejected，
+                # 再决定续发下一笔或整队中止。同持 _book_lock（RLock 可重入）。
+                self._tick_split_children()
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
 
@@ -1497,6 +1521,14 @@ class LiveEngine:
                 message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
             )
             return
+        # 批次2：TDX 大额拆单——资格命中则不提交原单，拆为等量子单队列：
+        # 仅立即提交子单 1，其余由 _tick_split_children 在前子单成交回填后
+        # 逐笔续发（F7 同向在途闸：前一子单未离场前续发必被拦；真实柜台按笔
+        # 独立冻结资金，顺序提交不等成交会超预算——成交结算后子单审批现金才对）。
+        # 资格判定在原单落库前——原单不落库，子单 1 带同 bar_time 落库，
+        # 重启重驱同一信号由 D6 去重挡住，不会重复下单。
+        if self._maybe_split_order(db, portfolio, order, ctx, period):
+            return
         # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
         live_order = self._persist_order_submitted(db, order)
         self._pending_orders[live_order.id] = live_order
@@ -1625,7 +1657,18 @@ class LiveEngine:
         # ref 留 None，执行器下单后由 /deals 回填周期再定位（彼时本单是
         # 最新同形状行，与 direct 模式同一口径）。
         if enqueued_oid != live_order.bridge_order_id:
-            self._try_match_order_ref(live_order)
+            # 批次2：提交时认领必须携带 DB 已占 refs——TDX/THS legacy 模糊匹配按
+            # 代码+方向+数量认领，同票同向等量的后续单（拆单等量子单/同量重下）
+            # 若 claimed 为空会把在提交窗口内可见的前单委托行绑到自己头上 →
+            # /deals 按 ref 双份回填 → 持仓翻倍。带全量已占 ref 后前单被排除，
+            # 只能绑自己的委托行（找不到则留 None 下轮回填再找，行为不变）。
+            claimed_refs_now = {
+                r[0] for r in db.query(LiveOrder.order_ref).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.order_ref.isnot(None),
+                ).all()
+            }
+            self._try_match_order_ref(live_order, claimed_refs=claimed_refs_now)
         # F6：SELL 已发单成功 → 从 bar 可用量扣减（同 bar 后续 SELL 见递减后的值，
         # 避免 A 卖 600+B 卖 400 超券商 available；扣过量钳到 0，券商端仍兜底）。
         if order.trade_type == TradeType.SELL:
@@ -1637,6 +1680,197 @@ class LiveEngine:
             order.signal_name, live_order.quantity, live_order.price,
             order.bar_time, self.session_id,
         )
+
+    # ---------------- 批次2：TDX 大额拆单（成交驱动子单队列）----------------
+
+    def _maybe_split_order(self, db: Session, portfolio: Portfolio,
+                           order: OrderEvent, ctx, period: Optional[str]) -> bool:
+        """TDX 大额拆单资格判定 + 子单队列建立。True=已拆单（调用方不再提交原单）。
+
+        资格：ctx.split_order_enabled 且通道 tdx_tq 且 price×quantity ≥
+        split_order_threshold（阈值 ≤0 视为未配置不拆；金额=阈值 → n=1 不拆）。
+        命中则按 n=ceil(金额/阈值) 拆等量子单（vol//n，余数依次补给前 vol%n 笔，
+        Σ=原量，每子单金额 ≤ 阈值+一手内偏差），子单 1 立即走完整提交闸门链
+        （独立审批 cap_quantity/exposure），其余入 _split_children 队列等续发。
+
+        同 (策略,股票) 已有队列 → 新单子单 append 排队（F7 保证同向在途唯一，
+        撞键仅发生在「队首已成交待续发」窗口；反方向大单不拆直接单笔提交，
+        保风控退出时效，且 SELL 不冻结现金无超预算问题）。子单带 _split_child
+        标记不再二次拆分。子单 bar_time 毫秒级递增：D6 跨重启去重键互异，
+        收盘守卫/日历/deferred 按 date/hour/minute 判定不受毫秒影响。
+        """
+        if getattr(order, "_split_child", False):
+            return False
+        if not getattr(ctx, "split_order_enabled", False):
+            return False
+        if getattr(self._dispatcher, "channel", None) != "tdx_tq":
+            return False
+        threshold = getattr(ctx, "split_order_threshold", None)
+        if (order.price is None or not order.quantity or threshold is None
+                or threshold <= 0):
+            return False
+        amount = order.price * order.quantity
+        if amount < threshold:
+            return False
+        n = int((amount / threshold).to_integral_value(rounding=ROUND_CEILING))
+        n = min(n, order.quantity)  # 防子单 0 股（阈值极小/股数极少时）
+        if n <= 1:
+            return False
+        base = order.quantity // n
+        rem = order.quantity - base * n
+        children: List[OrderEvent] = []
+        for i in range(n):
+            child = replace(order, quantity=base + (1 if i < rem else 0))
+            child._split_child = True
+            if child.bar_time is not None:
+                child.bar_time = child.bar_time + timedelta(milliseconds=i)
+            children.append(child)
+        self._rec_live(
+            "split_order", "split", portfolio, order,
+            message="大额拆单：金额 %s ≥ 阈值 %s，拆为 %d 笔子单（%s 股），成交驱动依次提交"
+                    % (amount, threshold, n, "+".join(str(c.quantity) for c in children)),
+        )
+        with self._book_lock:
+            key = (order.strategy_id, order.stock_code)
+            entry = self._split_children.get(key)
+            if entry is not None:
+                # 同策略同票已有队列：新单子单排队等待当前队列完成，不并行提交
+                entry["pending"].extend(children)
+                self._rec_live(
+                    "split_order", "split", portfolio, order,
+                    message="已有拆单队列在途：本单 %d 笔子单排队等待依次提交"
+                            % len(children),
+                )
+                return True
+            self._split_children[key] = {
+                "inflight": children[0],
+                "pending": children[1:],
+                "portfolio": portfolio,
+                "period": period,
+            }
+            # 子单 1 立即提交（走完整闸门链）。提交返回时落库行必已 commit
+            # （submitted 或 rejected），deals 池据行状态续发/中止。
+            self._submit_one_order(db, portfolio, children[0], period,
+                                   emit_signal=False)
+            if self._find_split_child_row(db, children[0]) is None:
+                # 防御：子单 1 被前置闸门吞掉且未落库（审批/deferred 等）→ 不建队列
+                self._split_children.pop(key, None)
+                self._rec_live(
+                    "split_order", "abort", portfolio, order,
+                    message="拆单中止：子单 1 未受理（前置闸门拦截），剩余 %d 笔不提交"
+                            % (n - 1),
+                )
+        return True
+
+    def _find_split_child_row(self, db: Session,
+                              child: Optional[OrderEvent]) -> Optional[LiveOrder]:
+        """子单 OrderEvent → LiveOrder 落库行。不过滤状态（终态也要能查到）。
+
+        子单 bar_time 毫秒级互异 + 原单不落库，(session, 组合, 策略, 股票, 方向,
+        bar_time) 精确唯一定位本子单。"""
+        if child is None:
+            return None
+        op = "buy" if child.trade_type == TradeType.BUY else "sell"
+        return (
+            db.query(LiveOrder)
+            .filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.portfolio_strategy_id == child.portfolio_id,
+                LiveOrder.strategy_id == child.strategy_id,
+                LiveOrder.stock_code == child.stock_code,
+                LiveOrder.trade_type == op,
+                LiveOrder.bar_time == child.bar_time,
+            )
+            .order_by(LiveOrder.id.desc())
+            .first()
+        )
+
+    def _tick_split_children(self) -> None:
+        """批次2：拆单队列成交驱动续发（_tick_deals 回填后调用，持 _book_lock）。
+
+        遍历队列：队首（inflight）子单 filled → pop 并提交下一笔（走
+        _submit_one_order 完整闸门链，独立审批）；pending 已空 → complete 决策
+        事件 + 清队。队首子单 canceled/rejected（超时撤单/柜台废单/桥拒单）→
+        整队丢弃 + abort 决策事件（message 含剩余数量）。submitted/partial →
+        等下轮回填。"""
+        if not self._split_children:
+            return
+        db = self._db_session_factory()
+        try:
+            first_port: Optional[Portfolio] = None
+            for key in list(self._split_children.keys()):
+                entry = self._split_children.get(key)
+                if entry is None:
+                    continue
+                if first_port is None:
+                    first_port = entry.get("portfolio")
+                self._advance_split_queue(db, key, entry)
+            self._drain_decisions(db, first_port)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _advance_split_queue(self, db: Session, key: tuple, entry: dict) -> None:
+        """推进单个拆单队列（持 _book_lock 调用）：续发 / 完成 / 中止 / 等待。"""
+        portfolio = entry.get("portfolio")
+        inflight: Optional[OrderEvent] = entry.get("inflight")
+        if portfolio is None or inflight is None:
+            self._split_children.pop(key, None)  # 组合/子单缺失（理论不可达）：清队
+            return
+        row = self._find_split_child_row(db, inflight)
+        pending: List[OrderEvent] = entry.get("pending") or []
+        if row is None:
+            # 防御：在途子单无落库行（正常路径子单落库后才建队）→ 视同废单中止
+            self._abort_split_queue(key, portfolio, inflight, 0, pending,
+                                    reason="在途子单无落库记录")
+            return
+        if row.status == "filled":
+            if not pending:
+                self._rec_live(
+                    "split_order", "complete", portfolio, inflight,
+                    message="拆单队列完成：全部子单已成交",
+                )
+                self._split_children.pop(key, None)
+                return
+            nxt = pending.pop(0)
+            entry["inflight"] = nxt
+            entry["pending"] = pending
+            self._submit_one_order(db, portfolio, nxt, entry.get("period"),
+                                   emit_signal=False)
+            if self._find_split_child_row(db, nxt) is None:
+                # 续发子单未落库（审批/前置闸门拦截）→ 中止剩余，防队列空转
+                self._abort_split_queue(key, portfolio, nxt, 0, pending,
+                                        reason="续发子单未受理（前置闸门拦截）")
+            return
+        if row.status in ("canceled", "rejected"):
+            self._abort_split_queue(
+                key, portfolio, inflight,
+                int(row.quantity or 0) - int(row.filled_quantity or 0), pending,
+                reason="子单%s（%s）" % (
+                    "已撤单" if row.status == "canceled" else "已废单/被拒",
+                    (row.error_message or row.status or "")[:80],
+                ),
+            )
+        # submitted/partial：等下轮回填
+
+    def _abort_split_queue(self, key: tuple, portfolio: Portfolio,
+                           order: OrderEvent, unfilled: int,
+                           pending: List[OrderEvent], reason: str) -> None:
+        """整队中止：abort 决策事件（中文含剩余数量）+ 清队。剩余 = 在途子单
+        未成交量 + 全部未提交子单量（已成交部分保留账面，不回滚）。"""
+        remaining = max(0, unfilled) + sum(c.quantity for c in pending)
+        self._rec_live(
+            "split_order", "abort", portfolio, order,
+            message="拆单中止：%s，丢弃剩余 %d 股（未提交 %d 笔）"
+                    % (reason, remaining, len(pending)),
+        )
+        logger.warning(
+            "split queue aborted (session %s) key=%s: %s, remaining=%d",
+            self.session_id, key, reason, remaining,
+        )
+        self._split_children.pop(key, None)
 
     def _release_signal_bar_deferred(
         self, portfolio: Portfolio, bar: BarEvent
