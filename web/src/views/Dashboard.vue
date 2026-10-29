@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import {
   getStockPools, getFormulas, getPortfolios, getBacktestRecords,
-  getLiveSessions, getSystemConfigs, getSystemStatus,
+  getLiveSessions, getSystemConfigs, getSystemStatus, getLiveChannel,
   type BacktestRecordItem, type SystemConfig, type SystemStatus,
+  type LiveSessionItem,
 } from '../api'
 
 const loading = ref(true)
@@ -14,9 +15,22 @@ const formulaCount = ref(0)
 const portfolioCount = ref(0)
 const backtestCount = ref(0)
 const liveCount = ref(0)
+const liveRunning = ref(0)
 const recentBacktests = ref<BacktestRecordItem[]>([])
 const cfg = ref<SystemConfig | null>(null)
 const status = ref<SystemStatus | null>(null)
+const liveSessions = ref<LiveSessionItem[]>([])
+const channels = ref<{ key: string; label: string; online: boolean | null }[]>([])
+
+const ENGINE_LABEL: Record<string, string> = {
+  tdx: '通达信 TQ', ths: '同花顺', iquant: 'iQuant 桥',
+}
+const EXEC_MODE_LABEL: Record<string, string> = {
+  alert: '预警', auto: '自动',
+}
+
+const liveRunningSessions = computed(() =>
+  liveSessions.value.filter((s) => s.status === 'running'))
 
 async function load() {
   errorMsg.value = ''
@@ -24,8 +38,10 @@ async function load() {
   const results = await Promise.allSettled([
     getStockPools(), getFormulas(), getPortfolios(), getBacktestRecords(),
     getLiveSessions(), getSystemConfigs(), getSystemStatus(),
+    getLiveChannel('tdx'), getLiveChannel('ths'), getLiveChannel('iquant'),
   ])
-  const [pools, formulas, portfolios, backtests, lives, configs, sys] = results
+  const [pools, formulas, portfolios, backtests, lives, configs, sys,
+    chTdx, chThs, chIquant] = results
 
   if (pools.status === 'fulfilled') poolCount.value = pools.value.length
   if (formulas.status === 'fulfilled') formulaCount.value = formulas.value.length
@@ -35,9 +51,23 @@ async function load() {
     // 最近 5 条回测记录，新的在前
     recentBacktests.value = backtests.value.slice(0, 5)
   }
-  if (lives.status === 'fulfilled') liveCount.value = lives.value.length
+  if (lives.status === 'fulfilled') {
+    liveSessions.value = lives.value
+    liveCount.value = lives.value.length
+    liveRunning.value = lives.value.filter((s) => s.status === 'running').length
+  }
   if (configs.status === 'fulfilled') cfg.value = configs.value
   if (sys.status === 'fulfilled') status.value = sys.value
+
+  const channelDefs: [string, any][] = [
+    ['tdx', chTdx], ['ths', chThs], ['iquant', chIquant],
+  ]
+  channels.value = channelDefs.map(([key, r]) => {
+    const fallback = { key, label: ENGINE_LABEL[key] || key, online: null }
+    if (r.status !== 'fulfilled') return fallback
+    const p = r.value
+    return { key, label: p.label || fallback.label, online: p.online }
+  })
 
   const failed = results.filter(r => r.status === 'rejected')
   if (failed.length > 0) {
@@ -100,7 +130,9 @@ onMounted(load)
           </div>
           <div class="metric-card">
             <span class="metric-label">实盘会话</span>
-            <span class="metric-value">{{ liveCount }}</span>
+            <span class="metric-value" :style="{ fontSize: '15px' }">
+              运行中 {{ liveRunning }} · 共 {{ liveCount }}
+            </span>
           </div>
           <div class="metric-card">
             <span class="metric-label">Core 状态</span>
@@ -118,6 +150,58 @@ onMounted(load)
     <div class="frame">
       <div class="frame-head">
         <span class="frame-num">02</span>
+        <span class="frame-title">实盘会话</span>
+      </div>
+      <div class="frame-body">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>名称</th><th>引擎</th><th>执行模式</th><th>组合</th><th>状态</th><th>对账差异</th></tr></thead>
+            <tbody>
+              <tr v-for="s in liveSessions" :key="s.id">
+                <td>{{ s.name }}</td>
+                <td>{{ ENGINE_LABEL[s.engine] || s.engine }}</td>
+                <td>{{ EXEC_MODE_LABEL[s.execution_mode] || s.execution_mode }}</td>
+                <td style="color:var(--ink-soft)">{{ (s.portfolio_ids || []).length }} 个组合</td>
+                <td>
+                  <span v-if="s.status === 'running'" class="badge badge-green">运行中</span>
+                  <span v-else class="badge badge-gray">已停止</span>
+                </td>
+                <td>
+                  <span v-if="(s.reconcile_mismatches || []).length"
+                        class="badge badge-red"
+                        :title="(s.reconcile_mismatches || []).map(m => `${m.code} 虚${m.virtual}/实${m.real}`).join('；')">
+                    {{ (s.reconcile_mismatches || []).length }} 项
+                  </span>
+                  <span v-else style="color:var(--ink-soft)">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="liveSessions.length === 0" class="empty-state"><p>暂无实盘会话</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">03</span>
+        <span class="frame-title">交易通道</span>
+      </div>
+      <div class="frame-body">
+        <div class="metric-grid" style="gap:12px;margin-bottom:0">
+          <div v-for="c in channels" :key="c.key" class="metric-card">
+            <span class="metric-label">{{ c.label }}</span>
+            <span class="metric-value" :style="{ fontSize: '15px' }">
+              {{ c.online === true ? '在线' : c.online === false ? '离线' : '未知' }}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">04</span>
         <span class="frame-title">最近回测</span>
       </div>
       <div class="frame-body">
@@ -143,7 +227,7 @@ onMounted(load)
 
     <div class="frame">
       <div class="frame-head">
-        <span class="frame-num">03</span>
+        <span class="frame-num">05</span>
         <span class="frame-title">系统配置</span>
       </div>
       <div class="frame-body">

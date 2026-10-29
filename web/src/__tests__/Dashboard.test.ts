@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import Dashboard from '../views/Dashboard.vue'
 
-// Dashboard.vue 走 ../api 客户端（7 个 getter）
 const mocks = vi.hoisted(() => ({
   mockGetStockPools: vi.fn(),
   mockGetFormulas: vi.fn(),
@@ -10,7 +10,9 @@ const mocks = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockGetSystemConfigs: vi.fn(),
   mockGetSystemStatus: vi.fn(),
+  mockGetLiveChannel: vi.fn(),
 }))
+
 vi.mock('../api', () => ({
   getStockPools: mocks.mockGetStockPools,
   getFormulas: mocks.mockGetFormulas,
@@ -19,12 +21,12 @@ vi.mock('../api', () => ({
   getLiveSessions: mocks.mockGetLiveSessions,
   getSystemConfigs: mocks.mockGetSystemConfigs,
   getSystemStatus: mocks.mockGetSystemStatus,
+  getLiveChannel: mocks.mockGetLiveChannel,
 }))
 
-import Dashboard from '../views/Dashboard.vue'
 import {
   getStockPools, getFormulas, getPortfolios, getBacktestRecords,
-  getLiveSessions, getSystemConfigs, getSystemStatus,
+  getLiveSessions, getSystemConfigs, getSystemStatus, getLiveChannel,
 } from '../api'
 
 const mockCfg = {
@@ -50,6 +52,11 @@ beforeEach(() => {
   ;(getLiveSessions as any).mockResolvedValue([])
   ;(getSystemConfigs as any).mockResolvedValue(mockCfg)
   ;(getSystemStatus as any).mockResolvedValue({ core: { online: true, version: '1.0', uptime: '0h0m' } })
+  ;(getLiveChannel as any).mockImplementation((engine: string) => Promise.resolve({
+    engine,
+    label: engine === 'tdx' ? '通达信 TQ' : engine === 'ths' ? '同花顺' : 'iQuant 桥',
+    online: null,
+  }))
 })
 
 describe('Dashboard.vue', () => {
@@ -64,6 +71,7 @@ describe('Dashboard.vue', () => {
     expect(getLiveSessions).toHaveBeenCalled()
     expect(getSystemConfigs).toHaveBeenCalled()
     expect(getSystemStatus).toHaveBeenCalled()
+    expect(getLiveChannel).toHaveBeenCalledTimes(3)   // tdx/ths/iquant 三通道
 
     // 统计卡：股票池=1、公式=1、回测=1；系统卡在线；配置路径
     expect(w.text()).toContain('股票池')
