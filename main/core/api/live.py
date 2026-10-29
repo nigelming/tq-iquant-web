@@ -317,8 +317,9 @@ def session_trades(session_id: int, db: Session = Depends(get_db)):
 
 @router.get("/sessions/{session_id}/positions")
 def session_positions(session_id: int, db: Session = Depends(get_db)):
-    """B4b：虚拟持仓。运行中读引擎内存态（含未落库当日变动）；停止后从 live_trades
-    重放聚合（与 recover 同口径：BUY 加、SELL 减，均价加权）。"""
+    """B4b：持仓分级。运行中读引擎内存态虚拟持仓（含未落库当日变动，source=strategy）
+    + dispatcher 真实持仓差集（账户原有持仓，source=external，60s TTL 缓存）；
+    停止后从 live_trades 重放聚合（与 recover 同口径：BUY 加、SELL 减，均价加权）。"""
     rows = svc.session_positions(db, session_id, _ENGINES.get(session_id))
     if rows is None:
         return err(404, "资源不存在")

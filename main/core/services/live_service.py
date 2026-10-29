@@ -19,6 +19,8 @@ start_session 只返回构造好、heartbeat 通过、recover 已执行但尚未
 """
 
 import logging
+import re
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
@@ -977,6 +979,97 @@ def engine_virtual_positions(engine: LiveEngine) -> List[dict]:
     return sorted(rows, key=lambda r: (r["stock_code"], r["portfolio_id"], r["strategy_id"]))
 
 
+# 外部持仓（真实账户原有持仓）读回缓存 TTL：THS UI 读回慢（约 3~10s，含验证码
+# 流水线），60s 内复用上次读回，避免工作台每次刷新都重走 UI 自动化。
+_EXTERNAL_POS_TTL_SECONDS = 60.0
+
+
+def _normalize_external_symbol(code) -> str:
+    """外部持仓代码归一：带后缀原样返回；6 位数字按首位推断交易所补后缀
+    （6/5/9→SH、4/8→BJ、其余→SZ，与 tdx_tq_dispatcher._exchange_for 同口径）。
+
+    无法归一（非 6 位数字且无后缀）返回空串，调用方丢弃该行。
+    """
+    text = str(code or "").strip()
+    if "." in text:
+        return text
+    digits = re.sub(r"\D", "", text)[:6]
+    if len(digits) != 6:
+        return ""
+    if digits.startswith(("6", "5", "9")):
+        suffix = "SH"
+    elif digits.startswith(("4", "8")):
+        suffix = "BJ"
+    else:
+        suffix = "SZ"
+    return "%s.%s" % (digits, suffix)
+
+
+def engine_external_positions(engine: LiveEngine) -> List[dict]:
+    """运行中：读 dispatcher 真实账户持仓，剔除策略虚拟持仓已持有的代码，
+    剩余即「原有持仓」（非策略买入，仅供监视，不参与策略交易）。
+
+    读回结果（dispatcher 原始行）带 60s TTL 缓存在引擎属性 _external_pos_cache
+    （(monotonic_ts, rows)）上——THS UI 读回慢，TDX SDK 读快但同样走缓存统一口径。
+    dispatcher 缺 get_positions（iquant 桥）/异常/None → 无外部行，不抛错。
+    """
+    dispatcher = getattr(engine, "dispatcher", None)
+    if dispatcher is None:
+        return []
+    virtual_codes = {r["stock_code"] for r in engine_virtual_positions(engine)}
+    now = time.monotonic()
+    real = None
+    cache = getattr(engine, "_external_pos_cache", None)
+    if cache is not None:
+        try:
+            ts, rows = cache
+            if now - ts < _EXTERNAL_POS_TTL_SECONDS:
+                real = rows
+        except Exception:
+            real = None
+    if real is None:
+        try:
+            fn = getattr(dispatcher, "get_positions", None)
+            real = fn() if callable(fn) else []
+        except Exception:
+            logger.warning("外部持仓读回失败（dispatcher.get_positions）", exc_info=True)
+            real = []
+        if not isinstance(real, list):
+            real = []
+        try:
+            engine._external_pos_cache = (now, real)
+        except Exception:
+            pass
+    out = []
+    for r in real:
+        if not isinstance(r, dict):
+            continue
+        code = _normalize_external_symbol(r.get("symbol"))
+        if not code or code in virtual_codes:
+            continue
+        try:
+            quantity = int(r.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if quantity <= 0:
+            continue
+        try:
+            avg_cost = float(r.get("cost") or 0)
+            market_value = float(r.get("market_value") or 0)
+        except (TypeError, ValueError):
+            avg_cost, market_value = 0.0, 0.0
+        out.append({
+            "portfolio_id": None,
+            "strategy_id": None,
+            "stock_code": code,
+            "quantity": quantity,
+            "avg_cost": avg_cost,
+            "market_value": market_value,
+            "source": "external",
+        })
+    return out
+
+
 def session_orders(db: Session, session_id: int, status: Optional[str] = None) -> Optional[List[dict]]:
     """委托历史。session 不存在返回 None。可选 status 过滤。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
@@ -1004,22 +1097,31 @@ def session_trades(db: Session, session_id: int) -> Optional[List[dict]]:
 
 
 def session_positions(db: Session, session_id: int, engine: Optional[LiveEngine]) -> Optional[List[dict]]:
-    """虚拟持仓。运行中读引擎内存态（含未落库当日变动）；停止后从 live_trades 重放聚合。
+    """持仓分级（策略持仓/原有持仓）。运行中读引擎内存态虚拟持仓（含未落库当日
+    变动，标 source=strategy）+ dispatcher 真实持仓差集（原有持仓，source=external）；
+    停止后从 live_trades 重放聚合（无外部数据可得，全部标 source=strategy）。
 
-    session 不存在返回 None。
+    session 不存在返回 None。返回 List[dict]，前端按 source 分级渲染。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return None
     if engine is not None:
-        return engine_virtual_positions(engine)
+        rows = engine_virtual_positions(engine)
+        for r in rows:
+            r["source"] = "strategy"
+        rows.extend(engine_external_positions(engine))
+        return rows
     trades = (
         db.query(LiveTrade)
         .filter(LiveTrade.live_session_id == session_id)
         .order_by(LiveTrade.trade_time, LiveTrade.id)
         .all()
     )
-    return aggregate_positions_from_trades(trades)
+    rows = aggregate_positions_from_trades(trades)
+    for r in rows:
+        r["source"] = "strategy"
+    return rows
 
 
 def serialize_decision(d: LiveDecisionEvent) -> dict:

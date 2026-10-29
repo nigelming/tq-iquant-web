@@ -928,7 +928,11 @@ class ThsUiDispatcher(OrderDispatcher):
             pass
         return None
 
-    def get_positions(self) -> list:
+    def _read_position_rows(self) -> list:
+        """持仓表原始读回（UI 列形状：symbol/name/volume/available/cost/price/market_value）。
+
+        get_account/query_positions/get_positions 共用；价格快照同步进 _price_map。
+        """
         if not self._connected:
             if not self.connect():
                 return []
@@ -1019,7 +1023,7 @@ class ThsUiDispatcher(OrderDispatcher):
 
     def get_account(self) -> list:
         try:
-            positions = self.get_positions()
+            positions = self._read_position_rows()
         except Exception:
             positions = []
         total_mv = sum(float(p.get("market_value") or 0) for p in positions)
@@ -1038,7 +1042,7 @@ class ThsUiDispatcher(OrderDispatcher):
 
     def query_positions(self) -> list:
         try:
-            rows = self.get_positions()
+            rows = self._read_position_rows()
         except Exception:
             return []
         out = []
@@ -1058,6 +1062,27 @@ class ThsUiDispatcher(OrderDispatcher):
                 "cost": float(r.get("cost") or 0),
                 "price": float(r.get("price") or 0),
                 "name": r.get("name") or "",
+            })
+        return out
+
+    def get_positions(self) -> list:
+        """通用形状持仓（与 TdxTqDispatcher.get_positions 同形状，供外部持仓分级）。
+
+        UI 原始读回归一：6 位代码按首位推断交易所补后缀；
+        market_value 用 UI 市价 × 余额计算（UI 原始行的市值列不透传）。
+        """
+        out = []
+        for r in self.query_positions():
+            code = str(r.get("instrument") or "")
+            if not self._CODE_RE.match(code):
+                continue
+            vol = int(r.get("volume") or 0)
+            out.append({
+                "symbol": "%s.%s" % (code, self._exchange_for(code)),
+                "volume": vol,
+                "available": int(r.get("available") or 0),
+                "cost": float(r.get("cost") or 0),
+                "market_value": float(r.get("price") or 0) * vol,
             })
         return out
 
@@ -1487,6 +1512,18 @@ class ThsUiDispatcher(OrderDispatcher):
         if ref:
             self._last_submit_ref = ref
             self._last_submit_time = self._split_time(found.get("time"))
+        # 委托价格校验闭环（真机实证：键入价被 THS 异步填充覆盖 → 委托价 4.415
+        # ≠ 键入 4.153）：柜台委托价格 ≠ 审批价 → 自动撤单 + 拒单（调用方重试），
+        # 防止以非审批价格真实成交。容差 0.001（ETF 3 位小数/股票 2 位均覆盖）。
+        found_price = float(found.get("price") or 0)
+        if found_price > 0 and abs(found_price - price) > 0.001:
+            try:
+                self.cancel_order(ref, code)
+            except Exception:
+                logger.warning("ths price-mismatch cancel failed: %s", ref)
+            raise BridgeOrderRejected(
+                "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖），已自动撤单"
+                % (found_price, price))
         fill_price = order.price if order.price is not None else Decimal(str(price))
         amount = fill_price * vol
         return TradeEvent(

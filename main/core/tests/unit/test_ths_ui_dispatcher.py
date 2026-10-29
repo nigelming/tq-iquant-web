@@ -48,7 +48,7 @@ class _FakeThs(ThsUiDispatcher):
     def get_orders(self):
         return self._parse_orders(self._text)
 
-    def get_positions(self):
+    def _read_position_rows(self):
         return self._parse_position_rows(
             "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
             "000001\t平安银行\t1000\t0\t10.0\t10.5\t10500\n"
