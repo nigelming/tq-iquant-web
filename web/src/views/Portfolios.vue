@@ -189,7 +189,7 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'signal_weekday', label: '周几推送', span: 1, type: 'number', placeholder: '1-5（仅 1w，默认周一）' },
     { key: 'signal_data_end', label: '数据口径', span: 1, type: 'select', options: 'signalDataEnds' },
   ]},
-  { title: '实盘执行', hint: '仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单（批次2 接线）。', fields: [
+  { title: '执行控制', hint: '单笔最大金额=回测/实盘双端生效；重下/拆单/风控时点=仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单。', fields: [
     { key: 'max_order_amount', label: '单笔最大金额（元）', span: 1, type: 'number', placeholder: '留空=不限', hint: 'BUY 审批金额超此值缩量到整手股数（回测/实盘双端生效）' },
     { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（限次数）' },
     { key: 'requote_max_attempts', label: '重试次数', span: 1, type: 'number', placeholder: '2', hint: '追价重下次数上限 0-10' },
