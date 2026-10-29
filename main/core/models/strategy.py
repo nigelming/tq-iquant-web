@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, ForeignKey, Numeric, DateTime
+from sqlalchemy import Boolean, Column, Float, Integer, String, ForeignKey, Numeric, DateTime
 from sqlalchemy.sql import func, text
 
 from .base import Base
@@ -52,5 +52,14 @@ class Strategy(Base):
     # #3 策略级敞口上限（默认关）：回测 BUY 审批加卡策略总持仓市值
     # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
     exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    # 实盘执行配置（批次1，全部向后兼容：默认关/保守默认）
+    # 撤单后有限追价重下：超时撤单成功且未超次数 → 剩余量按 tick 追价重下
+    requote_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    requote_max_attempts = Column(Integer, default=2, server_default="2", nullable=False)
+    # TDX 大额拆单（本批次仅落配置管线，拆单逻辑批次 2 实现）
+    split_order_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    split_order_threshold = Column(Float, default=500000.0, server_default="500000.0", nullable=False)
+    # 风控/信号执行时点：next_day=当日信号次日执行（回测对齐，默认）/ immediate=当日确认立即执行
+    risk_timing = Column(String(15), default="next_day", server_default="next_day", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

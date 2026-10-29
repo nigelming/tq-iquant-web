@@ -36,6 +36,12 @@ class StrategyContext:
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
         # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
+        # 实盘执行配置（批次1，全部默认关/保守默认，关闭时行为与原逻辑一致）
+        requote_enabled: bool = False,
+        requote_max_attempts: int = 2,
+        split_order_enabled: bool = False,
+        split_order_threshold: Decimal = Decimal("500000"),
+        risk_timing: str = "next_day",
         signal_frequency: Optional[str] = None,
         signal_at: Optional[str] = None,
         signal_weekday: Optional[int] = None,
@@ -75,6 +81,12 @@ class StrategyContext:
         self.trend_max_positions = trend_max_positions
         # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
         self.exposure_cap_enabled = exposure_cap_enabled
+        # 实盘执行配置（批次1）：撤单追价重下 / TDX 大额拆单（批次2接线）/ 风控时点
+        self.requote_enabled = requote_enabled
+        self.requote_max_attempts = requote_max_attempts
+        self.split_order_enabled = split_order_enabled
+        self.split_order_threshold = split_order_threshold
+        self.risk_timing = risk_timing
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
         self.strategy_risk: Optional[StrategyRiskManager] = None

@@ -50,6 +50,7 @@ VALID_TRADING_SESSIONS = {"full", "am", "pm"}  # draft:499，非 morning/afterno
 VALID_STATUSES = {"active", "archived"}  # draft:500
 VALID_POSITION_SIZING = {"dynamic", "fixed"}  # W2 仓位模型：动态净资产/固定名义
 VALID_DAILY_LOSS_BASIS = {"equity", "initial"}  # 日内亏损分母：昨收净值（默认）/ 初始资金
+VALID_RISK_TIMINGS = {"next_day", "immediate"}  # 实盘风控/信号执行时点（批次1）
 
 
 class StrategyItem(BaseModel):
@@ -80,6 +81,12 @@ class StrategyItem(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 实盘执行配置（批次1，默认关/保守默认）
+    requote_enabled: bool = False
+    requote_max_attempts: int = 2
+    split_order_enabled: bool = False
+    split_order_threshold: float = 500000.0
+    risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None
     signal_weekday: int | None = None
@@ -199,6 +206,23 @@ def _validate_strategy_numerics(req, label: str = "") -> str | None:
     return None
 
 
+def _validate_execution_config(req, label: str = "") -> str | None:
+    """实盘执行配置校验（批次1，组合批量与独立子策略端点共用）。
+
+    requote/split 互不依赖可独立开关，不做联动校验。
+    """
+    if not (0 <= req.requote_max_attempts <= 10):
+        return f"{label}requote_max_attempts 须在 [0,10]，收到 {req.requote_max_attempts}"
+    if req.split_order_threshold < 0:
+        return f"{label}split_order_threshold 不能为负，收到 {req.split_order_threshold}"
+    if req.risk_timing not in VALID_RISK_TIMINGS:
+        return (
+            f"{label}risk_timing 必须为 {sorted(VALID_RISK_TIMINGS)}，"
+            f"收到 {req.risk_timing}"
+        )
+    return None
+
+
 def _validate_portfolio_numerics(req) -> str | None:
     """组合数值字段范围校验：负佣金/负滑点会静默污染回测结果，须入口拦截。"""
     if req.initial_capital <= 0:
@@ -272,6 +296,10 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             return f"子策略[{idx}] 加仓阈值须为 -1（任何价都加）或 [0,1]，收到 {s.add_position_threshold}"
         if not (0 <= s.max_add_count <= 10):
             return f"子策略[{idx}] 加仓次数须在 [0,10]（0=禁加仓），收到 {s.max_add_count}"
+        # 实盘执行配置（批次1）
+        exec_msg = _validate_execution_config(s, f"子策略[{idx}] ")
+        if exec_msg:
+            return exec_msg
         if not db.query(Formula).filter(Formula.id == s.formula_id).first():
             return f"子策略[{idx}] 公式 id={s.formula_id} 不存在"
         # 主从配置期校验
@@ -395,6 +423,12 @@ class StrategyCreate(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 实盘执行配置（批次1，默认关/保守默认）
+    requote_enabled: bool = False
+    requote_max_attempts: int = 2
+    split_order_enabled: bool = False
+    split_order_threshold: float = 500000.0
+    risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None
     signal_weekday: int | None = None
@@ -440,6 +474,10 @@ def _validate_strategy(
         return f"trend_trailing_stop_ratio 须在 (0,1]，收到 {req.trend_trailing_stop_ratio}"
     if req.trend_max_positions is not None and req.trend_max_positions < 1:
         return f"trend_max_positions 须 ≥ 1，收到 {req.trend_max_positions}"
+    # 实盘执行配置（批次1）
+    exec_msg = _validate_execution_config(req)
+    if exec_msg:
+        return exec_msg
     if not db.query(Formula).filter(Formula.id == req.formula_id).first():
         return f"公式 id={req.formula_id} 不存在"
     if req.role == "slave":

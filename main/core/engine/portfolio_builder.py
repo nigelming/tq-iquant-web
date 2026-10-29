@@ -135,6 +135,13 @@ def assemble_portfolio(
             trend_max_positions=getattr(strat, "trend_max_positions", None),
             # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
+            # 实盘执行配置（批次1，默认关/保守默认；关闭时行为与原逻辑一致）
+            requote_enabled=bool(getattr(strat, "requote_enabled", False)),
+            requote_max_attempts=getattr(strat, "requote_max_attempts", None) or 2,
+            split_order_enabled=bool(getattr(strat, "split_order_enabled", False)),
+            split_order_threshold=Decimal(str(
+                getattr(strat, "split_order_threshold", None) or "500000")),
+            risk_timing=getattr(strat, "risk_timing", None) or "next_day",
             signal_frequency=strat.signal_frequency,
             signal_at=strat.signal_at,
             signal_weekday=strat.signal_weekday,
