@@ -891,6 +891,7 @@ export interface StrategyDetail {
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
   exposure_cap_enabled: boolean
+  max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled: boolean
   requote_max_attempts: number
   split_order_enabled: boolean
@@ -927,6 +928,7 @@ export interface StrategyRequest {
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
   exposure_cap_enabled?: boolean
+  max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled?: boolean
   requote_max_attempts?: number
   split_order_enabled?: boolean

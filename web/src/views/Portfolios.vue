@@ -92,6 +92,7 @@ const STRATEGY_RATIO_FIELDS = new Set([
 // （开关打开但阈值留空是最常见的自然操作，不能因此保存失败）
 const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
+  'max_order_amount',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
   'signal_weekday',
@@ -189,6 +190,7 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'signal_data_end', label: '数据口径', span: 1, type: 'select', options: 'signalDataEnds' },
   ]},
   { title: '实盘执行', hint: '仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单（批次2 接线）。', fields: [
+    { key: 'max_order_amount', label: '单笔最大金额（元）', span: 1, type: 'number', placeholder: '留空=不限', hint: 'BUY 审批金额超此值缩量到整手股数（回测/实盘双端生效）' },
     { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（限次数）' },
     { key: 'requote_max_attempts', label: '重试次数', span: 1, type: 'number', placeholder: '2', hint: '追价重下次数上限 0-10' },
     { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
@@ -209,6 +211,7 @@ function emptyStrategyForm(): Record<string, any> {
     rotation_enabled: false, rotation_momentum_bars: 20, rotation_hysteresis: 0.05,
     regime_filter_enabled: false, trend_trailing_stop_ratio: null, trend_max_positions: null,
     exposure_cap_enabled: false,
+    max_order_amount: null,
     requote_enabled: false, requote_max_attempts: 2,
     split_order_enabled: false, split_order_threshold: 500000,
     risk_timing: 'next_day',
@@ -424,6 +427,8 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   // 实盘执行（批次1，与后端 _validate_execution_config 同口径）
   const rma = num(p.requote_max_attempts)
   if (rma !== null && !(rma >= 0 && rma <= 10)) return '重试次数须在 [0,10]'
+  const moa = num(p.max_order_amount)
+  if (moa !== null && moa <= 0) return '单笔最大金额须大于 0'
   const sot = num(p.split_order_threshold)
   if (sot !== null && sot < 0) return '拆单阈值不能为负'
   if (p.risk_timing && !['next_day', 'immediate'].includes(String(p.risk_timing))) {
@@ -552,6 +557,7 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     rotation_hysteresis: s.rotation_hysteresis, regime_filter_enabled: s.regime_filter_enabled,
     trend_trailing_stop_ratio: s.trend_trailing_stop_ratio, trend_max_positions: s.trend_max_positions,
     exposure_cap_enabled: s.exposure_cap_enabled,
+    max_order_amount: s.max_order_amount ?? null,
     requote_enabled: s.requote_enabled ?? false,
     requote_max_attempts: s.requote_max_attempts ?? 2,
     split_order_enabled: s.split_order_enabled ?? false,

@@ -893,6 +893,97 @@ describe('Portfolios.vue — 实盘执行（批次1 配置分组）', () => {
   })
 })
 
+describe('Portfolios.vue — 单笔最大金额（max_order_amount）', () => {
+  async function openNewStrategy(w: any) {
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').find((b: any) => b.text().includes('新建子策略'))!.trigger('click')
+  }
+
+  it('子策略表单「实盘执行」组含单笔最大金额输入（留空=不限）', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+
+    expect(w.text()).toContain('单笔最大金额')
+    const input = w.find('input[data-field="max_order_amount"]')
+    expect(input.exists()).toBe(true)
+    expect(input.attributes('placeholder')).toBe('留空=不限')
+  })
+
+  it('默认留空 → payload max_order_amount null（不限）', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 40 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('input[data-field="name"]').setValue('AMOUNT_DEFAULT')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.max_order_amount).toBeNull()
+  })
+
+  it('填 200000 → payload 原样携带数字 200000', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 41 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('input[data-field="max_order_amount"]').setValue('200000')
+    await w.find('input[data-field="name"]').setValue('AMOUNT_SET')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.max_order_amount).toBe(200000)
+  })
+
+  it('非正数（-5）→ 前端拦截不提交', async () => {
+    ;(createStrategy as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('input[data-field="max_order_amount"]').setValue('-5')
+    await w.find('input[data-field="name"]').setValue('AMOUNT_BAD')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalled()
+    expect(createStrategy).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('编辑回填 max_order_amount，提交 round-trip', async () => {
+    ;(updateStrategy as any).mockResolvedValue({ id: 10 })
+    ;(getStrategies as any).mockResolvedValue([{
+      ...mockStrategies[0],
+      max_order_amount: 200000,
+    }])
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const editBtn = w.findAll('.strategy-sub-row button').find((b: any) => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    expect((w.find('input[data-field="max_order_amount"]').element as HTMLInputElement).value).toBe('200000')
+
+    await w.find('input[data-field="max_order_amount"]').setValue('300000')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(updateStrategy).toHaveBeenCalledTimes(1)
+    const arg = (updateStrategy as any).mock.calls[0][2]
+    expect(arg.max_order_amount).toBe(300000)
+  })
+})
+
 describe('Portfolios.vue — 实盘预警调度（提交校验）', () => {
   async function openNewStrategy(w: any) {
     await w.findAll('button.toggle-expand')[0].trigger('click')
