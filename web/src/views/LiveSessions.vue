@@ -484,22 +484,24 @@ onUnmounted(closeEventStream)
   <div class="card" style="margin-top:16px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h3 style="margin:0">实盘工作台</h3>
-      <div>
+      <div style="display:flex;flex:1;align-items:center">
         <button
           v-for="(label, key) in TAB_LABEL" :key="key"
           class="btn btn-sm" :class="wbTab === key ? 'btn-primary' : ''"
           @click="wbTab = key"
         >{{ label }}</button>
+        <button
+          v-if="wbTab === 'positions'"
+          class="btn btn-sm" style="margin-left:auto"
+          :disabled="loading || activeSessionId === null"
+          @click="loadHistory(activeSessionId!)"
+          title="重新拉取全量持仓（原有持仓服务端缓存 60s）"
+        >↻ 刷新持仓</button>
       </div>
     </div>
 
     <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行；来源分级：策略/原有持仓） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
-      <div style="display:flex;justify-content:flex-end;margin-bottom:6px">
-        <button class="btn btn-sm" :disabled="loading || activeSessionId === null"
-          @click="loadHistory(activeSessionId!)"
-          title="重新拉取全量持仓（原有持仓服务端缓存 60s）">↻ 刷新持仓</button>
-      </div>
       <table>
         <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>来源</th></tr></thead>
         <tbody>
