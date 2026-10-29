@@ -12,7 +12,6 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from core.main import app
 from core.db import get_db
@@ -22,15 +21,23 @@ from core.models import (
 )
 from core.engine.position import Position
 import core.api.live as live_api
+from core.services import live_service as live_svc
 
 
 @pytest.fixture
 def client(tmp_path):
-    """内存 SQLite（StaticPool 共享单连接）+ TestClient，覆盖 get_db。"""
+    """tmp 文件 SQLite（每会话独立连接）+ TestClient，覆盖 get_db。
+
+    注：此前是内存 SQLite + StaticPool（所有 session 共享单条连接）——LiveEngine
+    后台 tick 线程（_sweep_timeout_orders / persist_risk_state 等经 db_session_factory
+    开会话）与 HTTP 请求线程会在同一连接上并发执行语句，互踩游标状态
+    （sqlite3.InterfaceError: bad parameter or other API misuse / 事务交错），偶发
+    幂等返回错乱。M1 多会话并行测试加重引擎启停密度后概率显著上升，故改为 tmp
+    文件库：每会话独享连接，SQLite 文件锁 + busy timeout 天然串行化跨线程访问。
+    """
     engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        "sqlite:///%s" % (tmp_path / "test.db").as_posix(),
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -198,8 +205,87 @@ def test_start_session_runs_engine(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
-def test_start_second_session_rejected_while_one_running(client, mock_bridge):
-    """B6：全局限 1 个实盘 session——已有 session 运行，新 session start 被拒。"""
+def _seed_extra_portfolio(db):
+    """追加一个独立组合（池+成分股），返回组合 id（供多会话并行测试用）。"""
+    pool = StockPool(code="TEST2", name="test_pool2")
+    db.add(pool)
+    db.flush()
+    db.add(StockPoolStock(pool_id=pool.id, stock_code="000001.SZ"))
+    ps = PortfolioStrategy(
+        name="test_portfolio2", stock_pool_id=pool.id,
+        initial_capital=Decimal("200000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+    )
+    db.add(ps)
+    db.commit()
+    return ps.id
+
+
+class _FakeThsDispatcher:
+    """THS 通道替身：heartbeat 通过 + file_builtin（绕过 OCR 启动闸）+ 空行情。"""
+    channel = "ths_ui"
+    execute_mode = "file_builtin"
+    supports_batch_quote = False
+
+    def __init__(self, **kw):
+        self.init_kwargs = kw
+
+    def heartbeat(self):
+        return True
+
+    def query_quote(self, code, period="1m", count=10):
+        return []
+
+    def query_calendar(self):
+        return []
+
+    def query_positions(self):
+        return []
+
+
+class _FakeTdxDispatcher:
+    """TDX 通道替身：heartbeat 通过 + 空行情（不触真实通达信）。"""
+    channel = "tdx_tq"
+    supports_batch_quote = False
+
+    def __init__(self, **kw):
+        pass
+
+    def heartbeat(self):
+        return True
+
+    def query_quote(self, code, period="1m", count=10):
+        return []
+
+    def query_calendar(self):
+        return []
+
+    def query_positions(self):
+        return []
+
+
+def test_two_non_ths_sessions_run_in_parallel(client, mock_bridge):
+    """M1 多会话并行（B6 改资源互斥）：两个非 ths 会话先后 start → 都注册运行。"""
+    c, Session = client
+    db = Session()
+    ps1 = _seed(db)
+    ps2 = _seed_extra_portfolio(db)
+    db.close()
+
+    sid1 = _create_session(c, portfolio_ids=(ps1,))
+    sid2 = _create_session(c, portfolio_ids=(ps2,))
+
+    assert c.post("/api/live/sessions/%d/start" % sid1).json()["data"]["status"] == "running"
+    assert c.post("/api/live/sessions/%d/start" % sid2).json()["data"]["status"] == "running"
+    assert sid1 in live_api._ENGINES
+    assert sid2 in live_api._ENGINES
+
+    c.post("/api/live/sessions/%d/stop" % sid1)
+    c.post("/api/live/sessions/%d/stop" % sid2)
+
+
+def test_overlapping_portfolio_sessions_start_allowed(client, mock_bridge):
+    """M1 复制交易语义：同组合挂多个运行中会话 → 启动不拒（各会话独立虚拟账本）。"""
     c, Session = client
     db = Session()
     ps_id = _seed(db)
@@ -208,15 +294,62 @@ def test_start_second_session_rejected_while_one_running(client, mock_bridge):
     sid1 = _create_session(c, portfolio_ids=(ps_id,))
     sid2 = _create_session(c, portfolio_ids=(ps_id,))
 
-    assert c.post("/api/live/sessions/%d/start" % sid1).json()["data"]["status"] == "running"
+    assert c.post("/api/live/sessions/%d/start" % sid1).json()["code"] == 0
+    resp = c.post("/api/live/sessions/%d/start" % sid2)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "running"
+    assert sid2 in live_api._ENGINES
+
+    c.post("/api/live/sessions/%d/stop" % sid1)
+    c.post("/api/live/sessions/%d/stop" % sid2)
+
+
+def test_ths_second_session_rejected_channel_exclusive(client, mock_bridge, monkeypatch):
+    """M1 THS 键鼠独占：ths 会话运行中，第二个 ths 会话 start → 409 拒绝。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    monkeypatch.setattr(live_svc, "ThsUiDispatcher", _FakeThsDispatcher)
+
+    sid1 = _create_session(c, portfolio_ids=(ps_id,), engine="ths")
+    sid2 = _create_session(c, portfolio_ids=(ps_id,), engine="ths")
+
+    assert c.post("/api/live/sessions/%d/start" % sid1).json()["code"] == 0
     assert sid1 in live_api._ENGINES
 
     resp = c.post("/api/live/sessions/%d/start" % sid2)
     assert resp.status_code == 200  # 统一响应格式，业务错误在 body.code
     assert resp.json()["code"] != 0
+    assert "同花顺" in resp.json()["message"]
     assert sid2 not in live_api._ENGINES
+    assert sid1 in live_api._ENGINES  # 原会话不受影响
 
     c.post("/api/live/sessions/%d/stop" % sid1)
+
+
+def test_ths_running_tdx_session_start_allowed(client, mock_bridge, monkeypatch):
+    """M1：ths 运行中 + tdx 会话启动 → 成功（互斥仅限 THS 通道自身）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    monkeypatch.setattr(live_svc, "ThsUiDispatcher", _FakeThsDispatcher)
+    monkeypatch.setattr(live_svc, "TdxTqDispatcher", _FakeTdxDispatcher)
+
+    sid1 = _create_session(c, portfolio_ids=(ps_id,), engine="ths")
+    sid2 = _create_session(c, portfolio_ids=(ps_id,), engine="tdx")
+
+    assert c.post("/api/live/sessions/%d/start" % sid1).json()["code"] == 0
+    resp = c.post("/api/live/sessions/%d/start" % sid2)
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "running"
+    assert sid1 in live_api._ENGINES
+    assert sid2 in live_api._ENGINES
+
+    c.post("/api/live/sessions/%d/stop" % sid1)
+    c.post("/api/live/sessions/%d/stop" % sid2)
 
 
 def test_restart_same_running_session_is_idempotent(client, mock_bridge):

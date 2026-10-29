@@ -195,7 +195,8 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         return err(404, "资源不存在")
     # C1（终审）：整段「幂等检查 → threadpool 启动（秒级）→ 注册」持 _START_LOCK
     # 串行——并发的第二个 start 会等锁，进锁后见注册表已有引擎 → 幂等返回 running；
-    # 不同 session 的并发 start 也被串行化，B6 全局限 1 在锁内判定不再有竞态窗口。
+    # 不同 session 的并发 start 也被串行化，B6 资源互斥（M1 多会话并行：THS 通道
+    # 键鼠独占，其余通道可并行）在锁内判定不再有竞态窗口。
     async with _START_LOCK:
         # 幂等：已在跑直接返回（service 检测 session_id in _ENGINES）
         if session_id in _ENGINES:

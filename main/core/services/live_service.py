@@ -5,7 +5,8 @@
 
 - 引擎组装：build_engine（查 link/PS/strategy/股票池/Formula，算 code_period_count，
   建 dispatcher/poller/LiveEngine）
-- 进程注册表：ENGINES（session_id -> LiveEngine）+ B6 全局限 1 个 session 守卫
+- 进程注册表：ENGINES（session_id -> LiveEngine）+ B6 资源互斥守卫
+  （M1 多会话并行：仅 THS 通道键鼠独占，tdx/iquant 可并行，组合重叠=复制交易）
 - session CRUD：list/create/get/delete + start/stop 业务体
 - 熔断手动恢复：recover_breaker（运行中双写 / 未运行只改 DB）
 - 历史查询 + 序列化：orders/trades/positions（运行中读内存，停止后从 live_trades 重放）
@@ -696,6 +697,33 @@ def delete_session(db: Session, session_id: int, engines: Dict[int, LiveEngine])
 # start / stop 业务体
 # ---------------------------------------------------------------------------
 
+def _check_channel_conflict(
+    db: Session,
+    session: LiveSession,
+    engines: Dict[int, LiveEngine],
+) -> Optional[Tuple[int, str]]:
+    """B6 资源互斥（M1 多会话并行）：仅 THS 通道键鼠独占检查。
+
+    同花顺 UI 自动化独占键鼠，全平台同时只能有一个 THS 引擎会话运行；
+    tdx/iquant 会话可并行（tdx 共享 TQ 锁串行取数/下单，iquant 桥按会话独立）。
+    组合重叠允许：同一组合挂多个运行中会话=复制交易语义，各会话独立虚拟账本
+    （Per Portfolio），执行偏差用户自担，不加组合排他检查。
+
+    遍历注册表（_START_LOCK 临界区内，注册即运行）中的会话，任一为 ths 引擎
+    且新会话也是 ths → 409 拒绝。返回 None 表示无冲突。
+    """
+    if session_engine(session) != "ths":
+        return None
+    for running_id in engines:
+        other = db.query(LiveSession).filter(LiveSession.id == running_id).first()
+        if other is not None and session_engine(other) == "ths":
+            return (
+                409,
+                "同花顺通道键鼠独占：会话 %d 正在使用，请先停止" % running_id,
+            )
+    return None
+
+
 def start_session(
     db: Session,
     session_id: int,
@@ -713,6 +741,10 @@ def start_session(
       置 session.status=running + commit（注册先于 commit，闭合 B6 窗口）。
     - error 为 None 且 engine 为 None：幂等命中（session 已在跑），路由直接返回 ok running。
     - 否则 error = (http_status, message)。
+
+    多会话并行（M1）：B6 全局限 1 已移除，改为资源互斥——仅 THS 通道键鼠独占
+    （_check_channel_conflict），tdx/iquant 会话可并行；同组合挂多会话=复制交易
+    （各会话独立虚拟账本，执行偏差用户自担）。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
@@ -720,10 +752,11 @@ def start_session(
     if session_id in engines:
         # 幂等：已在跑，直接返回（无 engine 新建，路由据此返回 ok running）
         return None, session, None
-    if engines:
-        # B6：全局限 1 个实盘 session（防多引擎争抢桥单线程 + 持仓归属混乱，Q1 未解）。
-        running_id = next(iter(engines))
-        return None, session, (409, "已有实盘会话 %d 运行中，全局限 1 个" % running_id)
+    # B6 资源互斥（M1 多会话并行）：THS 通道键鼠独占，其余通道（tdx/iquant）
+    # 可并行；组合重叠允许（复制交易语义，各会话独立虚拟账本）。
+    conflict = _check_channel_conflict(db, session, engines)
+    if conflict is not None:
+        return None, session, conflict
 
     # 空股票池预检（audit ⑯）：空池会让 BarPoller 静默订阅占位 000001.SZ 空转，
     # 无任何告警；alert 与 auto 两条路径都在此拦截（位于 build_engine 之前，
