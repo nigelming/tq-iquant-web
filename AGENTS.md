@@ -108,6 +108,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 **同花顺文件交接层（THS file_builtin，默认）**：同花顺通道是纯 UI 自动化，`ThsUiDispatcher` 双模式 `execute_mode` ∈ `file_builtin`（默认）/ `direct`（同步直呼，原行为）。file_builtin 下：引擎 signal/decision/risk 事件同步落 `{ths_ui.work_dir}/{session_id}/` 下 `signals.jsonl`/`risk.jsonl`（LiveEngine `_emit` 钩子，写失败仅告警）；`place_order` 只做参数校验后把指令追加进 `orders.jsonl` 并**秒回 None**（LiveEngine 按 `last_enqueued_order_id` 把 None 识别为「已入队」，订单保持 submitted 等回填，不判 approval failed）；内置后台执行线程（daemon，惰性启动，`execute_interval_seconds` 默认 5s）按游标（`cursor.json`：消费行数 + done 幂等表）读指令逐单执行 UI 自动化，回执落 `results.jsonl`（accepted+合同编号 / rejected+错误详情），成功单补记 `_known_refs`/`_submit_times`（批次 A 口径）。OCR/验证码守卫移入执行器（file 模式 place_order 不做 OCR 前置拒单，direct 模式维持），OCR 未启用不再阻断 file 会话启动。THS 撤单未自动化（无 F3 自动化）：file 模式超时在途单走 180s expire rejected；读后游标即推进（at-most-once），执行前崩溃的单不重复执行，由 expire 兜底。执行器 rejected 回执由引擎 deals 轮询即时消费（`execution_receipts()` 弹出 → 在途单即时 rejected + order 事件，工作台秒级可见），不等 180s expire。**执行契约 schema 文档**（四文件/游标逐字段定义、seq 语义、执行器要求、通道接入指南、版本策略）见 [docs/execution-contract.md](docs/execution-contract.md)。
 
+**同花顺 UI 键入真机校准（2026-10-28 实证，勿回退）**：xiadan 下单页字段为自绘控件（WM_GETTEXT/ValuePattern/剪贴板均不可读、UIA 焦点报告与可见字段不对应），键入必须走「**鼠标点击进字段 + kb_send（SendInput）**」：①字段定位 UIA control_id 实测 代码=1032、价格=1033、数量=1034；②代码框是「输入区+下拉按钮」组合，点击必须落**输入区左起 8px**（中心点点到下拉按钮、键入丢失，像素差异扫描校准）；③代码键入后**等待 4s**——THS 异步用最新价覆盖价格框（真机实证委托价 4.415≠键入 4.153）；④`_key` 每次 `_focus()` 重置主窗口焦点打掉字段焦点、`Timings.fast()` 丢字符——键入路径禁用；⑤撤单=撤单页**双击委托行**（真机实证有效，页面提示「双击或回车即可撤单」；开盘前委托未报不可撤）；⑥窗口级键入会被 THS 热键层吃掉（整窗 OCR 实证屏幕零变化）。
+
 ## 关键路径与配置文件
 
 | 路径 | 说明 |
