@@ -891,6 +891,11 @@ export interface StrategyDetail {
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
   exposure_cap_enabled: boolean
+  requote_enabled: boolean
+  requote_max_attempts: number
+  split_order_enabled: boolean
+  split_order_threshold: number
+  risk_timing: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null
   signal_weekday?: number | null
@@ -922,6 +927,11 @@ export interface StrategyRequest {
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
   exposure_cap_enabled?: boolean
+  requote_enabled?: boolean
+  requote_max_attempts?: number
+  split_order_enabled?: boolean
+  split_order_threshold?: number
+  risk_timing?: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null
   signal_weekday?: number | null

@@ -790,6 +790,109 @@ describe('Portfolios.vue — 实盘预警调度（表单）', () => {
   })
 })
 
+describe('Portfolios.vue — 实盘执行（批次1 配置分组）', () => {
+  async function openNewStrategy(w: any) {
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').find((b: any) => b.text().includes('新建子策略'))!.trigger('click')
+  }
+
+  it('子策略表单含「实盘执行」组与五个字段', async () => {
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+
+    expect(w.text()).toContain('实盘执行')
+    expect(w.text()).toContain('撤单追价重下')
+    expect(w.text()).toContain('重试次数')
+    expect(w.text()).toContain('大额拆单')
+    expect(w.text()).toContain('拆单阈值')
+    expect(w.text()).toContain('风控执行时点')
+    expect(w.find('input[data-field="requote_enabled"]').exists() ||
+           w.find('select[data-field="requote_enabled"]').exists() ||
+           w.find('[data-field="requote_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="requote_max_attempts"]').exists()).toBe(true)
+    expect(w.find('[data-field="split_order_enabled"]').exists()).toBe(true)
+    expect(w.find('input[data-field="split_order_threshold"]').exists()).toBe(true)
+    const rtSel = w.find('select[data-field="risk_timing"]')
+    expect(rtSel.exists()).toBe(true)
+    expect(rtSel.html()).toContain('next_day')
+    expect(rtSel.html()).toContain('immediate')
+  })
+
+  it('默认 payload：重下/拆单关、重试 2、阈值 500000、时点 next_day', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 30 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('input[data-field="name"]').setValue('EXEC_DEFAULT')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.requote_enabled).toBe(false)
+    expect(arg.requote_max_attempts).toBe(2)
+    expect(arg.split_order_enabled).toBe(false)
+    expect(arg.split_order_threshold).toBe(500000)
+    expect(arg.risk_timing).toBe('next_day')
+  })
+
+  it('开启重下 + 重试 3 + 拆单阈值 600000 + immediate → payload 原样携带', async () => {
+    ;(createStrategy as any).mockResolvedValue({ id: 31 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await openNewStrategy(w)
+    await w.find('[data-field="requote_enabled"]').setValue(true)
+    await w.find('input[data-field="requote_max_attempts"]').setValue('3')
+    await w.find('input[data-field="split_order_threshold"]').setValue('600000')
+    await w.find('select[data-field="risk_timing"]').setValue('immediate')
+    await w.find('input[data-field="name"]').setValue('EXEC_SET')
+    await w.find('select[data-field="formula_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createStrategy as any).mock.calls[0][1]
+    expect(arg.requote_enabled).toBe(true)
+    expect(arg.requote_max_attempts).toBe(3)
+    expect(arg.split_order_threshold).toBe(600000)
+    expect(arg.risk_timing).toBe('immediate')
+  })
+
+  it('编辑回填实盘执行配置，提交 round-trip', async () => {
+    ;(updateStrategy as any).mockResolvedValue({ id: 10 })
+    ;(getStrategies as any).mockResolvedValue([{
+      ...mockStrategies[0],
+      requote_enabled: true, requote_max_attempts: 3,
+      split_order_enabled: true, split_order_threshold: 800000,
+      risk_timing: 'immediate',
+    }])
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.findAll('button.toggle-expand')[0].trigger('click')
+    await flushPromises()
+    const editBtn = w.findAll('.strategy-sub-row button').find((b: any) => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    expect((w.find('input[data-field="requote_max_attempts"]').element as HTMLInputElement).value).toBe('3')
+    expect((w.find('input[data-field="split_order_threshold"]').element as HTMLInputElement).value).toBe('800000')
+    expect((w.find('select[data-field="risk_timing"]').element as HTMLSelectElement).value).toBe('immediate')
+
+    await w.find('input[data-field="requote_max_attempts"]').setValue('5')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(updateStrategy).toHaveBeenCalledTimes(1)
+    const arg = (updateStrategy as any).mock.calls[0][2]
+    expect(arg.requote_enabled).toBe(true)
+    expect(arg.requote_max_attempts).toBe(5)
+    expect(arg.split_order_enabled).toBe(true)
+    expect(arg.split_order_threshold).toBe(800000)
+    expect(arg.risk_timing).toBe('immediate')
+  })
+})
+
 describe('Portfolios.vue — 实盘预警调度（提交校验）', () => {
   async function openNewStrategy(w: any) {
     await w.findAll('button.toggle-expand')[0].trigger('click')

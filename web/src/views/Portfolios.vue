@@ -67,6 +67,12 @@ const SIGNAL_FREQ_RANK: Record<string, number> = {
 }
 const WEEKDAY_LABELS: Record<number, string> = { 1: '周一', 2: '周二', 3: '周三', 4: '周四', 5: '周五' }
 
+// 实盘执行（批次1）：风控/信号执行时点；重下与拆单开关默认关（保守）
+const RISK_TIMINGS = [
+  { value: 'next_day', label: '次日执行 next_day（对齐回测，默认）' },
+  { value: 'immediate', label: '当日执行 immediate（当日确认立即下单）' },
+]
+
 // 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
 const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_drawdown', 'daily_loss_limit',
@@ -182,6 +188,13 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'signal_weekday', label: '周几推送', span: 1, type: 'number', placeholder: '1-5（仅 1w，默认周一）' },
     { key: 'signal_data_end', label: '数据口径', span: 1, type: 'select', options: 'signalDataEnds' },
   ]},
+  { title: '实盘执行', hint: '仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单（批次2 接线）。', fields: [
+    { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（限次数）' },
+    { key: 'requote_max_attempts', label: '重试次数', span: 1, type: 'number', placeholder: '2', hint: '追价重下次数上限 0-10' },
+    { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
+    { key: 'split_order_threshold', label: '拆单阈值（元）', span: 1, type: 'number', placeholder: '500000' },
+    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: 'next_day=当日信号次日执行（回测对齐）；immediate=当日确认立即执行' },
+  ]},
 ]
 
 function emptyStrategyForm(): Record<string, any> {
@@ -196,6 +209,9 @@ function emptyStrategyForm(): Record<string, any> {
     rotation_enabled: false, rotation_momentum_bars: 20, rotation_hysteresis: 0.05,
     regime_filter_enabled: false, trend_trailing_stop_ratio: null, trend_max_positions: null,
     exposure_cap_enabled: false,
+    requote_enabled: false, requote_max_attempts: 2,
+    split_order_enabled: false, split_order_threshold: 500000,
+    risk_timing: 'next_day',
     signal_frequency: null, signal_at: '', signal_weekday: null, signal_data_end: null,
   }
 }
@@ -405,6 +421,14 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   if (at && !/^\d{2}:\d{2}$/.test(String(at))) return '推送时点须为 HH:MM（如 15:05）'
   const wd = num(p.signal_weekday)
   if (wd !== null && !(wd >= 1 && wd <= 5)) return '周几推送须为 1-5'
+  // 实盘执行（批次1，与后端 _validate_execution_config 同口径）
+  const rma = num(p.requote_max_attempts)
+  if (rma !== null && !(rma >= 0 && rma <= 10)) return '重试次数须在 [0,10]'
+  const sot = num(p.split_order_threshold)
+  if (sot !== null && sot < 0) return '拆单阈值不能为负'
+  if (p.risk_timing && !['next_day', 'immediate'].includes(String(p.risk_timing))) {
+    return '风控执行时点须为 next_day 或 immediate'
+  }
   return null
 }
 
@@ -528,6 +552,11 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     rotation_hysteresis: s.rotation_hysteresis, regime_filter_enabled: s.regime_filter_enabled,
     trend_trailing_stop_ratio: s.trend_trailing_stop_ratio, trend_max_positions: s.trend_max_positions,
     exposure_cap_enabled: s.exposure_cap_enabled,
+    requote_enabled: s.requote_enabled ?? false,
+    requote_max_attempts: s.requote_max_attempts ?? 2,
+    split_order_enabled: s.split_order_enabled ?? false,
+    split_order_threshold: s.split_order_threshold ?? 500000,
+    risk_timing: s.risk_timing ?? 'next_day',
     signal_frequency: s.signal_frequency ?? null,
     signal_at: s.signal_at ?? '',
     signal_weekday: s.signal_weekday ?? null,
@@ -603,6 +632,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'slaveExitModes') return SLAVE_EXIT_MODES.map(m => ({ value: m.value, label: m.label }))
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
+  if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },
     ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),
