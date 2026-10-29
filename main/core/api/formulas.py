@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.models import Formula
 from core.engine.live.timing import _to_int
 from core.engine.tdx_formula import syntax_check
 from core.engine.tdx_formula.normalizer import normalize_formula
@@ -197,7 +198,8 @@ VALID_TEST_RUN_PERIODS = {"1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon"}
 
 
 class TestRunRequest(BaseModel):
-    content: str  # 公式源码（不落库）
+    content: str = ""  # 公式源码（不落库试算）；空 = 按 formula_id 走公式名计算（导入公式）
+    formula_id: int | None = None  # content 为空时的必填项（平台已存公式）
     stock_codes: list[str]  # 1~20 只
     period: str = "1d"
     count: int = 20  # 注入历史根数
@@ -222,11 +224,17 @@ def _summarize_line(values: list) -> dict:
 
 
 @router.post("/test-run")
-def test_run_formula(req: TestRunRequest):
-    """公式源码试算：逐股逐线返回摘要（n/ones/last_values）而非全量序列，
-    供前端编辑器即时验证公式。部分股票无返回（返回数 < 请求数）附 warning。"""
-    if not req.content.strip():
-        return err(400, "content 不能为空")
+def test_run_formula(req: TestRunRequest, db: Session = Depends(get_db)):
+    """公式试算：逐股逐线返回摘要（n/ones/last_values）而非全量序列。
+
+    双路径：content 非空 → formula_by_src 源码试算（不落库，编辑器即时验证）；
+    content 空 + formula_id → **按公式名 compute**（与回测/实盘同一条路径——
+    通达信导入公式平台库不存源码，只能按名计算）。部分股票无返回附 warning。
+    """
+    if not req.content.strip() and req.formula_id is None:
+        return err(400, "content 与 formula_id 至少提供一个")
+    if req.content.strip() and req.formula_id is not None:
+        return err(400, "content 与 formula_id 只能二选一")
     if not 1 <= len(req.stock_codes) <= 20:
         return err(400, "试算股票数须 1-20")
     if req.period not in VALID_TEST_RUN_PERIODS:
@@ -234,10 +242,23 @@ def test_run_formula(req: TestRunRequest):
     if not 1 <= req.count <= 500:
         return err(400, "count 必须为 1-500")
     try:
-        res = TQFormula().compute_by_src(
-            req.content, req.stock_codes, period=req.period, count=req.count,
-            dividend_type=req.dividend_type, formula_type=req.formula_type,
-        )
+        if req.content.strip():
+            res = TQFormula().compute_by_src(
+                req.content, req.stock_codes, period=req.period, count=req.count,
+                dividend_type=req.dividend_type, formula_type=req.formula_type,
+            )
+        else:
+            formula = db.query(Formula).filter(Formula.id == req.formula_id).first()
+            if formula is None:
+                return err(404, "公式不存在")
+            if formula.engine != "tq":
+                return err(400, "builtin 公式不支持试算（内置解释器仅回测）——请用回测验证")
+            # 按公式名计算：与回测/实盘同一条 compute 路径（导入公式平台库
+            # 不存源码，源码在通达信客户端）
+            res = TQFormula().compute(
+                formula.name, "", req.stock_codes, period=req.period,
+                count=req.count, dividend_type=req.dividend_type,
+            )
     except TDXConnectionError as e:
         return err(503, str(e))
     if str(res.get("ErrorId", "1")) != "0":
