@@ -435,6 +435,58 @@ def test_handle_bar_exposure_cap_disabled_keeps_old_behavior():
     db.close()
 
 
+# ---- 策略级单笔最大买入金额（max_order_amount，实盘透传 cap_quantity）----
+def test_handle_bar_amount_cap_shrinks_buy_before_submit():
+    """max_order_amount=1000 @9.3 → 缩至 100 股（1 整手）落 submitted + 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1m")
+    ctx.max_order_amount = Decimal("1000")  # 1000/9.3=107.5 → 1 整手 = 100 股
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    assert orders[0].quantity == 100  # 默认请求 600 → 金额封顶 100
+    evs = db.query(LiveDecisionEvent).filter_by(gate="order_amount_cap").all()
+    assert len(evs) == 1 and evs[0].action == "shrink"
+    db.close()
+    assert any(r.url.path == "/order" for r in rec.requests)  # 缩量后照常发桥
+
+
+def test_handle_bar_amount_cap_none_keeps_old_behavior():
+    """max_order_amount=None（默认）→ 600 股照常提交，无金额事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1m")
+    assert ctx.max_order_amount is None
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].quantity == 600
+    assert not any(
+        d.gate == "order_amount_cap" for d in db.query(LiveDecisionEvent).all()
+    )
+    db.close()
+
+
 def test_no_signal_no_trade():
     """bar 不触发信号 → 不落 trade、不落 order。"""
     factory, _ = _db_factory()

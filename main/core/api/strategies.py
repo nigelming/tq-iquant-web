@@ -81,6 +81,9 @@ class StrategyItem(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
+    # （回测/实盘双端生效）
+    max_order_amount: float | None = None
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2
@@ -203,6 +206,10 @@ def _validate_strategy_numerics(req, label: str = "") -> str | None:
     for field, val, ok, hint in checks:
         if not ok(val):
             return f"{label}{field} {hint}，收到 {val}"
+    # 单笔最大买入金额（可选，None=不限）：非 None 须 > 0
+    _moa = getattr(req, "max_order_amount", None)
+    if _moa is not None and _moa <= 0:
+        return f"{label}单笔最大金额须大于 0，收到 {_moa}"
     return None
 
 
@@ -423,6 +430,9 @@ class StrategyCreate(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
+    # （回测/实盘双端生效）
+    max_order_amount: float | None = None
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2

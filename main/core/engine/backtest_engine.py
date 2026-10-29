@@ -380,13 +380,21 @@ class BacktestEngine:
         （上一 bar 已刷新，口径与审批用的信号 bar 收盘一致）。关闭返回空 dict，
         execute 走默认 None（行为与旧逻辑一致）。实盘 LiveEngine 不调此方法——
         其 _handle_bar 持有同式 _exposure_kwargs 透传（B-2 敞口实盘化）。
+
+        同时携带策略级单笔最大买入金额（可选 None=不限，照 exposure 同式透传，
+        回测/实盘双端 cap_quantity 生效）。
         """
-        if not getattr(ctx, "exposure_cap_enabled", False):
-            return {}
-        return {
-            "strategy_position_value": portfolio.holdings_value(ctx),
-            "strategy_capital_limit": ctx.capital_ratio * portfolio.account.initial_capital,
-        }
+        kwargs = {}
+        if getattr(ctx, "exposure_cap_enabled", False):
+            kwargs["strategy_position_value"] = portfolio.holdings_value(ctx)
+            kwargs["strategy_capital_limit"] = (
+                ctx.capital_ratio * portfolio.account.initial_capital
+            )
+        _moa = getattr(ctx, "max_order_amount", None)
+        kwargs["max_order_amount"] = (
+            Decimal(str(_moa)) if _moa is not None else None
+        )
+        return kwargs
 
     def _build_timeline(self, klines: dict) -> List[tuple]:
         """合并所有股票所有周期的时间轴，返回排序去重的 (datetime, period) 列表。

@@ -184,6 +184,7 @@ class ExecutionEngine:
         *,
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
+        max_order_amount: Optional[Decimal] = None,
     ) -> Optional[int]:
         """审批/T+1 量上限：返回最终下单量（None=不通过不下单）。
 
@@ -196,6 +197,11 @@ class ExecutionEngine:
         时 BUY 可买额度 = min(现金, 上限 - strategy_position_value)——策略总持仓市值
         ≤ capital_ratio × 初始资金。缩量/拒单记 exposure_cap 闸门事件（敞口为 binding
         约束时），否则沿用 insufficient_funds/order_shrunk（现金为 binding 约束）。
+
+        策略级单笔最大买入金额（可选，None=不限）：BUY 审批通过后金额
+        （price × qty）超 max_order_amount → 缩量到该金额能买的整手股数
+        （不足 1 手拒单），记 order_amount_cap 闸门事件。仅 BUY 路径生效，
+        SELL 忽略。
         """
         if order.trade_type.value == "BUY":
             lot = self._lot(order.stock_code)
@@ -258,6 +264,33 @@ class ExecutionEngine:
                         message="资金不足缩量：请求 %d 股，按可用现金 %s 缩至 %d 股 @%s"
                                 % (order.quantity, fmt_money(account.cash), qty, fmt_price(order.price)),
                     )
+            # 策略级单笔最大买入金额（None=不限）：审批通过后金额封顶，
+            # 缩到该金额能买的整手股数（不足 1 手拒单）。仅 BUY 路径。
+            if (max_order_amount is not None and max_order_amount > 0
+                    and order.price and order.price > 0):
+                max_qty = int(float(max_order_amount) / float(order.price) / lot) * lot
+                if max_qty < qty:
+                    if max_qty < lot:
+                        self._rec_gate(
+                            "order_amount_cap", "reject", order, "capital_gate",
+                            requested=order.quantity, final=0,
+                            param_name="max_order_amount", param_value=float(max_order_amount),
+                            actual_value=float(order.price * qty),
+                            message="单笔最大金额拒单：%s 元上限按 %s 只能买 %d 股，不足 1 手"
+                                    % (fmt_money(max_order_amount),
+                                       fmt_price(order.price), max_qty),
+                        )
+                        return None
+                    self._rec_gate(
+                        "order_amount_cap", "shrink", order, "capital_gate",
+                        requested=order.quantity, final=max_qty,
+                        param_name="max_order_amount", param_value=float(max_order_amount),
+                        actual_value=float(order.price * max_qty),
+                        message="单笔最大金额缩量：请求 %d 股，%s 元上限按 %s 缩至 %d 股（整手）"
+                                % (order.quantity, fmt_money(max_order_amount),
+                                   fmt_price(order.price), max_qty),
+                    )
+                    qty = max_qty
             return qty
         if position is None or order.bar_time is None:
             return None
@@ -331,6 +364,7 @@ class ExecutionEngine:
         *,
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
+        max_order_amount: Optional[Decimal] = None,
         buy_fee_cfg: Optional[tuple] = None,
     ) -> Optional[TradeEvent]:
         """执行订单。
@@ -344,6 +378,9 @@ class ExecutionEngine:
         不启用（实盘 LiveEngine._handle_bar 按策略 exposure_cap_enabled 同式传入，
         回测/实盘行为一致）。
 
+        max_order_amount（可选，None=不限）：策略级单笔最大买入金额，透传
+        cap_quantity（回测/实盘双端同一闸门）。
+
         buy_fee_cfg（可选，(最低佣金, 买入费率)，实盘从组合 cost_params 传入）：
         实盘 BUY 费用感知前置钳制口径——approve_order 只卡价×量，尾款不足佣金
         会透支虚拟现金（与回测 apply 段的费用兜底同一审批正确性语义）。桥通道
@@ -355,6 +392,7 @@ class ExecutionEngine:
             order, account, position,
             strategy_position_value=strategy_position_value,
             strategy_capital_limit=strategy_capital_limit,
+            max_order_amount=max_order_amount,
         )
         if capped is None:
             return None

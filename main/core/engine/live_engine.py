@@ -1981,13 +1981,21 @@ class LiveEngine:
         （该策略虚拟持仓按最近已知价估值，_handle_bar 顶部 total_value(bar) 已刷新
         价格快照，与回测「上一 bar 收盘估值」同口径）；上限 = capital_ratio × 组合
         初始资金。关闭返回空 dict，cap_quantity/execute 走默认 None（行为不变）。
+
+        同时携带策略级单笔最大买入金额（可选 None=不限，与回测同式透传
+        cap_quantity，双端生效）。
         """
-        if not getattr(ctx, "exposure_cap_enabled", False):
-            return {}
-        return {
-            "strategy_position_value": portfolio.holdings_value(ctx),
-            "strategy_capital_limit": ctx.capital_ratio * portfolio.account.initial_capital,
-        }
+        kwargs = {}
+        if getattr(ctx, "exposure_cap_enabled", False):
+            kwargs["strategy_position_value"] = portfolio.holdings_value(ctx)
+            kwargs["strategy_capital_limit"] = (
+                ctx.capital_ratio * portfolio.account.initial_capital
+            )
+        _moa = getattr(ctx, "max_order_amount", None)
+        kwargs["max_order_amount"] = (
+            Decimal(str(_moa)) if _moa is not None else None
+        )
+        return kwargs
 
     @staticmethod
     def _buy_fee_cfg(portfolio: Portfolio) -> Optional[tuple]:

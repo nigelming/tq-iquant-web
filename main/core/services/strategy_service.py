@@ -49,6 +49,8 @@ def serialize_strategy(s: Strategy) -> dict:
         "trend_max_positions": s.trend_max_positions,
         # #3 策略级敞口上限（默认关）
         "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
+        # 策略级单笔最大买入金额（元，None=不限）
+        "max_order_amount": s.max_order_amount,
         # 实盘执行配置（批次1，默认关/保守默认；NULL 兜底默认值）
         "requote_enabled": bool(s.requote_enabled) if s.requote_enabled is not None else False,
         "requote_max_attempts": s.requote_max_attempts if s.requote_max_attempts is not None else 2,
@@ -175,6 +177,7 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
             trend_max_positions=getattr(s, "trend_max_positions", None),
             exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
+            max_order_amount=getattr(s, "max_order_amount", None),
             requote_enabled=getattr(s, "requote_enabled", False),
             requote_max_attempts=getattr(s, "requote_max_attempts", 2),
             split_order_enabled=getattr(s, "split_order_enabled", False),
@@ -298,6 +301,8 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.trend_max_positions = getattr(req, "trend_max_positions", None)
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
+    # 单笔最大买入金额（None=不限；缺省字段回落 None，保持旧请求行为不变）
+    s.max_order_amount = getattr(req, "max_order_amount", None)
     # 实盘执行配置（批次1；缺省字段回落默认，保持旧请求行为不变）
     s.requote_enabled = getattr(req, "requote_enabled", False)
     s.requote_max_attempts = getattr(req, "requote_max_attempts", 2)

@@ -1189,6 +1189,63 @@ def test_exposure_cap_disabled_fills_both():
 
 
 # ===========================================================================
+# 策略级单笔最大买入金额（max_order_amount 默认 None 不限）：BUY 审批金额封顶
+# ===========================================================================
+def _amount_cap_klines():
+    """单股票 1d klines：open=close=10（信号 7/29 触发，7/30 成交）。"""
+    rows = [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+    ]
+    return _klines("000001.SZ", rows)
+
+
+def _amount_cap_portfolio(max_order_amount):
+    """capital_ratio=0.6（策略资金 60000）、single_open_ratio=1.0（单笔 60000=6000 股）。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+        single_open_ratio=Decimal("1.0"),
+        max_order_amount=max_order_amount,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    return port, ctx
+
+
+def test_backtest_max_order_amount_caps_buy():
+    """max_order_amount=20000：6000 股请求 @10 → 缩至 2000 股 + order_amount_cap 事件。"""
+    port, _ = _amount_cap_portfolio(Decimal("20000"))
+    cache = {(1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=_amount_cap_klines(), signal_cache=cache)
+
+    assert len(result["trades"]) == 1
+    assert result["trades"][0].quantity == 2000
+    cap_events = [d for d in result["decisions"] if d["gate"] == "order_amount_cap"]
+    assert len(cap_events) == 1
+    assert cap_events[0]["action"] == "shrink"
+
+
+def test_backtest_max_order_amount_none_keeps_old_behavior():
+    """max_order_amount=None（默认）→ 6000 股照常全量成交，无金额事件。"""
+    port, _ = _amount_cap_portfolio(None)
+    cache = {(1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=_amount_cap_klines(), signal_cache=cache)
+
+    assert len(result["trades"]) == 1
+    assert result["trades"][0].quantity == 6000
+    assert not any(d["gate"] == "order_amount_cap" for d in result["decisions"])
+
+
+# ===========================================================================
 # #5 多周期午夜时间戳覆盖：1w/1mon 与 1d 同为 00:00，粗粒度行不得污染价格索引
 # ===========================================================================
 def test_weekly_bar_friday_keyed_does_not_pollute_fill_price():

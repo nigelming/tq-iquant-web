@@ -135,6 +135,12 @@ def assemble_portfolio(
             trend_max_positions=getattr(strat, "trend_max_positions", None),
             # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
+            # 单笔最大买入金额（元，可选 None=不限；回测/实盘双端 cap_quantity 生效）
+            max_order_amount=(
+                Decimal(str(getattr(strat, "max_order_amount", None)))
+                if getattr(strat, "max_order_amount", None) is not None
+                else None
+            ),
             # 实盘执行配置（批次1，默认关/保守默认；关闭时行为与原逻辑一致）
             requote_enabled=bool(getattr(strat, "requote_enabled", False)),
             requote_max_attempts=getattr(strat, "requote_max_attempts", None) or 2,

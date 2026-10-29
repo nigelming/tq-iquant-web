@@ -53,6 +53,8 @@ class Strategy(Base):
     # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
     exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     # 实盘执行配置（批次1，全部向后兼容：默认关/保守默认）
+    # 单笔最大买入金额（元）：BUY 审批时金额超此值→缩量到该金额能买的整手股数
+    max_order_amount = Column(Float, nullable=True)
     # 撤单后有限追价重下：超时撤单成功且未超次数 → 剩余量按 tick 追价重下
     requote_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     requote_max_attempts = Column(Integer, default=2, server_default="2", nullable=False)

@@ -36,6 +36,9 @@ class StrategyContext:
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
         # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
+        # 策略级单笔最大买入金额（元，可选，None=不限）：BUY 审批金额封顶，
+        # 超限缩量到该金额能买的整手股数（回测/实盘双端 cap_quantity 生效）
+        max_order_amount: Optional[Decimal] = None,
         # 实盘执行配置（批次1，全部默认关/保守默认，关闭时行为与原逻辑一致）
         requote_enabled: bool = False,
         requote_max_attempts: int = 2,
@@ -81,6 +84,8 @@ class StrategyContext:
         self.trend_max_positions = trend_max_positions
         # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
         self.exposure_cap_enabled = exposure_cap_enabled
+        # 单笔最大买入金额（None=不限，关闭时审批行为与原逻辑一致）
+        self.max_order_amount = max_order_amount
         # 实盘执行配置（批次1）：撤单追价重下 / TDX 大额拆单（批次2接线）/ 风控时点
         self.requote_enabled = requote_enabled
         self.requote_max_attempts = requote_max_attempts

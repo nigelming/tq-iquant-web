@@ -64,3 +64,21 @@ def test_downgrade_prev_head_removes_execution_config_columns(alembic_cfg):
     command.downgrade(alembic_cfg, _PREV_HEAD)
     cols = _strategy_columns(alembic_cfg)
     assert not (NEW_COLUMNS & cols)
+
+
+# ---- 策略级单笔最大买入金额（a8f9b0c1d2e3）----
+AMOUNT_CAP_COLUMN = {"max_order_amount"}
+_AMOUNT_CAP_PREV_HEAD = "d7e8f9a0b1c2"
+
+
+def test_upgrade_head_adds_max_order_amount_column(alembic_cfg):
+    command.upgrade(alembic_cfg, "head")
+    cols = _strategy_columns(alembic_cfg)
+    assert AMOUNT_CAP_COLUMN <= cols
+
+
+def test_downgrade_prev_head_removes_max_order_amount_column(alembic_cfg):
+    command.upgrade(alembic_cfg, "head")
+    command.downgrade(alembic_cfg, _AMOUNT_CAP_PREV_HEAD)
+    cols = _strategy_columns(alembic_cfg)
+    assert not (AMOUNT_CAP_COLUMN & cols)
