@@ -29,9 +29,6 @@ const EXEC_MODE_LABEL: Record<string, string> = {
   alert: '预警', auto: '自动',
 }
 
-const liveRunningSessions = computed(() =>
-  liveSessions.value.filter((s) => s.status === 'running'))
-
 async function load() {
   errorMsg.value = ''
   // allSettled：任一查询失败不阻塞其余卡片，失败项保持 0/空展示
@@ -159,8 +156,8 @@ onMounted(load)
             <tbody>
               <tr v-for="s in liveSessions" :key="s.id">
                 <td>{{ s.name }}</td>
-                <td>{{ ENGINE_LABEL[s.engine] || s.engine }}</td>
-                <td>{{ EXEC_MODE_LABEL[s.execution_mode] || s.execution_mode }}</td>
+                <td>{{ ENGINE_LABEL[s.engine ?? ''] || s.engine || '—' }}</td>
+                <td>{{ EXEC_MODE_LABEL[s.execution_mode ?? ''] || s.execution_mode || '—' }}</td>
                 <td style="color:var(--ink-soft)">{{ (s.portfolio_ids || []).length }} 个组合</td>
                 <td>
                   <span v-if="s.status === 'running'" class="badge badge-green">运行中</span>
