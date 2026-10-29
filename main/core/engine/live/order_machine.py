@@ -247,6 +247,8 @@ class OrderStateMachine:
         57废单→rejected；55部成是在途不碰、56全成走deals回填），
         把终态单转出 submitted——第一层自愈，覆盖 GUI 撤单/收盘自动撤/柜台废单。
         桥离线/查失败 → 本轮跳过（不改状态），下轮重试。
+        返回值：本轮带撤单请求标记且收敛为 canceled 的单 id 列表（撤单收敛统一
+        requote 挂点，LiveEngine._tick_deals 据此追价重下；其余调用方忽略）。
         """
         db = self._ctx.db_session_factory()
         session_id = self._ctx.session_id
@@ -261,7 +263,7 @@ class OrderStateMachine:
             )
             if not pending:
                 self.sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
-                return
+                return []
             # 0. 一次 /orders 查询，复用于 order_ref 定位 + 撤单终态同步（避免每笔单各查一次）。
             #    桥离线时 orders=None：定位与终态同步都跳过，本单留 submitted 下轮重试；
             #    /deals 回填仍可独立进行（成交优先）。
@@ -335,10 +337,16 @@ class OrderStateMachine:
             #    之后——否则 backfill_order 会把刚标的 canceled 覆盖回 partial。53部撤的部分
             #    成交真实存在，此处补 apply（backfill_order 对 partial 不 apply，撤单终态必落持仓）。
             #    注意 55=部成是在途非终态，绝不在此处理（2026-08-24 官方码修正）。
-            self.sync_terminal_order_status(db, pending, orders, deals)
+            cancel_converged = self.sync_terminal_order_status(
+                db, pending, orders, deals)
+            # id 须在 commit 前取（expire_on_commit=True 的 session close 后
+            # 访问属性会 DetachedInstanceError）；LiveEngine._tick_deals 据 id
+            # 重查后走撤单收敛统一 requote 判定。
+            converged_ids = [lo.id for lo in cancel_converged]
             db.commit()
             # 4. G7：重查剩余 submitted/partial 同步在途集合（filled/rejected/canceled 自然移除）
             self.sync_pending_orders(db)
+            return converged_ids
         finally:
             # 异常向上抛到 _deals_loop 统一记日志（不再此处静默吞），
             # rollback 清理未提交事务，close 归还连接。
@@ -347,7 +355,7 @@ class OrderStateMachine:
 
     def sync_terminal_order_status(self, db: Session, pending: list,
                                    orders: Optional[list],
-                                   deals: Optional[list]) -> None:
+                                   deals: Optional[list]) -> list:
         """终态同步（第一层自愈）：据 /orders 的 m_nOrderStatus 转出 submitted。
 
         iQuant 收盘自动撤 / GUI 手动撤 / 柜台废单后，ORDER 实时表里该单 status 变终态：
@@ -368,9 +376,16 @@ class OrderStateMachine:
           等下轮 /deals 把成交价/量/金额回填齐再 apply，避免无价格依据的空 apply。
         - 废单(57)按 rejected 处理（语义：柜台拒单，非我方撤）；正常不会带成交，若有残留
           filled_quantity 一并保留记录但不再 apply。
+
+        返回值（撤单收敛统一 requote 挂点）：本轮带撤单请求标记
+        （_CANCEL_REQUESTED_TAG）且收敛为 canceled 的单列表。TDX/THS 当日委托表
+        **保留已撤单**（不消失），真机超时撤单实际全走本路径（53/54 终态）收敛，
+        requote 判定必须覆盖本路径——调用方（LiveEngine._tick_deals）据此做有限
+        追价重下；非标记单（GUI 手撤/收盘自动撤/柜台正常收敛）不进返回值，不重下。
         """
         if not orders:
-            return  # 桥离线或无 /orders 数据：无法判终态，全部留待下轮
+            return []  # 桥离线或无 /orders 数据：无法判终态，全部留待下轮
+        cancel_converged: list = []  # 带撤单标记且本轮收敛 canceled（requote 挂点）
         # 按 order_ref 索引 /orders（有 ref 才能精确对应本单；无 ref 的单此处不处理，
         # 它们走 expire 超时或 remark /deals 回填路径）。
         by_ref = {}
@@ -427,6 +442,9 @@ class OrderStateMachine:
                     self.apply_filled_trade(
                         lo, trade.price, trade.quantity, trade.amount, trade.commission
                     )
+            # 撤单请求标记须在 error_message 覆盖前捕获（收敛后原文被终态文案替换）
+            cancel_requested = (lo.error_message or "").startswith(
+                _CANCEL_REQUESTED_TAG)
             lo.status = "canceled"
             lo.error_message = "order canceled by broker (m_nOrderStatus=%s)" % status
             self.pending_orders.pop(lo.id, None)
@@ -446,6 +464,9 @@ class OrderStateMachine:
                 "filled_quantity": int(lo.filled_quantity or 0),
                 "error_message": lo.error_message,
             })
+            if cancel_requested:
+                cancel_converged.append(lo)
+        return cancel_converged
 
     def expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         """陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
@@ -567,6 +588,10 @@ class OrderStateMachine:
         返回值（批次1 3a 挂点）：本轮经 _finalize_timeout_canceled 收敛为 canceled
         的 LiveOrder 列表——LiveEngine 据此对开启 requote_enabled 的策略做有限
         追价重下；其余调用方忽略返回值即可（行为不变）。
+        注意：这只是「消失」路径的挂点——TDX/THS 当日委托表**保留已撤单**，真机
+        实际全部走 5s 轮询 sync_terminal_order_status 的 53/54 终态路径收敛，该
+        路径的 requote 挂点在 poll_deals 返回值（两条路径统一进 LiveEngine
+        _requote_after_timeout_cancel 判定，含 _requote_fired 防双触发）。
         """
         minutes = self._cancel_unfilled_minutes()
         if minutes <= 0:

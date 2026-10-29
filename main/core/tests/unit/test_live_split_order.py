@@ -19,6 +19,7 @@ from core.engine.event import OrderEvent
 from core.engine.http_bridge_dispatcher import BridgeOrderRejected
 from core.engine.live_engine import LiveEngine
 from core.engine.portfolio import Portfolio
+from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.engine.live.timing import now_shanghai
@@ -399,6 +400,40 @@ def test_same_key_new_signal_appends_to_queue():
     assert ctx.positions[STOCK].quantity == 2002
     assert (1, STOCK) not in engine._split_children
     assert any(d.action == "complete" for d in _split_decisions(factory))
+
+
+def test_reverse_direction_large_order_bypasses_queue():
+    """反方向大单不拆不排队：BUY 队列在途 + SELL 大单 → 单笔直提（原量落库），
+    风控退出不被拆单队列拖延（docstring 承诺的行为约束）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_split()
+    disp = _FakeTdxDispatcher()
+    engine = _make_engine(disp, factory, port)
+
+    t1 = datetime(2026, 8, 5, 10, 0)
+    t2 = datetime(2026, 8, 5, 10, 5)
+    _submit(engine, port, _order(1001, bar_time=t1))
+    engine._poll_deals()  # 仅回填子 1 filled（不续发，制造撞键窗口）
+
+    pos = Position(STOCK)  # SELL 审批需虚拟持仓
+    pos.quantity = 1001
+    pos.avg_cost = Decimal("10")
+    ctx.positions[STOCK] = pos
+    sell = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=STOCK,
+        trade_type=TradeType.SELL, signal_type=SignalType.CLOSE,
+        quantity=1001, price=Decimal("10"),
+        bar_time=t2, signal_name="close_sig",
+    )
+    _submit(engine, port, sell)
+
+    entry = engine._split_children[(1, STOCK)]
+    assert [c.quantity for c in entry["pending"]] == [500]  # 队列未被 SELL 子单污染
+    rows = _rows(factory)
+    sells = [r for r in rows if r.trade_type == "sell"]
+    assert len(sells) == 1 and sells[0].quantity == 1001    # 单笔直提，未拆
+    events = engine._recorder.drain()
+    assert any(e.gate == "split_order" and e.action == "skip" for e in events)
 
 
 def test_split_children_do_not_cross_bind_same_volume_refs():

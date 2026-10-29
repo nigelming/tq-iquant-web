@@ -7289,3 +7289,93 @@ def test_requote_skips_when_fully_filled_before_cancel(monkeypatch):
     assert engine._requote_attempts == {}
 
 
+# ===========================================================================
+# 撤单收敛统一 requote 挂点：53/54 终态同步路径可达（终审修复）
+# 真机事实：TDX/THS 当日委托表保留已撤单（不消失），超时撤单实际全走 5s 轮询
+# sync_terminal_order_status 的 53/54 终态路径收敛——requote 必须覆盖该路径。
+# ===========================================================================
+def test_requote_fires_via_53_54_terminal_sync_path(monkeypatch):
+    """带撤单标记的单走 53/54 终态同步收敛（此前 requote 不可达的路径）→ 追价重下。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    # 委托表保留该单且已呈 54 全撤终态（撤单已生效但行不消失）
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001", status=54)])
+    engine, _, _ = _requote_engine(disp, factory, enabled=True)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    # 第 1 轮主循环：请求撤单（打标记）；委托表仍保留该单 → 不走消失路径
+    db = factory()
+    engine._sweep_timeout_orders(db)
+    db.close()
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "submitted"
+    assert (lo2.error_message or "").startswith(_CANCEL_TAG)
+    db.close()
+
+    # 第 2 轮 deals 池：5s 终态同步收敛 canceled → 统一 requote 挂点触发
+    engine._tick_deals()
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    assert len(orders) == 2
+    orig, requote = orders
+    assert orig.id == lo_id and orig.status == "canceled"
+    assert requote.status == "submitted"
+    assert requote.price == Decimal("9.31")   # BUY：原价 9.3 + 1 tick
+    assert requote.quantity == 600
+    db.close()
+    assert engine._requote_attempts[_REQUOTE_KEY] == 1
+
+
+def test_requote_not_fired_for_untagged_53_54_cancel(monkeypatch):
+    """非标记单（GUI 手撤/收盘自动撤）走 53/54 终态收敛 → 维持现行为，不重下。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001", status=54)])
+    engine, _, _ = _requote_engine(disp, factory, enabled=True)
+    db = factory()
+    _pending_order_with_ref(db)  # 无撤单请求标记
+    db.commit()
+    db.close()
+
+    engine._tick_deals()
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "canceled"
+    db.close()
+    assert engine._requote_attempts == {}
+    assert engine._requote_fired == set()
+
+
+def test_requote_fires_once_across_both_convergence_paths(monkeypatch):
+    """防双触发：同一单两条收敛路径都进统一判定 → 只触发一次（引擎级 set）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[])
+    engine, _, _ = _requote_engine(disp, factory, enabled=True)
+    db = factory()
+    lo = _pending_order_with_ref(db, status="canceled")
+    lo.error_message = _CANCEL_TAG + "超时未成交已撤单（阈值 3 分钟）"
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    # 模拟同一单同时被两条路径（消失路径返回 + 53/54 终态路径收集）递进判定
+    engine._requote_after_cancel_converged([lo_id])
+    engine._requote_after_cancel_converged([lo_id])
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    assert len(orders) == 2  # 仅一次重下
+    db.close()
+    assert engine._requote_attempts[_REQUOTE_KEY] == 1
+    assert engine._requote_fired == {_REQUOTE_KEY + (0,), ("order", lo_id)}
+    assert len(disp.place_calls) == 1
+
+

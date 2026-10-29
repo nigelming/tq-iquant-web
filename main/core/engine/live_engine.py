@@ -174,6 +174,11 @@ class LiveEngine:
         # requote_max_attempts 次数上限兜底，重启后最坏多追价一轮）。
         # key=(strategy_id, stock_code, signal_name, bar_date)，value=已用重试次数。
         self._requote_attempts: Dict[tuple, int] = {}
+        # 撤单收敛统一 requote 挂点的防重 set（只触发一次）：条目两种形状——
+        #   (strategy_id, stock_code, signal_name, bar_date, attempts)：同键同次数
+        #   防重复触发；(“order”, order_id)：同一收敛单只进一次判定（同一单的收敛
+        # 事件可能同时出现在主循环消失路径与 deals 池 53/54 终态路径的输入里）。
+        self._requote_fired: set = set()
         # 批次2：TDX 大额拆单队列（成交驱动）。key=(strategy_id, stock_code)，
         # value={"inflight": OrderEvent 当前在途子单, "pending": [OrderEvent 未提交子单],
         #        "portfolio": Portfolio, "period": str}。子单 1 落库提交后入队，
@@ -873,8 +878,11 @@ class LiveEngine:
     def _requote_after_timeout_cancel(self, db: Session, finalized: list) -> None:
         """批次1 3a：撤单收敛 canceled 后的有限追价重下（真机安全约束）。
 
-        对本轮经超时撤单收敛为 canceled 的单（_cancel_unfilled_orders 返回，
-        排除 GUI 手撤/53-54 终态同步路径——仅批次 A 超时撤单挂点）：
+        对本轮带撤单请求标记且收敛为 canceled 的单——两条收敛路径统一进本判定：
+        主循环 _cancel_unfilled_orders 返回（委托表消失路径）+ deals 池
+        _requote_after_cancel_converged 重查（53/54 终态同步路径，TDX/THS 当日
+        委托表保留已撤单，真机主要走这条）；未带标记的单（GUI 手撤/收盘自动撤）
+        不在两个入口的收集范围，维持现行为（终态 canceled），不重下：
         - 目标策略 requote_enabled 且 attempts < requote_max_attempts → 构造
           追价 OrderEvent 重下剩余量（quantity = 原量 − 已成交量，=0 不重下；
           price = 原价 ± tick_size，BUY +tick / SELL −tick；涨跌停界内不加校验，
@@ -921,6 +929,18 @@ class LiveEngine:
                     lo.id, lo.stock_code, attempts, max_attempts, self.session_id,
                 )
                 continue
+            # 防双触发（只触发一次）：同一收敛单可能同时出现在两条路径（消失 /
+            # 53/54 终态）的输入里——按来源单 id 保证一单只判一次；另按
+            # (strategy, code, signal, bar_date)+attempts 防同键同次数重复触发。
+            fired_key = key + (attempts,)
+            fired_order = ("order", lo.id)
+            if fired_key in self._requote_fired or fired_order in self._requote_fired:
+                logger.info(
+                    "requote skip: order %s %s key=%s attempts=%d already fired "
+                    "(dedup, session %s)",
+                    lo.id, lo.stock_code, key, attempts, self.session_id,
+                )
+                continue
             step = tick_size(lo.stock_code)
             orig_price = Decimal(str(lo.price)) if lo.price is not None else None
             if orig_price is None:
@@ -940,6 +960,8 @@ class LiveEngine:
                 signal_bar_date=None,  # 追价单当 bar 提交，不进 deferred 闸门
             )
             self._requote_attempts[key] = attempts + 1
+            self._requote_fired.add(fired_key)
+            self._requote_fired.add(fired_order)
             self._rec_live(
                 "requote", "submit", portfolio, requote,
                 message="撤单追价重下：第 %d/%d 次，%s %s 追价后价格 %s、数量 %d"
@@ -987,13 +1009,49 @@ class LiveEngine:
         try:
             with self._book_lock:
                 self._consume_execution_receipts()
-                self._poll_deals()
+                converged_ids = self._poll_deals() or []
                 # 批次2：拆单队列成交驱动续发——必须在 _poll_deals 之后：
                 # 依赖本轮回填/终态同步把队首子单推进到 filled/canceled/rejected，
                 # 再决定续发下一笔或整队中止。同持 _book_lock（RLock 可重入）。
                 self._tick_split_children()
+                # 撤单收敛统一 requote 挂点（53/54 终态同步路径）：带撤单请求
+                # 标记的单在委托表呈 53/54 终态收敛 canceled 后做有限追价重下
+                # （TDX/THS 当日委托表保留已撤单，真机超时撤单全走本路径）。
+                # 持 _book_lock（重下走提交闸门链，pending_orders 增删须串行）。
+                if converged_ids:
+                    self._requote_after_cancel_converged(converged_ids)
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
+
+    def _requote_after_cancel_converged(self, order_ids: list) -> None:
+        """53/54 终态同步收敛的撤单 requote 挂点（deals 池；持 _book_lock 调用）。
+
+        poll_deals 的 db session 已在 finally 关闭，此处按 id 重查（只认本 session
+        且已收敛 canceled 的行），复用 _requote_after_timeout_cancel 判定：
+        requote_enabled / attempts 上限 / 剩余量扣减 / _requote_fired 防双触发。
+        """
+        if not order_ids:
+            return
+        db = self._db_session_factory()
+        try:
+            rows = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.id.in_([int(i) for i in order_ids]),
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status == "canceled",
+                )
+                .all()
+            )
+            if not rows:
+                return
+            self._requote_after_timeout_cancel(db, rows)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def _consume_execution_receipts(self) -> None:
         """执行回执消费（file 交接层执行器拒单 → 工作台立即可见）。
@@ -1693,9 +1751,11 @@ class LiveEngine:
         Σ=原量，每子单金额 ≤ 阈值+一手内偏差），子单 1 立即走完整提交闸门链
         （独立审批 cap_quantity/exposure），其余入 _split_children 队列等续发。
 
-        同 (策略,股票) 已有队列 → 新单子单 append 排队（F7 保证同向在途唯一，
-        撞键仅发生在「队首已成交待续发」窗口；反方向大单不拆直接单笔提交，
-        保风控退出时效，且 SELL 不冻结现金无超预算问题）。子单带 _split_child
+        同 (策略,股票) 已有队列且队首子单同向 → 新单子单 append 排队（F7 保证
+        同向在途唯一，撞键仅发生在「队首已成交待续发」窗口）。队首子单**反方向**
+        → 不拆不排队，单笔直提（return False 走正常提交链）：反方向大单——尤其
+        风控止损/清仓 SELL——排队等待 BUY 队列会拖垮退出时效，且 SELL 不冻结
+        现金无超预算问题。子单带 _split_child
         标记不再二次拆分。子单 bar_time 毫秒级递增：D6 跨重启去重键互异，
         收盘守卫/日历/deferred 按 date/hour/minute 判定不受毫秒影响。
         """
@@ -1725,16 +1785,28 @@ class LiveEngine:
             if child.bar_time is not None:
                 child.bar_time = child.bar_time + timedelta(milliseconds=i)
             children.append(child)
-        self._rec_live(
-            "split_order", "split", portfolio, order,
-            message="大额拆单：金额 %s ≥ 阈值 %s，拆为 %d 笔子单（%s 股），成交驱动依次提交"
-                    % (amount, threshold, n, "+".join(str(c.quantity) for c in children)),
+        split_msg = (
+            "大额拆单：金额 %s ≥ 阈值 %s，拆为 %d 笔子单（%s 股），成交驱动依次提交"
+            % (amount, threshold, n, "+".join(str(c.quantity) for c in children))
         )
         with self._book_lock:
             key = (order.strategy_id, order.stock_code)
             entry = self._split_children.get(key)
             if entry is not None:
+                inflight = entry.get("inflight")
+                if (inflight is not None
+                        and getattr(inflight, "trade_type", None) != order.trade_type):
+                    # 反方向大单不拆不排队：单笔直提，保风控退出时效
+                    # （docstring 承诺：SELL 不冻结现金无超预算问题）
+                    self._rec_live(
+                        "split_order", "skip", portfolio, order,
+                        message="反方向拆单队列在途：本单不拆不排队，单笔直提（保风控退出时效）",
+                    )
+                    return False
                 # 同策略同票已有队列：新单子单排队等待当前队列完成，不并行提交
+                self._rec_live(
+                    "split_order", "split", portfolio, order, message=split_msg,
+                )
                 entry["pending"].extend(children)
                 self._rec_live(
                     "split_order", "split", portfolio, order,
@@ -1742,6 +1814,9 @@ class LiveEngine:
                             % len(children),
                 )
                 return True
+            self._rec_live(
+                "split_order", "split", portfolio, order, message=split_msg,
+            )
             self._split_children[key] = {
                 "inflight": children[0],
                 "pending": children[1:],
@@ -2077,8 +2152,9 @@ class LiveEngine:
     def _match_legacy_fuzzy(live_order, orders, claimed):
         return OrderStateMachine.match_legacy_fuzzy(live_order, orders, claimed)
 
-    def _poll_deals(self) -> None:
-        self._order_machine.poll_deals()
+    def _poll_deals(self) -> list:
+        """薄委托 → OrderStateMachine.poll_deals；返回撤单收敛（canceled）单 id 列表。"""
+        return self._order_machine.poll_deals()
 
     def _sync_terminal_order_status(self, db: Session, pending: list,
                                     orders: Optional[list],
