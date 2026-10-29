@@ -1037,25 +1037,105 @@ describe('LiveSessions.vue 会话切换清理 + 停止时序 + 重连状态（au
   })
 })
 
-describe('LiveSessions.vue B6 全局限 1 UI 预防（audit M6）', () => {
-  it('存在运行中会话时，其它行的启动按钮 disabled 且 title 提示全局限 1', async () => {
-    ;(getLiveSessions as any).mockResolvedValue([runningSession, stoppedSession])
-    const w = mount(LiveSessions)
-    await flushPromises()
+describe('LiveSessions.vue 多会话并行监控（M1）', () => {
+  const runningSession2 = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 
-    const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
-    expect(startBtn.attributes('disabled')).toBeDefined()
-    expect(startBtn.attributes('title')).toContain('已有运行中会话')
-    w.unmount()
-  })
-
-  it('无运行中会话时启动按钮正常可用', async () => {
-    ;(getLiveSessions as any).mockResolvedValue([stoppedSession, { ...stoppedSession, id: 9, name: '模拟盘C' }])
+  it('存在运行中会话时启动按钮仍可点（B6 全局限 1 已移除，多会话并行）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, { ...runningSession2, status: 'stopped' }])
     const w = mount(LiveSessions)
     await flushPromises()
 
     const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
     expect(startBtn.attributes('disabled')).toBeUndefined()
+    expect(startBtn.attributes('title')).toBeUndefined()
+    w.unmount()
+  })
+
+  it('多 running 会话：默认只接第一个的流，其余等用户点监控', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(FakeEventSource.instances.length).toBe(1)
+    expect(FakeEventSource.instances[0].url).toBe('/api/live/sessions/7/stream')
+    // 首个会话标「监控中」；仅第二个 running 行显示「监控」按钮
+    expect(w.text()).toContain('监控中')
+    const watchBtns = w.findAll('button').filter((b) => b.text() === '监控')
+    expect(watchBtns.length).toBe(1)
+    w.unmount()
+  })
+
+  it('点监控 → 关旧流、接目标会话流，工作台历史切到目标会话', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+
+    const watchBtn = w.findAll('button').find((b) => b.text() === '监控')!
+    await watchBtn.trigger('click')
+    await flushPromises()
+
+    expect(es7.close).toHaveBeenCalled()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    expect(getLivePositions).toHaveBeenLastCalledWith(8)
+    // 监控中标记随切换移动：已监控行（8）不再显示监控按钮，另一 running 行（7）显示
+    const watchBtns = w.findAll('button').filter((b) => b.text() === '监控')
+    expect(watchBtns.length).toBe(1)
+    w.unmount()
+  })
+
+  it('监控切换后旧会话在途历史不覆盖新会话工作台（防串台）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    let resolve7!: (v: unknown) => void
+    const m = getLivePositions as any
+    m.mockReset()
+    m.mockImplementationOnce(() => new Promise((res) => { resolve7 = res }))
+    m.mockResolvedValueOnce([
+      { stock_code: '000001.SZ', quantity: 500, avg_cost: 12, market_value: 6000, portfolio_id: 1, strategy_id: 1 },
+    ])
+    m.mockResolvedValue([])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const watchBtn = w.findAll('button').find((b) => b.text() === '监控')!
+    await watchBtn.trigger('click')
+    await flushPromises()
+    // 会话 8 历史已展示
+    expect(w.text()).toContain('000001.SZ')
+
+    // 会话 7 的在途历史此刻才 resolve → 不得覆盖会话 8 的工作台
+    resolve7([{ stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350, portfolio_id: 1, strategy_id: 1 }])
+    await flushPromises()
+    expect(w.text()).not.toContain('600000.SH')
+    expect(w.text()).toContain('000001.SZ')
+    w.unmount()
+  })
+
+  it('监控中的会话停止后，自动回退接其它 running 会话', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    // 停止 7 → load()：监控中(7) 已不在 running 列表 → 回退接 8
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([{ ...runningSession2 }])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    w.unmount()
+  })
+
+  it('通道条提示多会话并行规则（THS 独占 / 复制交易语义）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('支持多会话并行')
+    expect(w.text()).toContain('同花顺通道同时仅一个会话')
+    expect(w.text()).toContain('复制交易')
     w.unmount()
   })
 })

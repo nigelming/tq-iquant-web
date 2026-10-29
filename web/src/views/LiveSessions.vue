@@ -75,8 +75,8 @@ function defaultEngineKey(): LiveEngineKey {
   return (channel.value?.engine as LiveEngineKey) || 'tdx'
 }
 
-// B6 全局限 1：已有运行中会话时，其它行的「启动」按钮禁用（UI 层预防，后端 409 兜底）
-const hasRunningSession = computed(() => sessions.value.some((s) => s.status === 'running'))
+// M1 多会话并行：B6 全局限 1 已移除（后端改 THS 通道互斥），启动按钮恒可点，
+// 多会话冲突由后端 409 兜底（同花顺通道键鼠独占）。
 
 // 组合级状态列表：优先用后端 portfolios 字段，缺省时兜底 portfolio_ids(无状态视为 active)
 function portfolioStatuses(s: LiveSessionItem): { portfolio_id: number; status: string }[] {
@@ -249,6 +249,9 @@ async function loadHistory(id: number) {
       getLiveDecisions(id).catch(() => null),
       getLiveSignals(id, { limit: 200 }).catch(() => null),
     ])
+    // M1 多会话监控切换：五请求在途期间用户已切走（activeSessionId 变更）→
+    // 丢弃过期结果，防旧会话历史覆盖新会话工作台。
+    if (activeSessionId !== id) return
     positions.value = positionHistoryToRows(pos)
     orders.value = orderHistoryToRows(ord)
     trades.value = tradeHistoryToRows(trd)
@@ -266,6 +269,8 @@ async function loadHistory(id: number) {
       const [pos2, ord2, trd2] = await Promise.all([
         getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
       ])
+      // 补拉同样先验会话未切换（同上）
+      if (activeSessionId !== id) return
       positions.value = positionHistoryToRows(pos2)
       orders.value = orderHistoryToRows(ord2)
       trades.value = tradeHistoryToRows(trd2)
@@ -321,6 +326,20 @@ function closeEventStream() {
   if (signalsRefreshTimer !== null) { clearTimeout(signalsRefreshTimer); signalsRefreshTimer = null }
 }
 
+// 当前监控中的会话（工作台/事件流绑定目标）：load 优先续接；无则回退第一个 running
+const watchedSessionId = ref<number | null>(null)
+
+/** 行内「监控」：把工作台/事件流/通道条切到目标会话（startEventStream 先关旧流）。 */
+function watchSession(id: number) {
+  watchedSessionId.value = id
+  const target = sessions.value.find((s) => s.id === id)
+  if (target) {
+    runningEngine.value = (target.engine as LiveEngineKey) || null
+    loadChannel(target.engine)
+  }
+  startEventStream(id)
+}
+
 async function load() {
   try {
     sessions.value = await getLiveSessions()
@@ -330,12 +349,20 @@ async function load() {
     loading.value = false
   }
   portfolios.value = await getPortfolios().catch(() => [])
-  // B6 全局限 1 个运行 session,自动接它的流
-  const running = sessions.value.find((s) => s.status === 'running')
-  runningEngine.value = (running?.engine as LiveEngineKey) || null
-  if (running) startEventStream(running.id)
-  // 通道条跟随运行中 session 的引擎；无运行会话时跟随默认引擎
-  loadChannel(running?.engine)
+  // M1 多会话并行：优先续接「监控中」的会话；其已停止/不存在则回退第一个
+  // running（现行为）。多 running 时其余会话不自动接流——用户点行内「监控」切换。
+  const running = sessions.value.filter((s) => s.status === 'running')
+  const target = running.find((s) => s.id === watchedSessionId.value) || running[0] || null
+  watchedSessionId.value = target ? target.id : null
+  runningEngine.value = (target?.engine as LiveEngineKey) || null
+  if (target) {
+    startEventStream(target.id)
+  } else {
+    // 监控中会话已停止且无其它运行会话 → 断开事件流
+    closeEventStream()
+  }
+  // 通道条跟随监控中 session 的引擎；无运行会话时跟随默认引擎
+  loadChannel(target?.engine)
 }
 
 function openCreate() {
@@ -437,6 +464,7 @@ onUnmounted(closeEventStream)
       :style="{ color: channelTestMsg.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }"
     >{{ channelTestMsg.text }}</span>
     <span class="channel-hint">自动模式可在「新建实盘」时另选引擎；默认引擎在 系统设置 → 通达信 TQ 交易通道 修改</span>
+    <span class="channel-hint">支持多会话并行（不同引擎/不同账户）；同花顺通道同时仅一个会话；同组合多会话=复制交易（各账户独立记账）</span>
     <router-link to="/system" style="margin-left:auto;font-size:13px">通道配置 →</router-link>
   </div>
 
@@ -466,12 +494,14 @@ onUnmounted(closeEventStream)
             <span v-else class="badge badge-gray">{{ engineLabel(s.engine) }}</span>
           </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
-          <td><span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span></td>
           <td>
-            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary"
-              :disabled="hasRunningSession" :title="hasRunningSession ? '已有运行中会话（全局限 1）' : ''"
-            >启动</button>
+            <span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span>
+            <span v-if="s.status === 'running' && s.id === watchedSessionId" class="badge badge-blue" style="margin-left:4px">监控中</span>
+          </td>
+          <td>
+            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
+            <button v-if="s.status === 'running' && s.id !== watchedSessionId" @click="watchSession(s.id)" class="btn btn-sm">监控</button>
             <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
           </td>
         </tr>
