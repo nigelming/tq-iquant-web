@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   orderEventToRow, orderHistoryToRows,
   tradeEventToRow, tradeHistoryToRows,
-  upsertPositionRows, positionHistoryToRows, prependCapped,
+  upsertPositionRows, positionHistoryToRows, prependCapped, positionRowKey,
 } from '../utils/liveWorkbench'
 
 describe('liveWorkbench', () => {
@@ -73,13 +73,13 @@ describe('liveWorkbench', () => {
 
   describe('upsertPositionRows', () => {
     it('新 code 追加,已有 code 原位替换', () => {
-      const rows = [{ stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000, portfolio_id: null, strategy_id: null }]
+      const rows = [{ stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000, portfolio_id: null, strategy_id: null, source: 'strategy' }]
       const afterAdd = upsertPositionRows(rows, { stock_code: '000001.SZ', quantity: 50, avg_cost: 5, market_value: 250 })
       expect(afterAdd).toHaveLength(2)
 
       const afterUpdate = upsertPositionRows(afterAdd, { stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040 })
       expect(afterUpdate).toHaveLength(2)
-      expect(afterUpdate[0]).toEqual({ stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040, portfolio_id: null, strategy_id: null })
+      expect(afterUpdate[0]).toEqual({ stock_code: '600000.SH', quantity: 200, avg_cost: 10.2, market_value: 2040, portfolio_id: null, strategy_id: null, source: 'strategy' })
     })
 
     it('同 code 不同子策略 → 独立两行', () => {
@@ -106,6 +106,28 @@ describe('liveWorkbench', () => {
       const after = upsertPositionRows([], { stock_code: '000001.SZ', quantity: 0, avg_cost: 0, market_value: 0, portfolio_id: null, strategy_id: null })
       expect(after).toHaveLength(0)
     })
+
+    it('SSE payload 无 source → 默认 strategy；带 external → 透传', () => {
+      const strategy = upsertPositionRows([], { stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000, portfolio_id: 1, strategy_id: 1 })
+      expect(strategy[0].source).toBe('strategy')
+      const external = upsertPositionRows([], { stock_code: '000001.SZ', quantity: 1000, avg_cost: 12, market_value: 13000, source: 'external' })
+      expect(external[0].source).toBe('external')
+    })
+
+    it('外部行（组合/子策略为 null）与同码策略行互不覆盖（键不同）', () => {
+      const strategy = upsertPositionRows([], { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1 })
+      const external = upsertPositionRows(strategy, { stock_code: '600000.SH', quantity: 500, avg_cost: 8, market_value: 4000, source: 'external' })
+      expect(external).toHaveLength(2)
+      // 外部行新快照按 symbol 键原地替换
+      const replaced = upsertPositionRows(external, { stock_code: '600000.SH', quantity: 600, avg_cost: 8, market_value: 4800, source: 'external' })
+      expect(replaced).toHaveLength(2)
+      expect(replaced.filter((r) => r.source === 'external')[0].quantity).toBe(600)
+    })
+  })
+
+  it('positionRowKey：策略行用 股票+组合+子策略，外部行用股票代码', () => {
+    expect(positionRowKey({ stock_code: '600000.SH', portfolio_id: 1, strategy_id: 2 })).toBe('600000.SH|1|2')
+    expect(positionRowKey({ stock_code: '000001.SZ', portfolio_id: null, strategy_id: null })).toBe('ext|000001.SZ')
   })
 
   it('positionHistoryToRows 映射持仓历史', () => {
@@ -113,6 +135,15 @@ describe('liveWorkbench', () => {
     expect(rows[0].market_value).toBe(7350)
     expect(rows[0].portfolio_id).toBe(1)
     expect(rows[0].strategy_id).toBe(2)
+    expect(rows[0].source).toBe('strategy')
+  })
+
+  it('positionHistoryToRows 透传外部行 source（原有持仓）', () => {
+    const rows = positionHistoryToRows([
+      { stock_code: '000001.SZ', quantity: 1000, avg_cost: 12, market_value: 13000, portfolio_id: null, strategy_id: null, source: 'external' },
+    ])
+    expect(rows[0].source).toBe('external')
+    expect(rows[0].portfolio_id).toBeNull()
   })
 
   it('prependCapped 头部插入并封顶', () => {

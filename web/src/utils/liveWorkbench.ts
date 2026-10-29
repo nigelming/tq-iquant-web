@@ -35,9 +35,11 @@ export interface PositionRow {
   quantity: number
   avg_cost: number
   market_value: number
-  // 归属（组合策略/子策略）；同票多子策略持有时各一行
+  // 归属（组合策略/子策略）；同票多子策略持有时各一行；外部持仓（原有持仓）为 null
   portfolio_id: number | null
   strategy_id: number | null
+  // 来源：strategy=策略持仓 / external=账户原有持仓（非策略买入，仅供监视）
+  source: string
 }
 
 /** 决策闸门事件行（调参可观测性）。 */
@@ -121,13 +123,18 @@ export function tradeHistoryToRows(items: LiveTradeItem[]): TradeRow[] {
   }))
 }
 
-/** 持仓行复合键：股票 + 组合 + 子策略（同票多子策略各占一行）。 */
+/** 持仓行复合键：策略行为 股票+组合+子策略（同票多子策略各占一行）；
+ *  外部行（组合/子策略均为 null 的原有持仓）用股票代码作键。 */
 export function positionRowKey(r: Pick<PositionRow, 'stock_code' | 'portfolio_id' | 'strategy_id'>): string {
+  if ((r.portfolio_id ?? null) === null && (r.strategy_id ?? null) === null) {
+    return `ext|${r.stock_code}`
+  }
   return `${r.stock_code}|${r.portfolio_id ?? null}|${r.strategy_id ?? null}`
 }
 
 /** SSE position 事件 → 持仓行（按 股票+组合+子策略 复合键原地 upsert，不重复）。
- *  清仓（quantity<=0）→ 移除该行（与历史口径 quantity!=0 一致，不留幽灵持仓行）。 */
+ *  清仓（quantity<=0）→ 移除该行（与历史口径 quantity!=0 一致，不留幽灵持仓行）。
+ *  payload 无 source（SSE 仅推策略持仓）→ 默认 strategy。 */
 export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
   const row: PositionRow = {
     stock_code: (ev.stock_code as string) || '',
@@ -136,6 +143,7 @@ export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
     market_value: (ev.market_value as number) ?? 0,
     portfolio_id: (ev.portfolio_id as number) ?? null,
     strategy_id: (ev.strategy_id as number) ?? null,
+    source: (ev.source as string) || 'strategy',
   }
   const idx = rows.findIndex((r) => positionRowKey(r) === positionRowKey(row))
   if (row.quantity <= 0) {
@@ -152,7 +160,7 @@ export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
   return [...rows, row]
 }
 
-/** 持仓历史 → 行（归属 id 缺省为 null）。 */
+/** 持仓历史 → 行（归属 id 缺省为 null；source 缺省 strategy，外部行透传 external）。 */
 export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] {
   return items.map((i) => ({
     stock_code: i.stock_code,
@@ -161,6 +169,7 @@ export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] 
     market_value: i.market_value,
     portfolio_id: i.portfolio_id ?? null,
     strategy_id: i.strategy_id ?? null,
+    source: i.source || 'strategy',
   }))
 }
 

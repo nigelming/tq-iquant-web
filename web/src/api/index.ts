@@ -1556,6 +1556,8 @@ export interface LivePositionItem {
   // 归属（组合策略/子策略）；旧数据/旧接口可能缺省
   portfolio_id?: number | null
   strategy_id?: number | null
+  // 来源：strategy=策略持仓（缺省按 strategy）/ external=账户原有持仓
+  source?: string
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {

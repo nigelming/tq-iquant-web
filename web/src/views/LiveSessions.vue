@@ -493,20 +493,28 @@ onUnmounted(closeEventStream)
       </div>
     </div>
 
-    <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行） -->
+    <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行；来源分级：策略/原有持仓） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
       <table>
-        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th></tr></thead>
+        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>来源</th></tr></thead>
         <tbody>
           <tr v-for="(p, i) in positions" :key="positionRowKey(p)">
             <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
             <td>{{ p.portfolio_id !== null && p.portfolio_id !== undefined ? portfolioName(p.portfolio_id) : '—' }}</td>
             <td>{{ strategyName(p.portfolio_id, p.strategy_id) }}</td>
             <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_cost }}</td><td>{{ p.market_value }}</td>
+            <td>
+              <span class="badge" :class="p.source === 'external' ? 'badge-gray' : 'badge-blue'">
+                {{ p.source === 'external' ? '原有持仓' : '策略持仓' }}
+              </span>
+            </td>
           </tr>
         </tbody>
       </table>
-      <div v-if="positions.length === 0" class="empty-state"><p>暂无持仓</p></div>
+      <div v-if="positions.length === 0" class="empty-state">
+        <p>暂无持仓</p>
+        <p>账户原有持仓（非策略买入）以灰色标注为原有持仓，仅供监视，不参与策略交易</p>
+      </div>
     </div>
 
     <!-- 委托 -->

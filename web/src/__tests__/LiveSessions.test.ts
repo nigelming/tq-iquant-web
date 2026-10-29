@@ -269,6 +269,49 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('持仓 tab 来源列：策略持仓（蓝）/ 原有持仓（灰），外部行组合/子策略显示 —', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1, source: 'strategy' },
+      { stock_code: '000001.SZ', quantity: 1000, avg_cost: 12, market_value: 13000, portfolio_id: null, strategy_id: null, source: 'external' },
+    ])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 1, name: '日线趋势', portfolio_id: 1 }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 表头含「来源」列
+    expect(w.text()).toContain('来源')
+    const posTable = w.findAll('table').find((t) => t.text().includes('来源'))!
+    const rows = posTable.findAll('tbody tr')
+    expect(rows.length).toBe(2)
+    // 策略行：蓝色「策略持仓」徽章 + 组合/子策略名
+    const badge0 = rows[0].find('.badge')
+    expect(badge0.text()).toBe('策略持仓')
+    expect(badge0.classes()).toContain('badge-blue')
+    expect(rows[0].text()).toContain('稳健组合')
+    expect(rows[0].text()).toContain('日线趋势')
+    // 外部行：灰色「原有持仓」徽章 + 组合/子策略列显示 —
+    const badge1 = rows[1].find('.badge')
+    expect(badge1.text()).toBe('原有持仓')
+    expect(badge1.classes()).toContain('badge-gray')
+    expect(rows[1].text()).toContain('000001.SZ')
+    expect(rows[1].text()).toContain('—')
+    w.unmount()
+  })
+
+  it('持仓 tab 空态：提示原有持仓监视口径', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('暂无持仓')
+    expect(w.text()).toContain('账户原有持仓（非策略买入）以灰色标注为原有持仓，仅供监视，不参与策略交易')
+    w.unmount()
+  })
+
   it('SSE order/trade 事件 → 委托/成交表顶部插入', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
