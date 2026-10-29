@@ -580,6 +580,9 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
                              price=Decimal("1700.55")))
     assert switches == ["{F1}"]                    # 买入 → F1
+    # direct 模式下单成功后 ref 入 _known_refs（撤单 unknown 守卫豁免基线）
+    assert d._known_refs == {"200001"}
+    assert d._last_submit_ref == "200001"
     # 代码框点击 x = 316+8 = 324（左偏 8px，避开下拉按钮）
     assert clicks[0] == (324, 156)
     # 价格/数量中心点击
@@ -640,7 +643,7 @@ def test_cancel_order_geometry_flow(monkeypatch):
     # 撤单生效：双击后复读为空（第一次读回有目标 → 双击 → 第二次空）
     state = {"n": 0}
 
-    def _orders():
+    def _orders(**kwargs):
         state["n"] += 1
         return list(rows_now) if state["n"] == 1 else []
 
@@ -674,7 +677,7 @@ def test_cancel_order_refuses_unknown_refs(monkeypatch):
         {"order_id": "6333266769", "symbol": "510300", "direction": "buy"},
         {"order_id": "9999999999", "symbol": "600519", "direction": "buy"},  # 手动单
     ]
-    monkeypatch.setattr(d, "get_orders", lambda: list(rows_now))
+    monkeypatch.setattr(d, "get_orders", lambda **kw: list(rows_now))
     clicks = []
     import pywinauto.mouse as ths_mouse
     monkeypatch.setattr(ths_mouse, "double_click",
@@ -690,7 +693,7 @@ def test_cancel_order_target_missing(monkeypatch):
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     d._connected = True
     d._known_refs = {"6333266769"}
-    monkeypatch.setattr(d, "get_orders", lambda: [])
+    monkeypatch.setattr(d, "get_orders", lambda **kw: [])
 
     assert d.cancel_order("6333266769", "510300.SH") is False
 
@@ -708,3 +711,133 @@ def test_get_orders_retries_once_on_empty(monkeypatch):
     rows = d.get_orders()
     assert rows == [{"order_id": "W1"}]
     assert calls["n"] == 2
+
+
+# ===========================================================================
+# 终审修复：价格闭环撤单腿 / direct known_refs / cancel 页面语义固定
+# ===========================================================================
+def _ui_mocked_dispatcher(monkeypatch, found_row):
+    """_execute_via_ui 真机校准流全 mock（与 test_execute_via_ui_calibrated*
+    同款替身），_find_order 可注入回查行。返回 (dispatcher, switches)。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    fake_fields = {
+        "code": _FakeField(1032, 316, 141, 121),
+        "price": _FakeField(1033, 316, 205, 98),
+        "quantity": _FakeField(1034, 316, 301, 98),
+    }
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_switch", lambda k: None)
+    monkeypatch.setattr(d, "_uia_window", lambda: object())
+    monkeypatch.setattr(d, "_uia_field", lambda w, kind: fake_fields[kind])
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "click", lambda coords: None)
+    monkeypatch.setattr(d, "kb_send", lambda k: None)
+    monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
+    monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
+    monkeypatch.setattr(d, "_find_order", lambda code, direction, vol: found_row)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    return d
+
+
+def test_execute_via_ui_price_mismatch_cancels_via_known_ref(monkeypatch):
+    """价格闭环撤单腿：委托价 ≠ 审批价 → ref 先入 _known_refs（自身豁免守卫）
+    → cancel_order 被调 → 撤单成功 → rejected 带已自动撤单说明。"""
+    found = {"order_id": "200002", "price": 4.415, "time": "20261028 09:30:01"}
+    d = _ui_mocked_dispatcher(monkeypatch, found)
+    cancel_calls = []
+    monkeypatch.setattr(
+        d, "cancel_order",
+        lambda ref, code: cancel_calls.append((ref, code)) or True)
+
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
+                                 price=Decimal("4.153")))
+
+    assert cancel_calls == [("200002", "000001")]  # 撤单被调（6 位代码）
+    assert "200002" in d._known_refs               # 撤单前已入基线
+    msg = str(ei.value)
+    assert "4.415" in msg and "4.153" in msg
+    assert "已自动撤单" in msg
+
+
+def test_execute_via_ui_price_mismatch_cancel_failed_warns(monkeypatch):
+    """价格闭环撤单腿失败：cancel_order False → rejected 带附加警告与合同号。"""
+    found = {"order_id": "200003", "price": 4.415, "time": "20261028 09:30:01"}
+    d = _ui_mocked_dispatcher(monkeypatch, found)
+    cancel_calls = []
+    monkeypatch.setattr(
+        d, "cancel_order",
+        lambda ref, code: cancel_calls.append((ref, code)) or False)
+
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
+                                 price=Decimal("4.153")))
+
+    assert cancel_calls == [("200003", "000001")]
+    assert "200003" in d._known_refs
+    msg = str(ei.value)
+    assert "自动撤单失败" in msg and "请人工处理" in msg and "200003" in msg
+
+
+def test_cancel_order_pinned_to_cancel_page_and_status_gone(monkeypatch):
+    """cancel_order 撤单页语义固定：读回 pin_cancel_page=True；目标行仍在但
+    撤消数量=委托数量 → gone=True（旧口径按行消失判定会恒 False）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    d._known_refs = {"6333266769"}
+
+    class _GridEl:
+        class element_info:
+            class_name = "CVirtualGridCtrl"
+
+        def rectangle(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(left=207, top=111, right=1919, bottom=1044)
+
+    class _FakeWin:
+        def descendants(self):
+            return [_GridEl()]
+
+    d._win = _FakeWin()
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "double_click", lambda coords: None)
+
+    pin_kwargs = []
+
+    def _orders(**kwargs):
+        pin_kwargs.append(kwargs)
+        if len(pin_kwargs) == 1:
+            # 首次读回：目标在可撤列表（在途行，撤消数量 0）
+            return [{"order_id": "6333266769", "symbol": "510300",
+                     "direction": "buy", "price": 4.35,
+                     "volume": 100, "cancelled_volume": 0}]
+        # 撤后复读：行仍在（当日委托漂移场景）但已呈撤单态
+        return [{"order_id": "6333266769", "symbol": "510300",
+                 "direction": "buy", "price": 4.35,
+                 "volume": 100, "cancelled_volume": 100}]
+
+    monkeypatch.setattr(d, "get_orders", _orders)
+
+    assert d.cancel_order("6333266769", "510300.SH") is True
+    assert pin_kwargs == [{"pin_cancel_page": True}, {"pin_cancel_page": True}]
+
+
+def test_order_gone_by_status_or_missing_row():
+    """撤单生效判定（按行状态）：撤消数量扣满 → True；状态列含「撤」→ True；
+    部撤（成交+撤消扣满）→ True；行消失 → True；在途行 → False。"""
+    gone = ThsUiDispatcher._order_gone_in
+    assert gone([{"order_id": "R1", "volume": 100,
+                  "cancelled_volume": 100, "filled_volume": 0}], "R1") is True
+    assert gone([{"order_id": "R1", "volume": 1000,
+                  "cancelled_volume": 700, "filled_volume": 300}], "R1") is True
+    assert gone([{"order_id": "R1", "volume": 100,
+                  "cancelled_volume": 0, "filled_volume": 0,
+                  "note": "已撤"}], "R1") is True
+    assert gone([], "R1") is True                      # 行消失
+    assert gone([{"order_id": "R1", "volume": 100,   # 在途：未撤
+                  "cancelled_volume": 0, "filled_volume": 0}], "R1") is False
+    assert gone([{"order_id": "R1", "volume": 100,   # 部分撤未扣满：未生效
+                  "cancelled_volume": 30, "filled_volume": 0}], "R1") is False
+    assert gone([{"order_id": "R2", "volume": 100,
+                  "cancelled_volume": 0}], "R1") is True  # 目标行不在 → 消失

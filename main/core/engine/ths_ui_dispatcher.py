@@ -354,8 +354,14 @@ class ThsUiDispatcher(OrderDispatcher):
         """F3 撤单自动化（几何双击方案，真机实证：双击 (1063,156) 撤单成功、
         冻结归零、可撤列表清空）。
 
-        流程：F3 切撤单页 → 网格读回确认目标在列并取行索引 → 双击
-        CVirtualGridCtrl 网格目标行（页面提示「双击或回车即可撤单」）→ 复读验证。
+        流程：撤单页语义固定（读回 pin 在 F3 撤单页——可撤列表才是双击撤单的
+        作用域）→ 网格读回确认目标在列并取行索引 → 双击 CVirtualGridCtrl 网格
+        目标行（页面提示「双击或回车即可撤单」）→ 复读验证。
+
+        复读验证按**行状态**判定（_order_gone_in）：目标行消失或已呈撤单态
+        （撤消数量扣满委托数量 / 状态列含「撤」）→ 已撤。只按「行消失」判定的
+        旧口径受 UIA 页面选择漂移影响——读回可能切到「当日委托」页（保留已撤/
+        已成行）→ gone 恒 False → 撤单明明生效却报失败。
 
         安全约束：可撤列表含非平台单（order_id ∉ _known_refs）时拒绝执行
         （双击按行索引定位，列表混入手动委托时索引不可信，防误撤手动委托）。
@@ -363,9 +369,7 @@ class ThsUiDispatcher(OrderDispatcher):
         """
         if Application is None or self._win is None:
             return False
-        self._switch(self.TAB_CANCEL)
-        time.sleep(2.0)
-        rows = self.get_orders()
+        rows = self.get_orders(pin_cancel_page=True)
         idx = next((i for i, o in enumerate(rows)
                     if str(o.get("order_id")) == str(order_ref)), None)
         if idx is None:
@@ -403,13 +407,37 @@ class ThsUiDispatcher(OrderDispatcher):
         mouse.double_click(coords=(x, y))
         time.sleep(1.5)
 
-        rows2 = self.get_orders()
-        gone = not any(str(o.get("order_id")) == str(order_ref) for o in rows2)
+        rows2 = self.get_orders(pin_cancel_page=True)
+        gone = self._order_gone_in(rows2, order_ref)
         if gone:
             logger.info("ths cancel_order ok: ref=%s", order_ref)
         else:
             self._last_error = "cancel: 目标仍在可撤列表（撤单未生效）"
         return gone
+
+    @staticmethod
+    def _order_gone_in(rows: list, order_ref: str) -> bool:
+        """撤单生效判定（按行状态，页面语义鲁棒）：
+        - 目标行消失 → 已撤（撤单页语义：可撤列表清空）；
+        - 行仍在但已呈撤单态 → 已撤：状态列含「撤」，或撤消数量扣满委托数量
+          （全撤 54：cancelled ≥ volume；部撤 53：filled + cancelled ≥ volume）；
+        - 行仍在且非撤单态 → 未生效（False，调用方按重试处理）。
+        读回可能受 UIA 页面选择漂移切到「当日委托」页（保留已撤/已成行），
+        按行状态判定不受漂移影响。委托表无独立状态列，撤单态由 备注列/撤消数量/
+        成交数量 综合推断（与 _order_status_code 同口径）。
+        """
+        for o in rows:
+            if str(o.get("order_id") or "") != str(order_ref):
+                continue
+            if "撤" in str(o.get("note") or ""):
+                return True
+            volume = int(o.get("volume") or 0)
+            cancelled = int(o.get("cancelled_volume") or 0)
+            filled = int(o.get("filled_volume") or 0)
+            if volume > 0 and cancelled > 0 and filled + cancelled >= volume:
+                return True
+            return False
+        return True  # 行消失
 
     def kb_send(self, keys: str) -> None:
         """向当前焦点控件发送键入（SendInput）——不重置窗口焦点。
@@ -951,16 +979,26 @@ class ThsUiDispatcher(OrderDispatcher):
         self._price_map = {r["symbol"]: r["price"] for r in rows if r.get("price", 0) > 0}
         return rows
 
-    def get_orders(self) -> list:
+    def get_orders(self, pin_cancel_page: bool = False) -> list:
         """委托表读回（剪贴板+OCR 流水线）。空结果重试一次——真机偶发
-        整表读空（剪贴板竞态），二次读取可恢复；连续空视为真无委托。"""
-        rows = self._read_orders_once()
+        整表读空（剪贴板竞态），二次读取可恢复；连续空视为真无委托。
+
+        pin_cancel_page=True（撤单流程专用）：读回固定 F3「撤单」页语义——
+        默认读回优先 UIA 切「当日委托」页（含全部委托），会把 UI 漂走，
+        撤单流程的可撤列表索引与撤后验证都需要撤单页。
+        """
+        def _read():
+            if pin_cancel_page:
+                return self._read_orders_once(pin_cancel_page=True)
+            return self._read_orders_once()
+
+        rows = _read()
         if not rows:
             time.sleep(1.0)
-            rows = self._read_orders_once()
+            rows = _read()
         return rows
 
-    def _read_orders_once(self) -> list:
+    def _read_orders_once(self, pin_cancel_page: bool = False) -> list:
         if not self._connected:
             if not self.connect():
                 return []
@@ -969,7 +1007,8 @@ class ThsUiDispatcher(OrderDispatcher):
         try:
             # 「当日委托」页含全部当日委托（含已成交/已撤）；F3「撤单」页
             # 可能只显示可撤单，缺失已成交单会导致 backfill 漏成交。
-            if not self._select_page("当日委托"):
+            # pin_cancel_page=True 反转该优先级（撤单流程专用，见 get_orders）。
+            if pin_cancel_page or not self._select_page("当日委托"):
                 self._switch(self.TAB_CANCEL)
             return self._parse_orders(
                 self._copy_grid(required=("委托时间", "合同编号")))
@@ -1512,18 +1551,35 @@ class ThsUiDispatcher(OrderDispatcher):
         if ref:
             self._last_submit_ref = ref
             self._last_submit_time = self._split_time(found.get("time"))
+            # direct 模式唯一入基线处（file 执行器 _execute_entry 另有幂等 add）：
+            # 不入 _known_refs 则 direct 模式 cancel_order 的 unknown 守卫恒拒
+            # → 超时撤单/价格闭环撤单全部失效。
+            self._known_refs.add(ref)
         # 委托价格校验闭环（真机实证：键入价被 THS 异步填充覆盖 → 委托价 4.415
         # ≠ 键入 4.153）：柜台委托价格 ≠ 审批价 → 自动撤单 + 拒单（调用方重试），
         # 防止以非审批价格真实成交。容差 0.001（ETF 3 位小数/股票 2 位均覆盖）。
         found_price = float(found.get("price") or 0)
         if found_price > 0 and abs(found_price - price) > 0.001:
+            if not ref:
+                raise BridgeOrderRejected(
+                    "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖，无合同号可撤）"
+                    % (found_price, price))
+            # 自身 ref 豁免 unknown 守卫（语义正确：该单是本平台下的）——file 模式
+            # _execute_via_ui 返回后才入 _known_refs、direct 模式刚由上方补记前
+            # 未必覆盖（异常路径），撤单前显式补记防守卫误拒 → 错价单残留柜台。
+            self._known_refs.add(ref)
+            canceled = False
             try:
-                self.cancel_order(ref, code)
-            except Exception:
-                logger.warning("ths price-mismatch cancel failed: %s", ref)
+                canceled = bool(self.cancel_order(ref, code))
+            except Exception as e:  # noqa: BLE001 — 撤单失败升级文案，不吞拒单
+                logger.warning("ths price-mismatch cancel error: %s (%s)", ref, e)
+            if canceled:
+                raise BridgeOrderRejected(
+                    "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖），已自动撤单"
+                    % (found_price, price))
             raise BridgeOrderRejected(
-                "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖），已自动撤单"
-                % (found_price, price))
+                "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖）；"
+                "自动撤单失败，请人工处理（合同号 %s）" % (found_price, price, ref))
         fill_price = order.price if order.price is not None else Decimal(str(price))
         amount = fill_price * vol
         return TradeEvent(
