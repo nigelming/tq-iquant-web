@@ -586,9 +586,9 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     assert clicks[1] == (316 + 49, 220)
     assert clicks[2] == (316 + 49, 316)
     assert kb_transcript == [
-        "^a{DELETE}", "600519",
-        "^a{DELETE}", "1700.55",                   # 显式价格（限价）
-        "^a{DELETE}", "100",
+        "{END}", "{BACKSPACE}" * 12, "600519",
+        "{END}", "{BACKSPACE}" * 12, "1700.55",              # 显式价格（限价）
+        "{END}", "{BACKSPACE}" * 12, "100",
         "{ENTER}",
     ]
 
@@ -602,9 +602,9 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     assert switches == ["{F2}"]                    # 卖出 → F2
     assert clicks[0] == (324, 156)
     assert kb_transcript == [
-        "^a{DELETE}", "000001",
-        "^a{DELETE}", "9.99",
-        "^a{DELETE}", "300",
+        "{END}", "{BACKSPACE}" * 12, "000001",
+        "{END}", "{BACKSPACE}" * 12, "9.99",
+        "{END}", "{BACKSPACE}" * 12, "300",
         "{ENTER}",
     ]
 

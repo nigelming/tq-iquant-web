@@ -1438,23 +1438,35 @@ class ThsUiDispatcher(OrderDispatcher):
                     "ths 下单页字段未定位（UIA control_id=%s）: %s"
                     % (self._ORDER_FIELD_IDS, ",".join(missing)))
             self._click_field(code_f, left_offset=8)
-            self.kb_send("^a{DELETE}")
+            # 自绘字段 ^a 全选不可靠（残留致小数位异常→THS 弹「小数部分应为
+            # 3 位」校验框）——清空改 {END}+连发退格
+            self.kb_send("{END}")
+            self.kb_send("{BACKSPACE}" * 12)
             self.kb_send(code)
             # 真机实证（委托价格 4.415 ≠ 键入 4.153）：代码键入后 THS 异步用
             # 最新价覆盖价格框——必须等自动填充完成再改价格，否则键入价被覆盖。
             time.sleep(4.0)
             self._click_field(price_f)
-            self.kb_send("^a{DELETE}")
+            self.kb_send("{END}")
+            self.kb_send("{BACKSPACE}" * 12)
             self.kb_send(str(price))
             time.sleep(0.3)
             self._click_field(vol_f)
-            self.kb_send("^a{DELETE}")
+            self.kb_send("{END}")
+            self.kb_send("{BACKSPACE}" * 12)
             self.kb_send(str(vol))
             time.sleep(0.3)
             before = self._snapshot_hwnds()
             self.kb_send("{ENTER}")
             time.sleep(1.5)
-            confirmed = self._confirm_dialog(before, self.CONFIRM_BUTTONS)
+            # 弹窗两轮处理：①确认框 ②迟到的校验弹窗（如「小数部分应为3位，
+            # 是否继续」→ 是(Y)/继续 放行；按钮清单含是(Y)/继续/确定/确认）
+            dlg_buttons = (self.CONFIRM_BUTTONS + self.CANCEL_CONFIRM_BUTTONS
+                           + ("继续",))
+            confirmed = self._confirm_dialog(before, dlg_buttons)
+            time.sleep(1.0)
+            late = self._confirm_dialog(before, dlg_buttons)
+            confirmed = confirmed or late
         except BridgeOrderRejected:
             raise
         except BridgeUnavailableError:
