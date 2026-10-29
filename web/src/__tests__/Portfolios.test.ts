@@ -802,7 +802,7 @@ describe('Portfolios.vue — 实盘执行（批次1 配置分组）', () => {
     await flushPromises()
     await openNewStrategy(w)
 
-    expect(w.text()).toContain('实盘执行')
+    expect(w.text()).toContain('执行控制')
     expect(w.text()).toContain('撤单追价重下')
     expect(w.text()).toContain('重试次数')
     expect(w.text()).toContain('大额拆单')
