@@ -612,9 +612,8 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     ]
 
 
-def test_cancel_order_geometry_flow(monkeypatch):
-    """cancel_order 几何双击方案：F3 → 网格定位 → 双击目标行（y=top+45+idx*24）
-    → 复读目标消失 → True。"""
+def test_cancel_order_ocr_navigation_flow(monkeypatch):
+    """cancel_order OCR 导航：F3 → 整窗 OCR 定位目标行坐标 → 双击该行 → 复读为空 → True。"""
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     d._connected = True
     d._known_refs = {"6333266769"}
@@ -622,19 +621,8 @@ def test_cancel_order_geometry_flow(monkeypatch):
     rows_now = [{"order_id": "6333266769", "symbol": "510300",
                  "direction": "buy", "price": 4.35, "volume": 100}]
 
-    class _GridEl:
-        class element_info:
-            class_name = "CVirtualGridCtrl"
-
-        def rectangle(self):
-            from types import SimpleNamespace
-            return SimpleNamespace(left=207, top=111, right=1919, bottom=1044)
-
-    class _FakeWin:
-        def descendants(self):
-            return [_GridEl()]
-
-    d._win = _FakeWin()
+    d._win = SimpleNamespace(
+        rectangle=lambda: SimpleNamespace(left=100, top=100, right=2019, bottom=1144))
     clicks = []
     import pywinauto.mouse as ths_mouse
     monkeypatch.setattr(ths_mouse, "double_click",
@@ -648,9 +636,15 @@ def test_cancel_order_geometry_flow(monkeypatch):
         return list(rows_now) if state["n"] == 1 else []
 
     monkeypatch.setattr(d, "get_orders", _orders)
+    monkeypatch.setattr(d, "_ocr_words",
+                        lambda img: [("510300", 309, 157), ("沪深300ETF", 340, 157)])
+    monkeypatch.setattr(d, "_read_fund_values",
+                        lambda: {"frozen": "0.0", "available": "148071.29"})
+
     assert d.cancel_order("6333266769", "510300.SH") is True
     assert len(clicks) == 1
-    assert clicks[0] == ((207 + 1919) // 2, 156)   # 首行 y = top(111)+45
+    # 双击点 = 窗口原点(100,100) + 词坐标(309,157) + 偏移(30,8) = (439, 265)
+    assert clicks[0] == (100 + 309 + 30, 100 + 157 + 8)
 
 
 def test_cancel_order_refuses_unknown_refs(monkeypatch):
@@ -799,20 +793,28 @@ def test_cancel_order_pinned_to_cancel_page_and_status_gone(monkeypatch):
         def descendants(self):
             return [_GridEl()]
 
+        def rectangle(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(left=100, top=100, right=2019, bottom=1144)
+
     d._win = _FakeWin()
     import pywinauto.mouse as ths_mouse
-    monkeypatch.setattr(ths_mouse, "double_click", lambda coords: None)
+    clicks = []
+    monkeypatch.setattr(ths_mouse, "double_click",
+                        lambda coords: clicks.append((coords[0], coords[1])))
+    monkeypatch.setattr(d, "_ocr_words",
+                        lambda img: [("510300", 309, 157)])
 
     pin_kwargs = []
 
     def _orders(**kwargs):
         pin_kwargs.append(kwargs)
         if len(pin_kwargs) == 1:
-            # 首次读回：目标在可撤列表（在途行，撤消数量 0）
+            # 首次读回：目标在可撤列表（行中途，撤销量 0）
             return [{"order_id": "6333266769", "symbol": "510300",
                      "direction": "buy", "price": 4.35,
                      "volume": 100, "cancelled_volume": 0}]
-        # 撤后复读：行仍在（当日委托漂移场景）但已呈撤单态
+        # 撤单后复读：目标仍在（但呈撤单态——撤销量扣满委托数量）
         return [{"order_id": "6333266769", "symbol": "510300",
                  "direction": "buy", "price": 4.35,
                  "volume": 100, "cancelled_volume": 100}]
@@ -821,6 +823,8 @@ def test_cancel_order_pinned_to_cancel_page_and_status_gone(monkeypatch):
 
     assert d.cancel_order("6333266769", "510300.SH") is True
     assert pin_kwargs == [{"pin_cancel_page": True}, {"pin_cancel_page": True}]
+    # OCR 导航双击：窗口原点(100,100) + 词坐标(309,157) + 偏移(30,8)
+    assert clicks == [(439, 265)]
 
 
 def test_order_gone_by_status_or_missing_row():

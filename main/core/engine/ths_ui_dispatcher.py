@@ -210,6 +210,51 @@ class ThsUiDispatcher(OrderDispatcher):
             except OSError:
                 pass
 
+    def _ocr_words(self, img) -> list:
+        """整图 OCR，返回 [(text, x, y)] 词级坐标（窗口内偏移由调用方换算）。
+
+        Windows OCR（与验证码流水线同引擎）。用于撤单页委托行的视觉定位——
+        xiadan 网格为自绘控件，WM_GETTEXT/ValuePattern 均不可读，唯 OCR 可见。
+        """
+        from winrt.windows.graphics.imaging import BitmapDecoder
+        from winrt.windows.storage import FileAccessMode, StorageFile
+        import tempfile
+        import os as _os
+
+        engine = self._get_ocr_engine()
+        if engine is None:
+            raise BridgeUnavailableError("ths ui OCR unavailable")
+        fd, path = tempfile.mkstemp(suffix=".png")
+        _os.close(fd)
+        try:
+            img.save(path, "PNG")
+
+            async def _go():
+                f = await StorageFile.get_file_from_path_async(path)
+                stream = await f.open_async(FileAccessMode.READ)
+                decoder = await BitmapDecoder.create_async(stream)
+                bitmap = await decoder.get_software_bitmap_async()
+                return await engine.recognize_async(bitmap)
+
+            result = self._run_coro(_go())
+            words = []
+            for line in result.lines:
+                for w in line.words:
+                    box = w.bounding_rect
+                    words.append((w.text, int(box.x), int(box.y)))
+            return words
+        finally:
+            try:
+                _os.remove(path)
+            except OSError:
+                pass
+
+    def _get_ocr_engine_or_raise(self):
+        engine = self._get_ocr_engine()
+        if engine is None:
+            raise BridgeUnavailableError("ths ui OCR unavailable")
+        return engine
+
     @staticmethod
     def order_id(order: OrderEvent) -> str:
         import hashlib
@@ -354,9 +399,10 @@ class ThsUiDispatcher(OrderDispatcher):
         """F3 撤单自动化（几何双击方案，真机实证：双击 (1063,156) 撤单成功、
         冻结归零、可撤列表清空）。
 
-        流程：撤单页语义固定（读回 pin 在 F3 撤单页——可撤列表才是双击撤单的
-        作用域）→ 网格读回确认目标在列并取行索引 → 双击 CVirtualGridCtrl 网格
-        目标行（页面提示「双击或回车即可撤单」）→ 复读验证。
+        流程：撤单页语义固定（读回 pin 在 F3 撤单页）→ 网格读回确认目标在列 →
+        **整窗截图 OCR 定位目标行坐标 → 双击该行**（页面提示「双击或回车即可
+        撤单」；几何启发式 y=top+45+idx*24 真机复跑未命中，OCR 词坐标是唯一
+        可靠落点）→ 复读验证（按行状态判定）。
 
         复读验证按**行状态**判定（_order_gone_in）：目标行消失或已呈撤单态
         （撤消数量扣满委托数量 / 状态列含「撤」）→ 已撤。只按「行消失」判定的
@@ -385,26 +431,22 @@ class ThsUiDispatcher(OrderDispatcher):
                            [o.get("order_id") for o in unknown])
             return False
 
-        # 网格几何：CVirtualGridCtrl（win32 类名，屏幕内合理坐标）
-        grid = None
-        for e in self._win.descendants():
-            try:
-                cls = e.element_info.class_name or ""
-                r = e.rectangle()
-                if ("VirtualGrid" in cls and 0 <= r.left < 1920
-                        and 0 <= r.top < 1080):
-                    grid = r
-                    break
-            except Exception:
-                continue
-        if grid is None:
-            self._last_error = "cancel: 撤单网格未定位（CVirtualGridCtrl）"
-            return False
-
+        # OCR 导航定位（真机实证：OCR 读回 '510300' @ (309,157) → 双击 (339,165)
+        # 撤单成功）——几何启发式 y=top+45+idx*24 在真机复跑中未命中（网格布局
+        # 漂移），OCR 词坐标是唯一可靠落点。
+        from PIL import ImageGrab
         from pywinauto import mouse
-        x = (grid.left + grid.right) // 2
-        y = grid.top + 45 + idx * 24   # 表头 ~45px + 行高 24px（真机单行实证 y=156）
-        mouse.double_click(coords=(x, y))
+        wr = self._win.rectangle()
+        words = self._ocr_words(ImageGrab.grab(bbox=(
+            wr.left, wr.top, wr.right, wr.bottom)))
+        code6 = re.sub(r"\D", "", str(stock_code))[:6]
+        row_words = [w for w in words if code6 in w[0]]
+        if not row_words:
+            self._last_error = (
+                "cancel: 撤单页 OCR 未定位到目标行（%s）" % code6)
+            return False
+        _, tw_x, tw_y = row_words[0]
+        mouse.double_click(coords=(wr.left + tw_x + 30, wr.top + tw_y + 8))
         time.sleep(1.5)
 
         rows2 = self.get_orders(pin_cancel_page=True)
