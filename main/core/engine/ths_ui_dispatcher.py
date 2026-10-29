@@ -1082,7 +1082,7 @@ class ThsUiDispatcher(OrderDispatcher):
                 "volume": vol,
                 "available": int(r.get("available") or 0),
                 "cost": float(r.get("cost") or 0),
-                "market_value": float(r.get("price") or 0) * vol,
+                "market_value": round(float(r.get("price") or 0) * vol, 2),
             })
         return out
 
