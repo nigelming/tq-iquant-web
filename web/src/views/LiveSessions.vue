@@ -484,7 +484,7 @@ onUnmounted(closeEventStream)
   <div class="card" style="margin-top:16px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h3 style="margin:0">实盘工作台</h3>
-      <div style="display:flex;flex:1;align-items:center">
+      <div style="display:flex;align-items:center;margin-left:auto">
         <button
           v-for="(label, key) in TAB_LABEL" :key="key"
           class="btn btn-sm" :class="wbTab === key ? 'btn-primary' : ''"
@@ -492,7 +492,7 @@ onUnmounted(closeEventStream)
         >{{ label }}</button>
         <button
           v-if="wbTab === 'positions'"
-          class="btn btn-sm" style="margin-left:auto"
+          class="btn btn-sm" style="margin-left:8px"
           :disabled="loading || activeSessionId === null"
           @click="loadHistory(activeSessionId!)"
           title="重新拉取全量持仓（原有持仓服务端缓存 60s）"
