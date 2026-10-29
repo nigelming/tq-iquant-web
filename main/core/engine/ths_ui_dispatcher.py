@@ -350,6 +350,67 @@ class ThsUiDispatcher(OrderDispatcher):
         mouse.click(coords=(x, y))
         time.sleep(0.3)
 
+    def cancel_order(self, order_ref: str, stock_code: str) -> bool:
+        """F3 撤单自动化（几何双击方案，真机实证：双击 (1063,156) 撤单成功、
+        冻结归零、可撤列表清空）。
+
+        流程：F3 切撤单页 → 网格读回确认目标在列并取行索引 → 双击
+        CVirtualGridCtrl 网格目标行（页面提示「双击或回车即可撤单」）→ 复读验证。
+
+        安全约束：可撤列表含非平台单（order_id ∉ _known_refs）时拒绝执行
+        （双击按行索引定位，列表混入手动委托时索引不可信，防误撤手动委托）。
+        返回 True=目标已不在可撤列表；False=未生效（调用方按重试处理）。
+        """
+        if Application is None or self._win is None:
+            return False
+        self._switch(self.TAB_CANCEL)
+        time.sleep(2.0)
+        rows = self.get_orders()
+        idx = next((i for i, o in enumerate(rows)
+                    if str(o.get("order_id")) == str(order_ref)), None)
+        if idx is None:
+            # 目标不在可撤列表：已成交收口/已撤/委托表读回失败
+            self._last_error = "cancel: 目标 %s 不在可撤列表" % order_ref
+            return False
+        unknown = [o for o in rows
+                   if str(o.get("order_id")) not in self._known_refs]
+        if unknown:
+            self._last_error = (
+                "cancel: 可撤列表含 %d 条非本平台委托，拒绝撤单" % len(unknown))
+            logger.warning("ths cancel_order refuse: %s",
+                           [o.get("order_id") for o in unknown])
+            return False
+
+        # 网格几何：CVirtualGridCtrl（win32 类名，屏幕内合理坐标）
+        grid = None
+        for e in self._win.descendants():
+            try:
+                cls = e.element_info.class_name or ""
+                r = e.rectangle()
+                if ("VirtualGrid" in cls and 0 <= r.left < 1920
+                        and 0 <= r.top < 1080):
+                    grid = r
+                    break
+            except Exception:
+                continue
+        if grid is None:
+            self._last_error = "cancel: 撤单网格未定位（CVirtualGridCtrl）"
+            return False
+
+        from pywinauto import mouse
+        x = (grid.left + grid.right) // 2
+        y = grid.top + 45 + idx * 24   # 表头 ~45px + 行高 24px（真机单行实证 y=156）
+        mouse.double_click(coords=(x, y))
+        time.sleep(1.5)
+
+        rows2 = self.get_orders()
+        gone = not any(str(o.get("order_id")) == str(order_ref) for o in rows2)
+        if gone:
+            logger.info("ths cancel_order ok: ref=%s", order_ref)
+        else:
+            self._last_error = "cancel: 目标仍在可撤列表（撤单未生效）"
+        return gone
+
     def kb_send(self, keys: str) -> None:
         """向当前焦点控件发送键入（SendInput）——不重置窗口焦点。
 
@@ -887,6 +948,15 @@ class ThsUiDispatcher(OrderDispatcher):
         return rows
 
     def get_orders(self) -> list:
+        """委托表读回（剪贴板+OCR 流水线）。空结果重试一次——真机偶发
+        整表读空（剪贴板竞态），二次读取可恢复；连续空视为真无委托。"""
+        rows = self._read_orders_once()
+        if not rows:
+            time.sleep(1.0)
+            rows = self._read_orders_once()
+        return rows
+
+    def _read_orders_once(self) -> list:
         if not self._connected:
             if not self.connect():
                 return []

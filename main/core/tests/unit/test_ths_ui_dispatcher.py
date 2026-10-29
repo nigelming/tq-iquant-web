@@ -607,3 +607,104 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
         "^a{DELETE}", "300",
         "{ENTER}",
     ]
+
+
+def test_cancel_order_geometry_flow(monkeypatch):
+    """cancel_order 几何双击方案：F3 → 网格定位 → 双击目标行（y=top+45+idx*24）
+    → 复读目标消失 → True。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    d._known_refs = {"6333266769"}
+
+    rows_now = [{"order_id": "6333266769", "symbol": "510300",
+                 "direction": "buy", "price": 4.35, "volume": 100}]
+
+    class _GridEl:
+        class element_info:
+            class_name = "CVirtualGridCtrl"
+
+        def rectangle(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(left=207, top=111, right=1919, bottom=1044)
+
+    class _FakeWin:
+        def descendants(self):
+            return [_GridEl()]
+
+    d._win = _FakeWin()
+    clicks = []
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "double_click",
+                        lambda coords: clicks.append((coords[0], coords[1])))
+
+    # 撤单生效：双击后复读为空（第一次读回有目标 → 双击 → 第二次空）
+    state = {"n": 0}
+
+    def _orders():
+        state["n"] += 1
+        return list(rows_now) if state["n"] == 1 else []
+
+    monkeypatch.setattr(d, "get_orders", _orders)
+    assert d.cancel_order("6333266769", "510300.SH") is True
+    assert len(clicks) == 1
+    assert clicks[0] == ((207 + 1919) // 2, 156)   # 首行 y = top(111)+45
+
+
+def test_cancel_order_refuses_unknown_refs(monkeypatch):
+    """可撤列表含非平台单（order_id ∉ _known_refs）→ 拒绝执行（防误撤手动委托）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    d._known_refs = {"6333266769"}
+
+    class _GridEl:
+        class element_info:
+            class_name = "CVirtualGridCtrl"
+
+        def rectangle(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(left=207, top=111, right=1919, bottom=1044)
+
+    class _FakeWin:
+        def descendants(self):
+            return [_GridEl()]
+
+    d._win = _FakeWin()
+
+    rows_now = [
+        {"order_id": "6333266769", "symbol": "510300", "direction": "buy"},
+        {"order_id": "9999999999", "symbol": "600519", "direction": "buy"},  # 手动单
+    ]
+    monkeypatch.setattr(d, "get_orders", lambda: list(rows_now))
+    clicks = []
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "double_click",
+                        lambda coords: clicks.append(coords))
+
+    assert d.cancel_order("6333266769", "510300.SH") is False
+    assert d.last_error and "非本平台委托" in d.last_error
+    assert clicks == []   # 未做任何双击
+
+
+def test_cancel_order_target_missing(monkeypatch):
+    """目标不在可撤列表（已撤/已成交收口）→ False。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    d._known_refs = {"6333266769"}
+    monkeypatch.setattr(d, "get_orders", lambda: [])
+
+    assert d.cancel_order("6333266769", "510300.SH") is False
+
+
+def test_get_orders_retries_once_on_empty(monkeypatch):
+    """委托表读回偶发整表读空 → 空结果重试一次。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    calls = {"n": 0}
+
+    def _once():
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [{"order_id": "W1"}]
+
+    monkeypatch.setattr(d, "_read_orders_once", _once)
+    rows = d.get_orders()
+    assert rows == [{"order_id": "W1"}]
+    assert calls["n"] == 2
