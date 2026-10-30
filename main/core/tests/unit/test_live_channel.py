@@ -202,6 +202,33 @@ def test_create_session_persists_engine(db_session):
     assert listed[0]["engine"] == "tdx"
 
 
+# ---------------- 外部信号注入：signal_file_path 会话配置（0011） ----------------
+
+def test_create_session_persists_signal_file_path(db_session):
+    """create_session 透传存储 signal_file_path；get/list 序列化可见。"""
+    data = svc.create_session(
+        db_session, {"name": "ext", "engine": "tdx",
+                     "signal_file_path": "D:/ths/alert.txt"}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.signal_file_path == "D:/ths/alert.txt"
+    detail = svc.get_session(db_session, data["id"])
+    assert detail["signal_file_path"] == "D:/ths/alert.txt"
+    listed = svc.list_sessions(db_session)
+    assert listed[0]["signal_file_path"] == "D:/ths/alert.txt"
+
+
+def test_create_session_empty_signal_file_path_becomes_none(db_session):
+    """空串/缺省 → None（不启用外部信号注入）。"""
+    data = svc.create_session(
+        db_session, {"name": "ext2", "engine": "tdx",
+                     "signal_file_path": "   "}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.signal_file_path is None
+    data2 = svc.create_session(db_session, {"name": "ext3", "engine": "tdx"}, "simulation")
+    row2 = db_session.query(svc.LiveSession).filter_by(id=data2["id"]).first()
+    assert row2.signal_file_path is None
+
+
 # ---------------- A-6：create_session 默认引擎（tq_trade.default_engine 覆盖） ----------------
 
 def test_default_engine_prefers_tq_trade_override(monkeypatch):

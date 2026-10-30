@@ -421,6 +421,7 @@ def build_engine(
     dispatcher_cls=None,
     engine: Optional[str] = None,
     execution_mode: str = "auto",
+    signal_file_path: Optional[str] = None,
 ) -> LiveEngine:
     """组装一个 session 的 LiveEngine：各组合 Portfolio + dispatcher + BarPoller。
 
@@ -434,6 +435,11 @@ def build_engine(
 
     execution_mode=alert 时固定使用 AlertDataDispatcher（TQ 行情、禁止下单），
     优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
+
+    外部信号注入（0011）：signal_file_path 参数非空 → LiveEngine 建
+    ExternalSignalFileSource（同花顺条件预警文件增量读取）；None 时回退读
+    session.signal_file_path（会话级配置，start_session/api 组装路径无需显式传），
+    两者皆空 → 不启用，行为不变。
     """
     if execution_mode == "alert":
         dispatcher = AlertDataDispatcher()
@@ -469,6 +475,9 @@ def build_engine(
     # None=各组合用自身 initial_capital（现行为）。
     session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     live_capital = getattr(session_row, "live_capital", None)
+    # 外部信号注入（0011）：参数优先；未传回退 session.signal_file_path（会话级配置）
+    if signal_file_path is None and session_row is not None:
+        signal_file_path = getattr(session_row, "signal_file_path", None)
     portfolios = []
     stock_codes: set = set()
     # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
@@ -568,6 +577,7 @@ def build_engine(
         regime_provider=_regime_provider,
         benchmark_codes=benchmark_codes,
         execution_mode=execution_mode,
+        signal_file_path=signal_file_path,
         formula_id_by_strategy=strategy_formula,
         enable_signal_monitor=True,
     )
@@ -598,6 +608,8 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "execution_mode": s.execution_mode,
             # 会话级实盘资金基准：None=各组合用自身 initial_capital
             "live_capital": s.live_capital,
+            # 外部信号注入（0011）：None=不启用
+            "signal_file_path": s.signal_file_path,
             "status": s.status,
             "started_at": s.started_at,
             "stopped_at": s.stopped_at,
@@ -615,11 +627,17 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
+    # 外部信号注入（0011）：空串/纯空白 → None（不启用）；非空原样存储（API 层同规则）
+    signal_file_path = data.get("signal_file_path")
+    if signal_file_path is not None:
+        signal_file_path = str(signal_file_path).strip() or None
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
         live_capital=data.get("live_capital"),
+        # 外部信号注入（0011）：None=不启用；非空=同花顺条件预警输出文件路径
+        signal_file_path=signal_file_path,
     )
     db.add(session)
     db.flush()
@@ -649,6 +667,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "execution_mode": session.execution_mode,
         # 会话级实盘资金基准：None=各组合用自身 initial_capital
         "live_capital": session.live_capital,
+        # 外部信号注入（0011）：None=不启用
+        "signal_file_path": session.signal_file_path,
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -784,6 +804,7 @@ def start_session(
         db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
         engine=session_engine(session),
         execution_mode=execution_mode,
+        signal_file_path=getattr(session, "signal_file_path", None),
     )
     # 启动前探测通道在线：客户端未起/未登录直接拒绝，不建引擎、不置 running，
     # 避免「一点就成功、通道离线却无告警」。heartbeat() 本地 loopback 瞬时失败，

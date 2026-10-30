@@ -21,6 +21,9 @@ class LiveSession(Base):
     # 执行模式：alert（半自动，只预警不下单）/ auto（现有自动交易）。
     # 迁移前历史会话写 auto；新建会话由 live_service 显式写 alert。
     execution_mode = Column(String(10), nullable=False, server_default="auto")
+    # 外部信号注入（0011）：同花顺条件预警输出文件路径。NULL=不启用（行为不变）；
+    # 配置后引擎每轮增量读取该文件，公式名匹配策略的信号走全套注入链。
+    signal_file_path = Column(String(500), nullable=True)
     status = Column(String(10), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

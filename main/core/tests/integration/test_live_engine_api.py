@@ -644,6 +644,44 @@ def test_build_engine_fills_formula_mapping(client, mock_bridge):
     assert engine._formula_count_by_name == {"open_formula": 200}
 
 
+# ---- 0011 外部信号注入：signal_file_path → build_engine 接线 ----
+
+def test_create_and_build_engine_wires_signal_file_source(client, mock_bridge):
+    """POST /sessions 带 signal_file_path → 落库；_build_engine 建信号源
+    （公式名集合 = formula_by_strategy 值集）；未配置会话 → _signal_source is None。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    resp = c.post("/api/live/sessions", json={
+        "name": "ext", "portfolio_ids": [ps_id], "mode": "simulation",
+        "execution_mode": "auto", "engine": "iquant",
+        "signal_file_path": "D:/ths/alert.txt",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    sid = body["data"]["id"]
+
+    db2 = Session()
+    try:
+        engine = live_api._build_engine(sid, db2)
+        assert engine._signal_source is not None
+        assert engine._signal_source._formula_names == {"open_formula"}
+    finally:
+        db2.close()
+
+    # 未配置 signal_file_path 的会话 → 不启用（引擎行为不变）
+    sid2 = _create_session(c, name="no-ext", portfolio_ids=(ps_id,))
+    db3 = Session()
+    try:
+        engine2 = live_api._build_engine(sid2, db3)
+        assert engine2._signal_source is None
+    finally:
+        db3.close()
+
+
 # ---- B4b: 历史查询端点（orders / trades / positions）----
 
 def _add_order(db, sid, stock="600000.SH", status="filled", trade_type="BUY",

@@ -124,6 +124,11 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         if not live_capital > 0:
             return err(400, "实盘资金基准须大于 0")
     data["live_capital"] = live_capital
+    # 外部信号注入（0011）：同花顺条件预警输出文件路径；空串/缺省 → None（不启用）
+    signal_file_path = data.get("signal_file_path")
+    if signal_file_path is not None:
+        signal_file_path = str(signal_file_path).strip() or None
+    data["signal_file_path"] = signal_file_path
     # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
     # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
     pids = data.get("portfolio_ids") or []
