@@ -53,7 +53,7 @@ from .live.timing import (
     periods_on_boundary,
 )
 from .live.event_bus import EventBus
-# 外部信号注入源（同花顺条件预警文件 → 公式名匹配策略 → 注入 signal_cache）
+# 外部信号注入源（通达信条件预警文件 → 公式名匹配策略 → 注入 signal_cache）
 from .live.external_signal_source import (
     ExternalSignalFileSource,
     normalize_external_symbol,
@@ -123,7 +123,7 @@ class LiveEngine:
         signal_scheduler=None,
         formula_id_by_strategy: Optional[Dict[int, int]] = None,
         enable_signal_monitor: bool = False,
-        # 外部信号注入（0011）：同花顺条件预警文件路径。None=不启用；非空=建
+        # 外部信号注入（0011）：通达信条件预警文件路径。None=不启用；非空=建
         # ExternalSignalFileSource，_tick_main 每轮增量读取并经 _handle_bar 全套注入。
         signal_file_path: Optional[str] = None,
     ):
@@ -845,7 +845,7 @@ class LiveEngine:
                 )
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
             self._bar_poller.poll()
-            # 0011 外部信号注入：poll 之后增量读取同花顺条件预警文件，公式名匹配
+            # 0011 外部信号注入：poll 之后增量读取通达信条件预警文件，公式名匹配
             # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
             self._tick_external_signals()
             # P2：超时检查移主循环——deals 循环被 60s 主循环饿死（单 worker 串行，
