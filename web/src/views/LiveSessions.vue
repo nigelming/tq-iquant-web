@@ -37,6 +37,8 @@ const form = ref({
   portfolio_ids: [] as number[],
   // 实盘资金基准（元）：null=用组合初始资金；number input v-model 空输入为 ''，提交前归一化
   live_capital: null as number | string | null,
+  // 外部信号注入：通达信条件预警输出的信号文件路径（空=走 TQ 公式计算）
+  signal_file_path: '' as string,
 })
 
 /** live_capital 归一化：空串/未填 → null（用组合初始资金），否则转数值透传。 */
@@ -368,7 +370,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
   showCreate.value = true
 }
 
@@ -379,7 +381,7 @@ async function create() {
   }
   await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
   showCreate.value = false
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
   load()
 }
 
@@ -726,6 +728,11 @@ onUnmounted(closeEventStream)
       <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 用组合初始资金" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         填写后会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
+      </p>
+      <label>外部信号文件路径（可选）</label>
+      <input v-model="form.signal_file_path" placeholder="留空 = 使用 TQ 公式计算信号；填写 = 读取外部条件预警文件" />
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。
       </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">

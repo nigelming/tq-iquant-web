@@ -494,10 +494,35 @@ export interface BacktestRobustnessItem {
     rolling_3y: { start: string; end: string; cagr: number | null; max_drawdown: number | null }[]
     concentration: {
       total_realized_pnl: number
-      top: { code: string; pnl: number; share: number }[]
-      top20_share: number
+      // 占比字段在毛利/净利 <= 0 时为 null（避免负占比误导）；旧 payload 缺这些键
+      top: { code: string; pnl: number; share: number | null;
+             share_gross?: number | null; share_net?: number | null }[]
+      top20_share: number | null
+      gross_profit?: number
+      gross_loss?: number
+      top20_share_gross?: number | null
+      // 期末未平仓：未实现盈亏单列，不计入已实现净利
+      unrealized?: {
+        total_pnl: number
+        cost: number
+        market_value: number
+        rows: { code: string; quantity: number | null; cost: number;
+                market_value: number; pnl: number; share_net: number | null }[]
+      }
       profitable_stocks: number
       total_stocks: number
+      // 单笔（FIFO 平仓批次）贡献分布
+      lots?: {
+        count: number
+        winners: number
+        top: { rank: number; code: string; buy_date: string | null; sell_date: string | null;
+               quantity: number; pnl: number;
+               share_gross: number | null; share_net: number | null }[]
+        cumulative: { n: number; pct_of_lots: number; pnl: number;
+                      share_gross: number | null; share_net: number | null }[]
+        hhi: number | null
+        effective_sources: number | null
+      }
     }
     oos: {
       split_year: string
@@ -1682,6 +1707,7 @@ export interface LiveSessionCreate {
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
   live_capital?: number | null  // 实盘资金基准（元）；空=null=用组合初始资金
+  signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
 }
 
 export async function getLiveSessions() {
