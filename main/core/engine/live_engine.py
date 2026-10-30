@@ -1525,6 +1525,14 @@ class LiveEngine:
         )
         if released:
             orders = list(released) + list(orders or [])
+        # 先卖后买：SELL 全部先于 BUY 提交（风控卖出优先——释放现金和持仓槽位）。
+        # SELL 提交后不等待成交（回填由 _tick_deals 5s 轮询处理），BUY 随即提交——
+        # BUY 审批用虚拟现金，SELL 未回填前现金未释放，BUY 可能因资金不足被拒/缩量，
+        # 属保守正确（宁可 BUY 失败，不可超卖）；等 SELL 成交再发 BUY 会阻塞主循环
+        # 60s 节拍。稳定排序：SELL/BUY 各自组内保持原相对顺序（released 放行单
+        # 先行语义在同类内保留）。
+        if orders:
+            orders.sort(key=lambda o: 0 if o.trade_type.value == "SELL" else 1)
         # db 会话在 on_bar 之后即开：决策闸门事件（熔断 halt/剥 BUY/风险触发）可能在无新单
         # 时也产生，需随本 bar 落库——故不再 orders 为空就早退，drain 放 finally 收尾。
         db = self._db_session_factory()
@@ -1706,6 +1714,70 @@ class LiveEngine:
                 message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
             )
             return
+        # 批次1 外部信号改造：BUY 槽位/排重闸（SELL 不受限——风控卖出必须放行）。
+        # ① 槽位闸：已持仓数 + 本策略在途 BUY 单数 >= max_positions → 拦截
+        # （portfolio.on_bar 的 OPEN 闸用内存 _pending_orders 口径，此处用 DB
+        # 口径兜底——跨池回填/重启恢复的在途单不漏数）。已持仓股票的 BUY
+        # （ADD 补仓）不占新槽位，槽位闸不适用；拆单子单豁免（同一笔逻辑单的
+        # 等量切片，槽位/排重按父单口径判定）。
+        # ② 排重闸（T+1）：该策略该股票当日已有 BUY 成交（live_trades）→ 重复
+        # 信号拦截——通达信条件预警是电平信号会反复触发，当日二次开仓不交易。
+        if (order.trade_type == TradeType.BUY
+                and not getattr(order, "_split_child", False)
+                and not self._split_children.get(
+                    (order.strategy_id, order.stock_code))):
+            # 拆单队列在途（同策略同股）→ 本单是大额拆单的后续信号，
+            # 交由 _maybe_split_order 排队（既有拆单语义，闸门不拦）。
+            held_pos = ctx.positions.get(order.stock_code)
+            if held_pos is None or held_pos.quantity <= 0:
+                pos_limit = ctx.effective_max_positions(
+                    getattr(portfolio, "current_regime", None))
+                held = sum(
+                    1 for p in ctx.positions.values() if p.quantity > 0)
+                inflight_buys = db.query(LiveOrder).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                    LiveOrder.strategy_id == order.strategy_id,
+                    LiveOrder.trade_type == "buy",
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                ).count()
+                if held + inflight_buys >= pos_limit:
+                    logger.info(
+                        "skip buy %s %s: positions full (%d held + %d inflight >= %d)",
+                        order.stock_code, order.signal_name,
+                        held, inflight_buys, pos_limit,
+                    )
+                    self._rec_live(
+                        "position_full", "block", portfolio, order,
+                        message="槽位已满：持仓 %d + 在途 BUY %d >= max_positions %d，跳过 BUY"
+                                % (held, inflight_buys, pos_limit),
+                    )
+                    return
+            # T+1 排重按订单 bar_time 的自然日（bar 驱动口径，与收盘/日历闸一致；
+            # bar_time 缺省回退当前上海时间）。
+            ref_day = (order.bar_time or now_shanghai()).date()
+            day_start = datetime(ref_day.year, ref_day.month, ref_day.day)
+            bought_today = db.query(LiveTrade).filter(
+                LiveTrade.live_session_id == self.session_id,
+                LiveTrade.portfolio_strategy_id == order.portfolio_id,
+                LiveTrade.strategy_id == order.strategy_id,
+                LiveTrade.stock_code == order.stock_code,
+                LiveTrade.trade_type == "buy",
+                LiveTrade.trade_time >= day_start,
+            ).first()
+            if bought_today is not None:
+                logger.info(
+                    "skip duplicate-signal buy %s %s: already bought today "
+                    "(trade %s order %s)",
+                    order.stock_code, order.signal_name,
+                    bought_today.id, bought_today.live_order_id,
+                )
+                self._rec_live(
+                    "duplicate_signal", "block", portfolio, order,
+                    message="同股当日已有 BUY 成交（trade %s，T+1 排重），跳过重复信号"
+                            % bought_today.id,
+                )
+                return
         # 批次2：TDX 大额拆单——资格命中则不提交原单，拆为等量子单队列：
         # 仅立即提交子单 1，其余由 _tick_split_children 在前子单成交回填后
         # 逐笔续发（F7 同向在途闸：前一子单未离场前续发必被拦；真实柜台按笔

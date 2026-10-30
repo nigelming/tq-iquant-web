@@ -7633,3 +7633,216 @@ def test_engine_init_wires_signal_source_from_path():
         bar_poller=poller, db_session_factory=factory,
     )
     assert e2._signal_source is None
+
+
+# ---------------- 批次1：先卖后买 + 槽位/排重闸（_handle_bar 提交链）----------------
+
+_BT = datetime(2026, 8, 5, 10, 0)
+
+
+def _gate_engine(factory, port):
+    """单组合单策略引擎（直调 _handle_bar/_submit_one_order 用）。"""
+    from core.engine.bar_poller import BarPoller
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    return engine, rec
+
+
+def _order(stock, trade_type, signal_type=None, signal_name="open_sig",
+           bar_time=None):
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=trade_type,
+        signal_type=signal_type or SignalType.OPEN,
+        quantity=100, price=Decimal("9.3"),
+        bar_time=bar_time or _BT, signal_name=signal_name,
+    )
+
+
+def _seed_buy_trade(db, stock, trade_time, qty=600, price="9.0", status="accepted"):
+    """预置一笔 BUY 成交（LiveOrder 终态 + LiveTrade），供排重/豁免用例。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="buy", order_type="limit", price=Decimal(price), quantity=qty,
+        filled_quantity=qty, filled_price=Decimal(price), status=status,
+        signal_name="open_sig", signal_type="OPEN", bar_time=trade_time,
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1,
+        strategy_id=1, stock_code=stock, trade_type="buy",
+        price=Decimal(price), quantity=qty, amount=Decimal(price) * qty,
+        commission=Decimal("0"), stamp_duty=Decimal("0"), trade_time=trade_time,
+    ))
+    db.flush()
+    # 提交：外部信号链路引擎自建 session（StaticPool 同连接），未提交的跨
+    # session 行不可见——预置成交必须 commit，引擎闸门查询才能命中。
+    db.commit()
+    return lo
+
+
+def test_handle_bar_submits_sell_before_buy(monkeypatch):
+    """混合 SELL+BUY：SELL 全部先于 BUY 提交（风控卖出优先释放现金/槽位）。
+
+    SELL 提交后不等待成交（回填由 _tick_deals 5s 轮询处理），BUY 随即提交——
+    BUY 审批用虚拟现金，SELL 未回填前现金未释放，BUY 可能因资金不足被拒/缩量，
+    属保守正确（宁可 BUY 失败，不可超卖）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    engine, _rec = _gate_engine(factory, port)
+    submitted = []
+    monkeypatch.setattr(
+        engine, "_submit_one_order",
+        lambda db, p, o, period, emit_signal=True: submitted.append(
+            o.trade_type.value))
+    sell = _order("000001.SZ", TradeType.SELL, SignalType.STOP_LOSS, "stop_loss")
+    buy = _order("600000.SH", TradeType.BUY, SignalType.OPEN, "open_sig")
+    monkeypatch.setattr(port, "on_bar", lambda *a, **k: [buy, sell])
+
+    engine._handle_bar(port, _bar("600000.SH", "9.3", _BT))
+
+    assert submitted == ["SELL", "BUY"]
+
+
+def test_submit_one_order_blocks_buy_when_positions_full():
+    """槽位闸：已持仓数 + 在途 BUY 单数 >= max_positions → 拦截 + position_full 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()  # max_positions=5
+    for code in ("600001.SH", "600002.SH", "600003.SH", "600004.SH"):
+        _preset_position(ctx, code, 100, Decimal("9.0"))
+    db = factory()
+    _seed_buy_submitted(db, _BT, status="submitted", stock_code="600005.SH")
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600006.SH", TradeType.BUY), "1m")
+    engine._drain_decisions(db, port)
+
+    # 槽满拦截：新 BUY 不落库（仅预置在途单）、不发桥
+    assert db.query(LiveOrder).count() == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    rows = _decision_rows(factory)
+    assert [(r.gate, r.action) for r in rows] == [("position_full", "block")]
+    db.close()
+
+
+def test_submit_one_order_allows_buy_when_slot_free():
+    """槽位闸有位：已持仓 + 在途 BUY < max_positions → BUY 正常落库发桥。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    for code in ("600001.SH", "600002.SH", "600003.SH"):
+        _preset_position(ctx, code, 100, Decimal("9.0"))
+    db = factory()
+    _seed_buy_submitted(db, _BT, status="submitted", stock_code="600004.SH")
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600005.SH", TradeType.BUY), "1m")
+
+    # 3 持仓 + 1 在途 = 4 < 5 → 新 BUY 提交（预置 + 新单共 2 笔）
+    assert db.query(LiveOrder).count() == 2
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_submit_one_order_blocks_buy_already_traded_today():
+    """排重闸：该策略该股票今日已有 BUY 成交 → 重复信号拦截 + duplicate_signal 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    db = factory()
+    _seed_buy_trade(db, "600000.SH", _BT)  # 当日（2026-8-5）已有 BUY 成交
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600000.SH", TradeType.BUY), "1m")
+    engine._drain_decisions(db, port)
+
+    # 拦截：不落新单（库内仅预置成交的 LiveOrder）、不发桥
+    assert db.query(LiveOrder).count() == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    rows = _decision_rows(factory)
+    assert [(r.gate, r.action) for r in rows] == [("duplicate_signal", "block")]
+    db.close()
+
+
+def test_submit_one_order_allows_buy_traded_only_yesterday():
+    """排重口径：昨日成交不算今日重复 → BUY 正常提交。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    db = factory()
+    _seed_buy_trade(db, "600000.SH", _BT)  # 2026-8-5 成交
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(
+        db, port, _order("600000.SH", TradeType.BUY,
+                         bar_time=datetime(2026, 8, 6, 10, 0)), "1m")
+
+    # 昨日成交不算今日重复：新 BUY 落库（预置成交单 + 新单共 2 笔）
+    assert db.query(LiveOrder).count() == 2
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_submit_one_order_sell_not_gated_by_slots_or_dedup():
+    """SELL 不受槽位/排重闸（风控卖出必须放行）：槽满 + 当日已有成交仍提交。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    for i in range(5):
+        _preset_position(ctx, "60000%d.SH" % i, 100, Decimal("9.0"))
+    db = factory()
+    _seed_buy_trade(db, "600000.SH", _BT)  # 当日已有 BUY 成交
+    engine, rec = _gate_engine(factory, port)
+
+    order = _order("600000.SH", TradeType.SELL, SignalType.STOP_LOSS, "stop_loss")
+    engine._submit_one_order(db, port, order, "1m")
+
+    # 预置成交单 + SELL 新单共 2 笔
+    assert db.query(LiveOrder).count() == 2
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_submit_one_order_split_children_exempt_from_gates():
+    """拆单子单豁免（_split_child）：同一逻辑单的等量切片，槽位/排重按父单口径。
+
+    max_positions=1 已满 + 子单1当日已成交 → 非子单 BUY 必被拦；子单豁免正常提交。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external(max_positions=1)
+    _preset_position(ctx, "600000.SH", 600, Decimal("9.0"))  # 子单1成交已 apply
+    db = factory()
+    _seed_buy_trade(db, "600000.SH", datetime(2026, 8, 5, 10, 1))
+    engine, rec = _gate_engine(factory, port)
+
+    child = _order("600000.SH", TradeType.BUY,
+                   bar_time=datetime(2026, 8, 5, 10, 2))
+    child._split_child = True
+    engine._submit_one_order(db, port, child, "1m")
+
+    # 预置成交单 + 子单共 2 笔
+    assert db.query(LiveOrder).count() == 2
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_external_signal_inherits_gates_duplicate_trade():
+    """外部信号走 _handle_bar 同链：同股今日已有 BUY 成交 → duplicate_signal 拦截。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    db = factory()
+    _seed_buy_trade(db, "600000.SH", _EXT_SIG["time"])  # 信号当日已有 BUY 成交
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+
+    engine._process_external_signal(dict(_EXT_SIG))
+    engine._drain_decisions(db, port)
+
+    # 拦截：仅预置成交单，无新单
+    assert db.query(LiveOrder).count() == 1
+    rows = _decision_rows(factory)
+    assert any(r.gate == "duplicate_signal" for r in rows)
+    db.close()
