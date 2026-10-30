@@ -12,9 +12,10 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
-  recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock,
+  recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas,
   type PortfolioItem, type LiveSessionItem, type DecisionSummaryItem,
   type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
+  type FormulaItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -26,10 +27,24 @@ const channel = ref<LiveChannelInfo | null>(null)
 const channelTesting = ref(false)
 const channelTestMsg = ref<{ ok: boolean; text: string } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
+const formulas = ref<FormulaItem[]>([])  // 公式列表（formula_id → name 映射，用于组合策略标注公式名）
 const showCreate = ref(false)
 // M2 实盘配置指南弹窗
 const showGuide = ref(false)
 // 默认与后端 create_session 对齐：新会话默认 alert（半自动预警，仅 TQ 行情+send_warn，不下单）
+// 组合策略多选时标注公式名称——外部信号注入需按公式名建立一一对应关系
+function portfolioFormulas(pid: number): string {
+  const p = portfolios.value.find(x => x.id === pid)
+  if (!p || !(p as any).strategies) return ''
+  const names = ((p as any).strategies as { formula_id?: number }[])
+    .map((s) => {
+      const f = formulas.value.find(f => f.id === s.formula_id)
+      return f ? f.name : null
+    })
+    .filter(Boolean)
+  return [...new Set(names)].join(' + ')
+}
+
 const form = ref({
   name: '', mode: 'simulation',
   engine: 'tdx' as LiveEngineKey,
@@ -353,6 +368,7 @@ async function load() {
     loading.value = false
   }
   portfolios.value = await getPortfolios().catch(() => [])
+  formulas.value = await getFormulas().catch(() => [])
   // M1 多会话并行：优先续接「监控中」的会话；其已停止/不存在则回退第一个
   // running（现行为）。多 running 时其余会话不自动接流——用户点行内「监控」切换。
   const running = sessions.value.filter((s) => s.status === 'running')
@@ -730,7 +746,8 @@ onUnmounted(closeEventStream)
         填写后会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
       </p>
       <label>外部信号文件路径（可选）</label>
-      <input v-model="form.signal_file_path" placeholder="留空 = 使用 TQ 公式计算信号；填写 = 读取外部条件预警文件" />
+      <label>外部信号文件路径（通达信条件预警输出）</label>
+      <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。
       </p>
@@ -739,6 +756,7 @@ onUnmounted(closeEventStream)
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
           <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" />
           {{ p.name }}<span style="color:var(--ink-faint)">（#{{ p.id }}）</span>
+          <span v-if="portfolioFormulas(p.id)" class="formula-tag">{{ portfolioFormulas(p.id) }}</span>
         </label>
       </div>
       <div v-if="portfolios.length === 0" class="empty-state" style="padding:8px">
@@ -838,6 +856,7 @@ onUnmounted(closeEventStream)
 }
 .channel-label { font-size: 13px; color: var(--ink-soft); }
 .channel-hint { font-size: 12px; color: var(--ink-faint); }
+.formula-tag { font-size: 11px; color: var(--accent); background: var(--accent-light); padding: 1px 6px; border-radius: 3px; margin-left: 4px; }
 .event-log {
   max-height: 420px;
   overflow-y: auto;
