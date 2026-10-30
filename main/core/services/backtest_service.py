@@ -1015,6 +1015,8 @@ def _upsert_robustness(
     row.status = status
     row.error = error
     row.payload_json = json.dumps(payload, ensure_ascii=False, allow_nan=False) if payload else None
+    # 重算要刷新「计算于」：server_default 只在 INSERT 生效，复用旧行会显示过时时间
+    row.computed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     db.refresh(row)
     return row
@@ -1041,12 +1043,17 @@ def compute_and_store_robustness(
     payload = analyze_robustness(
         snaps=[
             {"snap_date": s.snap_date, "total_value": s.total_value,
-             "benchmark_value": s.benchmark_value}
-            for s in snaps
+             "benchmark_value": s.benchmark_value,
+             # 仅末期快照带持仓明细：未实现盈亏需要它（其余快照无需解析）
+             "positions": (json.loads(s.positions_json)
+                           if i == len(snaps) - 1 and s.positions_json
+                           else None)}
+            for i, s in enumerate(snaps)
         ],
         trades=[
             {"stock_code": t.stock_code, "trade_type": t.trade_type, "amount": t.amount,
-             "commission": t.commission, "stamp_duty": t.stamp_duty}
+             "commission": t.commission, "stamp_duty": t.stamp_duty,
+             "price": t.price, "quantity": t.quantity, "bar_time": t.bar_time}
             for t in trades
         ],
         oos_ratio=oos_ratio,

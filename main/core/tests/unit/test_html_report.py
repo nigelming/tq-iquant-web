@@ -103,6 +103,51 @@ def _detail(**overrides):
     return detail
 
 
+def _robustness_payload():
+    """稳健性检验 data 区（年度/3年滚动/集中度/样本内外）。"""
+    return {
+        "total_return": 10.0847, "benchmark_return": 0.8593,
+        "years_positive": "13/13",
+        "annual": [{"year": "2014", "return": 0.814, "max_drawdown": -0.079},
+                   {"year": "2026", "return": 0.048, "max_drawdown": -0.005}],
+        "rolling_3y": [{"start": "2014", "end": "2016", "cagr": 0.532,
+                        "max_drawdown": -0.079}],
+        "concentration": {
+            "total_realized_pnl": 1000000,
+            "gross_profit": 1400000, "gross_loss": 400000,
+            "top": [{"code": "000408.SZ", "pnl": 338874, "share": 0.3389,
+                     "share_gross": 0.2421, "share_net": 0.3389}],
+            "top20_share": 0.42, "top20_share_gross": 0.30,
+            "unrealized": {
+                "total_pnl": 5845.01, "cost": 200404.99, "market_value": 206250,
+                "rows": [{"code": "002230.SZ", "quantity": 5500,
+                          "cost": 200404.99, "market_value": 206250,
+                          "pnl": 5845.01, "share_net": 0.0058}],
+            },
+            "profitable_stocks": 195, "total_stocks": 262,
+            "lots": {
+                "count": 314, "winners": 177,
+                "top": [{"rank": 1, "code": "002843.SZ", "buy_date": "2026-02-10",
+                         "sell_date": "2026-03-03", "quantity": 10900,
+                         "pnl": 115144.07, "share_gross": 0.0401,
+                         "share_net": 0.0513}],
+                "cumulative": [{"n": 5, "pct_of_lots": 0.0159, "pnl": 495833,
+                                "share_gross": 0.1728, "share_net": 0.2209}],
+                "hhi": 0.0145, "effective_sources": 69.0,
+            },
+        },
+        "oos": {
+            "split_year": "2023",
+            "in_sample": {"start": "2014-01-02", "end": "2023-12-29",
+                          "return": 8.145, "cagr": 0.248,
+                          "max_drawdown": -0.079, "benchmark_return": 0.478},
+            "out_of_sample": {"start": "2024-01-02", "end": "2026-10-09",
+                              "return": 0.212, "cagr": 0.066,
+                              "max_drawdown": -0.008, "benchmark_return": 0.275},
+        },
+    }
+
+
 def test_tr19_1_html_self_contained_with_inline_echarts():
     html = build_html_report(_detail())
     assert html.lstrip().lower().startswith("<!doctype html>")
@@ -200,34 +245,28 @@ def test_robustness_check_section_renders():
     detail = _detail()
     detail["robustness"] = {
         "status": "completed", "computed_at": "2026-10-12T10:00:00",
-        "data": {
-            "total_return": 10.0847, "benchmark_return": 0.8593,
-            "years_positive": "13/13",
-            "annual": [{"year": "2014", "return": 0.814, "max_drawdown": -0.079},
-                       {"year": "2026", "return": 0.048, "max_drawdown": -0.005}],
-            "rolling_3y": [{"start": "2014", "end": "2016", "cagr": 0.532,
-                            "max_drawdown": -0.079}],
-            "concentration": {
-                "total_realized_pnl": 1000000,
-                "top": [{"code": "000408.SZ", "pnl": 338874, "share": 0.036}],
-                "top20_share": 0.42, "profitable_stocks": 195, "total_stocks": 262,
-            },
-            "oos": {
-                "split_year": "2023",
-                "in_sample": {"start": "2014-01-02", "end": "2023-12-29",
-                              "return": 8.145, "cagr": 0.248,
-                              "max_drawdown": -0.079, "benchmark_return": 0.478},
-                "out_of_sample": {"start": "2024-01-02", "end": "2026-10-09",
-                                  "return": 0.212, "cagr": 0.066,
-                                  "max_drawdown": -0.008, "benchmark_return": 0.275},
-            },
-        },
+        "data": _robustness_payload(),
     }
     html = build_html_report(detail)
     for token in ["稳健性检验", "年度收益与年内最大回撤", "3年滚动窗口",
-                  "个股已实现净", "样本内 / 样本外对比", "000408.SZ",
-                  "断点年份", "13/13", "2024 ~ 2026"]:
+                  "盈利贡献分布（已实现 / 未实现 / 单笔）", "样本内 / 样本外对比",
+                  "000408.SZ", "断点年份", "13/13", "2024 ~ 2026"]:
         assert token in html, f"报告缺少 {token!r}"
+
+
+def test_robustness_concentration_new_blocks_render():
+    """3.3 节新版：未实现单列 + 单笔贡献分布（累计表 + Top 明细 + HHI）。"""
+    detail = _detail()
+    detail["robustness"] = {"status": "completed", "data": _robustness_payload()}
+    html = build_html_report(detail)
+    for token in ["已实现净利 1,000,000.00", "毛利 1,400,000.00",
+                  "前20只占毛利 30.00%", "占净利 42.00%",
+                  "期末未平仓（未实现盈亏单列，不计入已实现净利）",
+                  "FIFO 平仓批次 314 笔", "HHI 0.0145", "69.0 笔",
+                  "前 5 笔", "2026-02-10 → 2026-03-03"]:
+        assert token in html, f"报告缺少 {token!r}"
+    # 002230.SZ 必须出现在未实现表里（旧口径会把它当负贡献进个股 Top 表）
+    assert "002230.SZ" in html
 
 
 def test_persistence_check_section_renders():

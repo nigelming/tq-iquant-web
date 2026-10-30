@@ -1713,11 +1713,63 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     const text = w.text()
     expect(text).toContain('年度收益与年内最大回撤')
     expect(text).toContain('3年滚动窗口')
-    expect(text).toContain('个股已实现净')
+    expect(text).toContain('盈利贡献分布（已实现 / 未实现 / 单笔）')
     expect(text).toContain('样本内 / 样本外对比')
     expect(text).toContain('000408.SZ')
     expect(text).toContain('断点年份：2023')
     expect(text).toContain('13/13')
+  })
+
+  it('盈利贡献分布：未实现单列 + 单笔贡献表', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      robustness: {
+        status: 'completed',
+        data: {
+          total_return: 11.2514, benchmark_return: 0.5, years_positive: '1/1',
+          annual: [], rolling_3y: [],
+          concentration: {
+            total_realized_pnl: 2244555, gross_profit: 2870112, gross_loss: 625556,
+            top: [{ code: '002328.SZ', pnl: 149477, share: 0.0667,
+                    share_gross: 0.0521, share_net: 0.0667 }],
+            top20_share: 0.8078, top20_share_gross: 0.5742,
+            unrealized: {
+              total_pnl: 5845.01, cost: 200404.99, market_value: 206250,
+              rows: [{ code: '002230.SZ', quantity: 5500, cost: 200404.99,
+                       market_value: 206250, pnl: 5845.01, share_net: 0.0026 }],
+            },
+            profitable_stocks: 77, total_stocks: 111,
+            lots: {
+              count: 314, winners: 177,
+              top: [{ rank: 1, code: '002843.SZ', buy_date: '2026-02-10',
+                      sell_date: '2026-03-03', quantity: 10900, pnl: 115144,
+                      share_gross: 0.0401, share_net: 0.0513 }],
+              cumulative: [{ n: 5, pct_of_lots: 0.0159, pnl: 495833,
+                             share_gross: 0.1728, share_net: 0.2209 }],
+              hhi: 0.0145, effective_sources: 68.9,
+            },
+          },
+          oos: null,
+        },
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rbHeader = w.findAll('.ca-header').find((h) => h.text().includes('稳健性检验'))!
+    await rbHeader.trigger('click')
+    await flushPromises()
+    const text = w.text()
+    expect(text).toContain('已实现净利')
+    expect(text).toContain('毛利')
+    expect(text).toContain('未实现')
+    expect(text).toContain('002230.SZ')          // 未平仓单列
+    expect(text).toContain('单笔贡献分布（FIFO 平仓批次）')
+    expect(text).toContain('前 5 笔')
+    expect(text).toContain('002843.SZ')
+    expect(text).toContain('等效独立盈利来源')
+    expect(text).toContain('68.9')
   })
 
   it('robustness 为 null：显示未计算提示', async () => {

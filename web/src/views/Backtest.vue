@@ -4420,25 +4420,99 @@ watch(theme, () => {
           </table>
         </div>
 
-        <div class="section-title" style="font-size:14px">三、个股已实现净 P&amp;L 集中度</div>
+        <div class="section-title" style="font-size:14px">三、盈利贡献分布（已实现 / 未实现 / 单笔）</div>
         <div class="ca-status" style="margin-bottom:6px">
-          盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
-          ｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}
-          ｜ 总净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+          已实现净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+          <template v-if="rbData.concentration.gross_profit != null">
+            （毛利 {{ fmtMoney(rbData.concentration.gross_profit) }} − 毛亏 {{ fmtMoney(rbData.concentration.gross_loss) }}）
+          </template>
+          <template v-if="rbData.concentration.unrealized">
+            ｜ 未实现 <span :class="valueClass(rbData.concentration.unrealized.total_pnl)">{{ fmtMoney(rbData.concentration.unrealized.total_pnl) }}</span>
+          </template>
+          ｜ 盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
+          <template v-if="rbData.concentration.top20_share_gross != null">
+            ｜ 前20只占毛利 {{ pct(rbData.concentration.top20_share_gross) }} ／ 占净利 {{ pct(rbData.concentration.top20_share) }}
+          </template>
+          <template v-else>｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}</template>
         </div>
         <div class="table-container">
           <table>
-            <thead><tr><th>#</th><th>代码</th><th>净 P&amp;L</th><th>占比</th></tr></thead>
+            <thead><tr><th>#</th><th>代码</th><th>已实现净 P&amp;L</th><th>占毛利</th><th>占净利</th></tr></thead>
             <tbody>
               <tr v-for="(t, i) in rbData.concentration.top" :key="t.code">
                 <td>{{ i + 1 }}</td>
                 <td>{{ t.code }}</td>
                 <td :class="valueClass(t.pnl)">{{ fmtMoney(t.pnl) }}</td>
-                <td>{{ pct(t.share) }}</td>
+                <td>{{ pct(t.share_gross ?? t.share) }}</td>
+                <td>{{ pct(t.share_net ?? t.share) }}</td>
               </tr>
             </tbody>
           </table>
         </div>
+
+        <template v-if="rbData.concentration.unrealized?.rows?.length">
+          <div class="ca-status" style="margin:8px 0 6px">
+            期末未平仓（未实现盈亏单列，不计入已实现净利）：{{ rbData.concentration.unrealized.rows.length }} 只
+            ｜ 成本 {{ fmtMoney(rbData.concentration.unrealized.cost) }}
+            ｜ 市值 {{ fmtMoney(rbData.concentration.unrealized.market_value) }}
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>代码</th><th>持股数</th><th>成本</th><th>市值</th><th>浮动盈亏</th><th>占已实现净利</th></tr></thead>
+              <tbody>
+                <tr v-for="u in rbData.concentration.unrealized.rows" :key="u.code">
+                  <td>{{ u.code }}</td>
+                  <td>{{ fmtQty(u.quantity) }}</td>
+                  <td>{{ fmtMoney(u.cost) }}</td>
+                  <td>{{ fmtMoney(u.market_value) }}</td>
+                  <td :class="valueClass(u.pnl)">{{ fmtMoney(u.pnl) }}</td>
+                  <td>{{ pct(u.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <template v-if="rbData.concentration.lots">
+          <div class="section-title" style="font-size:14px">单笔贡献分布（FIFO 平仓批次）</div>
+          <div class="ca-status" style="margin-bottom:6px">
+            平仓批次 {{ rbData.concentration.lots.count }} 笔（盈利 {{ rbData.concentration.lots.winners }} 笔）
+            <template v-if="rbData.concentration.lots.hhi != null">
+              ｜ 盈利集中度 HHI {{ rbData.concentration.lots.hhi }}
+              ｜ 等效独立盈利来源 ≈ {{ rbData.concentration.lots.effective_sources }} 笔
+            </template>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>累计笔数</th><th>占批次</th><th>累计盈利</th><th>占毛利</th><th>占净利</th></tr></thead>
+              <tbody>
+                <tr v-for="k in rbData.concentration.lots.cumulative" :key="k.n">
+                  <td>前 {{ k.n }} 笔</td>
+                  <td>{{ pct(k.pct_of_lots) }}</td>
+                  <td>{{ fmtMoney(k.pnl) }}</td>
+                  <td>{{ pct(k.share_gross) }}</td>
+                  <td>{{ pct(k.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-container" style="margin-top:8px">
+            <table>
+              <thead><tr><th>#</th><th>代码</th><th>买入 → 卖出</th><th>股数</th><th>盈亏</th><th>占毛利</th><th>占净利</th></tr></thead>
+              <tbody>
+                <tr v-for="l in rbData.concentration.lots.top" :key="`${l.rank}-${l.code}-${l.sell_date}`">
+                  <td>{{ l.rank }}</td>
+                  <td>{{ l.code }}</td>
+                  <td>{{ (l.buy_date || '').slice(0, 10) }} → {{ (l.sell_date || '').slice(0, 10) }}</td>
+                  <td>{{ fmtQty(l.quantity) }}</td>
+                  <td :class="valueClass(l.pnl)">{{ fmtMoney(l.pnl) }}</td>
+                  <td>{{ pct(l.share_gross) }}</td>
+                  <td>{{ pct(l.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
 
         <div class="section-title" style="font-size:14px">四、样本内 / 样本外对比（默认 75/25 自动切分）</div>
         <template v-if="rbData.oos">

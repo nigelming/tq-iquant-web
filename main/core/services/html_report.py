@@ -65,6 +65,13 @@ def num(v: Any, digits: int = 2) -> str:
     return f"{float(v):.{digits}f}"
 
 
+def money(v: Any) -> str:
+    """金额：千分位 + 2 位小数（非数值返回 —）。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "—"
+    return f"{v:,.2f}"
+
+
 def cls(v: Any) -> str:
     """A 股配色：正红负绿。"""
     if v is None:
@@ -1061,22 +1068,80 @@ def _robustness_section(detail: dict) -> str:
 
     conc = d.get("concentration") or {}
     top = conc.get("top") or []
+    # 口径：已实现净利按 FIFO 逐笔匹配（双边费用按股分摊）；期末未平仓单列为
+    # 未实现，不混入已实现；占比同时给毛利/净利两个分母。
+    gp, gl = conc.get("gross_profit"), conc.get("gross_loss")
     conc_rows, conc_cls = [], []
     for i, t in enumerate(top, 1):
         pnl = t.get("pnl")
-        conc_rows.append([str(i), esc(t.get("code")),
-                          f"{pnl:,.2f}" if isinstance(pnl, (int, float)) else "—",
-                          pct(t.get("share"))])
-        conc_cls.append([None, None, cls(pnl), None])
-    conc_summary = (
-        f"盈利个股 {conc.get('profitable_stocks', 0)} / {conc.get('total_stocks', 0)}　"
-        f"前20只占总净利 {pct(conc.get('top20_share'))}　"
-        f"总净利 {conc.get('total_realized_pnl', 0):,.2f}"
+        share_g = t.get("share_gross", t.get("share"))
+        share_n = t.get("share_net", t.get("share"))
+        conc_rows.append([str(i), esc(t.get("code")), money(pnl),
+                          pct(share_g), pct(share_n)])
+        conc_cls.append([None, None, cls(pnl), None, None])
+    summary = (
+        f"已实现净利 {money(conc.get('total_realized_pnl'))}"
+        + (f"（毛利 {money(gp)} − 毛亏 {money(gl)}）" if gp is not None else "")
+        + f"　盈利个股 {conc.get('profitable_stocks', 0)} / {conc.get('total_stocks', 0)}"
     )
-    body.append("<h3>3.3 个股已实现净 P&L 集中度</h3>")
-    body.append(f'<p class="note">{esc(conc_summary)}</p>')
-    body.append(_table(["#", "代码", "净 P&L", "占比"], conc_rows, conc_cls)
+    if conc.get("top20_share_gross") is not None:
+        summary += (f"　前20只占毛利 {pct(conc.get('top20_share_gross'))}"
+                    f" ／ 占净利 {pct(conc.get('top20_share'))}")
+    else:
+        summary += f"　前20只占总净利 {pct(conc.get('top20_share'))}"
+    body.append("<h3>3.3 盈利贡献分布（已实现 / 未实现 / 单笔）</h3>")
+    body.append(f'<p class="note">{esc(summary)}</p>')
+    body.append(_table(["#", "代码", "已实现净 P&L", "占毛利", "占净利"],
+                       conc_rows, conc_cls)
                 if conc_rows else _empty("无成交记录"))
+
+    unreal = conc.get("unrealized") or {}
+    u_rows = unreal.get("rows") or []
+    if u_rows:
+        body.append(
+            f'<p class="note">期末未平仓（未实现盈亏单列，不计入已实现净利）：'
+            f'{len(u_rows)} 只　成本 {esc(money(unreal.get("cost")))}'
+            f'　市值 {esc(money(unreal.get("market_value")))}'
+            f'　浮动合计 {esc(money(unreal.get("total_pnl")))}</p>')
+        u_body, u_cls = [], []
+        for u in u_rows:
+            pnl = u.get("pnl")
+            u_body.append([esc(u.get("code")), num(u.get("quantity"), 0),
+                           money(u.get("cost")), money(u.get("market_value")),
+                           money(pnl), pct(u.get("share_net"))])
+            u_cls.append([None, None, None, None, cls(pnl), None])
+        body.append(_table(["代码", "持股数", "成本", "市值", "浮动盈亏", "占已实现净利"],
+                           u_body, u_cls))
+
+    lots = conc.get("lots") or {}
+    if lots.get("count"):
+        hhi = lots.get("hhi")
+        lots_note = (f"单笔贡献分布（FIFO 平仓批次 {lots.get('count')} 笔，"
+                     f"盈利 {lots.get('winners', 0)} 笔）")
+        if hhi is not None:
+            lots_note += (f"　盈利集中度 HHI {num(hhi, 4)}"
+                          f"　等效独立盈利来源 ≈ {num(lots.get('effective_sources'), 1)} 笔")
+        body.append(f'<p class="note">{esc(lots_note)}</p>')
+        cum_rows = []
+        for k in (lots.get("cumulative") or []):
+            cum_rows.append([f"前 {esc(k.get('n'))} 笔", pct(k.get("pct_of_lots")),
+                             money(k.get("pnl")), pct(k.get("share_gross")),
+                             pct(k.get("share_net"))])
+        if cum_rows:
+            body.append(_table(["累计笔数", "占批次", "累计盈利", "占毛利", "占净利"],
+                               cum_rows))
+        lot_rows, lot_cls = [], []
+        for l in (lots.get("top") or []):
+            pnl = l.get("pnl")
+            lot_rows.append([str(l.get("rank")), esc(l.get("code")),
+                             f"{esc(str(l.get('buy_date') or '')[:10])} → "
+                             f"{esc(str(l.get('sell_date') or '')[:10])}",
+                             num(l.get("quantity"), 0), money(pnl),
+                             pct(l.get("share_gross")), pct(l.get("share_net"))])
+            lot_cls.append([None, None, None, None, cls(pnl), None, None])
+        if lot_rows:
+            body.append(_table(["#", "代码", "买入 → 卖出", "股数", "盈亏", "占毛利", "占净利"],
+                               lot_rows, lot_cls))
 
     body.append("<h3>3.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
     oos = d.get("oos")
