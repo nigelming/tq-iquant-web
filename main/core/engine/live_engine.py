@@ -880,8 +880,9 @@ class LiveEngine:
     def _tick_external_signals(self) -> None:
         """外部信号注入轮（_tick_main 在 bar_poller.poll() 后调用）。
 
-        ExternalSignalFileSource 增量读取预警文件新行（行号游标），逐条
-        _process_external_signal 注入；单条失败不阻断其余信号与主循环。
+        ExternalSignalFileSource 时间窗口增量读取预警文件（时间戳游标 + lookback
+        窗口——通达信启动补齐的历史信号在源内过滤，见 external_signal_source），
+        逐条 _process_external_signal 注入；单条失败不阻断其余信号与主循环。
         源未启用（None）直接返回，行为不变。
         """
         if self._signal_source is None:

@@ -6,17 +6,26 @@
     行号\\t代码(6位)\\t名称\\tYYYY-MM-DD HH:MM\\t价格\\t涨跌幅%\\t现量\\t公式名
     1\\t920718\\t六合高科\\t2026-10-30 09:50\\t 9.83\\t-1.90%\\t    1\\t分时突击
 
-平台定时增量读取（行号游标），公式名匹配策略后注入 signal_cache 走 Portfolio.on_bar
-全套（风控/审批/在途单闸不绕过）。所有周期公式信号均可经此链路注入——包括 1m
-（绕过 TQ 公式引擎 1m 返回全空的限制）。
+平台定时增量读取（时间戳游标 + lookback 时间窗口），公式名匹配策略后注入
+signal_cache 走 Portfolio.on_bar 全套（风控/审批/在途单闸不绕过）。所有周期
+公式信号均可经此链路注入——包括 1m（绕过 TQ 公式引擎 1m 返回全空的限制）。
 
-本源是通道无关的：文件由外部（同花顺客户端）产生，平台只读，不回写不删除。
+时间窗口模型（批次1 外部信号改造）：通达信条件预警启动时会**补齐全部历史信号**
+写入文件——按行号游标处理会消费所有旧信号（旧信号股价已拉升/条件已消失，
+不应交易）。改为双重过滤：
+
+    ① 时间戳游标（_last_read_time，初始=启动时当前时间）——只处理时间 > 游标
+       的行，启动前存量（含窗口内近端补齐行）全挡；
+    ② lookback 窗口（默认 300s）——晚到的陈旧行（时间 > 游标但早于
+       now - lookback_seconds）不返回，信号新鲜度兜底。
+
+本源是通道无关的：文件由外部（通达信客户端）产生，平台只读，不回写不删除。
 """
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Dict, List, Set
+from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -55,16 +64,27 @@ def normalize_external_symbol(code: str) -> str:
 class ExternalSignalFileSource:
     """通达信条件预警文本文件信号源。
 
-    定时读取预警文件 → 解析新行（行号游标增量）→ 返回新信号列表。
-    文件由同花顺客户端条件预警功能动态输出（追加写入），游标语义天然适配：
-    每轮只消费新增行，旧行不再重放。公式名不在 strategy_formula_names 集合
-    中的行不返回（文件里可能混有其它公式的预警）。
+    定时读取预警文件 → 解析（时间戳游标 + lookback 窗口增量）→ 返回新信号列表。
+    文件由通达信客户端条件预警功能动态输出（追加写入），游标语义适配增量：
+    每轮只消费晚于游标的时间窗口内新行，旧行不再重放。公式名不在
+    strategy_formula_names 集合中的行不返回（文件里可能混有其它公式的预警）。
     """
 
-    def __init__(self, file_path: str, strategy_formula_names: Set[str]):
+    def __init__(
+        self,
+        file_path: str,
+        strategy_formula_names: Set[str],
+        lookback_seconds: int = 300,
+        clock: Optional[Callable[[], datetime]] = None,
+    ):
         self._path = file_path
         self._formula_names = set(strategy_formula_names or ())
-        self._last_line_count = 0  # 行号游标（已消费的完整行数）
+        self._lookback_seconds = max(0, int(lookback_seconds))
+        self._clock = clock or datetime.now
+        # 时间戳游标：初始 = 启动时当前时间。通达信条件预警启动会补齐全部历史
+        # 信号写入文件，游标把启动前存量（含窗口内近端补齐行）全部挡掉，
+        # 只消费启动后新触发的信号。
+        self._last_read_time: datetime = self._clock()
         self._seen_codes: Set[str] = set()  # 本日已处理代码（防重复）
 
     def read_new_signals(self) -> List[Dict]:
@@ -74,38 +94,52 @@ class ExternalSignalFileSource:
                 "price": Decimal("9.83"), "formula_name": "分时突击"}]
         （code 为文件中的 6 位原码，带后缀归一由引擎注入时完成。）
 
-        游标推进：读取后 _last_line_count = 完整行总数（含本轮跳过的异常行）。
-        编码 GBK（通达信输出）。解析失败的行跳过 + warning 留痕。
-        去重：同代码（_seen_codes）同日只返回第一条；公式名不匹配的行不占用
-        去重名额（同代码换匹配公式后仍可触发）。
+        双重过滤（批次1）：
+        ① 时间戳游标——只处理 signal_time > _last_read_time 的行；
+        ② lookback 窗口——只返回 signal_time >= now - lookback_seconds 的信号。
+        游标推进：本轮文件全部可解析行中最晚 signal_time（单调不回退，防补齐
+        旧行把游标拉回过去）。编码 GBK（通达信输出）。解析失败的行跳过 +
+        warning 留痕。去重：同代码（_seen_codes）同日只返回第一条；公式名不
+        匹配的行不占去重名额（同代码换匹配公式后仍可触发）。
         """
+        now = self._clock()
+        cutoff = now - timedelta(seconds=self._lookback_seconds)
         lines = self._read_complete_lines()
-        if len(lines) <= self._last_line_count:
-            return []
-        new_lines = lines[self._last_line_count:]
-        self._last_line_count = len(lines)
         signals: List[Dict] = []
-        for raw in new_lines:
+        latest: Optional[datetime] = None
+        for raw in lines:
             line = raw.strip().lstrip("﻿").strip()
             if not line:
                 continue  # 空行
             sig = self._parse_line(line)
             if sig is None:
                 continue
+            if latest is None or sig["time"] > latest:
+                latest = sig["time"]
+            # ① 时间戳游标：启动前存量行（含通达信补齐历史）不消费
+            if sig["time"] <= self._last_read_time:
+                continue
+            # ② lookback 窗口：晚到的陈旧行不交易（股价已拉升/条件已消失）
+            if sig["time"] < cutoff:
+                continue
             if sig["code"] in self._seen_codes:
                 continue
             self._seen_codes.add(sig["code"])
             signals.append(sig)
+        # 游标单调推进 = 文件中最晚信号时间（仅前进，防补齐行把游标拉回过去）
+        if latest is not None and latest > self._last_read_time:
+            self._last_read_time = latest
         return signals
 
     def reset_daily(self):
-        """每日重置：清空 seen_codes 和游标。
+        """每日重置：清空 seen_codes，游标归位当前时间。
 
-        供调用方在新交易日（预警文件按日轮转/换新文件路径）调用；游标归零
-        意味着重读文件全部行，调用前应确保文件已轮转，否则旧信号会重放。
+        供调用方在新交易日（预警文件按日轮转/换新文件路径）调用；时间戳游标
+        归位当前时间，与「启动后新信号才消费」同语义——新文件的行只要时间晚于
+        重置时点且落在 lookback 窗口内即消费。
         """
         self._seen_codes = set()
-        self._last_line_count = 0
+        self._last_read_time = self._clock()
 
     # ------------------------------------------------------------------
     def _read_complete_lines(self) -> List[str]:

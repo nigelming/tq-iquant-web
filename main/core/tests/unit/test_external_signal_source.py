@@ -1,18 +1,36 @@
-"""外部信号注入源单测 — 同花顺条件预警文本文件解析。
+"""外部信号注入源单测 — 通达信条件预警文本文件解析（0011 外部信号注入链路）。
 
 文件形态（真机样本）：GBK 编码、追加写入、制表符分隔，每行一条预警：
   行号\t代码(6位)\t名称\tYYYY-MM-DD HH:MM\t价格\t涨跌幅%\t现量\t公式名
-ExternalSignalFileSource 增量读取（行号游标）→ 公式名匹配过滤 → 标准化信号 dict。
+ExternalSignalFileSource 时间窗口增量读取（时间戳游标 + lookback 窗口）→
+公式名匹配过滤 → 标准化信号 dict。
+
+时间窗口模型（批次1 外部信号改造）：通达信条件预警启动时会补齐全部历史信号
+写入文件——按行号游标处理会消费所有旧信号（旧信号股价已拉升/条件已消失）。
+改为：时间戳游标（初始=启动时当前时间，只处理时间 > 游标的行）+ lookback
+窗口（只返回 signal_time >= now - lookback_seconds 的信号）。
 """
 import logging
 from datetime import datetime
 from decimal import Decimal
 
-import pytest
-
 from core.engine.live.external_signal_source import ExternalSignalFileSource
 
 NAMES = {"分时突击"}
+
+# 固定测试时钟基准：早于用例全部信号时间（游标与 lookback 窗口均放行），
+# 供解析/去重/公式匹配等基础用例使用。
+TEST_NOW = datetime(2026, 10, 30, 9, 49)
+
+
+class _Clock:
+    """可推进的固定时钟：read_new_signals 的窗口/游标判定可测。"""
+
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 def _line(no, code, name, ts, price, pct, vol, formula):
@@ -35,8 +53,10 @@ def _write_lines(tmp_path, lines, append=False):
     return p
 
 
-def _source(path, names=NAMES):
-    return ExternalSignalFileSource(str(path), names)
+def _source(path, names=NAMES, clock=None, lookback_seconds=300):
+    return ExternalSignalFileSource(
+        str(path), names, lookback_seconds=lookback_seconds,
+        clock=clock or _Clock(TEST_NOW))
 
 
 # ---------------- 基本解析 ----------------
@@ -63,7 +83,7 @@ def test_missing_file_returns_empty(tmp_path):
     p = tmp_path / "alert.txt"
     src = _source(p)
     assert src.read_new_signals() == []
-    # 文件随后出现（同花顺客户端启动后才开始写）→ 正常读到
+    # 文件随后出现（通达信客户端启动后才开始写）→ 正常读到
     _write_lines(tmp_path, [
         _line(1, "600000", "浦发银行", "2026-10-30 09:50", "9.83", "0.1%", "1", "分时突击"),
     ])
@@ -80,12 +100,13 @@ def test_empty_file_and_blank_lines(tmp_path):
 
 
 def test_cursor_incremental_read(tmp_path):
+    """时间戳游标：消费后旧行不重放（时间 <= 游标），新行（时间 > 游标）正常读出。"""
     p = _write_lines(tmp_path, [
         _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
     ])
     src = _source(p)
     assert len(src.read_new_signals()) == 1
-    # 追加写入（同花顺动态输出）→ 只读到新增行
+    # 追加写入（通达信动态输出）→ 只读到新增行
     _write_lines(tmp_path, [
         _line(2, "605377", "科兴科技", "2026-10-30 09:51", "7.74", "0.91%", "12", "分时突击"),
     ], append=True)
@@ -97,7 +118,7 @@ def test_cursor_incremental_read(tmp_path):
 
 
 def test_incomplete_trailing_line_not_consumed(tmp_path):
-    """同花顺正在写半行（无换行符结尾）→ 不消费，待写完整后下一轮读出。"""
+    """通达信正在写半行（无换行符结尾）→ 不消费，待写完整后下一轮读出。"""
     p = _write_lines(tmp_path, [
         _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
     ])
@@ -112,6 +133,82 @@ def test_incomplete_trailing_line_not_consumed(tmp_path):
     sigs = src.read_new_signals()
     assert len(sigs) == 1
     assert sigs[0]["code"] == "600000"
+
+
+# ---------------- 时间窗口 / 时间戳游标（批次1 外部信号改造）----------------
+
+def test_startup_backfill_not_consumed(tmp_path):
+    """通达信启动补齐全部历史信号 → 时间戳游标（初始=启动时当前时间）全挡。
+
+    即使部分补齐行落在 lookback 窗口内（09:58 距启动 10:00:30 不足 300s），
+    启动前的存量行也不消费——旧信号股价已拉升/条件已消失，不应交易。
+    """
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 30))
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
+        _line(2, "605377", "科兴科技", "2026-10-30 09:58", "7.74", "0.91%", "12", "分时突击"),
+    ])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    assert src.read_new_signals() == []
+
+
+def test_new_signal_after_startup_consumed_and_cursor_advances(tmp_path):
+    """启动后新触发的信号（时间 > 游标）→ 消费；游标推进 = 文件中最晚信号时间。"""
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 30))
+    p = _write_lines(tmp_path, [])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    assert src.read_new_signals() == []
+    _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:02", "9.83", "-1.90%", "1", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 2, 40)
+    sigs = src.read_new_signals()
+    assert [s["code"] for s in sigs] == ["920718"]
+    # 游标 = 已消费文件中最晚信号时间
+    assert src._last_read_time == datetime(2026, 10, 30, 10, 2)
+    # 同文件重读：时间 <= 游标 → 不重放
+    assert src.read_new_signals() == []
+
+
+def test_stale_row_beyond_lookback_window_filtered(tmp_path):
+    """晚到的陈旧行（时间 > 游标但超出 lookback 窗口）→ 被窗口过滤，不交易。"""
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 30))
+    p = _write_lines(tmp_path, [])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    # 启动后首个信号：正常消费，游标推进到 10:01
+    _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:01", "9.83", "0.1%", "1", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 1, 30)
+    assert [s["code"] for s in src.read_new_signals()] == ["920718"]
+    # 迟写的 10:02 行（> 游标 10:01，但距 now 10:30 超出 300s 窗口）→ 过滤
+    _write_lines(tmp_path, [
+        _line(2, "605377", "科兴科技", "2026-10-30 10:02", "7.74", "0.91%", "12", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 30, 0)
+    assert src.read_new_signals() == []
+    # 窗口内的新信号（10:28 >= now 10:30 - 300s）仍通过
+    _write_lines(tmp_path, [
+        _line(3, "600000", "浦发银行", "2026-10-30 10:28", "9.80", "0.1%", "1", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 30, 10)
+    assert [s["code"] for s in src.read_new_signals()] == ["600000"]
+
+
+def test_window_boundary_inclusive(tmp_path):
+    """窗口边界：signal_time == now - lookback_seconds（含边界）→ 通过。"""
+    clock = _Clock(datetime(2026, 10, 30, 9, 50, 0))
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:00", "9.83", "0.1%", "1", "分时突击"),
+    ])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    assert [s["code"] for s in src.read_new_signals()] == ["920718"]
+    # 边界信号：10:05 恰好 = now 10:10 - 300s → 含边界通过
+    _write_lines(tmp_path, [
+        _line(2, "605377", "科兴科技", "2026-10-30 10:05", "7.74", "0.91%", "12", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 10, 0)
+    assert [s["code"] for s in src.read_new_signals()] == ["605377"]
 
 
 # ---------------- 异常行 / 编码 ----------------
@@ -130,7 +227,6 @@ def test_malformed_rows_skipped_with_warning(tmp_path, caplog):
         sigs = src.read_new_signals()
     assert [s["code"] for s in sigs] == ["920718", "605377"]
     assert caplog.text  # 异常行有告警留痕
-    # 异常行同样推进游标（不会重复出现）
     # 异常行同样推进游标（不会重复出现）
     assert src.read_new_signals() == []
 
@@ -171,8 +267,9 @@ def test_reset_daily_clears_dedup_and_cursor(tmp_path):
     assert len(src.read_new_signals()) == 1
     src.reset_daily()
     assert src._seen_codes == set()
-    assert src._last_line_count == 0
-    # 重置后重读（文件按日轮转场景：新一天的新文件从行 0 开始）
+    # 时间戳游标归位当前时间（新文件「启动后新信号才消费」同语义）
+    assert src._last_read_time == TEST_NOW
+    # 重置后重读（文件按日轮转场景）
     assert len(src.read_new_signals()) == 1
 
 

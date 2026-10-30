@@ -437,7 +437,7 @@ def build_engine(
     优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
 
     外部信号注入（0011）：signal_file_path 参数非空 → LiveEngine 建
-    ExternalSignalFileSource（同花顺条件预警文件增量读取）；None 时回退读
+    ExternalSignalFileSource（通达信条件预警文件时间窗口增量读取）；None 时回退读
     session.signal_file_path（会话级配置，start_session/api 组装路径无需显式传），
     两者皆空 → 不启用，行为不变。
     """
