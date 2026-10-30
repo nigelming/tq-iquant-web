@@ -633,7 +633,7 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     w.unmount()
   })
 
-  it('新建表单默认 alert，切到 auto 才显示交易引擎 select；提交带 execution_mode', async () => {
+  it('新建表单默认 alert，引擎 select 始终可见（决定信号计算数据源）；提交带 execution_mode', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue([
       { id: 1, name: '稳健组合', strategies: [] },
@@ -644,14 +644,14 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
     await flushPromises()
 
-    // 默认 alert：只有 名称/模式/执行模式 三个 select 区域，无引擎 select
+    // 默认 alert：执行模式 select
     const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
     expect(execSelect).toBeTruthy()
     expect((execSelect!.element as HTMLSelectElement).value).toBe('alert')
-    // alert 模式下不渲染交易引擎 select
-    expect(w.findAll('select').some((s) => s.html().includes('iQuant HTTP 桥'))).toBe(false)
+    // alert 模式下引擎 select 也渲染（决定信号计算数据源）
+    expect(w.findAll('select').some((s) => s.html().includes('iQuant HTTP 桥'))).toBe(true)
 
-    // 切到 auto：出现交易引擎 select
+    // 切到 auto：引擎 select 仍在
     await execSelect!.setValue('auto')
     await flushPromises()
     expect(w.findAll('select').some((s) => s.html().includes('iQuant HTTP 桥'))).toBe(true)

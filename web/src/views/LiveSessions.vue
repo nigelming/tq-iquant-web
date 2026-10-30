@@ -493,8 +493,7 @@ onUnmounted(closeEventStream)
             >{{ executionModeLabel(s.execution_mode) }}</span>
           </td>
           <td>
-            <span v-if="isAlert(s)" class="badge badge-gray" title="预警模式不经交易引擎下单">—</span>
-            <span v-else class="badge badge-gray">{{ engineLabel(s.engine) }}</span>
+            <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：引擎决定信号计算数据源（TQ 内存注入），不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
           </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td>
@@ -708,18 +707,16 @@ onUnmounted(closeEventStream)
         <option value="alert">预警（半自动，仅 TQ 行情 + send_warn 推送，不下单）</option>
         <option value="auto">自动（按交易引擎下单）</option>
       </select>
-      <template v-if="form.execution_mode === 'auto'">
-        <label>交易引擎</label>
-        <select v-model="form.engine">
-          <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
-            {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
-          </option>
-        </select>
-      </template>
+      <label>交易引擎（决定信号计算的数据源）</label>
+      <select v-model="form.engine">
+        <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
+          {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
+        </option>
+      </select>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。
         <span v-if="form.execution_mode === 'alert'">
-          预警模式：直接使用通达信 TQ 行情计算信号并通过 send_warn 推送预警，不经过下单通道，无需选择交易引擎；启动前会校验公式绑定与 TQ 可用性。
+          预警模式：按所选引擎的数据源计算信号并通过 send_warn 推送预警，不下单。通达信 TQ 引擎使用 TQ 内存注入计算信号。
         </span>
         <span v-else>
           自动模式：下单由所选引擎执行——iQuant 桥按 iQuant 客户端启动按钮切换账号；通达信 TQ 直连通达信客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
