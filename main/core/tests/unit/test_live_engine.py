@@ -7431,3 +7431,205 @@ def test_requote_fires_once_across_both_convergence_paths(monkeypatch):
     assert len(disp.place_calls) == 1
 
 
+
+
+# ---------------- 外部信号注入（0011 外部信号注入链路） ----------------
+
+class _StubSignalSource:
+    """外部信号源替身：read_new_signals 返回预置信号，reset_daily 计数。"""
+
+    def __init__(self, signals=None):
+        self._signals = list(signals or [])
+        self._seen_codes = set()
+        self.reset_calls = 0
+
+    def read_new_signals(self):
+        return list(self._signals)
+
+    def reset_daily(self):
+        self.reset_calls += 1
+
+
+def _portfolio_external(formula_name="分时突击", max_positions=5, period="1m"):
+    """单组合单策略：ctx.formula_name 指向外部预警公式，公式信号 OPEN(trigger=1)。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period=period,
+        capital_ratio=Decimal("0.6"), max_positions=max_positions,
+        single_open_ratio=Decimal("0.1"),
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.formula_name = formula_name
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"),
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    return port, ctx
+
+
+def _external_engine(factory, port):
+    from core.engine.bar_poller import BarPoller
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+
+
+_EXT_SIG = {
+    "code": "600000", "name": "浦发银行", "time": datetime(2026, 10, 30, 9, 50),
+    "price": Decimal("9.30"), "formula_name": "分时突击",
+}
+
+
+def test_process_external_signal_formula_match_runs_full_pipeline():
+    """公式名匹配 → 合成 bar + signal_cache 注入 → _handle_bar 全套（submitted 落库）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    assert len(orders) == 1
+    o = orders[0]
+    assert o.status == "submitted"
+    assert o.stock_code == "600000.SH"  # 6 位码 → 通达信带后缀口径
+    assert o.trade_type == "buy"
+    assert o.signal_name == "open_sig"
+    assert o.bar_time == datetime(2026, 10, 30, 9, 50)  # bar_time 用文件时间（非墙钟）
+    # 下单量与 bar 驱动同口径：int(0.1 * 60000 / 9.3 / 100) * 100 = 600
+    assert o.quantity == 600
+    # signal_cache 注入条目（策略信号名 + 值 1）
+    assert engine.signal_cache[(1, "600000.SH", _EXT_SIG["time"])] == [
+        {"name": "open_sig", "value": 1},
+    ]
+    # 处理成功后记入 seen_codes（同代码同日去重）
+    assert engine._signal_source._seen_codes == {"600000"}
+
+
+def test_process_external_signal_dedup_by_seen_codes():
+    """代码已在 seen_codes → 跳过（不重复处理/下单）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+    engine._signal_source._seen_codes.add("600000")
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_process_external_signal_max_positions_full_blocks(monkeypatch):
+    """max_positions 满 → 注入前过滤（不构造合成 bar、不进 _handle_bar）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external(max_positions=1)
+    pos = Position("000001.SZ")
+    pos.quantity = 100
+    pos.avg_cost = Decimal("10")
+    ctx.positions["000001.SZ"] = pos
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert calls == []
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    # 已尝试处理 → 占去重名额
+    assert engine._signal_source._seen_codes == {"600000"}
+
+
+def test_process_external_signal_already_holding_blocks(monkeypatch):
+    """该股票已持仓 → 跳过（不重复开仓，加仓走 ADD 信号职责）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    pos = Position("600000.SH")
+    pos.quantity = 600
+    pos.avg_cost = Decimal("9.0")
+    ctx.positions["600000.SH"] = pos
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert calls == []
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_process_external_signal_formula_mismatch_drops(monkeypatch):
+    """公式名无匹配策略 → 信号丢弃（不占去重名额，换匹配公式后可再触发）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external(formula_name="别的公式")
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert calls == []
+    assert engine._signal_source._seen_codes == set()
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
+def test_tick_external_signals_dispatches_and_noops_without_source(monkeypatch):
+    """_tick_external_signals：源非空 → 逐条注入；源 None → 直接返回（未启用）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource([dict(_EXT_SIG)])
+    processed = []
+    monkeypatch.setattr(engine, "_process_external_signal", lambda s: processed.append(s))
+
+    engine._tick_external_signals()
+    assert len(processed) == 1
+
+    engine._signal_source = None
+    engine._tick_external_signals()
+    assert len(processed) == 1
+
+
+def test_engine_init_wires_signal_source_from_path():
+    """signal_file_path 非空 → 建源（公式名集合取自 formula_by_strategy 值）；缺省 None。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    from core.engine.bar_poller import BarPoller
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    e1 = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        formula_by_strategy={1: "分时突击"},
+        signal_file_path="D:/ths/alert.txt",
+    )
+    assert e1._signal_source is not None
+    assert e1._signal_source._formula_names == {"分时突击"}
+    e2 = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    assert e2._signal_source is None

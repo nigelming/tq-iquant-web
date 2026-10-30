@@ -53,6 +53,11 @@ from .live.timing import (
     periods_on_boundary,
 )
 from .live.event_bus import EventBus
+# 外部信号注入源（同花顺条件预警文件 → 公式名匹配策略 → 注入 signal_cache）
+from .live.external_signal_source import (
+    ExternalSignalFileSource,
+    normalize_external_symbol,
+)
 from .live.context import EngineContext
 from .live.market_data import (
     MarketDataService,
@@ -118,6 +123,9 @@ class LiveEngine:
         signal_scheduler=None,
         formula_id_by_strategy: Optional[Dict[int, int]] = None,
         enable_signal_monitor: bool = False,
+        # 外部信号注入（0011）：同花顺条件预警文件路径。None=不启用；非空=建
+        # ExternalSignalFileSource，_tick_main 每轮增量读取并经 _handle_bar 全套注入。
+        signal_file_path: Optional[str] = None,
     ):
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
@@ -146,6 +154,20 @@ class LiveEngine:
             self._signal_monitor = SignalMonitor(
                 session_id, db_session_factory, self._tq_alert, self._emit,
                 execution_mode,
+            )
+        # 外部信号注入源（0011）：signal_file_path 非空时启用——定时增量读取同花顺
+        # 条件预警文件，公式名匹配策略后合成 bar 注入 signal_cache，经 _handle_bar
+        # 全套执行（风控/审批/在途闸不绕过）。None=不启用，行为不变。
+        self._signal_source: Optional[ExternalSignalFileSource] = None
+        if signal_file_path:
+            formula_names = {
+                name for name in (formula_by_strategy or {}).values() if name
+            }
+            self._signal_source = ExternalSignalFileSource(
+                signal_file_path, formula_names)
+            logger.info(
+                "external signal source enabled: %s (formulas %s)",
+                signal_file_path, sorted(formula_names),
             )
         # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
         # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
@@ -823,6 +845,9 @@ class LiveEngine:
                 )
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
             self._bar_poller.poll()
+            # 0011 外部信号注入：poll 之后增量读取同花顺条件预警文件，公式名匹配
+            # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
+            self._tick_external_signals()
             # P2：超时检查移主循环——deals 循环被 60s 主循环饿死（单 worker 串行，
             # 主循环拉 ~73 只行情耗 50-57s/轮），180s 超时实际 440s 才跑到。移到主循环
             # 60s 节拍，最坏 60s 延迟。#1 修复后受理即丢弃已即时 rejected，此超时退为
@@ -851,6 +876,107 @@ class LiveEngine:
             logger.warning("bridge unavailable: %s, skip this round", e)
         except Exception:  # noqa: BLE001
             logger.exception("live loop unexpected error")
+
+    def _tick_external_signals(self) -> None:
+        """外部信号注入轮（_tick_main 在 bar_poller.poll() 后调用）。
+
+        ExternalSignalFileSource 增量读取预警文件新行（行号游标），逐条
+        _process_external_signal 注入；单条失败不阻断其余信号与主循环。
+        源未启用（None）直接返回，行为不变。
+        """
+        if self._signal_source is None:
+            return
+        try:
+            signals = self._signal_source.read_new_signals()
+        except Exception:  # noqa: BLE001 — 读文件异常不阻断主循环
+            logger.exception(
+                "external signal read error (session %s)", self.session_id)
+            return
+        for sig in signals:
+            try:
+                self._process_external_signal(sig)
+            except Exception:  # noqa: BLE001 — 单条信号失败不阻断其余信号
+                logger.exception(
+                    "external signal process error (session %s)", self.session_id)
+
+    def _process_external_signal(self, sig: dict) -> None:
+        """单条外部信号注入：公式名匹配策略 → 过滤 → 合成 bar 注入 signal_cache
+        → _handle_bar 全套（风控/审批/在途闸/去重与 bar 驱动同链，不绕过）。
+
+        步骤：
+        1. 同代码去重（source._seen_codes，本日已处理直接跳过）；
+        2. 代码归一 6 位 → 带后缀（920718 → 920718.SH，通达信口径）；
+        3. 公式名精确匹配（ctx.formula_name == sig["formula_name"]；一个公式名
+           可命中多策略=复制交易，逐策略各注入一次）；
+        4. 命中即占去重名额；满槽（已持仓数 >= max_positions）或该股票已持仓
+           的策略跳过（不构造合成 bar）；
+        5. 合成 bar（OHLC=预警价、bar_time=文件时间——非墙钟，bar_time 语义与
+           TQ bar 一致）+ signal_cache 条目（策略信号名 → 值 1，trigger_value=1
+           的信号线按配置自然命中），period=策略周期（on_bar 周期节拍过滤）。
+        股票池约束由 Portfolio.on_bar 的池过滤兜底（池外股票不出信号）。
+        """
+        source = self._signal_source
+        if source is None:
+            return
+        if sig.get("code") in source._seen_codes:
+            return
+        symbol = normalize_external_symbol(sig.get("code"))
+        if not symbol:
+            logger.warning(
+                "external signal invalid code %r (session %s)",
+                sig.get("code"), self.session_id)
+            return
+        formula_name = sig.get("formula_name") or ""
+        targets = [
+            (port, ctx)
+            for port in self.portfolios
+            for ctx in port.strategies
+            if ctx.formula_name and ctx.formula_name == formula_name
+        ]
+        if not targets:
+            logger.info(
+                "external signal dropped (no matching strategy): %s %s "
+                "formula=%s (session %s)",
+                symbol, sig.get("time"), formula_name, self.session_id)
+            return
+        # 命中策略 → 本日该代码已处理（后续同代码预警不再注入）
+        source._seen_codes.add(sig["code"])
+        bar_time = sig["time"]
+        price = sig["price"]
+        logger.info(
+            "external signal inject: %s %s price=%s formula=%s -> %d strategy "
+            "instance(s) (session %s)",
+            symbol, bar_time, price, formula_name, len(targets), self.session_id)
+        for port, ctx in targets:
+            held_count = sum(
+                1 for pos in ctx.positions.values() if pos.quantity > 0)
+            pos_limit = ctx.effective_max_positions(
+                getattr(port, "current_regime", None))
+            if held_count >= pos_limit:
+                logger.info(
+                    "external signal skip: strategy %s max_positions full "
+                    "(%d/%d) (session %s)",
+                    ctx.strategy_id, held_count, pos_limit, self.session_id)
+                continue
+            held_pos = ctx.positions.get(symbol)
+            if held_pos is not None and held_pos.quantity > 0:
+                logger.info(
+                    "external signal skip: strategy %s already holding %s "
+                    "(session %s)", ctx.strategy_id, symbol, self.session_id)
+                continue
+            bar = BarEvent(
+                stocks={symbol: {
+                    "open": price, "high": price, "low": price,
+                    "close": price, "volume": 0,
+                }},
+                bar_time=bar_time,
+                period=ctx.period,
+            )
+            self.signal_cache[(ctx.strategy_id, symbol, bar_time)] = [
+                {"name": cfg["signal_name"], "value": 1}
+                for cfg in ctx.formula_signals
+            ]
+            self._handle_bar(port, bar)
 
     def _sweep_timeout_orders(self, db: Session) -> None:
         """主循环超时收割段（P2 + A-2）：expire 兜底收割 + 超时撤单收割，同块提交。
