@@ -7612,6 +7612,53 @@ def test_tick_external_signals_dispatches_and_noops_without_source(monkeypatch):
     assert len(processed) == 1
 
 
+def test_tick_external_signals_resets_source_on_day_change(monkeypatch):
+    """跨日检测（audit Fix1）：now_shanghai 日期 != _ext_sig_last_date → reset_daily()。
+
+    源的 _seen_codes 是「本日已处理代码」——长跑会话跨日不重置则同代码次日
+    起被 read_new_signals 静默去重丢弃。日期变更轮：先重置源（清去重 + 游标
+    归位当前时间）并更新记账日期，再读信号注入。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    stub = _StubSignalSource([dict(_EXT_SIG)])
+    engine._signal_source = stub
+    engine._ext_sig_last_date = date(2026, 10, 30)
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai",
+        lambda: datetime(2026, 10, 31, 9, 31))
+    processed = []
+    monkeypatch.setattr(engine, "_process_external_signal", lambda s: processed.append(s))
+
+    engine._tick_external_signals()
+
+    assert stub.reset_calls == 1
+    assert engine._ext_sig_last_date == date(2026, 10, 31)
+    assert len(processed) == 1
+
+
+def test_tick_external_signals_same_day_keeps_dedup_state(monkeypatch):
+    """同日 tick（audit Fix1）：不调 reset_daily，当日 _seen_codes 去重状态保持。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    stub = _StubSignalSource([dict(_EXT_SIG)])
+    engine._signal_source = stub
+    engine._ext_sig_last_date = date(2026, 10, 31)
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai",
+        lambda: datetime(2026, 10, 31, 10, 0))
+    processed = []
+    monkeypatch.setattr(engine, "_process_external_signal", lambda s: processed.append(s))
+
+    engine._tick_external_signals()
+
+    assert stub.reset_calls == 0
+    assert engine._ext_sig_last_date == date(2026, 10, 31)
+    assert len(processed) == 1
+
+
 def test_engine_init_wires_signal_source_from_path():
     """signal_file_path 非空 → 建源（公式名集合取自 formula_by_strategy 值）；缺省 None。"""
     factory, _ = _db_factory()
@@ -7633,6 +7680,58 @@ def test_engine_init_wires_signal_source_from_path():
         bar_poller=poller, db_session_factory=factory,
     )
     assert e2._signal_source is None
+
+
+class _StubTqFormulaRecalc:
+    """TQ 重算替身（audit Fix2）：5m 重算有值 open_sig=0（非注入值 1）。"""
+
+    @staticmethod
+    def compute_injected_batch(**kw):
+        return {
+            "ErrorId": "0",
+            "600000.SH": {"open_sig": [{"Date": "202610300950", "Value": 0.0}]},
+        }
+
+
+def test_external_signal_injection_survives_tq_recalc(monkeypatch):
+    """注入条目不被 fill_signal_cache 的 TQ 重算覆盖（audit Fix2，非 1m 周期场景）。
+
+    _process_external_signal 先写注入条目（open_sig=1）再经 _handle_bar →
+    fill Phase C 的 TQ 重算返回 open_sig=0——修复前无条件覆盖同 key
+    (strategy_id, code, bar_time)，OPEN(trigger=1) 不命中，注入信号被吞；
+    修复后已有条目优先，注入信号走完整下单链。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        tq_formula=_StubTqFormulaRecalc(),
+        formula_by_strategy={1: "分时突击"},
+    )
+    engine._signal_source = _StubSignalSource()
+    monkeypatch.setattr(
+        engine.market_data, "get_bars_with_increment",
+        lambda code, period, count: _quote_bars(
+            code, [datetime(2026, 10, 30, 9, 30 + i) for i in range(10)]),
+    )
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    # 注入条目原样保留（未被 TQ 重算的 open_sig=0 覆盖）
+    assert engine.signal_cache[(1, "600000.SH", _EXT_SIG["time"])] == [
+        {"name": "open_sig", "value": 1},
+    ]
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    assert len(orders) == 1
+    assert orders[0].status == "submitted"
+    assert orders[0].signal_name == "open_sig"
 
 
 # ---------------- 批次1：先卖后买 + 槽位/排重闸（_handle_bar 提交链）----------------

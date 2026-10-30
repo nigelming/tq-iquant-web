@@ -169,6 +169,11 @@ class LiveEngine:
                 "external signal source enabled: %s (formulas %s)",
                 signal_file_path, sorted(formula_names),
             )
+        # 外部信号源跨日重置记账（audit Fix1）：源的 _seen_codes 是「本日已处理
+        # 代码」集合，长跑会话跨日不重置则同代码次日起被 read_new_signals 静默
+        # 去重丢弃。记引擎启动日，_tick_external_signals 检测日期变更时调
+        # reset_daily()（清去重集合 + 游标归位当前时间）。
+        self._ext_sig_last_date: date = now_shanghai().date()
         # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
         # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
         self._recorder = DecisionRecorder()
@@ -887,6 +892,15 @@ class LiveEngine:
         """
         if self._signal_source is None:
             return
+        # 跨日重置（audit Fix1）：now_shanghai 日期变更 → reset_daily()（清
+        # _seen_codes + 游标归位当前时间），同代码次日起不再被静默去重丢弃。
+        today = now_shanghai().date()
+        if self._ext_sig_last_date != today:
+            self._signal_source.reset_daily()
+            self._ext_sig_last_date = today
+            logger.info(
+                "external signal source reset for new day %s (session %s)",
+                today, self.session_id)
         try:
             signals = self._signal_source.read_new_signals()
         except Exception:  # noqa: BLE001 — 读文件异常不阻断主循环

@@ -352,10 +352,18 @@ class MarketDataService:
                 raw_cache[(code, period, formula_name)] = \
                     self._extract_latest_signal(raw, code)
         # Phase C：回填 signal_cache（含本轮批量算的与 raw_cache 已命中的）。
+        # 已有条目优先（audit Fix2）：外部信号注入（_process_external_signal）先
+        # 写入同 key (strategy_id, code, bar.bar_time) 条目再经 _handle_bar 走到
+        # 本 Phase——TQ 重算不得覆盖注入信号（1m TQ 全空本就写不进，5m/15m/1d
+        # 等周期重算有值时会吞掉注入信号）；同 key 重算同输入同结果，跳过无损。
         for strategy_id, raw_key in signal_targets:
             outputs = raw_cache.get(raw_key)
-            if outputs:
-                self.signal_cache[(strategy_id, raw_key[0], bar.bar_time)] = outputs
+            if not outputs:
+                continue
+            key = (strategy_id, raw_key[0], bar.bar_time)
+            if key in self.signal_cache:
+                continue
+            self.signal_cache[key] = outputs
         if n_inject:
             # 每根 bar 每个有注入的组合一条（1m 每分钟一条）：tq= 为 tqcenter 公式
             # 累计耗时、fetch= 为拉桥累计，据此区分瓶颈在通达信公式还是桥，观察 tq=
