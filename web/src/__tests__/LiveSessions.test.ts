@@ -23,6 +23,7 @@ vi.mock('../api', () => ({
   getLiveDecisions: vi.fn(),
   getLiveSignals: vi.fn(),
   getPortfolios: vi.fn(),
+  getFormulas: vi.fn(),
   sendUserBlock: vi.fn(),
 }))
 
@@ -51,7 +52,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas } from '../api'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -72,6 +73,7 @@ beforeEach(() => {
   ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
   ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
   ;(getPortfolios as any).mockResolvedValue([])
+  ;(getFormulas as any).mockResolvedValue([])
   ;(getLiveChannel as any).mockResolvedValue({
     engine: 'iquant',
     active: 'iquant_bridge',
