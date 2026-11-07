@@ -80,5 +80,5 @@ main/core/tests/unit/test_dbg_pywinauto.py
 .trae/
 .superpowers/
 
-# TODO(待确认): 根目录 scripts/ 是本地运维脚本，是否入库尚未决定；确认后再取消注释
-# scripts/
+# Local ops scripts at repo root (not part of the platform)
+scripts/
