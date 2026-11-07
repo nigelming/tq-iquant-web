@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,28 @@ def _defaults() -> dict:
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},
             "live": {"base_url": "http://127.0.0.1:8791"},
+            # 桥请求超时（秒）：桥在本机 loopback，正常毫秒~秒级；超时按在途处理，
+            # 不判拒单。缺省/非法回退该值（live_service.iquant_config）。
+            "request_timeout_seconds": 10.0,
+            # 慢响应告警阈值（秒）：须明显小于请求超时；超阈值记 WARNING + risk/bridge_slow。
+            "slow_response_seconds": 5.0,
+            # 同一会话慢告警冷却窗（秒），避免轮询刷屏。
+            "slow_warn_interval_seconds": 300.0,
+        },
+        # 掘金量化桥（2026-11-04 替代 QMT 桥）：桥策略跑在掘金终端内
+        # （live/bridge/goldminer_bridge.py），base_url 指向其本地 HTTP 服务。
+        "goldminer": {
+            "base_url": "http://127.0.0.1:7801",
+            "token": "",
+            "account_id": "",
+            # 桥请求超时（秒）：桥内全局锁串行，实测单次 4~10s；下单超时须
+            # ≥30s 且小于主循环周期 60s（超时后按在途处理，不判拒单）。
+            "request_timeout_seconds": 30.0,
+            # 慢响应告警阈值（秒）：须明显小于请求超时；超阈值记 WARNING +
+            # risk/bridge_slow 事件（按 endpoint 冷却去重）。
+            "slow_response_seconds": 15.0,
+            # 同一 endpoint 慢告警冷却窗（秒），避免 5s 轮询刷屏。
+            "slow_warn_interval_seconds": 300.0,
         },
         "ths_ui": {
             "enabled": False,
@@ -48,6 +71,9 @@ def _defaults() -> dict:
             "client_exe_path": "D:/同花顺远航版/transaction/xiadan.exe",
             "driver": "clipboard",
             "captcha_ocr": False,
+            # 委托价模式：approval=键入审批价（信号价）限价，委托价≠审批价自动撤单；
+            # latest=不键价格，让 THS 代码键入后自动跟出最新价（日线信号跨日跳空补救）。
+            "price_mode": "approval",
             # 文件交接层：file_builtin=信号/风控/指令落 JSONL + 内置后台执行器按
             # 频率执行（place_order 秒回）；direct=同步 UI 自动化直呼（原行为）。
             "execute_mode": "file_builtin",
@@ -55,6 +81,27 @@ def _defaults() -> dict:
             # 交接目录（相对路径按服务进程 CWD=main/ 解析），实际文件在
             # {work_dir}/{session_id}/ 下。
             "work_dir": "data/ths",
+        },
+        # 实盘引擎存活监控（进程内 EngineWatchdog，单位秒；非法/非正回退默认）。
+        # heartbeat_timeout_seconds：引擎 tick/账户快照双信号静默阈值；
+        # execution_stall_seconds：ths 文件交接层积压/cursor 停滞阈值；
+        # bridge_timeout_seconds：HTTP 桥持续离线阈值；
+        # market_data_stall_seconds：tdx 最后一根 bar 停滞阈值。
+        "live": {
+            "heartbeat_timeout_seconds": 90,
+            "execution_stall_seconds": 180,
+            "bridge_timeout_seconds": 90,
+            "market_data_stall_seconds": 180,
+            # 行情轮询窗口（Asia/Shanghai，左闭右开）：窗口外（交易日 15:05 之后 /
+            # 次日 09:15 之前 / 非交易日）完全停 BarPoller 行情拉取，消除收盘后对
+            # 掘金桥 /quote 与通达信 TQ 的无谓持续压力；账户快照/成交回填/收盘清扫
+            # 不受影响。enabled=false 恢复旧行为（全天轮询）。缺该键 → 安全默认
+            # （即下列值：收盘后停轮询）。
+            "quote_polling": {
+                "enabled": True,
+                "resume_time": "09:15",
+                "pause_time": "15:05",
+            },
         },
         "tq_trade": {
             "account": "",
@@ -89,7 +136,22 @@ def load_config(config_path: Optional[str] = None) -> dict:
     return _deep_merge(_defaults(), cfg)
 
 
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
 def save_config(cfg: dict, config_path: Optional[str] = None) -> None:
+    """原子写配置（临时文件 + os.replace）并串行化并发写。
+
+    直接 open("w") 会先截断原文件：进程在写入中崩溃/被强杀，config.yaml
+    变成空文件，下次加载静默回退全默认（tdx_path/iquant_path 等丢失）。
+    保存路由跑在线程池，并发请求互相截断还会写出错乱内容 → 进程内写锁。
+    """
     path = Path(config_path) if config_path else _default_config_path()
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    text = yaml.dump(cfg, default_flow_style=False, allow_unicode=True)
+    with _CONFIG_WRITE_LOCK:
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
