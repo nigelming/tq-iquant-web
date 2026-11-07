@@ -74,9 +74,13 @@ def mask(src: str) -> MaskResult:
                 if out[k] not in ("\n", "\r"):
                     out[k] = " "
             i = end
-        elif ch == "'":
+        elif ch in ("'", '"'):
+            # 单引号字符串 + 双引号字符串（TDX 跨公式引用 "公式名.线名"）。
+            # 与 parser.parse_defs（两种引号都当字符串）保持同一口径——否则
+            # 双引号内文本会被当作代码参与标识符扫描（precheck 误报未来函数）。
+            quote = ch
             j = i + 1
-            while j < n and src[j] != "'" and src[j] != "\n":
+            while j < n and src[j] != quote and src[j] != "\n":
                 j += 1
             stop = min(j + 1, n)
             strings.append((i, stop, src[i + 1 : j]))

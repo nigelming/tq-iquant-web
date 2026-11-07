@@ -1099,6 +1099,109 @@ def recompute_robustness(db: Session, record_id: int, oos_ratio: float = 0.25) -
     }
 
 
+def recompute_validation_crisis(db: Session, record_id: int) -> Optional[dict]:
+    """离线刷新验证结论的 crisis 块（不重跑回测）。
+
+    危机防御判定仅依赖组合日快照（snap_date/total_value/cash/benchmark_value），
+    从落库快照按当前 CRISIS_WINDOWS/判定规则重算后，原位更新 validation_json
+    的 crisis 键；capacity/oos 等其余块保持冻结结果不动。
+    记录不存在返回 None（路由 404）。
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+    crisis = build_crisis_verification([
+        {"snap_date": s.snap_date, "total_value": s.total_value,
+         "cash": s.cash, "benchmark_value": s.benchmark_value}
+        for s in snaps
+    ])
+    try:
+        payload = json.loads(rec.validation_json) if rec.validation_json else None
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("capacity", [])
+    payload.setdefault("oos", None)
+    payload["crisis"] = crisis
+    rec.validation_json = json.dumps(payload, ensure_ascii=False, default=str)
+    db.commit()
+    return {"status": "ok", "crisis": crisis}
+
+
+def recompute_validation(db: Session, record_id: int) -> Optional[dict]:
+    """离线重算验证结论全量（capacity + crisis + oos，不重跑回测）。
+
+    与 build_validation_verdict 的差异：数据源全部来自落库（快照/评估/策略配置），
+    无 klines → ADV 容量预警无法复算（需逐股日线成交额），静默跳过；
+    concentration 从落库 evaluation 取 max_single_weight，敞口上限维度
+    （Σ持仓数上限×单仓上限 vs 期末净值）用快照+策略配置重算。
+    记录不存在返回 None（路由 404）。
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法重算"}
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法重算"}
+    ev_row = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .one_or_none()
+    )
+    evaluations = {}
+    if ev_row is not None and ev_row.max_single_weight is not None:
+        evaluations = {"max_single_weight": float(ev_row.max_single_weight)}
+    capacity = build_capacity_warnings(
+        [], None, evaluations,
+        getattr(ps, "position_sizing", "dynamic"),
+        getattr(ps, "equity_cap", None),
+        snapshots=snaps,
+        exposure_ceiling=_exposure_ceiling_for_ps(db, ps.id),
+    )
+    crisis = build_crisis_verification([
+        {"snap_date": s.snap_date, "total_value": s.total_value,
+         "cash": s.cash, "benchmark_value": s.benchmark_value}
+        for s in snaps
+    ])
+    oos: Optional[dict] = None
+    wf = (
+        db.query(WalkForwardRun)
+        .filter(WalkForwardRun.portfolio_strategy_id == ps.id)
+        .order_by(WalkForwardRun.id.desc())
+        .first()
+    )
+    if wf is not None:
+        oos = {
+            "run_id": wf.id, "name": wf.name,
+            "completed_at": wf.completed_at,
+            "windows_passed": (json.loads(wf.summary_json or "{}")
+                               .get("windows_passed")),
+            "overall_pass": (json.loads(wf.summary_json or "{}")
+                             .get("overall_pass")),
+        }
+    payload = {"capacity": capacity, "crisis": crisis, "oos": oos}
+    rec.validation_json = json.dumps(payload, ensure_ascii=False, default=str)
+    db.commit()
+    return {"status": "ok", "capacity": capacity, "crisis": crisis, "oos": oos}
+
+
 # ---------------------------------------------------------------------------
 # 持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化
 # ---------------------------------------------------------------------------
@@ -1189,6 +1292,12 @@ def recompute_persistence(
         )
         return _serialize_persistence(row)
     nav_series = {s.snap_date: s.total_value for s in snaps}
+    utilization_series = {
+        s.snap_date: Decimal(str(s.market_value)) / Decimal(str(s.total_value))
+        for s in snaps
+        if s.total_value is not None and Decimal(str(s.total_value)) > 0
+        and s.market_value is not None
+    }
     trades = [{
         "bar_time": t.bar_time.date(),
         "trade_type": t.trade_type,
@@ -1200,6 +1309,7 @@ def recompute_persistence(
         nav_series, trades,
         {c: closes[c] for c in codes if c in closes},
         benchmark_code, benchmark_name,
+        utilization_series=utilization_series,
     )
     if payload.get("status") == "failed":
         row = _upsert_persistence(db, record_id, "failed", error=payload.get("error"), skipped=skipped)
@@ -2033,19 +2143,20 @@ def build_signal_warnings(
 
 
 # --- 辅助：从 DB 读组装所需数据 ---
-_POOL_STOCK_CACHE: dict = {}  # pool_id → set(stock_code)，进程级缓存避免回测中重复查询
 
 
 def _pool_stock_set(db: Session, pool_id: int) -> set:
-    """股票池成分集合（带进程级缓存，避免 build_signal_cache 中逐策略重复查询）。"""
-    if pool_id in _POOL_STOCK_CACHE:
-        return _POOL_STOCK_CACHE[pool_id]
-    codes = {
+    """股票池成分集合（每次实时查库）。
+
+    原实现用进程级 dict 缓存且无失效入口：服务运行期内经接口增删池成分后，
+    此处仍返回旧集合，而股票清单侧（_pool_stocks）实时查库 → 新增成分有行情
+    无信号、删除成分仍出「幽灵信号」，回测静默失真且不可复现。改为实时查询
+    （每策略一次，量级极小）。
+    """
+    return {
         row.stock_code
         for row in db.query(StockPoolStock).filter_by(pool_id=pool_id).all()
     }
-    _POOL_STOCK_CACHE[pool_id] = codes
-    return codes
 
 
 def _pool_stocks(ps, db: Session) -> list:
@@ -2147,7 +2258,6 @@ def _with_returns(snaps: list) -> list:
 def _persist_result(
     db: Session, record_id: int, ps_id: int, result: dict, strategies: list
 ) -> None:
-    strat_by_id = {s.id: s for s in strategies}
     for trade in result["trades"]:
         db.add(BacktestTrade(
             backtest_record_id=record_id,
@@ -2823,6 +2933,10 @@ def _log_kline_summary(record_id: int, klines: dict) -> None:
 # 流动性假设下，实盘按回测价成交不现实）；最大单票权重 > 25% → 集中度/权重膨胀。
 _CAP_PARTICIPATION_WARN = 0.30
 _CAP_MAX_WEIGHT_WARN = 0.25
+# 敞口上限预警：Σ(持仓数上限×单仓上限) < 期末净值 50% → 上限已结构性约束仓位部署
+_CAP_CEILING_RATIO_WARN = 0.50
+# 近端利用率窗口（交易日，取利用率序列末段均值 vs 全期均值对照）
+_CAP_RECENT_UTIL_DAYS = 60
 
 
 def _fmt_yuan(v: float) -> str:
@@ -2836,18 +2950,29 @@ def _fmt_yuan(v: float) -> str:
 
 # 危机期窗口（历史锁定、未来定义标准）：固定常量，非按策略表现回填，
 # 保证"危机防御判定"的标准先于结果确定（无前视）。key 用于稳定标识。
+# 窗口按"急跌段"定界，不含随后的修复/反弹期（否则基准收益被稀释成顺风窗）。
 CRISIS_WINDOWS: tuple = (
+    {"key": "2008_gfc", "name": "2008 金融危机", "start": "2008-01-01", "end": "2008-12-31"},
+    {"key": "2010_eurozone", "name": "2010 欧债/地产调控", "start": "2010-04-01", "end": "2010-07-31"},
+    {"key": "2013_cash_squeeze", "name": "2013 钱荒", "start": "2013-06-01", "end": "2013-07-31"},
     {"key": "2015_crash", "name": "2015 股灾", "start": "2015-06-01", "end": "2015-09-30"},
     {"key": "2016_circuit_breaker", "name": "2016 熔断", "start": "2016-01-01", "end": "2016-02-29"},
     {"key": "2018_tradewar", "name": "2018 贸易战/去杠杆", "start": "2018-01-01", "end": "2018-12-31"},
-    {"key": "2020_covid", "name": "2020 疫情", "start": "2020-01-01", "end": "2020-04-30"},
-    {"key": "2024_liquidity", "name": "2023底-24初流动性危机", "start": "2023-11-01", "end": "2024-02-29"},
-    {"key": "2025_tradewar", "name": "2025 贸易战", "start": "2025-04-01", "end": "2025-07-31"},
+    {"key": "2020_covid", "name": "2020 疫情", "start": "2020-01-01", "end": "2020-03-31"},
+    {"key": "2021_crowded_unwind", "name": "2021 抱团瓦解", "start": "2021-02-18", "end": "2021-03-31"},
+    {"key": "2022_multi_shock", "name": "2022 俄乌/加息/封控", "start": "2022-01-01", "end": "2022-04-30"},
+    {"key": "2024_liquidity", "name": "2023底-24初流动性危机", "start": "2024-01-01", "end": "2024-02-29"},
+    {"key": "2025_tradewar", "name": "2025 贸易战", "start": "2025-04-01", "end": "2025-04-30"},
     {"key": "2026_techcrash", "name": "2026-07 科技崩盘", "start": "2026-07-01", "end": "2026-07-31"},
 )
 
-# 危机防御判定：危机期正收益/持平 → 防御；负收益但最低现金占比 ≥70%（高现金避险）→ 防御。
+# 危机防御判定（三条规则，按序优先）：
+# ① 危机期正收益/持平 → 防御；
+# ② 负收益但最低现金占比 ≥70%（高现金避险）→ 防御；
+# ③ 负收益但跑赢基准 ≥5pp（显著抗跌；benchmark_return 为窗口内首末日比值）→ 防御。
+# 三条皆不满足 → exposed。
 _CRISIS_DEFENSIVE_CASH = 0.70
+_CRISIS_OUTPERFORM_PP = 0.05
 
 
 def build_crisis_verification(snapshots: list) -> list:
@@ -2883,8 +3008,13 @@ def build_crisis_verification(snapshots: list) -> list:
         base_total = float(by_date[base_day]["total_value"])
         end_total = float(by_date[in_window[-1]]["total_value"])
         strategy_return = (end_total / base_total - 1.0) if base_total else None
-        # 基准收益
+        # 基准收益：与策略侧**同一起点**——窗口前一日有基准值优先，否则窗口
+        # 首日（原实现只在窗口内取，两侧相差一个交易日收益，窗口首日大涨/大跌
+        # 时会系统性偏移超额，足以翻转 5pp 阈值的 defensive/exposed 判定）。
+        base_bv = by_date[base_day].get("benchmark_value")
         bench_vals = []
+        if base_bv is not None:
+            bench_vals.append(float(base_bv))
         for d in in_window:
             bv = by_date[d].get("benchmark_value")
             if bv is not None:
@@ -2919,6 +3049,13 @@ def build_crisis_verification(snapshots: list) -> list:
             verdict, reason = "defensive", "危机期仍取得正收益/持平"
         elif min_cash_ratio is not None and min_cash_ratio >= _CRISIS_DEFENSIVE_CASH:
             verdict, reason = "defensive", f"高现金避险（最低现金占比 {min_cash_ratio:.0%}）"
+        elif benchmark_return is not None and (
+                strategy_return - benchmark_return) >= _CRISIS_OUTPERFORM_PP:
+            out = strategy_return - benchmark_return
+            verdict, reason = "defensive", (
+                f"危机期受损但跑赢基准 {out:.0%}"
+                f"（策略 {strategy_return:.1%} vs 基准 {benchmark_return:.1%}）"
+            )
         else:
             verdict, reason = "exposed", f"危机期受损且现金占比低（最低 {min_cash_ratio:.0%}）"
         result.append({
@@ -2936,17 +3073,21 @@ def build_crisis_verification(snapshots: list) -> list:
 def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dict:
     """回测"验证结论"聚合：容量健康 + 危机防御 + 样本外引用，随结果冻结落库。
 
-    - capacity：build_capacity_warnings 的告警列表（空=健康）；
+    - capacity：build_capacity_warnings 的告警列表（空=健康），含集中度/ADV/
+      敞口上限（Σ持仓数上限×单仓上限 vs 期末净值）维度；
     - crisis：固定窗口危机防御验证（build_crisis_verification）；
     - oos：该组合最近的 walk-forward 运行摘要（None=未做过样本外验证）。
     """
     snapshots = result.get("snapshots") or []
     trades = result.get("trades") or []
+    ceiling = _exposure_ceiling_for_ps(db, ps.id) if db is not None else None
     warnings = build_capacity_warnings(
         trades, klines,
         result.get("evaluations") or {},
         getattr(ps, "position_sizing", "dynamic"),
         getattr(ps, "equity_cap", None),
+        snapshots=snapshots,
+        exposure_ceiling=ceiling,
     )
     crisis = build_crisis_verification(snapshots)
     oos: Optional[dict] = None
@@ -2973,72 +3114,98 @@ def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dic
     }
 
 
+def _snap_field(s, key):
+    """快照字段读取：dict（引擎 result）与 ORM 行（DB 查询）双兼容。"""
+    if isinstance(s, dict):
+        return s.get(key)
+    return getattr(s, key, None)
+
+
+def _exposure_ceiling_for_ps(db: Session, ps_id: int) -> Optional[Decimal]:
+    """组合级策略敞口上限 = Σ(策略 max_positions × max_order_amount)。
+
+    仅统计两者都有效配置（>0）的策略；全部未配置单仓上限 → None（无法归因，
+    不预警，宁缺勿假）。"""
+    total = Decimal("0")
+    found = False
+    for s in db.query(Strategy).filter_by(portfolio_id=ps_id).all():
+        mp = getattr(s, "max_positions", None)
+        moa = getattr(s, "max_order_amount", None)
+        if mp and moa:
+            total += Decimal(str(mp)) * Decimal(str(moa))
+            found = True
+    return total if found else None
+
+
 def build_capacity_warnings(
     trades: list,
     klines: dict,
     evaluations: Optional[dict] = None,
     position_sizing: str = "dynamic",
     equity_cap=None,
+    snapshots: Optional[list] = None,
+    exposure_ceiling=None,
 ) -> list:
     """容量健康度告警（自动）：即使未设 equity_cap，也在结果里明确提示
     "该结果是否含不可实现仓位"。
 
-    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_手×100×Close)，从 klines 估算）：
+    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_股×Close)，从 klines 估算）：
       最大占比 ≥ 30% → 该笔实盘按回测价成交不现实；
     - 最大单票权重 max_single_weight > 25% → 集中度/权重随涨幅过度膨胀；
+    - 敞口上限（snapshots + exposure_ceiling 均传入时）：Σ(持仓数上限×单仓上限)
+      < 期末净值 50% → 仓位上限已结构性约束策略弹性，附近端/全期利用率对照；
     - dynamic 且未设 equity_cap 时命中任一 → 附设置容量上限/成交量约束的建议。
 
     仅在有成交且可估算 ADV 时生效；无数据静默跳过（不误报）。
     """
-    if not trades:
-        return []
     warns: list = []
     # 1. 每股日均成交额（元）。TQ 单位已实测确认：Volume=股、Amount=万元。
     #    故优先用 量(股)×价(元) 直接得元口径；Amount(万元)×10000 兜底。
     adv_by_code: Dict[str, float] = {}
-    for code, periods in (klines or {}).items():
-        df = periods.get("1d") if isinstance(periods, dict) else None
-        if df is None:
-            continue
-        try:
-            cols = df.columns
-            amounts = df["Amount"].to_list() if "Amount" in cols else None
-            vols = df["Volume"].to_list() if "Volume" in cols else None
-            closes = df["Close"].to_list() if "Close" in cols else None
-        except Exception:
-            continue
-        day_amts = []
-        if vols is not None and closes is not None:
-            day_amts = [
-                float(v) * float(c)
-                for v, c in zip(vols, closes)
-                if v is not None and c is not None and float(v) > 0 and float(c) > 0
-            ]
-        if not day_amts and amounts is not None:
-            day_amts = [float(a) * 10000.0 for a in amounts
-                        if a is not None and float(a) > 0]
-        if day_amts:
-            adv_by_code[code] = sum(day_amts) / len(day_amts)
-    # 2. 最大单笔成交 vs ADV 占比
-    worst = None  # (amount, code, adv, ratio)
-    for t in trades:
-        code = getattr(t, "stock_code", None)
-        adv = adv_by_code.get(code)
-        if not adv or adv <= 0:
-            continue
-        amt = float(getattr(t, "amount", 0) or 0)
-        if amt <= 0:
-            continue
-        ratio = amt / adv
-        if worst is None or ratio > worst[3]:
-            worst = (amt, code, adv, ratio)
-    if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
-        amt, code, adv, ratio = worst
-        warns.append(
-            f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
-            f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
-            f"实盘按此价成交不现实，该结果可能含不可实现仓位"
-        )
+    if trades:
+        for code, periods in (klines or {}).items():
+            df = periods.get("1d") if isinstance(periods, dict) else None
+            if df is None:
+                continue
+            try:
+                cols = df.columns
+                amounts = df["Amount"].to_list() if "Amount" in cols else None
+                vols = df["Volume"].to_list() if "Volume" in cols else None
+                closes = df["Close"].to_list() if "Close" in cols else None
+            except Exception:
+                continue
+            day_amts = []
+            if vols is not None and closes is not None:
+                day_amts = [
+                    float(v) * float(c)
+                    for v, c in zip(vols, closes)
+                    if v is not None and c is not None and float(v) > 0 and float(c) > 0
+                ]
+            if not day_amts and amounts is not None:
+                day_amts = [float(a) * 10000.0 for a in amounts
+                            if a is not None and float(a) > 0]
+            if day_amts:
+                adv_by_code[code] = sum(day_amts) / len(day_amts)
+        # 2. 最大单笔成交 vs ADV 占比
+        worst = None  # (amount, code, adv, ratio)
+        for t in trades:
+            code = getattr(t, "stock_code", None)
+            adv = adv_by_code.get(code)
+            if not adv or adv <= 0:
+                continue
+            amt = float(getattr(t, "amount", 0) or 0)
+            if amt <= 0:
+                continue
+            ratio = amt / adv
+            if worst is None or ratio > worst[3]:
+                worst = (amt, code, adv, ratio)
+        if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
+            amt, code, adv, ratio = worst
+            warns.append(
+                f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
+                f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
+                f"实盘按此价成交不现实，该结果可能含不可实现仓位"
+            )
     # 3. 最大单票权重
     msw = (evaluations or {}).get("max_single_weight")
     if msw is not None and float(msw) > _CAP_MAX_WEIGHT_WARN:
@@ -3046,7 +3213,36 @@ def build_capacity_warnings(
             f"集中度预警：最大单票权重 {float(msw):.1%} 超过 {_CAP_MAX_WEIGHT_WARN:.0%}，"
             f"组合过度集中于单只股票（仓位随涨幅膨胀）"
         )
-    # 4. 修复建议
+    # 4. 敞口上限 vs 净值规模：上限 < 期末净值 50% → 已结构性限制仓位部署
+    if exposure_ceiling and snapshots:
+        utils: list = []
+        final_tv = Decimal("0")
+        for s in snapshots:
+            tv = _snap_field(s, "total_value")
+            mv = _snap_field(s, "market_value")
+            if tv is None or Decimal(str(tv)) <= 0:
+                continue
+            tv_d = Decimal(str(tv))
+            final_tv = tv_d
+            utils.append(Decimal(str(mv)) / tv_d if mv else Decimal("0"))
+        if final_tv > 0:
+            cap_ratio = float(exposure_ceiling) / float(final_tv)
+            if cap_ratio < _CAP_CEILING_RATIO_WARN:
+                whole = float(sum(utils) / len(utils)) if utils else 0.0
+                recent_n = min(len(utils), _CAP_RECENT_UTIL_DAYS)
+                recent = (
+                    float(sum(utils[-recent_n:]) / recent_n) if recent_n else 0.0
+                )
+                warns.append(
+                    f"敞口上限预警：策略敞口上限（Σ 持仓数上限×单仓上限）"
+                    f"{_fmt_yuan(float(exposure_ceiling))}，仅为期末净值 "
+                    f"{_fmt_yuan(float(final_tv))} 的 {cap_ratio:.0%}"
+                    f"（<{_CAP_CEILING_RATIO_WARN:.0%}），"
+                    f"近 {_CAP_RECENT_UTIL_DAYS} 日平均仓位利用率 "
+                    f"{recent:.1%}（全期 {whole:.1%}）——仓位上限已开始约束策略弹性；"
+                    f"资金规模扩大前建议上调 max_order_amount/持仓数并重测容量"
+                )
+    # 5. 修复建议
     if warns and position_sizing == "dynamic" and not equity_cap:
         warns.append(
             "容量建议：为组合设置 equity_cap（容量上限，仓位封顶）或开启 "

@@ -5,6 +5,7 @@ TQ 调用是阻塞 DLL 调用，FastAPI 自动丢线程池。TDXConnectionError 
 err(503, str(e))（消息已中文）；SDK 返回 dict 的 ErrorId 语义由本层判定
 （无 ErrorId 视为成功，空 dict = wrapper 归一的 SDK 失败 → 503）。
 """
+import json
 import logging
 
 import pandas as pd
@@ -60,11 +61,30 @@ def create_user_block(req: UserBlockReq):
         return err(400, "mode 仅允许 replace/append")
     try:
         if req.mode == "replace":
+            # 覆写的正确性完全依赖「先清空成功」：SDK delete 失败常态是返回
+            # None/ErrorId≠0（不是抛异常），静默放过会让旧成分股残留并与新
+            # 成分股追加合并，随后 sync_pool 会把残留票同步进策略股票池。
+            # 板块本就不存在（删除报「不存在」）属正常，继续 ensure 创建。
             try:
-                TQData().delete_sector(req.block_code)
+                del_ret = TQData().delete_sector(req.block_code)
             except Exception as e:
-                logger.warning("delete_sector(%s) 失败（忽略，继续覆盖写入）：%s",
-                               req.block_code, e)
+                logger.warning("delete_sector(%s) 失败：%s", req.block_code, e)
+                return err(503, "清空通达信板块失败：%s" % e)
+            del_dict: dict = {}
+            if isinstance(del_ret, dict):
+                del_dict = del_ret
+            elif isinstance(del_ret, str) and del_ret.strip():
+                try:
+                    parsed = json.loads(del_ret)
+                    del_dict = parsed if isinstance(parsed, dict) else {}
+                except ValueError:
+                    del_dict = {}
+            del_msg = _sdk_err_msg(del_dict, "清空通达信板块失败（SDK 无返回）")
+            # _sdk_err_msg 成功时返回 None（ErrorId=0），不能直接 in/upper。
+            absent = bool(del_msg) and (
+                "不存在" in del_msg or "not exist" in del_msg.lower())
+            if del_msg and not absent:
+                return err(503, del_msg)
         ensured = TQData().ensure_sector(
             req.block_code, req.block_name or req.block_code)
         msg = _sdk_err_msg(ensured, "创建通达信板块失败")

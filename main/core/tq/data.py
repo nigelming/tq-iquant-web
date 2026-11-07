@@ -228,7 +228,9 @@ class TQData:
 
     def get_all_stocks(self, market: str = "5") -> List[str]:
         tq = get_tq()
-        return tq.get_stock_list(market) or []
+        # tqcenter 非线程安全：与回测 worker 其它 SDK 调用同锁串行。
+        with get_tdx_lock():
+            return tq.get_stock_list(market) or []
 
     # --- TDX 底层调用 ---
     def _get_pools(self) -> List[dict]:
@@ -237,6 +239,10 @@ class TQData:
         SDK get_user_sector() 返回 [{"Code","Name"}]（大写首字母）。
         v1 曾用 get_sector_list（系统板块，587 个，非用户板块）且把 dict 当 str → 线上炸。
         """
+        # 调用方（get_stock_pools）已持 get_tdx_lock()。此处不能再取——
+        # _tdx_lock 是非重入 threading.Lock，同线程重入即自死锁（股票池接口整路卡死，
+        # 且锁永不释放会连带阻塞回测/实盘所有 TQ 调用）。私有 _load_history 等
+        # 同口径均假设调用方持锁。
         tq = get_tq()
         sectors = tq.get_user_sector() or []
         return [{"code": s["Code"], "name": s["Name"]} for s in sectors]
@@ -247,8 +253,10 @@ class TQData:
         SDK get_stock_list_in_sector(code, block_type=1, list_type=1) 返回
         [{"Code","Name"}]。必须传板块 Code（如 TQCS），传 Name 返回空。
         """
+        # 同上：调用方（get_pool_stocks）已持锁，此处不可重入取锁。
         tq = get_tq()
-        stocks = tq.get_stock_list_in_sector(pool_code, block_type=1, list_type=1) or []
+        stocks = tq.get_stock_list_in_sector(
+            pool_code, block_type=1, list_type=1) or []
         return [
             {"stock_code": s["Code"], "stock_name": s["Name"]}
             for s in stocks
@@ -283,8 +291,10 @@ class TQData:
                                 series[col] = df[col][code]
                         if series:
                             result[code][period] = pl.DataFrame(series)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 静默丢弃会让回测/试算少一只股票且不可复现——异常必须可见。
+                        logger.warning(
+                            "跳过行情构建失败股票 %s(period=%s)：%s", code, period, e)
         return result
 
     def _load_history_raw(

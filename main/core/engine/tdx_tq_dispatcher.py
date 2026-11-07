@@ -1,10 +1,10 @@
-"""通达信 TQ 交易通道（TdxTqDispatcher）。
+﻿"""通达信 TQ 交易通道（TdxTqDispatcher）。
 
 参照 OpenCrabTrader ``backend/brokers/tdx_tq.py``，与 Core 内嵌的 TQ 模块用同一条
 ``tqcenter.tq`` 连接（同进程、同一通达信客户端，见 core/tq/utils.py）。前置条件：
 通达信客户端已启动并登录资金账号，且 ``PYPlugins`` 下存在 ``tqcenter.py``。
 
-与 iQuant 桥的差异（决定 Core 侧委托认领路径）：
+与 QMT 桥的差异（决定 Core 侧委托认领路径）：
 
 - 通达信 ``order_stock`` 无法写入备注（remark），委托表只有 ``Wtbh`` / ``Code`` /
   ``BSFlag`` / ``Status`` / ``WtPrice`` / ``WtVol`` / ``CjVol``，**没有委托时间列**。
@@ -56,7 +56,7 @@ PRICE_MODE_MAP = {
     "dtj": "PRICE_DTJ",
 }
 
-# TQ 委托状态 WTSTATUS -> iQuant m_nOrderStatus（Core 状态机口径）：
+# TQ 委托状态 WTSTATUS -> QMT m_nOrderStatus（Core 状态机口径）：
 #   0 无效单/废单(57) 1 未成交(50) 2 部分成交(55, 非终态) 3 全部成交(56)
 #   4 部分撤单(53, 终态) 5 全部撤单(54, 终态)
 _STATUS_MAP = {0: 57, 1: 50, 2: 55, 3: 56, 4: 53, 5: 54}
@@ -93,6 +93,14 @@ def _num(row: dict, keys, default=None):
 
 
 def _exchange_for(code: str) -> str:
+    # 92xxxx 属北交所（新股段）须先判；11xxxx 沪市可转债（110/113/118）→SH——
+    # 落入默认 SZ 分支会让持仓 exchange 与带后缀代码对不上，T+1 可用量校验
+    # fail-open 成全量（当日买入即可卖出），下单也会发往错误市场。
+    # 其余 6/5/9→SH、4/8→BJ、0/1/2/3→SZ。
+    if code.startswith("92"):
+        return "BJ"
+    if code.startswith("11"):
+        return "SH"
     if code.startswith(("6", "5", "9")):
         return "SH"
     if code.startswith(("4", "8")):
@@ -157,11 +165,21 @@ class TdxTqDispatcher(OrderDispatcher):
     supports_batch_quote = True
 
     def __init__(self, account: str = "", account_type: str = "stock",
-                 price_mode: str = "my", client_path: str = "", **_kwargs):
+                 price_mode: str = "my", client_path: str = "",
+                 auto_confirm_dialog: bool = True, confirm_timeout: float = 12.0,
+                 confirmer=None, **_kwargs):
         self._account = str(account or "")
         self._account_type = str(account_type or "stock")
         self._price_mode = str(price_mode or "my")
         self._client_path = str(client_path or "")
+        # 「下单确认」自动确认（无人值守）：实盘账户 order_stock 恒返回 Value=1
+        # 「已发送信号至客户端，待用户确认！」，信号落在客户端「交易信号」窗口，
+        # 每行需点「发送」才真正报柜台。
+        self._auto_confirm_dialog = bool(auto_confirm_dialog)
+        #: 单笔下单「定位待发送行 + 点击 + 等委托表」的总时限（秒）
+        self._confirm_timeout = float(confirm_timeout)
+        #: 可注入的确认器（测试用）；None 时首次需要才构造
+        self._confirmer = confirmer
         self._account_id = -1
         self._connected = False
         self._last_error = ""
@@ -179,6 +197,10 @@ class TdxTqDispatcher(OrderDispatcher):
         #: 在首次回查被新单误绑（真钱风险）。A-4 recover 的补记（DB 已绑 ref，
         #: 属真实恢复）不算 fabricated（recover 直写 _submit_times，不经本集合）。
         self._fabricated_refs: set = set()
+        #: 柜台已受理（ErrorId=0）但回查窗口内委托表未见该单 → 记本单确定性 order_id，
+        #: place_order 返回 None。引擎据此把订单**保持 submitted**（不判拒单），
+        #: 由后续 /deals 轮询认领或 180s 超时收口——避免真实在途单脱离跟踪。
+        self.last_unconfirmed_order_id: Optional[str] = None
 
     # ---- 连接 ----
 
@@ -188,7 +210,7 @@ class TdxTqDispatcher(OrderDispatcher):
 
     @staticmethod
     def order_id(order: OrderEvent) -> str:
-        """确定性订单 ID（与 iQuant 桥同一算法），仅用于 Core 侧幂等标识。
+        """确定性订单 ID（与 QMT 桥同一算法），仅用于 Core 侧幂等标识。
 
         通达信委托无法写 remark，本值不会出现在柜台上，也不参与认领。
         """
@@ -341,16 +363,30 @@ class TdxTqDispatcher(OrderDispatcher):
         rows = self._query("query_stock_orders", [])
         out = []
         for r in rows if isinstance(rows, list) else []:
+            raw_flag = r.get("BSFlag", r.get("Type", r.get("BsFlag")))
             try:
-                flag = int(r.get("BSFlag", r.get("Type", r.get("BsFlag", 0))) or 0)
+                flag = int(raw_flag or 0)
             except (TypeError, ValueError):
                 flag = 0
+            if raw_flag is None or flag not in (0, 1, -1):
+                # 方向字段缺失/未知时静默按「买」会让卖出委托在认领与
+                # 对账阶段永远匹配不上（方向不符），必须留下可见告警。
+                logger.warning(
+                    "委托 %s 方向字段缺失或未知（BSFlag=%r），按买入处理",
+                    r.get("Wtbh") or r.get("OrderId"), raw_flag)
             if flag == -1:
                 continue  # 撤单流水，不是委托
+            raw_status = r.get("Status", r.get("WtStatus"))
             try:
-                status = int(r.get("Status", r.get("WtStatus", 0)) or 0)
+                status = int(raw_status or 0)
             except (TypeError, ValueError):
                 status = 0
+            if status not in _STATUS_MAP:
+                # 未知 WTSTATUS 静默映射为「未成交」会让已成交/已撤单一直
+                # 挂成在途单，直到超时收割才消失；留痕便于排查 SDK 版本差异。
+                logger.warning(
+                    "委托 %s 未知 WTSTATUS=%r，按「未成交」处理",
+                    r.get("Wtbh") or r.get("OrderId"), raw_status)
             out.append({
                 "order_id": str(r.get("Wtbh") or r.get("OrderId") or ""),
                 "symbol": str(r.get("Code") or r.get("StockCode") or ""),
@@ -525,9 +561,12 @@ class TdxTqDispatcher(OrderDispatcher):
             if frame is None:
                 return 0.0
             try:
-                return float(frame.at[ts, code])
+                v = float(frame.at[ts, code])
             except Exception:
                 return 0.0
+            # 批量失败走 _fetch_per_stock 逐只拉取 + pd.concat(axis=1) 时，
+            # 各股票日期区间不同会产生 NaN 行；NaN 会毒化下游指标与价格。
+            return 0.0 if v != v else v
 
         for col in getattr(close, "columns", []):
             code = str(col)
@@ -540,12 +579,17 @@ class TdxTqDispatcher(OrderDispatcher):
                     stime = digits[:14] if len(digits) >= 14 else ""
                 if len(stime) != 14:
                     continue
+                cl = _value("Close", code, ts)
+                # 收盘价缺失/NaN/≤0 的 bar 无意义（停牌或拼接产物），丢弃
+                # 以免污染信号与实时估值。
+                if cl <= 0:
+                    continue
                 bars.append({
                     "stime": stime,
                     "open": _value("Open", code, ts),
                     "high": _value("High", code, ts),
                     "low": _value("Low", code, ts),
-                    "close": _value("Close", code, ts),
+                    "close": cl,
                     "volume": _value("Volume", code, ts),
                     "amount": _value("Amount", code, ts),
                 })
@@ -763,6 +807,161 @@ class TdxTqDispatcher(OrderDispatcher):
             logger.warning("涨跌停前置校验异常，跳过检查继续下单：%s", e)
             return None
 
+    @staticmethod
+    def _snapshot_dialog_hwnds() -> set:
+        """当前可见 #32770 对话框句柄集合（弹窗新增检测基线）。"""
+        try:
+            from pywinauto import Desktop
+        except ImportError:
+            return set()
+        out = set()
+        try:
+            for w in Desktop(backend="win32").windows():
+                try:
+                    if w.class_name() == "#32770" and w.is_visible():
+                        out.add(w.handle)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    _CONFIRM_BUTTON_KEYWORDS = ("确定", "确认", "是(Y)", "是")
+
+    @classmethod
+    def _pick_confirm_dialog(cls, windows, before: set):
+        """从窗口列表挑「新增的、含确认按钮的、**属于通达信进程**的 #32770
+        对话框」→ (dlg, button)。
+
+        进程归属过滤（win_dialog_scope）：双引擎并行时桌面上的弹窗可能来自
+        THS（xiadan.exe）——TDX 自动化只认映像名含 tdx 的属主进程。
+        """
+        from .live.win_dialog_scope import dialog_matches_channel
+        for w in windows:
+            try:
+                if w.class_name() != "#32770" or not w.is_visible():
+                    continue
+                if not dialog_matches_channel(w, "tdx"):
+                    continue
+                if w.handle in before:
+                    continue
+                for b in w.descendants(class_name="Button"):
+                    t = b.window_text() or ""
+                    if any(k in t for k in cls._CONFIRM_BUTTON_KEYWORDS):
+                        return w, b
+            except Exception:
+                continue
+        return None, None
+
+    def _find_confirm_panel(self):
+        """在 tdxw.exe 顶层窗口树内定位「下单确认面板」。
+
+        实证（2026-11-04 真机）：通达信的确认面板**不是独立 #32770 对话框**，
+        而是主框架 `TdxW_MainFrame_Class` 内的自绘面板——含「确定」按钮 +
+        「买入委托/卖出委托」标题 +「…成本价、盈利等数据仅供参考」提示。
+        特征判定：'确定' 与 '…仅供参考'提示语 同时存在于窗口树（卖出确认面板无买入/卖出标题）。
+
+        返回 (frame, confirm_ctrl, cancel_ctrls) 或 (None, None, [])。"""
+        from .live.win_dialog_scope import window_image_name, dialog_matches_channel
+        try:
+            from pywinauto import Desktop
+        except ImportError:
+            return None, None, []
+        for w in Desktop(backend="win32").windows():
+            try:
+                if not w.is_visible():
+                    continue
+                if window_image_name(w.process_id()) != "tdxw.exe":
+                    continue
+                if not dialog_matches_channel(w, "tdx"):
+                    continue
+                texts = set()
+                confirm_ctrl = None
+                cancel_ctrls = []
+                for c in w.descendants():
+                    try:
+                        t = (c.window_text() or "").strip()
+                    except Exception:
+                        continue
+                    if not t:
+                        continue
+                    texts.add(t)
+                    if t == "确定" and confirm_ctrl is None:
+                        confirm_ctrl = c
+                    if t == "取消":
+                        cancel_ctrls.append(c)
+                if confirm_ctrl is not None and any(
+                        "仅供参考" in t for t in texts):
+                    return w, confirm_ctrl, cancel_ctrls
+            except Exception:
+                continue
+        return None, None, []
+
+    def _find_chrome_hosts(self, frame) -> list:
+        """通达信交易界面是 WebView（Chrome）渲染——确认/取消弹窗是网页 DOM
+        元素，Win32/UIA 控件枚举均不可见。键盘事件必须发给 Chrome 的输入
+        接收窗口（RenderWidgetHostHWND）才进入网页。"""
+        hosts = []
+        try:
+            for c in frame.descendants():
+                try:
+                    if c.class_name() in ("Chrome_RenderWidgetHostHWND",
+                                          "Chrome_WidgetWin_1"):
+                        hosts.append(c)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return hosts
+
+    def _confirm_order_dialog(self, before: set, timeout: float = 5.0,
+                              action: str = "confirm") -> bool:
+        """自动处置通达信「下单确认」面板（鼠标键盘模拟，无人值守）。
+
+        真机实证（2026-11-04 凌晨）：
+        - 面板是 tdxw 主框架内嵌 WebView 的 **网页 DOM 模态框**——「确定/
+          取消/全部确认/全部取消」按钮是 HTML 元素，Win32/UIA 枚举均不可见
+          （BM_CLICK/坐标点击/esc 全部无效——焦点不在网页内）；
+        - **焦点注入 Chrome_RenderWidgetHostHWND 后发键盘**：网页模态框标准
+          行为 Enter=确认、Esc=取消（Esc 实测面板消失 ✓）。
+        - 键盘段落持 UI_AUTO_LOCK（跨引擎互斥：THS 自动化同进程并发）。
+
+        action: confirm=Enter（执行委托）；cancel=Esc（放弃委托）。
+        """
+        from .live.win_dialog_scope import UI_AUTO_LOCK
+        key = "{ENTER}" if action == "confirm" else "{ESC}"
+        deadline = time.time() + timeout
+        with UI_AUTO_LOCK:
+            while time.time() < deadline:
+                try:
+                    frame, confirm_ctrl, _cancels = self._find_confirm_panel()
+                    if frame is None:
+                        # 面板已消失（键盘生效后的复查窗口）= 处置成功
+                        return True
+                    hosts = self._find_chrome_hosts(frame)
+                    if not hosts:
+                        logger.warning("tdx 确认面板无 chrome host，无法注入键盘")
+                        return False
+                    for h in hosts:
+                        try:
+                            h.set_focus()
+                            time.sleep(0.25)
+                            h.type_keys(key)
+                            time.sleep(0.7)
+                        except Exception as e:
+                            logger.warning("tdx 确认键盘注入失败: %s", e)
+                    time.sleep(0.6)
+                    frame2, _c2, _cn2 = self._find_confirm_panel()
+                    if frame2 is None:
+                        logger.info(
+                            "tdx 下单确认面板已自动处置（%s）", action)
+                        return True
+                    continue
+                except Exception:
+                    logger.exception("tdx 确认面板检测异常")
+                time.sleep(0.5)
+        return False
+
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         self._ensure()
         symbol = normalize_symbol(order.stock_code)
@@ -779,6 +978,17 @@ class TdxTqDispatcher(OrderDispatcher):
         # check_price_limit 公共方法，四通道同口径）；此处不再内联校验（防双查）。
         const = _tqconst()
         order_type = (const.STOCK_BUY if direction == "buy" else const.STOCK_SELL)
+        # 「下单确认」弹窗基线（order_stock 前的对话框句柄集——弹窗自动点击
+        # 只点**新增**的确认框，不误碰客户端其它对话框）
+        dialog_before = (self._snapshot_dialog_hwnds()
+                         if self._auto_confirm_dialog else set())
+        #: 信号行时间匹配基准（客户端与本进程同机同时钟，±45s 内即本次信号）
+        sent_at = now_shanghai()
+        # 「交易信号」待发送行基线（order_stock **之前**拍）：确认流程只点基线
+        # 之后新出现的行。2026-11-05 09:51 实证：新行尚未渲染时旧逻辑按时间
+        # 就近误点了 09:51:08 的历史残留行（同代码/数量/价格才没出事）。
+        baseline = (self._get_confirmer().snapshot_rows()
+                    if self._auto_confirm_dialog else ())
         try:
             res = _call(
                 self._tq().order_stock,
@@ -806,14 +1016,47 @@ class TdxTqDispatcher(OrderDispatcher):
         else:
             msg = str(res)
 
-        ref = self._resolve_order_id(symbol, direction, price, vol)
+        # 实盘账户 order_stock 恒返回 Value=1（待用户确认），信号落到客户端
+        # 「交易信号」窗口：每行「发送」才真正报柜台（2026-11-04 真机实证，
+        # 该窗口为 CEF 渲染，无 Win32 按钮可 BM_CLICK，必须 OCR 定位后真实点击）。
+        pending = self._pending_confirmation(res, msg)
+        ref = ""
+        confirm_detail = ""
+        clicked = False
+        if pending and self._auto_confirm_dialog:
+            ref, confirm_detail, clicked = self._confirm_pending_order(
+                symbol, direction, price, vol, code6, sent_at,
+                dialog_before, msg, baseline)
+
         if not ref:
-            if "确认" in msg:
+            ref = self._resolve_order_id(symbol, direction, price, vol)
+        if not ref:
+            if pending and not self._auto_confirm_dialog:
                 raise BridgeOrderRejected(
-                    "通达信为「下单确认」半自动模式，委托未提交柜台（%s）。"
-                    "请在通达信客户端关闭下单确认后重试" % msg)
-            raise BridgeOrderRejected(
-                "下单未生效（委托列表未见该单）：%s" % (msg or res))
+                    "通达信下单待人工确认（%s）：自动确认已关闭"
+                    "（tq_trade.auto_confirm_dialog=false），请在客户端"
+                    "「交易信号」窗口点该行『发送』" % (msg or ""))
+            if pending and not clicked:
+                raise BridgeOrderRejected(
+                    "通达信下单待人工确认，自动确认未成功（%s）。请检查客户端"
+                    "「交易信号」窗口是否已打开、本单行是否可点『发送』，"
+                    "或关闭下单确认后重试" % (confirm_detail or msg))
+            # 柜台已受理（ErrorId=0）但回查窗口（~1.05s）内委托表未见该单：
+            # 委托表刷新延迟/连续竞价高峰都会命中。**不能当拒单**——拒单会让引擎
+            # 把订单标 rejected 并移出在途集合，真实在途单从此无 ref、无成交回填、
+            # 无法撤单，虚拟持仓/现金与柜台脱节（SELL 还会二次卖出）。
+            # 已点『发送』但委托表尚未出现同理：点击成功≠委托表立即可见。
+            # 返回 None + 标记 last_unconfirmed_order_id：引擎保持 submitted，
+            # 后续 poll_deals 继续 legacy 模糊认领，最坏 180s expire 收口。
+            self.last_unconfirmed_order_id = self.order_id(order)
+            self._last_error = (
+                "已受理未认领：委托列表暂未见该单（%s）"
+                % (confirm_detail or msg or res))
+            logger.warning(
+                "tdx order accepted but unclaimed: %s %s x%s @%s (%s)",
+                direction, symbol, vol, price, confirm_detail or msg or res,
+            )
+            return None
 
         now = now_shanghai()
         self._submit_times[ref] = (now.strftime("%Y%m%d"), now.strftime("%H%M%S"))
@@ -832,7 +1075,94 @@ class TdxTqDispatcher(OrderDispatcher):
             amount=fill_price * vol,
             commission=Decimal("0"),
             stamp_duty=Decimal("0"),
-            trade_time=order.bar_time or datetime.now(),
+            trade_time=order.bar_time or now_shanghai(),
             signal_type=order.signal_type,
             signal_name=order.signal_name,
         )
+
+    # ---- 「交易信号」待确认自动处置 ----
+
+    @staticmethod
+    def _pending_confirmation(res, msg: str) -> bool:
+        """order_stock 是否处于「待用户确认」态。
+
+        官方契约：Value 0=失败 / 1=待用户确认 / 2=成功。Value 缺失时按
+        Msg 文案兜底（旧版本/桩实现）。
+        """
+        value = res.get("Value") if isinstance(res, dict) else None
+        try:
+            value_i = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            value_i = None
+        if value_i == 2:
+            return False
+        if value_i == 1:
+            return True
+        text = msg or ""
+        return ("待用户确认" in text) or ("待确认" in text)
+
+    def _get_confirmer(self):
+        """惰性构造「交易信号」确认器（基线采集与确认共用同一实例）。"""
+        if self._confirmer is None:
+            from .live.tdx_signal_confirm import TdxSignalConfirmer
+            self._confirmer = TdxSignalConfirmer(timeout=self._confirm_timeout)
+        return self._confirmer
+
+    def _confirm_pending_order(self, symbol: str, direction: str, price: float,
+                               vol: int, code6: str, sent_at, dialog_before,
+                               msg: str, baseline=()):
+        """点掉「交易信号」窗口本次委托行的『发送』并等委托表认领。
+
+        返回 (order_ref, 诊断说明, 是否已点击)。order_ref 为空表示自动确认未
+        成功；是否已点击用于区分「未发出任何委托」（可安全判拒单）与「已点
+        但委托表尚未刷新」（不可判拒单，交由引擎保持 submitted 等认领）。
+        ``baseline`` 是 order_stock 之前拍下的旧行指纹（只点之后新出现的行）。
+        """
+        from .live.tdx_signal_confirm import SignalSpec
+
+        spec = SignalSpec(code6=code6, direction=direction, volume=int(vol),
+                          price=float(price), sent_at=sent_at)
+        state = {"ref": ""}
+
+        def _submitted() -> bool:
+            ref = self._resolve_order_id(symbol, direction, price, vol, attempts=1)
+            if ref:
+                state["ref"] = ref
+            return bool(ref)
+
+        def _on_clicked() -> None:
+            # 兼容仍带独立「下单确认」面板的旧形态：点『发送』后可能再弹一次
+            try:
+                self._handle_legacy_confirm_dialog(dialog_before)
+            except Exception:  # noqa: BLE001
+                logger.exception("tdx 下单后旧式确认面板处置异常")
+
+        outcome = self._get_confirmer().confirm(
+            spec, is_submitted=_submitted, on_clicked=_on_clicked,
+            baseline=baseline)
+        if not outcome.ok:
+            logger.warning("tdx 交易信号自动确认失败：%s（%s）",
+                           outcome.detail, msg or "")
+        return state["ref"], outcome.detail, int(outcome.clicks) > 0
+
+    def _handle_legacy_confirm_dialog(self, dialog_before) -> None:
+        """旧版「下单确认」面板（自绘面板或新增 #32770）兜底处置。"""
+        try:
+            panel, _btn, _txt = self._find_confirm_panel()
+        except Exception:  # noqa: BLE001
+            panel = None
+        if panel is not None:
+            self._confirm_order_dialog(dialog_before, timeout=2.0)
+            return
+        try:
+            from pywinauto import Desktop
+            dlg, btn = self._pick_confirm_dialog(
+                Desktop(backend="win32").windows(), dialog_before)
+        except Exception:  # noqa: BLE001
+            return
+        if dlg is None or btn is None:
+            return
+        try:
+            btn.click_input()
+        except Exception:  # noqa: BLE001
+            self._confirm_order_dialog(dialog_before, timeout=2.0)

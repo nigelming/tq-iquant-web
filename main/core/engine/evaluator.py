@@ -276,6 +276,10 @@ class Evaluator:
         for i in range(1, len(rows)):
             prev = rows[i - 1]["total_value"]
             cur = rows[i]["total_value"]
+            # 总资产为 0/负只可能来自退化数据（异常快照）；直接除会抛
+            # ZeroDivisionError（Decimal）或给出无意义收益率，跳过该日。
+            if prev <= 0:
+                continue
             returns.append(float((cur - prev) / prev))
         return returns
 

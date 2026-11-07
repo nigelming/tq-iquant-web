@@ -31,7 +31,7 @@ logger = logging.getLogger("core.engine.live.daily_closer")
 
 # 上海 14:30 收盘后驱动（E5/E6 update_daily + C6(B/C) 1d 快照/1w/1mon 注入共用）。
 _DAILY_CLOSE_TIME = (14, 30)
-# 收盘清扫时点（15:05）：交易所已收盘、iQuant 自动撤单已落定后做确定性兜底。
+# 收盘清扫时点（15:05）：交易所已收盘、QMT 自动撤单已落定后做确定性兜底。
 _MARKET_CLOSE_SWEEP_TIME = (15, 5)
 
 
@@ -116,7 +116,7 @@ class DailyCloser:
         """C6(B/C)：日终（≥14:30 当日一次）1d 快照 bar + 1w/1mon 通达信注入驱动。
 
         **14:30 数据源定案**：
-          - 1d    → **iQuant 桥** /quote?period=1d（最新 forming 1d bar 的 OHLCV 快照）
+          - 1d    → **QMT 桥** /quote?period=1d（最新 forming 1d bar 的 OHLCV 快照）
           - 1w/1mon → **通达信 TQFormula.compute**（桥端 xtdata 拉不到 1w/1mon，仅此通路）
         与启动的去重/长度规则**一致**：
           - 1d 长度按 ctx.code_period_count[(code,"1d")]（该股 1d 公式最大 formula_count，
@@ -140,7 +140,7 @@ class DailyCloser:
             return
         if self.last_daily_bar_date == today:
             return
-        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）。数据源 **iQuant 桥**
+        # 拉 1d 快照（供 1d 注入 + 构造 daily_time/stocks）。数据源 **QMT 桥**
         # （1w/1mon 桥端 xtdata 拉不到，走通达信 inject_startup_periods，见下 C6(C)）。
         # 长度/去重规则 **同启动预热（preheat）**：
         #   长度 = 该股该周期最大 formula_count（ctx.code_period_count[(code,"1d")]，
@@ -377,7 +377,7 @@ class DailyCloser:
     def _best_effort_cancel(self, lo) -> None:
         """A-3：清扫终态前 best-effort 撤真实委托。
 
-        通道无 cancel_order（如 iQuant 桥）→ 跳过；异常/失败仅 warning——收盘后
+        通道无 cancel_order（如 QMT 桥）→ 跳过；异常/失败仅 warning——收盘后
         交易所/券商对当日单自动失效，撤单失败不阻断清扫终态。
         """
         cancel = getattr(self._ctx.dispatcher, "cancel_order", None)

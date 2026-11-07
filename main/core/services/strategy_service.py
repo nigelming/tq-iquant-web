@@ -147,9 +147,14 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         p.daily_loss_basis = req.daily_loss_basis
     if getattr(req, "cash_enhance_enabled", None) is not None:
         p.cash_enhance_enabled = req.cash_enhance_enabled
-    p.cash_enhance_equity_threshold = getattr(req, "cash_enhance_equity_threshold", None)
-    p.cash_enhance_position_ratio_threshold = getattr(
-        req, "cash_enhance_position_ratio_threshold", None)
+    # 阈值：None=请求未携带（编辑不动已有值）——与相邻开关/价格约束收视口径一致。
+    # 原实现无条件赋值：前端开关关闭时字段被 showIf 隐藏不进 payload → 阈值被清 NULL，
+    # 而 cash_enhance_enabled 仍为 True，净值闸/仓位闸永久失效（界面看不出来）。
+    if getattr(req, "cash_enhance_equity_threshold", None) is not None:
+        p.cash_enhance_equity_threshold = req.cash_enhance_equity_threshold
+    if getattr(req, "cash_enhance_position_ratio_threshold", None) is not None:
+        p.cash_enhance_position_ratio_threshold = (
+            req.cash_enhance_position_ratio_threshold)
     # W3 容量上限（可选，None=不设上限）
     p.equity_cap = getattr(req, "equity_cap", None)
 
@@ -274,7 +279,7 @@ def delete_portfolio(db: Session, pid: int) -> bool:
 # ===========================================================================
 # 独立子策略 CRUD
 # ===========================================================================
-def _apply_strategy_fields(s: Strategy, req) -> None:
+def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     s.name = req.name
     s.formula_id = req.formula_id
     s.period = req.period
@@ -293,12 +298,22 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.stock_pool_id = req.stock_pool_id
     s.slave_exit_mode = req.slave_exit_mode
     # B4/B5 可选增强（默认关；缺省字段回落默认，保持旧请求行为不变）
-    s.rotation_enabled = getattr(req, "rotation_enabled", False)
-    s.rotation_momentum_bars = getattr(req, "rotation_momentum_bars", 20)
-    s.rotation_hysteresis = getattr(req, "rotation_hysteresis", 0.05)
-    s.regime_filter_enabled = getattr(req, "regime_filter_enabled", False)
-    s.trend_trailing_stop_ratio = getattr(req, "trend_trailing_stop_ratio", None)
-    s.trend_max_positions = getattr(req, "trend_max_positions", None)
+    # 编辑路径：前端在开关关闭时用 showIf 隐藏子参数、不进 payload——这里若用
+    # 模型默认值（20/0.05）回填，用户自定义的轮动/趋势参数会被静默重置。
+    # 故 update 时仅应用请求显式携带（model_fields_set）的键。
+    provided = set(getattr(req, "model_fields_set", ()) or ()) if is_update else None
+
+    def _apply_opt(attr: str, default) -> None:
+        if provided is not None and attr not in provided:
+            return
+        setattr(s, attr, getattr(req, attr, default))
+
+    _apply_opt("rotation_enabled", False)
+    _apply_opt("rotation_momentum_bars", 20)
+    _apply_opt("rotation_hysteresis", 0.05)
+    _apply_opt("regime_filter_enabled", False)
+    _apply_opt("trend_trailing_stop_ratio", None)
+    _apply_opt("trend_max_positions", None)
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
     # 单笔最大买入金额（None=不限；缺省字段回落 None，保持旧请求行为不变）
@@ -346,7 +361,7 @@ def update_strategy(db: Session, pid: int, sid: int, req) -> dict | None:
     s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
     if s is None:
         return None
-    _apply_strategy_fields(s, req)
+    _apply_strategy_fields(s, req, is_update=True)
     db.commit()
     db.refresh(s)
     return serialize_strategy(s)

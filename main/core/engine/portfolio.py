@@ -212,6 +212,12 @@ class Portfolio:
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
+                # 周期不匹配：仅跑风控（止损/止盈/移动止损按当前 bar 价盘中核算
+                # 与执行），公式信号仍锁策略周期（W4 防混合周期前视语义不变）。
+                # 实盘快照合成 1m bar → 日线策略持仓获得盘中风控；回测日线数据
+                # 无 1m bar → 行为与历史一致；混合周期回测 → 双端盘中风控统一。
+                orders.extend(self._process_strategy(
+                    ctx, bar, signal_cache, inflight, include_signals=False))
                 continue
             strat_orders = self._process_strategy(ctx, bar, signal_cache, inflight)
             orders.extend(strat_orders)
@@ -297,9 +303,18 @@ class Portfolio:
 
     def _process_strategy(
         self, ctx: StrategyContext, bar: BarEvent, signal_cache,
-        inflight: Dict[int, set],
+        inflight: Dict[int, set], include_signals: bool = True,
     ) -> List[OrderEvent]:
-        signals = ctx.get_signal(bar, signal_cache=signal_cache)
+        """单策略 bar 处理：公式信号 + 风控检查 → 合并排序 → 转订单。
+
+        include_signals=False（周期解耦盘中风控）：跳过公式信号评估，仅产出
+        风控单——非本策略周期的 bar 到来时按当前 bar 价核算止损/止盈/移动止损
+        （实盘快照合成 1m bar 盘中风控；信号周期锁不受影响）。
+        """
+        signals = (
+            ctx.get_signal(bar, signal_cache=signal_cache)
+            if include_signals else []
+        )
         # 风控检查：对每只持仓股票检查止损/止盈/移动止损
         risk_signals = self._check_risks(ctx, bar)
 
@@ -347,9 +362,20 @@ class Portfolio:
             if pos.quantity == 0 or stock_code not in bar.stocks:
                 continue
             close = bar.stocks[stock_code]["close"]
-            if close > Decimal("0"):
-                # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
-                pos.update_high(close)
+            if close <= Decimal("0"):
+                # 停牌/无数据 bar（TQ NaN → close=0）：先算盈亏会得到 -100% 的
+                # 假止损并污染信号流（2026-11-06 实测 601989/000939/002013）。
+                # 在风控计算之前拦截，只留一条可见的「跳过」记录。
+                self.recorder.record(
+                    gate="risk_skip_no_price", layer="strategy_risk", action="skip",
+                    portfolio_id=self.portfolio_id, strategy_id=ctx.strategy_id,
+                    stock_code=stock_code, bar_time=bar.bar_time,
+                    message="跳过风控：%s 无有效价格（close=%s），不计算盈亏、不发信号"
+                            % (stock_code, fmt_price(close)),
+                )
+                continue
+            # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
+            pos.update_high(close)
             # B5：移动止损阈值按市场状态解析（未开闸/非趋势态回落策略风控原值，行为不变）
             eff_trailing = ctx.effective_trailing_stop(self.current_regime)
             if risk_manager.check_stop_loss(pos, close):
@@ -366,8 +392,9 @@ class Portfolio:
                     param_name="stop_loss_ratio",
                     param_value=float(risk_manager.stop_loss_ratio),
                     actual_value=float(loss),
-                    message="止损：成本 %s 现价 %s 亏 %s" % (
-                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(loss)),
+                    message="止损：整仓成本 %s 现价 %s 亏 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(loss),
+                        pos.cost_note()),
                 )
             elif risk_manager.check_take_profit(pos, close):
                 profit = (close - pos.avg_cost) / pos.avg_cost if pos.avg_cost else Decimal("0")
@@ -383,8 +410,9 @@ class Portfolio:
                     param_name="take_profit_ratio",
                     param_value=float(risk_manager.take_profit_ratio),
                     actual_value=float(profit),
-                    message="止盈：成本 %s 现价 %s 盈 %s" % (
-                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(profit)),
+                    message="止盈：整仓成本 %s 现价 %s 盈 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(profit),
+                        pos.cost_note()),
                 )
             elif risk_manager.check_trailing_stop(pos, close, ratio=eff_trailing):
                 drawdown = (
@@ -406,8 +434,9 @@ class Portfolio:
                         else risk_manager.trailing_stop_ratio
                     ),
                     actual_value=float(drawdown),
-                    message="移动止损：最高 %s 现价 %s 回撤 %s" % (
-                        fmt_price(pos.highest_price), fmt_price(close), fmt_pct(drawdown)),
+                    message="移动止损：整仓成本 %s 最高 %s 现价 %s 回撤 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(pos.highest_price),
+                        fmt_price(close), fmt_pct(drawdown), pos.cost_note()),
                 )
         return risks
 

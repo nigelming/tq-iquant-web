@@ -35,6 +35,20 @@ def fmt_price(v) -> str:
     return DASH if d is None else format(d, "f")
 
 
+def dec_price(v) -> Optional[Decimal]:
+    """成本价展示字段（数值型）：量化到 3 位。计算与存储仍用全精度。"""
+    return _quantize(v, 3)
+
+
+def dec_money(v) -> Optional[Decimal]:
+    """金额展示字段（数值型）：量化到 2 位（与金额语义一致）。
+
+    成本价按 3 位（成交价精度），市值/金额按 2 位（分的精度）——两者口径不同，
+    但都只作用于展示层，计算与存储仍保全精度。
+    """
+    return _quantize(v, 2)
+
+
 def fmt_qty(v) -> str:
     d = _quantize(v, 0)
     return DASH if d is None else "{:,}".format(int(d))

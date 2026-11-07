@@ -205,7 +205,15 @@ class BacktestEngine:
                                 vol_lot = lot_size_for(
                                     order.stock_code, portfolio.bond_lot_enabled
                                 )
-                                if cap_shares >= vol_lot:
+                                # A 股规则：买入必须整手，卖出允许零股。买入缩量
+                                # 必须先按手取整（否则会产生 137 股这类非整手持仓，
+                                # 后续 SELL 手数校验会把它当成不足一手而永远卖不掉）。
+                                is_buy = order.trade_type == TradeType.BUY
+                                final_qty = (
+                                    (cap_shares // vol_lot) * vol_lot
+                                    if is_buy else cap_shares
+                                )
+                                if final_qty >= vol_lot or (not is_buy and final_qty > 0):
                                     recorder.record(
                                         gate="volume_cap_shrink", layer="execution",
                                         action="shrink",
@@ -214,13 +222,13 @@ class BacktestEngine:
                                         stock_code=order.stock_code,
                                         bar_time=t,
                                         requested_qty=order.quantity,
-                                        final_qty=cap_shares,
+                                        final_qty=final_qty,
                                         message="成交量约束：订单 %d 股 > 本 bar 上限 %d 股"
-                                                "（当日成交 %s 股 ×%s），缩量成交"
+                                                "（当日成交 %s 股 ×%s），缩量至 %d 股成交"
                                                 % (order.quantity, cap_shares, bar_volume,
-                                                   portfolio.volume_limit_ratio),
+                                                   portfolio.volume_limit_ratio, final_qty),
                                     )
-                                    order.quantity = cap_shares
+                                    order.quantity = final_qty
                                 else:
                                     if id(order) not in volume_defer_recorded:
                                         volume_defer_recorded.add(id(order))

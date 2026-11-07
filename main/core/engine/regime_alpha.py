@@ -447,7 +447,8 @@ class RegimeAlphaAnalyzer:
             peak = v if peak is None else max(peak, v)
             if peak > 0:
                 dd = min(dd, v / peak - 1.0)
-        return dd
+        # 与 robustness._max_drawdown 统一口径：返回正号回撤（0 表示无回撤）
+        return abs(dd)
 
     def _opportunity(self, labeled) -> dict:
         out = {
@@ -814,7 +815,8 @@ class RegimeAlphaAnalyzer:
             peak = v if peak is None else max(peak, v)
             if peak > 0:
                 dd = min(dd, v / peak - 1.0)
-        return dd
+        # 与 robustness._max_drawdown 统一口径：返回正号回撤
+        return abs(dd)
 
     def _dispersion(self) -> dict:
         """宽基截面分化度时间序列 + 策略超额按分化度分桶对比。"""

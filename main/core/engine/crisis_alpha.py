@@ -44,7 +44,11 @@ def _mean(values: Sequence[float]) -> float:
 
 
 def _clip(value: float) -> float:
-    return float(max(0.0, min(100.0, value)))
+    """百分制截断；NaN/Inf（样本退化时 pandas 均值可能给出）返回中性 50。"""
+    v = float(value)
+    if not math.isfinite(v):
+        return 50.0
+    return float(max(0.0, min(100.0, v)))
 
 
 def _classify_crisis(b_values, s_values) -> List[str]:
@@ -165,9 +169,14 @@ class CrisisAlphaAnalyzer:
         b_c = b[down]
         counts = {cat: int((labels == cat).sum()) for cat in CRISIS_CATS}
         avg_ret = {}
+        avg_bench = {}
         for cat in CRISIS_CATS:
-            v = s_c[labels == cat]
+            mask = labels == cat
+            v = s_c[mask]
             avg_ret[cat] = float(v.mean()) if len(v) > 0 else 0.0
+            # 分档基准平均：报告侧「基准平均」列取此字段（原先误用策略均值
+            # avg_ret，导致基准列与策略列相同、超额恒为 0）。
+            avg_bench[cat] = float(b_c[mask].mean()) if len(v) > 0 else 0.0
         n_up = counts["逆势上涨"]
         n_alpha = counts["逆势上涨"] + counts["跌得少"]
         n_follow = counts["跟着跌"] + counts["跌更多"]
@@ -189,6 +198,7 @@ class CrisisAlphaAnalyzer:
             "odds": odds,
             "counts": counts,
             "avg_ret": avg_ret,
+            "avg_bench": avg_bench,
             "down_avg_s": float(s_c.mean()) if n_down else 0.0,
             "down_avg_b": float(b_c.mean()) if n_down else 0.0,
             "win_avg": win_avg,

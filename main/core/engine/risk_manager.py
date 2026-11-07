@@ -24,13 +24,15 @@ class StrategyRiskManager:
         self.trailing_stop_ratio = trailing_stop_ratio
 
     def check_stop_loss(self, position: Position, current_price: Decimal) -> bool:
-        if position.quantity == 0:
+        if position.quantity == 0 or position.avg_cost <= 0:
+            # avg_cost<=0 = 成本未知（外部导入持仓桥侧未给 cost）→ 跳过而非 0 除
             return False
         loss = (position.avg_cost - current_price) / position.avg_cost
         return loss >= self.stop_loss_ratio
 
     def check_take_profit(self, position: Position, current_price: Decimal) -> bool:
-        if position.quantity == 0:
+        if position.quantity == 0 or position.avg_cost <= 0:
+            # 同上：无成本基准时止盈同样无从判断（导入时已打 WARN）
             return False
         profit = (current_price - position.avg_cost) / position.avg_cost
         return profit >= self.take_profit_ratio

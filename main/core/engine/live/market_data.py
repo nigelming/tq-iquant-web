@@ -102,17 +102,31 @@ class MarketDataService:
         self.signal_cache: Dict = {}
 
     # ---------------- 预热 + 增量拼接（拉取优化）----------------
-    def preheat(self) -> None:
+    def preheat(self, only_missing: bool = False) -> None:
         """启动预热：对每个 (code, period) 拉 code_period_count 根历史存 _preheat_cache。
 
         只预热 ctx.code_period_count 里的 (code,period)（实例真实有策略的，按需不浪费），
         跳过 1d/1w/1mon（1d 不预热走日终 _maybe_daily_bars；1w/1mon 走通达信 inject_startup_periods）。
         单 (code,period) 拉取失败不阻断启动（log warn，运行期该 key 走 _get_bars_with_increment
         的"缓存未命中全量补"自愈）。启动一次性同步调用，在 start() 里 inject_startup_periods 之后。
+
+        only_missing=True（收盘后停轮询 → 次日恢复时的预热）：跳过已有缓存的
+        (code, period)，只补缺失项。暂停期不产生 bar（无交易无 bar），已有缓存
+        可直接续接，全量重拉会在开盘前对桥/TQ 形成数百次突发请求（与"收盘降压"
+        目标相反）；缺失项（暂停期扩池的新代码）仍按 code_period_count 全量补齐，
+        保证开盘第一根 bar 公式历史不缺。
         """
+        n_pull = 0
         for (code, period), count in self.ctx.code_period_count.items():
             if period in ("1d", "1w", "1mon"):
                 continue
+            if only_missing and (code, period) in self._preheat_cache:
+                continue
+            # 节流：预热是大批量连续 TQ 拉（数百 (code,period)），同步调用会冻结
+            # 通达信客户端 UI——逐笔小睡让出 UI 线程（总时长 +~2 分钟，可接受）
+            n_pull += 1
+            if n_pull % 5 == 0:
+                time.sleep(0.2)
             try:
                 bars = self.ctx.dispatcher.query_quote(code, period=period, count=count)
             except BridgeUnavailableError:
@@ -340,17 +354,27 @@ class MarketDataService:
                     raw_cache[raw_key] = []
                     continue
                 pending.setdefault((formula_name, period), {})[code] = df
-        # Phase B：每组 (formula, period) 一次批量 process，逐 code 拆结果填 raw_cache。
+        # Phase B：每组 (formula, period) 批量 process（分片节流：日线全池 250 只
+        # 一组的 ~10s 级 TDX 公式计算整段占住通达信 UI 线程 → 客户端冻结。按
+        # 30 只分片、片间让 0.4s，单段冻结降到亚秒级；总耗时略增可接受），
+        # 逐 code 拆结果填 raw_cache。
         for (formula_name, period), df_by_code in pending.items():
-            _tt = time.perf_counter()
-            raw = self._tq_formula.compute_injected_batch(
-                formula_name=formula_name, ohlcv_by_code=df_by_code, period=period,
-            )
-            tq_elapsed += time.perf_counter() - _tt
-            n_inject += len(df_by_code)
-            for code in df_by_code:
-                raw_cache[(code, period, formula_name)] = \
-                    self._extract_latest_signal(raw, code)
+            codes = list(df_by_code.keys())
+            chunk_size = 30
+            for i in range(0, len(codes), chunk_size):
+                chunk_codes = codes[i:i + chunk_size]
+                if i > 0:
+                    time.sleep(0.4)
+                chunk = {c: df_by_code[c] for c in chunk_codes}
+                _tt = time.perf_counter()
+                raw = self._tq_formula.compute_injected_batch(
+                    formula_name=formula_name, ohlcv_by_code=chunk, period=period,
+                )
+                tq_elapsed += time.perf_counter() - _tt
+                n_inject += len(chunk)
+                for code in chunk:
+                    raw_cache[(code, period, formula_name)] = \
+                        self._extract_latest_signal(raw, code)
         # Phase C：回填 signal_cache（含本轮批量算的与 raw_cache 已命中的）。
         # 已有条目优先（audit Fix2）：外部信号注入（_process_external_signal）先
         # 写入同 key (strategy_id, code, bar.bar_time) 条目再经 _handle_bar 走到
@@ -545,6 +569,8 @@ class MarketDataService:
                 if not formula_name:
                     continue
                 for code in codes:
+                    # 节流：逐股 TDX 公式 compute（1w/1mon 全池）同步占 UI，逐笔小睡
+                    time.sleep(0.2)
                     try:
                         raw = self._tq_formula.compute(
                             formula_name, "", [code], period=ctx.period, count=-1

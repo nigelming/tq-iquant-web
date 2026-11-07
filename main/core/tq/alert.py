@@ -70,7 +70,10 @@ class TQAlert:
                 "volum_list": [_num(i.volume) for i in chunk],
                 "bs_flag_list": [i.bs_flag if i.bs_flag in ("0", "1", "2")
                                  else "2" for i in chunk],
-                "warn_type_list": ["0" for _ in chunk],
+                # 原实现硬编码 "0"，WarnItem.warn_type 被静默丢弃（调用方显式
+                # 指定的预警类型永远不生效）。非数字值退化为默认 "0"。
+                "warn_type_list": [str(i.warn_type) if str(i.warn_type).isdigit()
+                                   else "0" for i in chunk],
                 "reason_list": [(i.reason or "")[:25] for i in chunk],
                 "count": len(chunk),
             }

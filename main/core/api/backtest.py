@@ -149,6 +149,8 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_market_regime as _svc_recompute_market_regime,
     recompute_evaluation as _svc_recompute_evaluation,
     recompute_robustness as _svc_recompute_robustness,
+    recompute_validation_crisis as _svc_recompute_validation_crisis,
+    recompute_validation as _svc_recompute_validation,
     recompute_persistence as _svc_recompute_persistence,
     run_pool_comparison as _svc_run_pool_comparison,
 )
@@ -235,6 +237,28 @@ def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
     return ok(result)
 
 
+@router.post("/records/{record_id}/validation-crisis/recompute")
+def recompute_record_validation_crisis(record_id: int, db: Session = Depends(get_db)):
+    """离线刷新验证结论的危机防御块（新窗口/新判定，仅用落库快照，不重跑回测）。"""
+    result = _svc_recompute_validation_crisis(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/validation/recompute")
+def recompute_record_validation(record_id: int, db: Session = Depends(get_db)):
+    """离线重算验证结论全量（capacity 含敞口上限维度 + crisis + oos，不重跑回测）。
+
+    capacity 从落库快照/评估/策略配置重建；ADV 容量预警需逐股日线（离线无
+    klines）→ 跳过。新回测完成时由 build_validation_verdict 自动含全部维度。
+    """
+    result = _svc_recompute_validation(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
 @router.post("/records/{record_id}/persistence/recompute")
 def recompute_record_persistence(
     record_id: int, benchmark_code: str | None = None, db: Session = Depends(get_db),
@@ -265,6 +289,12 @@ def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_d
         return err(400, "请至少选择一个备选股票池")
     if req.start_date >= req.end_date:
         return err(400, f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}")
+    # 未来日期 TQ 拉不到行情：提前拦截，避免每池各跑一轮才失败（多池耗时放大）
+    today = date.today()
+    if req.start_date > today:
+        return err(400, f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）")
+    if req.end_date > today:
+        return err(400, f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）")
     if req.dividend_mode not in ("front", "back", "dual"):
         return err(400, f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}")
 
@@ -455,6 +485,8 @@ def _validate_param_perturb_request(req: ParamPerturbRequest) -> Optional[str]:
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
     if req.dividend_mode not in ("front", "back", "dual"):
         return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):

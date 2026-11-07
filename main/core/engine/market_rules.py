@@ -12,14 +12,15 @@ from typing import Optional
 
 
 def _limit_ratio_for(stock_code: str) -> Decimal:
-    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8 前缀) 30%，其余 10%。
+    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8/92 前缀) 30%，其余 10%。
 
     ST 5% 不特判（v1 偏宽松可接受：对 ST 股拦截区间偏宽，少拦不错拦）。
     """
     prefix = stock_code.split(".")[0]
     if prefix.startswith(("300", "301", "688")):
         return Decimal("0.20")
-    if prefix[:1] in ("4", "8"):
+    # 北交所：4xxxxx / 8xxxxx / 92xxxx（新股段），均 30%
+    if prefix[:1] in ("4", "8") or prefix.startswith("92"):
         return Decimal("0.30")
     return Decimal("0.10")
 
@@ -72,3 +73,19 @@ def session_allows_bar(session: Optional[str], t: dtime, period: Optional[str]) 
     if period is not None and period not in _INTRADAY_PERIODS:
         return True
     return session_allows(session, t)
+
+
+# ---- 板块每手规则（实盘下单/审批整手口径；科创板 200 股起购）----
+# 来源：project2 版本 _MARKET_RULES 表校准。转债（10 张）由 lot_size_for 单独处理。
+_LOT_SIZE_RULES: dict = {
+    ("688", ".SH"): 200,   # 科创板：200 股起购（超出部分可 1 股递增，整手口径取 200）
+}
+
+
+def lot_size_for_board(stock_code: str) -> int:
+    """按板块返回每手股数：科创板 200，其余 100（转债口径另由 lot_size_for 处理）。"""
+    code = (stock_code or "").upper().strip()
+    for (prefix, suffix), lot in _LOT_SIZE_RULES.items():
+        if code.startswith(prefix) and code.endswith(suffix):
+            return lot
+    return 100

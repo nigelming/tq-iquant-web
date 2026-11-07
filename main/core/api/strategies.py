@@ -38,7 +38,7 @@ from core.services.signal_schedule import validate_signal_config
 router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
 # 枚举校验集合（出处：docs/system-plan-draft.md §5.3.2）
-# 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
+# 周期取 TQ 公式支持 ∩ QMT 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
 # 实盘三段式（C6）：1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；
 # 1w/1mon 桥端 xtdata 拉不到，走通达信 TQFormula.compute 启动/日终注入（见 live_engine._STARTUP_ONLY_PERIODS）。
 # 注意 60h 两端都不认（TQ periodstr error + xtdata 白名单是 1h 不是 60m）。
@@ -292,6 +292,30 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             return f"子策略[{idx}] role 必须为 {sorted(VALID_ROLES)}，收到 {s.role}"
         if s.period not in VALID_PERIODS:
             return f"子策略[{idx}] period 必须为 {sorted(VALID_PERIODS)}，收到 {s.period}"
+        # 预警调度 + 轮动/趋势参数校验（与单策略端点 _validate_strategy 同口径）。
+        # 批量路径才是「新建/编辑组合」的真实入口：缺这段会让非法配置静默落库，
+        # 下游 parse_signal_at 静默回退 14:30、portfolio_builder 静默改 20。
+        sig_msg = validate_signal_config(
+            s.period, getattr(s, "signal_frequency", None),
+            getattr(s, "signal_at", None),
+            getattr(s, "signal_weekday", None),
+            getattr(s, "signal_data_end", None),
+        )
+        if sig_msg:
+            return f"子策略[{idx}] {sig_msg}"
+        if not (1 <= s.rotation_momentum_bars <= 250):
+            return (f"子策略[{idx}] rotation_momentum_bars 须在 [1,250]，"
+                    f"收到 {s.rotation_momentum_bars}")
+        if not (0 <= s.rotation_hysteresis <= 1):
+            return (f"子策略[{idx}] rotation_hysteresis 须在 [0,1]，"
+                    f"收到 {s.rotation_hysteresis}")
+        if (s.trend_trailing_stop_ratio is not None
+                and not (0 < s.trend_trailing_stop_ratio <= 1)):
+            return (f"子策略[{idx}] trend_trailing_stop_ratio 须在 (0,1]，"
+                    f"收到 {s.trend_trailing_stop_ratio}")
+        if s.trend_max_positions is not None and s.trend_max_positions < 1:
+            return (f"子策略[{idx}] trend_max_positions 须 ≥ 1，"
+                    f"收到 {s.trend_max_positions}")
         if not (0 < s.capital_ratio <= 1):
             return f"子策略[{idx}] capital_ratio 必须在 (0,1]，收到 {s.capital_ratio}"
         # 数值字段范围校验（max_positions/开平仓比例/风控比例）

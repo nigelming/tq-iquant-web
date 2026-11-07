@@ -185,6 +185,7 @@ class ExecutionEngine:
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
         max_order_amount: Optional[Decimal] = None,
+        available_cash_cap: Optional[Decimal] = None,
     ) -> Optional[int]:
         """审批/T+1 量上限：返回最终下单量（None=不通过不下单）。
 
@@ -198,11 +199,9 @@ class ExecutionEngine:
         ≤ capital_ratio × 初始资金。缩量/拒单记 exposure_cap 闸门事件（敞口为 binding
         约束时），否则沿用 insufficient_funds/order_shrunk（现金为 binding 约束）。
 
-        策略级单笔最大买入金额（可选，None=不限）：BUY 审批通过后金额
-        （price × qty）超 max_order_amount → 缩量到该金额能买的整手股数
-        （不足 1 手拒单），记 order_amount_cap 闸门事件。仅 BUY 路径生效，
-        SELL 忽略。
-        """
+        available_cash_cap（实盘账户全貌对齐，可选，仅 BUY 生效）：非 None 时
+        现金上限取 min(账本现金, 该值)——真实账户可用资金（快照表 × 0.98 缓冲）
+        透传 approve_order.cash_override，防虚拟虚高导致柜台拒单。"""
         if order.trade_type.value == "BUY":
             lot = self._lot(order.stock_code)
             use_exposure = strategy_capital_limit is not None
@@ -214,6 +213,7 @@ class ExecutionEngine:
                 order.quantity, order.price or Decimal("0"), pos_value,
                 strategy_capital_limit_override=strategy_capital_limit if use_exposure else None,
                 lot_size=lot,
+                cash_override=available_cash_cap,
             )
             # binding 约束判定：敞口余量 < 现金 → 缩量/拒单归因于策略敞口上限
             exposure_binds = use_exposure and (
@@ -298,9 +298,16 @@ class ExecutionEngine:
             position, order.bar_time.date()
         )
         qty = min(order.quantity, available)
-        # SELL 手数随持仓（建仓时按标的类型定档：转债 10 张 / 股票 100 股）
+        # SELL 手数随持仓（建仓时按标的类型定档：转债 10 张 / 股票 100 股）。
+        # 例外：清仓且持仓本身不足一手（可转债 5 张、缩量历史残仓）——A 股允许
+        # 不足一手的余额一次性卖出，否则这类残仓永远卖不掉（可用不足的部分
+        # 仍按原逻辑拒单，保守语义不变）。
         sell_lot = position.lot_size
-        if qty < sell_lot:
+        is_odd_lot_clear = (
+            qty == position.quantity and position.quantity > 0
+            and qty < sell_lot
+        )
+        if qty < sell_lot and not is_odd_lot_clear:
             self._rec_gate(
                 "t1_insufficient", "block", order, "t1",
                 requested=order.quantity, final=qty,

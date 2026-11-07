@@ -1,4 +1,4 @@
-"""LiveEngine — 实盘端到端引擎（0009 切片4）。
+﻿"""LiveEngine — 实盘端到端引擎（0009 切片4）。
 
 定时拉 Bar（BarPoller）→ Portfolio.on_bar 取信号/风控 → HttpBridgeDispatcher 真实下单
 → 落 live_orders/live_trades。引擎核心（Portfolio/ExecutionEngine）复用回测逻辑，
@@ -11,8 +11,12 @@
 与 Account.cash，保证恢复后的持仓结构与在线时一致。虚拟现金以成本计（§93）。
 """
 import asyncio
+import functools
 import logging
+import math
 import threading
+import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -23,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from .portfolio import Portfolio
 from .position import Position
+from .format import dec_money, dec_price, fmt_price
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
 try:
@@ -39,10 +44,11 @@ except Exception:
         pass
 
     HttpBridgeDispatcher = object  # type: ignore
-from .bar_poller import BarPoller
+from .bar_poller import BarPoller, QuotePollingWindow
 # TradingCalendar 为 live 专属（仅实盘引擎及其协作者使用，回测不依赖），
 # 0010 后续迁入 live 子包；旧路径 core.engine.trading_calendar 保留 re-export shim。
 from .live.calendar import TradingCalendar
+from .live.snapshot_bars import SnapshotBarSynthesizer
 # 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
 # re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
 # 保持 core.engine.live_engine 命名空间可见。
@@ -80,16 +86,112 @@ from .live.daily_closer import DailyCloser
 from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .regime import CausalRegimeTracker
-from core.models import LiveOrder, LiveTrade, LiveDecisionEvent
+from core.models import (
+    LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveDecisionEvent,
+    LiveOrder, LiveSignal, LiveTrade,
+)
 from core.tq.formula import TQFormula
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
+
+def _finite_or_none(value):
+    """非有限浮点（inf / -inf / nan / DBL_MAX 哨兵）→ None，其它类型原样返回。
+
+    桥侧已做清洗，这里是落库/回写路径的兜底：QMT 对停牌或异常持仓会返回
+    inf（实测 601989 market_value=Infinity），一旦进库，会话详情接口的
+    json.dumps 会直接 500（Out of range float values are not JSON compliant）。
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return value
+    return num if math.isfinite(num) else None
+
+
+def _allocate_proportional(weights: list, total: int) -> list:
+    """按权重把 total 拆成整数（最大余数法），保证各项之和恰为 total。
+
+    多组合策略共享同一 QMT 账户、各维护虚拟持仓：桥只给账户合计数量，
+    镜面覆盖时按各策略既有持仓比例分摊，避免某一策略被整仓覆盖吞掉。
+    """
+    base = sum(weights)
+    if not weights or base <= 0 or total <= 0:
+        return [0 for _ in weights]
+    raw = [w * total / float(base) for w in weights]
+    alloc = [int(x) for x in raw]
+    remainder = total - sum(alloc)
+    order = sorted(range(len(weights)),
+                   key=lambda i: (raw[i] - alloc[i], weights[i]), reverse=True)
+    for i in range(remainder):
+        alloc[order[i % len(order)]] += 1
+    return alloc
+
+
+def _position_code(row) -> str:
+    """真实持仓行的代码归一：symbol 优先，桥通道回退 instrument+exchange。
+
+    TDX/THS 的 get_positions 返回带后缀 symbol；QMT/掘金桥 /positions 行
+    没有 symbol，只有 instrument（601827）与 exchange（SH）。只认 symbol
+    会让导入/快照把全部行静默丢掉（2026-11-06 实证：桥 15 只持仓、导入 0 只、
+    工作台持仓表为空）。口径与 _intraday_reconcile_diffs/_reconcile_positions
+    一致：instrument.exchange。
+    """
+    if not isinstance(row, dict):
+        return ""
+    code = str(row.get("symbol") or "").strip()
+    if code:
+        return code
+    inst = str(row.get("instrument") or "").strip()
+    exch = str(row.get("exchange") or "").strip()
+    if inst and exch:
+        return "%s.%s" % (inst, exch)
+    return ""
+
+
+def _position_cost(row, volume: int) -> Decimal:
+    """导入仓成本价：行内 cost 优先，其次 market_value/volume，都没有 → 0（未知）。
+
+    桥 /positions 自 2026-11-06 起补 cost 字段（QMT 持仓均价）；旧桥或不给
+    cost 的通道回退「市值 ÷ 股数」。两者都拿不到（停牌票 QMT 市值返回
+    Infinity → _safe_num 归一成 None）时返回 Decimal("0") 表示**成本未知**：
+    调用点打节流 WARN，风控 check_stop_loss/take_profit 见 avg_cost<=0 直接
+    跳过（不再以 0 做分母抛 Decimal DivisionByZero）。
+    """
+    try:
+        cost = Decimal(str(row.get("cost") or 0))
+    except Exception:  # noqa: BLE001
+        cost = Decimal("0")
+    if cost > 0:
+        return cost
+    try:
+        mv = Decimal(str(row.get("market_value") or 0))
+        vol = Decimal(int(volume))
+    except Exception:  # noqa: BLE001
+        return cost
+    if mv > 0 and vol > 0:
+        return mv / vol
+    # QMT 对个别长持仓会给负的合并成本（分红/送转后成本为负，实测 300413/300722），
+    # 负值同样视为「未知」返回 0，避免风控拿负成本做分母。
+    return cost if cost > 0 else Decimal("0")
+
+
 # 深交所收盘时点（上海 15:00）。收盘后禁止新下单——报不进交易所，会成待报单
 # 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
 # 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
 _MARKET_CLOSE_TIME = (15, 0)
+# 盘中持仓对账节流（秒）：快照采集 5s/60s 级，对账判定 5 分钟一次足够
+_INTRADAY_RECONCILE_INTERVAL = 300.0
+# 展示层事件去重表上限（条）：同一 (bar_time, 组合, 策略, 票, 闸门/信号) 只推一次，
+# 溢出按插入序淘汰最旧，长跑会话不无限增长（不参与任何交易判断）。
+_EVENT_DEDUPE_MAX = 5000
+# D 恢复期告警阈值：一次 recover 重建的 deferred 日线单超过该条数 → risk 事件提示
+# 人工确认（不阻断启动）。正常单日单组合是「几只票 × 一个方向」级别，两位数意味着
+# 日线轮被重复驱动或旧版本重复行未清理（2026-11-04 实证 6 条重复止损卖单）。
+DEFERRED_RECOVER_ALERT_THRESHOLD = 10
 # _DAILY_CLOSE_TIME(14:30) / _MARKET_CLOSE_SWEEP_TIME(15:05) 与日终/收盘编排一并
 # 迁入 core.engine.live.daily_closer.DailyCloser（0010 步骤 5）；收盘新落单拦截仍留
 # 本模块（_MARKET_CLOSE_TIME，_handle_bar 内按 bar_time 判定）。
@@ -126,11 +228,50 @@ class LiveEngine:
         # 外部信号注入（0011）：通达信条件预警文件路径。None=不启用；非空=建
         # ExternalSignalFileSource，_tick_main 每轮增量读取并经 _handle_bar 全套注入。
         signal_file_path: Optional[str] = None,
+        # 盘中 1m 数据源（快照合成）：None=不启用（K 线轮询原行为）。TQ 通道
+        # （tdx/ths/alert）盘中分钟 K 线只到上一交易日，快照合成器随 deals 节拍
+        # 采样、经 SnapshotQuoteDispatcher 供 poller 读取。
+        snapshot_synth: Optional[SnapshotBarSynthesizer] = None,
+        # 账户全貌对齐：engine_key（快照表落库标记）、account_snapshot_interval
+        # （采集节拍秒，0=禁用；live_service 按通道传 5/60）、pool_codes_by_portfolio
+        # （组合→股票池代码集，外部持仓归属匹配用）。
+        engine_key: str = "",
+        account_snapshot_interval: float = 0.0,
+        pool_codes_by_portfolio: Optional[Dict[int, set]] = None,
+        # 行情轮询窗口（config.live.quote_polling）：交易日窗口外（15:05 收盘后 /
+        # 次日 09:15 前 / 非交易日）完全停 BarPoller.poll()，消除收盘后对掘金桥
+        # /quote 与通达信 TQ 的无谓压力。None → 安全默认（窗口 09:15–15:05，收盘后停）。
+        quote_polling: Optional[Dict] = None,
     ):
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
         self._calendar = trading_calendar or TradingCalendar(dispatcher.query_calendar)
         self._bar_poller = bar_poller
+        # 行情轮询窗口：窗口外整轮停行情拉取（账户快照/成交回填/收盘清扫不受影响）
+        self._quote_polling = QuotePollingWindow.from_config(quote_polling)
+        # 暂停状态标记：只在进入/退出暂停时各打一条 INFO，避免每 tick 刷屏
+        self._quote_poll_paused = False
+        # 快照合成器（盘中 1m 数据源，TQ 通道专用；None=不启用）
+        self._snapshot_synth = snapshot_synth
+        # 账户全貌对齐（快照采集 + 外部持仓导入 + BUY 资金对齐）
+        self._engine_key = engine_key
+        self._acct_snap_interval = account_snapshot_interval
+        self._last_acct_capture = 0.0
+        self._last_intraday_reconcile = 0.0
+        self._latest_account_cash: Optional[Decimal] = None
+        self._pool_codes_by_portfolio = pool_codes_by_portfolio or {}
+        # 池外持仓上报去重（同一批代码只报一次，避免 5s 节拍刷屏）
+        self._out_of_pool_reported: set = set()
+        # 无可归属组合策略的跳过上报去重（同批代码只报一次；配置恢复后重置）
+        self._no_attr_reported: set = set()
+        # 零股残行跳过日志去重：首次出现/N 变化报 INFO，其余同值降 DEBUG
+        # （None=上次无零股行，再次出现按首次报 INFO）
+        self._zero_skipped_reported: Optional[int] = None
+        # 真实持仓行缺可用代码（symbol/instrument+exchange 都没有）的告警去重：
+        # 一次采集节拍报一次 WARN，恢复后重置，避免 5s/60s 刷屏
+        self._no_code_rows_reported = False
+        # 导入仓成本未知（桥未给 cost 且市值不可用）的告警去重：每代码一次
+        self._no_cost_warned: set = set()
         # 协作者共享状态容器（0010 步骤 2a）：session_id/portfolios/dispatcher/
         # db_session_factory/code_period_count/clock 归 EngineContext，引擎上的同名
         # 属性保留为 property 委托（见类体下方），调用点与测试直连无需改动。
@@ -192,6 +333,12 @@ class LiveEngine:
         # trading_session（full/am/pm）时段闸：每组合每日首次跳过记 1 条决策
         # 事件防刷屏（内存 set 按 (portfolio_id, date)，Core 重启重记无碍）。
         self._session_skip_recorded: set = set()
+        # 事件级去重（进度/推送噪声收敛，不影响交易决策与下单）：
+        # daily_closer 用同一份日线快照依次驱动 1d/1w/1mon，每次 _handle_bar 都对
+        # 全部持仓跑风控 → 同一 (bar_time, 票, 规则) 的 decision/signal 会重复三轮。
+        # 落单侧已有 deferred/在途/同 bar 同向去重，这里只收敛「决策事件落库 +
+        # SSE 推送」。键含 bar_time，跨 bar 天然不同；上限按插入序淘汰防长跑膨胀。
+        self._emitted_event_keys: "OrderedDict[tuple, None]" = OrderedDict()
         # B-1 未来函数闸门（对齐回测）：日线级信号当日不下单，订单暂存此内存队列，
         # 次一交易日首 bar（bar_time.date() 严格小于当前 bar 日期）放行重走提交链。
         # 已知限制：队列仅内存，Core 重启即丢（信号边沿去重不会重发，无感知），
@@ -265,7 +412,8 @@ class LiveEngine:
         # 终态同步、陈旧单失效、filled apply 归 OrderStateMachine。持有 _pending_orders/
         # _last_backfill_time。事件发射经 self._emit 回调注入（不反向 import LiveEngine）。
         # 引擎保留全部同名方法/属性为薄委托，既有测试直连穿透。
-        self._order_machine = OrderStateMachine(self.ctx, self._emit)
+        self._order_machine = OrderStateMachine(
+            self.ctx, self._emit, resolve_attribution=self._resolve_attribution)
         # 熔断编排协作者（0010 步骤 4）：每 bar update_peak/max_drawdown、日终 daily_loss、
         # 计数持久化、3 次转手动、手动恢复、重启读回归 BreakerService。持有 _breaker_count_written。
         # 事件发射经 self._emit 回调注入（不反向 import LiveEngine）。引擎保留同名薄委托。
@@ -332,6 +480,10 @@ class LiveEngine:
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
         self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_online = True
+        # 存活监控信号（进程内 watchdog 读）：主循环每轮起始刷新心跳；start 记录
+        # 启动时刻用于预热宽限。仅两个赋值，不增加任何 TQ/桥调用。
+        self._started_at: Optional[datetime] = None
+        self._last_tick_at: Optional[datetime] = None
         # 三个幂等日期标记已迁入 self._closer（DailyCloser，0010 步骤 5）；下列赋值经
         # 同名 property 委托穿透到 closer 字段（初始化为 None，与 closer 默认一致）。
         self._last_daily_date = None
@@ -347,8 +499,10 @@ class LiveEngine:
         # 已迁入 self._breaker（BreakerService，0010 步骤 4）；引擎保留同名可读写
         # property 委托（recover 直接赋值 self._breaker_count_written[pid]=n、测试直连
         # engine._breaker_count_written 穿透到同一份字典）。
-        # D3：recover 对账结果——虚拟持仓 vs 桥 /positions 按 code 比对的差异列表
-        # （{code, virtual, real, diff}）。只记录/告警，不自动修正账面（首期安全）。
+        # D3：最近一次对账结果——虚拟持仓 vs 真实持仓按 code 比对的差异列表
+        # （{code, virtual, real, diff, computed_at}）。只记录/告警，不自动修正账面
+        # （首期安全）；recover/收盘复查/每轮账户采集导入后都会重算（见
+        # _set_reconcile_mismatches）。
         self._reconcile_mismatches: List[dict] = []
         # I-7：收盘复查对账的幂等日期标记（每交易日一次，见 _maybe_reconcile_after_close）
         self._last_reconcile_date: Optional[date] = None
@@ -517,6 +671,20 @@ class LiveEngine:
         self._closer.last_close_sweep_date = value
 
     # ---------------- B5 SSE 事件流（委托 EventBus，0010 步骤 1）----------------
+    def _first_emit_for_key(self, key: Optional[tuple]) -> bool:
+        """同键事件只放行一次（key=None 不去重，用于无 bar_time 的事件）。
+
+        仅用于展示层收敛（decision/signal 落库与 SSE），不参与任何交易闸门。
+        """
+        if key is None:
+            return True
+        if key in self._emitted_event_keys:
+            return False
+        self._emitted_event_keys[key] = None
+        while len(self._emitted_event_keys) > _EVENT_DEDUPE_MAX:
+            self._emitted_event_keys.popitem(last=False)
+        return True
+
     def _emit(self, event_type: str, payload: dict) -> None:
         """向所有 SSE 订阅队列广播（委托 EventBus.emit，线程安全语义见 event_bus）。"""
         self._emit_file_handoff(event_type, payload)
@@ -557,8 +725,8 @@ class LiveEngine:
     # 缓存（_preheat_cache/signal_cache）归服务所有。保留同名入口让既有调用点与测试直连
     # （engine._preheat()、engine._get_bars_with_increment(...)、LiveEngine._bars_to_formula_df(...)
     # 等）无需改动，纯搬移不改行为。
-    def _preheat(self) -> None:
-        self.market_data.preheat()
+    def _preheat(self, only_missing: bool = False) -> None:
+        self.market_data.preheat(only_missing=only_missing)
 
     def _make_cache_entry(self, bars: list, count: int) -> dict:
         return self.market_data._make_cache_entry(bars, count)
@@ -584,6 +752,8 @@ class LiveEngine:
         if self._running:
             return
         self._running = True
+        self._started_at = now_shanghai()
+        self._last_tick_at = self._started_at
         self._stop_requested = False  # 重启支持：清掉上次 stop 的拒单闸
         # 审计 #3：捕获运行中的事件循环，供 _emit 跨线程 call_soon_threadsafe 回投。
         self._loop_ref = asyncio.get_running_loop()
@@ -612,9 +782,61 @@ class LiveEngine:
         await self._loop_ref.run_in_executor(self._executor, self._sync_startup)
         self._bar_poller.on_bar = self._on_bar
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(functools.partial(self._on_loop_done, "main"))
         # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 60s 拉 bar 一起）
         if self.execution_mode != "alert":
             self._deals_task = asyncio.create_task(self._deals_loop())
+            self._deals_task.add_done_callback(functools.partial(self._on_loop_done, "deals"))
+
+    def _on_loop_done(self, name: str, task: asyncio.Task) -> None:
+        """循环任务死亡监控（防 2026-11-03 08:54 式静默僵死）。
+
+        生产实证（2026-11-03）：``_loop`` 任务被 CancelledError 静默杀死
+        （非 stop 路径——stop 先置 ``_running=False`` 再 cancel），引擎从此
+        零 tick：当日 deferred 单永不放行、盘中风控停摆，且无任何日志。
+        本回调分类处置：
+
+        - cancelled 且 ``_running=False`` → 正常 stop，静默；
+        - cancelled 且 ``_running=True`` → 异常死亡 → WARNING + 自愈重启；
+        - 异常退出（``task.exception()`` 非 None）→ CRITICAL + 自愈重启；
+        - 无异常退出（while 条件意外转假）→ WARNING + 自愈重启。
+
+        注：SystemExit/KeyboardInterrupt 在 tick 内逃逸会直接杀死整个事件
+        循环（CPython Task.__step 对 BaseException 子类 set_exception 后
+        re-raise 进 loop.run_forever）——那是进程级崩溃（uvicorn 退出，必然
+        可见），不属于本监控的静默僵尸范畴。done-callback 在事件循环线程
+        执行，create_task 安全；name 由 partial 按任务绑定（main/deals
+        双循环并发死亡不串标）。
+        """
+        if task.cancelled():
+            if not self._running:
+                return
+            logger.warning(
+                "%s loop task cancelled unexpectedly while running "
+                "(session %s) — auto-restart",
+                name, self.session_id,
+            )
+        else:
+            exc = task.exception()
+            if exc is not None:
+                logger.critical(
+                    "%s loop task died with %r (session %s) — auto-restart",
+                    name, exc, self.session_id,
+                )
+            else:
+                logger.warning(
+                    "%s loop exited unexpectedly (session %s) — auto-restart",
+                    name, self.session_id,
+                )
+        if not self._running:
+            return
+        coro = self._loop if name == "main" else self._deals_loop
+        new_task = asyncio.create_task(coro())
+        new_task.add_done_callback(functools.partial(self._on_loop_done, name))
+        if name == "main":
+            self._task = new_task
+        else:
+            self._deals_task = new_task
 
     def _sync_startup(self) -> None:
         """start() 的一次性同步重活（I-6：在主 executor worker 线程执行）。
@@ -637,7 +859,7 @@ class LiveEngine:
         stop() 经主 executor 执行本方法（I-5）：close 排队于在途 tick 之后——
         在途 tick 持 get_tdx_lock 跑完后 close 自然获得锁，事件循环不被 TDX
         退订对账阻塞。TdxTqDispatcher.close 做行情退订对账；其余通道 close 为
-        轻量/无操作；iQuant 桥无 close 则跳过。失败仅告警，不阻断停止流程。
+        轻量/无操作；QMT 桥无 close 则跳过。失败仅告警，不阻断停止流程。
         """
         close = getattr(self._dispatcher, "close", None)
         if callable(close):
@@ -652,7 +874,7 @@ class LiveEngine:
         在途集合以 DB 为准（submitted/partial，与 poll_deals/sync_pending_orders 同一
         口径；_pending_orders 缓存的 ORM 实例可能已随原 session 关闭而 detached）：
         有 order_ref → 尽力 ``dispatcher.cancel_order(ref, code)``（复用 A-1 撤单；
-        异常吞并计数）；通道不支持撤单（如 iQuant 桥）或单无 order_ref → 计入风险汇总。
+        异常吞并计数）；通道不支持撤单（如 QMT 桥）或单无 order_ref → 计入风险汇总。
         停止后不再有轮询收敛这些单，撤单失败/无 ref 的部分汇成**一条**
         risk 事件（中文，工作台事件日志可见），提示人工核对柜台委托。
         """
@@ -760,11 +982,15 @@ class LiveEngine:
         # 之后若再有同步直调 _emit（测试 / 外部），走「无 loop」直接 put_nowait 路径。
         self._loop_ref = None
         self._event_bus.clear_loop()
-        # B-1：停会话丢弃 deferred 日线信号订单（预期行为——未提交的信号不跨会话补发）。
+        # B-1：停会话丢弃内存 deferred 队列——但 deferred 单已持久化
+        # （status=deferred，2026-11-04 起），新会话 recover 会重建队列并
+        # 在次日首 bar 放行执行（止损/信号单跨会话不丢）。
         # I-3（终审）：清空条数记 info 日志，留运行痕迹。
         if self._signal_bar_deferred:
             logger.info(
-                "stop: drop %d deferred daily-signal order(s) (session %s)",
+                "stop: %d deferred daily-signal order(s) kept in DB "
+                "(status=deferred), next session recover will restore "
+                "(session %s)",
                 len(self._signal_bar_deferred), self.session_id,
             )
         self._signal_bar_deferred.clear()
@@ -820,15 +1046,79 @@ class LiveEngine:
                 logger.exception("live loop executor error")
             await asyncio.sleep(self._poll_interval)
 
+    # ---------------- 行情轮询窗口（收盘后停拉行情）----------------
+    def _quote_poll_active(self, now: datetime) -> bool:
+        """now 时刻是否允许行情轮询：交易日 + 轮询窗口内。
+
+        enabled=False（显式关窗）→ 永远允许（等价旧行为：全天轮询，非交易日也轮）。
+        """
+        window = self._quote_polling
+        if not window.enabled:
+            return True
+        return self._calendar.is_trading_day(now.date()) and window.is_open(now)
+
+    def _enter_quote_poll_pause(self, now: datetime) -> None:
+        """进入轮询暂停：只在状态跳变时调用一次（不按 tick 刷屏）。"""
+        if not self._calendar.is_trading_day(now.date()):
+            reason = "非交易日"
+        else:
+            reason = "已过收盘轮询截止 %s" % self._quote_polling.pause_time.strftime("%H:%M")
+        next_at = self._quote_polling.next_resume_at(now, self._calendar.is_trading_day)
+        next_text = next_at.strftime("%Y-%m-%d %H:%M") if next_at else "下一交易日"
+        logger.info(
+            "行情轮询已暂停（会话 %s）：%s，下次恢复 %s；账户快照/成交回填/收盘清扫照常",
+            self.session_id,
+            reason,
+            next_text,
+        )
+        # 状态跳变同步发 risk 事件（SSE 可见）；调用方以 _quote_poll_paused 保证只发一次。
+        self._emit("risk", {
+            "rule": "quote_polling_paused",
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "reason": reason,
+            "next_resume_at": next_at.strftime("%Y-%m-%d %H:%M") if next_at else None,
+            "message": "行情轮询已暂停：%s，下次恢复 %s；快照/成交回填/收盘清扫照常"
+                       % (reason, next_text),
+        })
+
+    def _leave_quote_poll_pause(self, now: datetime) -> None:
+        """退出轮询暂停（恢复）：打边界守护 + 预热（仅补缺失缓存，不重拉历史）。"""
+        if hasattr(self._bar_poller, "mark_resume_boundary"):
+            # 无水位的新代码（暂停期扩池）只建基线；恢复当日之前的 bar 一律不触发
+            self._bar_poller.mark_resume_boundary(now.date())
+        started = time.perf_counter()
+        try:
+            self._preheat(only_missing=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("恢复行情轮询预热失败（会话 %s）", self.session_id)
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "行情轮询已恢复（会话 %s，%s）：预热 %.1fs（仅补缺失缓存，不重拉历史）",
+            self.session_id, now.strftime("%H:%M:%S"), elapsed,
+        )
+        # 状态跳变同步发 risk 事件（SSE 可见）；调用方以 _quote_poll_paused 保证只发一次。
+        self._emit("risk", {
+            "rule": "quote_polling_resumed",
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "resumed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "preheat_seconds": round(elapsed, 1),
+            "message": "行情轮询已恢复：进入 %s 窗口，已预热缺失行情"
+                       % self._quote_polling.resume_time.strftime("%H:%M"),
+        })
+
     def _tick_main(self) -> None:
         """_loop 单轮同步体（在 worker 线程执行）：心跳 → poll → 日终。
 
         异常在此捕获（非 CancelledError）——与原 _loop 行为一致：记日志不外抛，
         下一轮继续。BridgeUnavailableError → 置离线，本轮跳过。
         """
+        now = now_shanghai()
+        self._last_tick_at = now  # 存活心跳（进程内 watchdog 读）
         try:
             if self.execution_mode == "alert":
-                self._tick_alert()
+                self._tick_alert(now)
                 return
             # E8：心跳前的在线状态，用于离线→在线转场时重建基线
             was_online = self._bridge_online
@@ -844,15 +1134,29 @@ class LiveEngine:
                 # （断档超 10 根）。清空后下次 _get_bars_with_increment 走"缓存未命中"
                 # 全量拉 code_period_count 根重建——异常路径自愈，不污染正常增量路径。
                 self._preheat_cache.clear()
+                # 快照合成器同步重置：丢弃断线期 forming 态与差分基线
+                if self._snapshot_synth is not None:
+                    self._snapshot_synth.reset()
                 logger.info(
                     "bridge back online, reset poller baseline + preheat cache (session %s)",
                     self.session_id,
                 )
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
-            self._bar_poller.poll()
-            # 0011 外部信号注入：poll 之后增量读取通达信条件预警文件，公式名匹配
-            # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
-            self._tick_external_signals()
+            # 行情轮询窗口（收盘后停拉行情）：窗口外（交易日 15:05 后 / 次日 09:15 前 /
+            # 非交易日）整轮不拉行情、不注入外部信号——这是收盘后对掘金桥 /quote
+            # 与 TQ 压力最大的来源。暂停期间以下链路照常：心跳、账户快照采集与
+            # 对账导入（_tick_deals）、超时收割/日终/收盘清扫/收盘对账复查。
+            if self._quote_poll_active(now):
+                if self._quote_poll_paused:
+                    self._quote_poll_paused = False
+                    self._leave_quote_poll_pause(now)
+                self._bar_poller.poll()
+                # 0011 外部信号注入：poll 之后增量读取通达信条件预警文件，公式名匹配
+                # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
+                self._tick_external_signals()
+            elif not self._quote_poll_paused:
+                self._quote_poll_paused = True
+                self._enter_quote_poll_pause(now)
             # P2：超时检查移主循环——deals 循环被 60s 主循环饿死（单 worker 串行，
             # 主循环拉 ~73 只行情耗 50-57s/轮），180s 超时实际 440s 才跑到。移到主循环
             # 60s 节拍，最坏 60s 延迟。#1 修复后受理即丢弃已即时 rejected，此超时退为
@@ -920,7 +1224,7 @@ class LiveEngine:
 
         步骤：
         1. 同代码去重（source._seen_codes，本日已处理直接跳过）；
-        2. 代码归一 6 位 → 带后缀（920718 → 920718.SH，通达信口径）；
+        2. 代码归一 6 位 → 带后缀（920718 → 920718.BJ，北交所新股段；通达信口径）；
         3. 公式名精确匹配（ctx.formula_name == sig["formula_name"]；一个公式名
            可命中多策略=复制交易，逐策略各注入一次）；
         4. 命中即占去重名额；满槽（已持仓数 >= max_positions）或该股票已持仓
@@ -1148,6 +1452,30 @@ class LiveEngine:
         收割、收盘清扫真并发，整段记账持 _book_lock 串行化。
         """
         try:
+            # 快照采样（盘中 1m 数据源）：deals 节拍 5s、独立池不占主 worker；
+            # 采样失败仅告警，不影响本轮回填主职责。滚动完成在 sample 内部
+            # （门控关闭也执行），主循环 poll() 经适配器读取。
+            if self._snapshot_synth is not None:
+                try:
+                    self._snapshot_synth.sample(now_shanghai())
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "snapshot synth sample error (session %s)", self.session_id)
+            # 账户全貌快照采集（per-channel 节流）：落库 + 外部持仓导入 +
+            # 真实可用资金缓存。失败仅告警——辅助链路不阻断回填主职责。
+            if self._acct_snap_interval > 0:
+                nowm = time.monotonic()
+                if nowm - self._last_acct_capture >= self._acct_snap_interval:
+                    self._last_acct_capture = nowm
+                    db_cap = self._db_session_factory()
+                    try:
+                        self._capture_account_snapshot(db_cap)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "account snapshot capture error (session %s)",
+                            self.session_id)
+                    finally:
+                        db_cap.close()
             with self._book_lock:
                 self._consume_execution_receipts()
                 converged_ids = self._poll_deals() or []
@@ -1163,6 +1491,680 @@ class LiveEngine:
                     self._requote_after_cancel_converged(converged_ids)
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
+
+    # ---- 账户全貌对齐（快照采集 / 外部持仓导入 / 资金对齐）----
+
+    def _read_account_overview(self):
+        """统一读取真实账户：positions 三通道同形状（symbol/volume/available/
+        cost/market_value），asset 有则附（TDX get_asset / THS get_account；
+        QMT 桥缺资产端点 → 空 dict，现金对齐自动降级虚拟口径）。
+        读取失败返回 None（本轮跳过）。"""
+        d = self._dispatcher
+        pos_fn = getattr(d, "get_positions", None)
+        if not callable(pos_fn):
+            pos_fn = getattr(d, "query_positions", None)
+        if not callable(pos_fn):
+            return None
+        try:
+            positions = pos_fn()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "account snapshot positions read failed (session %s)",
+                self.session_id, exc_info=True)
+            return None
+        if positions is None:
+            # 通道读失败（未登录/验证码/切页失败）≠ 真空仓：跳过本轮快照，
+            # 否则会被当成 real=0 触发假对账差异（2026-11-06 实证）。
+            logger.warning(
+                "account snapshot positions unavailable (session %s): %s",
+                self.session_id, getattr(d, "last_error", "") or "unknown")
+            return None
+        if not isinstance(positions, list):
+            positions = []
+        asset = {}
+        asset_fn = getattr(d, "get_asset", None)
+        if not callable(asset_fn):
+            asset_fn = getattr(d, "get_account", None)
+        if callable(asset_fn):
+            try:
+                raw = asset_fn()
+                if isinstance(raw, dict):
+                    asset = raw
+                elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+                    asset = raw[0]
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "account snapshot asset read failed (session %s)",
+                    self.session_id, exc_info=True)
+        return asset, positions
+
+    def _capture_account_snapshot(self, db: Session) -> None:
+        """采集真实账户全貌：落快照表 + 缓存真实可用资金 + 导入外部持仓 + 清理。
+
+        同时持久化移动止损峰值（highest_price）：写入 = max(上次快照记录,
+        当前虚拟账本峰值)；恢复 = 上次记录 > 账本峰值（重启丢峰）时还原——
+        移动止损基准跨重启单调，不从启动价重新起算。"""
+        read = self._read_account_overview()
+        if read is None:
+            return
+        asset, positions = read
+        # 复用本轮真实持仓回读结果作为 live_service.engine_external_positions 的
+        # 60s TTL 缓存：快照线程已每 60s 读一次真实持仓，/positions 请求不应再
+        # 独立等一次 GUI 读表（THS 单次 6-10s，冷读会顶到前端 20s 超时）。
+        try:
+            self._external_pos_cache = (time.monotonic(), positions)
+        except Exception:  # noqa: BLE001
+            pass
+        now = now_shanghai()
+        # 上一份快照的峰值（跨重启恢复源）
+        prev_peaks: Dict[str, Decimal] = {}
+        last_snap = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == self.session_id)
+            .order_by(LiveAccountSnapshot.captured_at.desc(),
+                      LiveAccountSnapshot.id.desc())
+            .first()
+        )
+        if last_snap is not None:
+            for p in (last_snap.positions or []):
+                if p.highest_price is not None:
+                    prev_peaks[p.stock_code] = Decimal(str(p.highest_price))
+        # 全部策略 ctx 的峰值查找表（虚拟账本当前值）
+        ctx_peaks: Dict[str, Decimal] = {}
+        for port in self.ctx.portfolios:
+            for ctx in (getattr(port, "strategies", None) or []):
+                for code, pos in (getattr(ctx, "positions", None) or {}).items():
+                    hp = getattr(pos, "highest_price", None)
+                    if hp and hp > ctx_peaks.get(code, Decimal("0")):
+                        ctx_peaks[code] = hp
+        snap = LiveAccountSnapshot(
+            live_session_id=self.session_id,
+            engine=self._engine_key or "unknown",
+            captured_at=now,
+            total_asset=_finite_or_none(asset.get("total_asset")),
+            available_cash=_finite_or_none(asset.get("available")),
+            market_value=_finite_or_none(asset.get("market_value")),
+        )
+        for r in positions:
+            if not isinstance(r, dict):
+                continue
+            code = _position_code(r)
+            prev_hp = prev_peaks.get(code)
+            cur_hp = ctx_peaks.get(code)
+            effective_hp = max(
+                (h for h in (prev_hp, cur_hp) if h is not None),
+                default=None,
+            )
+            # QMT 会对停牌/异常持仓返回 inf/nan/DBL_MAX（实测 601989 市值 inf）：
+            # 直接落库会让会话详情 JSON 序列化 500，这里先归一为 None。
+            volume = _finite_or_none(r.get("volume"))
+            avail_qty = _finite_or_none(r.get("available"))
+            cost = _finite_or_none(r.get("cost"))
+            mv = _finite_or_none(r.get("market_value"))
+            snap.positions.append(LiveAccountPositionSnapshot(
+                stock_code=code,
+                quantity=int(volume or 0),
+                available_quantity=int(avail_qty) if avail_qty is not None else None,
+                cost_price=Decimal(str(cost)) if cost is not None else None,
+                market_value=Decimal(str(mv)) if mv is not None else None,
+                highest_price=effective_hp,
+            ))
+            # 账本峰值低于历史记录（重启丢峰）→ 还原（只升不降语义安全）
+            pos = None
+            for port in self.ctx.portfolios:
+                for ctx in (getattr(port, "strategies", None) or []):
+                    p = (getattr(ctx, "positions", None) or {}).get(code)
+                    if p is not None and p.quantity > 0:
+                        pos = p
+                        break
+            if pos is not None and effective_hp and effective_hp > (pos.highest_price or Decimal("0")):
+                pos.update_high(effective_hp)
+        db.add(snap)
+        avail = _finite_or_none(asset.get("available"))
+        if avail is not None:
+            try:
+                self._latest_account_cash = Decimal(str(avail))
+            except Exception:  # noqa: BLE001
+                pass
+        # 问题 6（2026-11-06 定稿）：先把桥 /positions 的数量/成本镜面覆盖到
+        # 已存在的虚拟持仓（覆盖不累加），再导入账本缺失的代码。顺序不能反：
+        # 先导入会把「已有仓」当新仓重复写入，先覆盖才能让对账差异归零
+        # （归零路径是快照覆盖，不是再 apply 一次成交）。
+        mirrored = self._mirror_bridge_positions(db, positions, now)
+        imported = self._import_external_positions(db, positions, now, prev_peaks)
+        # 对账面就地刷新：复用本轮已取到的真实持仓行（不再查 dispatcher），
+        # 导入完成后立刻重算当期差异——否则 API 一直挂着启动时点（导入前）
+        # 的旧照片（recover 对账先于导入，virtual=0/real=5300 会滞留一整天）。
+        # 读取/计算失败 → 不调用替换（保留上一次差异与它原来的 computed_at）。
+        diffs = None
+        try:
+            diffs = self._intraday_reconcile_diffs(db, positions)
+            self._set_reconcile_mismatches(diffs, now)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reconcile panel refresh failed (session %s)", self.session_id)
+        # 盘中持仓对账（D3 同语义：仅告警不修正；节流 5 分钟）：虚拟聚合 vs
+        # 快照真实持仓差异 → risk SSE 告警，把「收盘才发现的漂移」提前到盘中。
+        # 复用上面已算好的 diffs，避免同一轮重复查询。
+        nowm = time.monotonic()
+        if nowm - self._last_intraday_reconcile >= _INTRADAY_RECONCILE_INTERVAL:
+            self._last_intraday_reconcile = nowm
+            try:
+                if diffs is None:
+                    diffs = self._intraday_reconcile_diffs(db, positions)
+                for code, v, rr in diffs:
+                    self._emit("risk", {
+                        "session_id": self.session_id,
+                        "rule": "reconcile_intraday",
+                        "stock_code": code,
+                        "virtual": v,
+                        "real": rr,
+                        "diff": rr - v,
+                        "message": "盘中持仓对账差异 %s：虚拟=%d 真实=%d（仅告警，"
+                                   "收盘对账口径一致）" % (code, v, rr),
+                    })
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "intraday reconcile error (session %s)", self.session_id)
+        # 保留 7 天
+        db.query(LiveAccountSnapshot).filter(
+            LiveAccountSnapshot.live_session_id == self.session_id,
+            LiveAccountSnapshot.captured_at < now - timedelta(days=7),
+        ).delete()
+        db.commit()
+        if mirrored:
+            logger.info(
+                "bridge mirror applied to %d holding(s) (session %s)",
+                mirrored, self.session_id)
+        if imported:
+            logger.info(
+                "alignment import %d external position(s) (session %s)",
+                imported, self.session_id)
+
+    def _strategy_ctx_for_code(self, code: str):
+        """外部持仓归属：股票池包含该代码的组合 → 其首个策略；否则
+        首个组合的首个策略。返回 (portfolio, strategy_ctx) 或 None。"""
+        pools = self._pool_codes_by_portfolio or {}
+        for port in self.ctx.portfolios:
+            if code in (pools.get(port.portfolio_id) or ()):
+                strategies = getattr(port, "strategies", None) or []
+                if strategies:
+                    return port, strategies[0]
+        for port in self.ctx.portfolios:
+            strategies = getattr(port, "strategies", None) or []
+            if strategies:
+                return port, strategies[0]
+        return None
+
+    def _resolve_attribution(self, code: str):
+        """外部成交归属（注入 OrderStateMachine）：code -> (portfolio, strategy) id 元组。
+
+        与外部持仓导入同一口径，避免同一位代码在「持仓导入」与「成交补记」里
+        落到不同策略造成虚拟现金/持仓错位。
+        """
+        target = self._strategy_ctx_for_code(code)
+        if target is None:
+            return None
+        port, strategy_ctx = target
+        return port.portfolio_id, strategy_ctx.strategy_id
+
+    def _mirror_bridge_positions(self, db: Session, positions: list, now) -> int:
+        """以桥 /positions 镜面覆盖虚拟账本的数量/可卖/成本（覆盖不累加）。
+
+        口径（2026-11-06 定稿）：
+        - 数量/可卖一律以柜台为准；成本用券商合并均价（``m_dOpenPrice``），
+          作为止损/止盈/整仓盈亏的唯一基准。平台成交只更新 ``strategy_cost``
+          归因，不再用它反推风控基准成本；
+        - 在途单（DB submitted/partial）覆盖的代码跳过——提交到成交回填之间
+          的持仓变动由成交回填负责，此时覆盖会与在途成交方向打架；
+        - 桥没有对应行（已清仓）不强行清零：交给本地成交记录与对账收口，
+          避免桥瞬时漏行把真实持仓抹掉；
+        - 幂等：同一快照反复调用结果相同；只有实际变化才发 position 事件，
+          避免 60s 节拍把同一持仓刷屏。
+        """
+        real: Dict[str, tuple] = {}
+        for r in positions:
+            if not isinstance(r, dict):
+                continue
+            code = _position_code(r)
+            if not code:
+                continue
+            try:
+                vol = int(r.get("volume") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            try:
+                cost = _position_cost(r, vol)
+            except Exception:  # noqa: BLE001
+                cost = Decimal("0")
+            avail = _finite_or_none(r.get("available"))
+            real[code] = (max(0, vol), avail, cost)
+        if not real:
+            return 0
+        inflight = {
+            row[0] for row in db.query(LiveOrder.stock_code).filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.status.in_(["submitted", "partial"]),
+            ).all()
+        }
+        query_date = now.date() if hasattr(now, "date") else now
+        changed = 0
+        with self._book_lock:
+            for code, (vol, avail, cost) in real.items():
+                if code in inflight:
+                    continue
+                holders = []
+                for port in self.ctx.portfolios:
+                    for ctx in (getattr(port, "strategies", None) or []):
+                        pos = (getattr(ctx, "positions", None) or {}).get(code)
+                        if pos is not None and pos.quantity > 0:
+                            holders.append((port, ctx, pos))
+                if not holders:
+                    continue  # 账本无此仓 → 由 _import_external_positions 导入
+                weights = [pos.quantity for _, _, pos in holders]
+                qty_alloc = (_allocate_proportional(weights, vol)
+                             if len(holders) > 1 else [vol])
+                try:
+                    sellable = vol if avail is None else max(0, min(int(avail), vol))
+                except (TypeError, ValueError, OverflowError):
+                    sellable = vol
+                avail_alloc = (
+                    qty_alloc if sellable >= vol
+                    else _allocate_proportional(weights, sellable))
+                for i, (port, ctx, pos) in enumerate(holders):
+                    qty = qty_alloc[i]
+                    sell = min(avail_alloc[i], qty)
+                    before_qty, before_cost = pos.quantity, pos.avg_cost
+                    pos.mirror_bridge(qty, sell, cost, query_date)
+                    if pos.quantity == before_qty and pos.avg_cost == before_cost:
+                        continue
+                    changed += 1
+                    logger.info(
+                        "bridge mirror: %s %d -> %d (available=%d cost %s -> %s, "
+                        "portfolio %s strategy %s, session %s)",
+                        code, before_qty, pos.quantity, sell,
+                        before_cost, pos.avg_cost, port.portfolio_id,
+                        ctx.strategy_id, self.session_id)
+                    self._emit("position", {
+                        "portfolio_id": port.portfolio_id,
+                        "strategy_id": ctx.strategy_id,
+                        "stock_code": code,
+                        "quantity": pos.quantity,
+                        "avg_cost": float(dec_price(pos.avg_cost) or 0),
+                        "market_value": float(dec_money(pos.market_value) or 0),
+                        "pnl": 0,
+                        "reason": "bridge_mirror",
+                    })
+        return changed
+
+    def _import_external_positions(
+        self, db: Session, positions: list, now,
+        prev_peaks: Optional[Dict[str, Decimal]] = None,
+    ) -> int:
+        """真实持仓中虚拟账本缺失的代码 → 导入为对齐仓（挂主策略，纳入风控）。
+
+        幂等：虚拟已有（quantity>0）→ 跳过；在途 BUY 覆盖的代码跳过
+        （成交回填后自然进虚拟账本，重复导入会双计）。"""
+        imported = 0
+        imported_shares = 0
+        skipped_zero = 0
+        no_code = 0
+        out_of_pool = []  # [(code, volume)]：不在任何组合股票池
+        no_attr = []  # [(code, volume)]：所有组合都没有策略 → 跳过且不受风控
+        pools = self._pool_codes_by_portfolio or {}
+        for r in positions:
+            if not isinstance(r, dict):
+                continue
+            code = _position_code(r)
+            if not code:
+                # 换行/未知形状：以前在这里静默 continue（QMT 桥行只有
+                # instrument+exchange，15 只持仓被全部丢掉且无任何日志）
+                no_code += 1
+                continue
+            try:
+                vol = int(r.get("volume") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if vol <= 0:
+                # 通达信/同花顺卖出后持仓表保留 0 股残行；不得导入成虚拟持仓
+                skipped_zero += 1
+                continue
+            if pools and not any(
+                    code in (pools.get(p.portfolio_id) or ())
+                    for p in self.ctx.portfolios):
+                # 柜台持仓不在任何组合股票池：仅登记上报，归属仍走原有兜底逻辑
+                out_of_pool.append((code, vol))
+            target = self._strategy_ctx_for_code(code)
+            if target is None:
+                # 所有已加载组合都没有策略：保持跳过语义（不进账本/不参与风控），
+                # 但必须可见——否则真实仓位完全暴露于无保护状态且无任何痕迹
+                no_attr.append((code, vol))
+                continue
+            port, ctx = target
+            held = ctx.positions.get(code)
+            if held is not None and held.quantity > 0:
+                continue
+            inflight = db.query(LiveOrder).filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.stock_code == code,
+                LiveOrder.trade_type == "buy",
+                LiveOrder.status.in_(["submitted", "partial"]),
+            ).first()
+            if inflight is not None:
+                continue
+            try:
+                cost = _position_cost(r, vol)
+            except Exception:  # noqa: BLE001
+                cost = Decimal("0")
+            if cost <= 0 and code not in self._no_cost_warned:
+                # 桥未给 cost 且市值不可用（停牌票 Infinity→None）：不伪造成本，
+                # 该票止损/止盈跳过（风控 avg_cost<=0 分支），此处显式告警一次
+                self._no_cost_warned.add(code)
+                logger.warning(
+                    "import legacy positions: %s x%d has no cost "
+                    "(cost/market_value both unusable) — stop-loss/take-profit "
+                    "skipped for this holding (session %s)",
+                    code, vol, self.session_id)
+            pos = held if held is not None else Position(
+                code, lot_size=self._engine._lot(code))
+            # 与 _mirror_bridge_positions 同口径：数量/可卖/成本都以桥行镜像，
+            # 不用 pos.buy（那会把 buy_time 记成今日 → T+1 当天不可卖）。
+            try:
+                avail = _finite_or_none(r.get("available"))
+            except Exception:  # noqa: BLE001
+                avail = None
+            pos.mirror_bridge(vol, avail, cost,
+                              now.date() if hasattr(now, "date") else now)
+            # 峰值恢复：上次快照记录的历史最高价 > 成本 → 还原（移动止损基准
+            # 跨重启不丢；无记录 → 留 0，首 bar update_high(close) 初始化，
+            # 不会拿成本价当峰值误触移动止损）
+            prev_hp = (prev_peaks or {}).get(code)
+            if prev_hp and prev_hp > 0:
+                pos.update_high(prev_hp)
+            ctx.positions[code] = pos
+            imported += 1
+            imported_shares += vol
+            # 动态扩池：导入仓纳入快照合成/行情轮询 → _check_risks 才能对其
+            # 执行止损/止盈/移动止损（否则 stock_code not in bar.stocks 被跳过）
+            if self._snapshot_synth is not None:
+                try:
+                    self._snapshot_synth.add_codes([code])
+                except Exception:  # noqa: BLE001
+                    logger.exception("synth add_codes error (session %s)", self.session_id)
+            if self._bar_poller is not None and hasattr(self._bar_poller, "add_codes"):
+                try:
+                    self._bar_poller.add_codes([code])
+                except Exception:  # noqa: BLE001
+                    logger.exception("poller add_codes error (session %s)", self.session_id)
+            self._emit("alignment_import", {
+                "session_id": self.session_id,
+                "stock_code": code,
+                "quantity": vol,
+                "cost_price": float(dec_price(cost) or 0),
+                "portfolio_id": port.portfolio_id,
+                "strategy_id": ctx.strategy_id,
+                "message": "外部持仓导入：真实账户 %s ×%d（成本 %s）纳入 %d/%d 风控"
+                           % (code, vol, fmt_price(cost), port.portfolio_id,
+                              ctx.strategy_id),
+            })
+        if skipped_zero:
+            if skipped_zero != self._zero_skipped_reported:
+                logger.info(
+                    "alignment import skipped %d zero-quantity position row(s) "
+                    "(session %s)", skipped_zero, self.session_id)
+                self._zero_skipped_reported = skipped_zero
+            else:
+                # 同值重复（5s 采集节拍）降 DEBUG，避免 INFO 刷屏
+                logger.debug(
+                    "alignment import skipped %d zero-quantity position row(s) "
+                    "(session %s)", skipped_zero, self.session_id)
+        else:
+            # 零股行消失 → 重置；下次再出现按「首次」报 INFO
+            self._zero_skipped_reported = None
+        # 导入成功：可辨识的汇总日志（排障时一眼确认账本是否真写入）
+        if imported:
+            logger.info(
+                "import legacy positions: %d codes, total %d shares (session %s)",
+                imported, imported_shares, self.session_id)
+        if no_code:
+            if not self._no_code_rows_reported:
+                logger.warning(
+                    "import legacy positions: %d real position row(s) skipped, "
+                    "no usable code (symbol / instrument+exchange both empty) "
+                    "(session %s)", no_code, self.session_id)
+                self._no_code_rows_reported = True
+        else:
+            self._no_code_rows_reported = False
+        self._report_out_of_pool(out_of_pool)
+        self._report_no_attributable(no_attr)
+        return imported
+
+    def _report_out_of_pool(self, rows: list) -> None:
+        """池外持仓显式上报（不改变导入/风控行为，只让问题可见）。
+
+        现有归属逻辑 ``_strategy_ctx_for_code`` 在代码不属任何组合股票池时会
+        兜底挂到首个组合的首个策略，因此这些持仓**仍会进入虚拟账本并参与
+        风控**；本方法只负责告警 + 事件，避免"静默"。
+        """
+        codes = {c for c, _ in rows}
+        if not rows:
+            self._out_of_pool_reported = set()  # 恢复后可再次上报
+            return
+        if codes == self._out_of_pool_reported:
+            return  # 同一批池外持仓已报过，去重防 5s 刷屏
+        self._out_of_pool_reported = set(codes)
+        for code, vol in rows:
+            logger.warning(
+                "alignment import: out-of-pool position (session %s) "
+                "code=%s quantity=%d reason=不在任何组合股票池（已按兜底组合导入）",
+                self.session_id, code, vol)
+        logger.warning(
+            "alignment import: %d out-of-pool position(s) detected (session %s): %s",
+            len(rows), self.session_id, ", ".join("%s×%d" % r for r in rows))
+        quantities = {c: v for c, v in rows}
+        self._emit("risk", {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "rule": "out_of_pool_position",
+            "count": len(rows),
+            "codes": sorted(codes),
+            "quantities": quantities,
+            "message": "柜台持有但不在任何组合股票池：%s。当前已按兜底组合纳入"
+                       "虚拟持仓与风控，请确认组合归属是否正确（如需指定组合，"
+                       "请把代码加入对应股票池）。"
+                       % ", ".join("%s×%d" % r for r in rows),
+        })
+
+    def _report_no_attributable(self, rows: list) -> None:
+        """无任何可归属组合策略时的跳过上报（不改变导入行为，只让静默分支可见）。
+
+        该分支仍 ``continue`` 跳过：仓位不进虚拟账本、不参与风控、不生成卖单，
+        因此真实仓位处于「完全无风控保护」状态，必须显式告警 + SSE 事件。
+        """
+        codes = {c for c, _ in rows}
+        if not rows:
+            self._no_attr_reported = set()  # 配置恢复后可再次上报
+            return
+        if codes == self._no_attr_reported:
+            return  # 同一批已报过，去重防 5s 刷屏
+        self._no_attr_reported = set(codes)
+        for code, vol in rows:
+            logger.warning(
+                "alignment import: no attributable portfolio (session %s) "
+                "code=%s quantity=%d reason=会话无可归属组合策略，该仓位未纳入风控",
+                self.session_id, code, vol)
+        logger.warning(
+            "alignment import: %d position(s) skipped without attributable "
+            "portfolio (session %s): %s",
+            len(rows), self.session_id, ", ".join("%s×%d" % r for r in rows))
+        self._emit("risk", {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "rule": "no_attributable_portfolio",
+            "count": len(rows),
+            "codes": sorted(codes),
+            "quantities": {c: v for c, v in rows},
+            "message": "会话无可归属组合策略：%s。该仓位完全不受风控保护，"
+                       "请检查会话组合/策略配置（未导入虚拟账本，不参与风控）。"
+                       % ", ".join("%s×%d" % r for r in rows),
+        })
+
+    def _on_bridge_slow(self, endpoint: str, elapsed: float,
+                        summary: Optional[dict] = None) -> None:
+        """桥单次调用超慢阈值告警（dispatcher 回调）。
+
+        dispatcher 已按「会话」维度做窗口节流（每窗口最多一条，同一分钟内的多个
+        端点合并）：``summary`` 非空表示上一窗口内还有被节流的慢请求，字段为
+        ``{count, slowest_endpoint, slowest_elapsed_seconds, window_seconds}``。
+
+        与「桥不可达/协议错误」区分：桥在线但响应慢（进程内查询排队），
+        下单可能超时后转在途；只做观测告警，不改变交易行为。
+        """
+        summary = summary or {}
+        prev_count = int(summary.get("count") or 0)
+        message = "交易桥响应缓慢：%s 单次耗时 %.1fs" % (endpoint, elapsed)
+        if prev_count:
+            message += "；上一 %ss 窗口内另有 %d 次慢请求，最慢 %s %.1fs" % (
+                int(float(summary.get("window_seconds") or 0)),
+                prev_count,
+                summary.get("slowest_endpoint") or endpoint,
+                float(summary.get("slowest_elapsed_seconds") or 0.0),
+            )
+        message += ("。桥内查询排队，下单可能超时后转在途（等待委托回查认领），"
+                    "与桥不可达/协议错误不同。")
+        logger.warning(
+            "bridge slow response: endpoint=%s elapsed=%.2fs (session %s)%s",
+            endpoint, elapsed, self.session_id,
+            " prev_window_count=%d" % prev_count if prev_count else "",
+        )
+        self._emit("risk", {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "rule": "bridge_slow",
+            "endpoint": endpoint,
+            "elapsed_seconds": round(float(elapsed), 2),
+            "window_slow_count": prev_count,
+            "slowest_endpoint": summary.get("slowest_endpoint"),
+            "slowest_elapsed_seconds": summary.get("slowest_elapsed_seconds"),
+            "message": message,
+        })
+
+    def _volume_cap_shares(self, code: str) -> Optional[int]:
+        """最近完成 1m bar 成交量（股）——快照合成源（TDX 快照 Volume 单位=手，
+        ×100 转股，与回测 TQ K 线量纲对齐）。无合成器/无 bar → None。"""
+        if self._snapshot_synth is None:
+            return None
+        try:
+            bars = self._snapshot_synth.completed_bars([code], 2).get(code) or []
+        except Exception:  # noqa: BLE001
+            return None
+        if not bars:
+            return None
+        v = bars[-1].get("volume")
+        try:
+            return int(v) * 100
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_volume_cap(self, order, portfolio: Portfolio) -> None:
+        """成交量约束（实盘化，对齐回测 #2）：本单股数上限 = 最近完成 1m bar
+        成交量 × volume_limit_ratio。
+
+        - BUY > 上限且上限 ≥ 1 手 → 缩至整手（floor）；上限 < 1 手 → 拒单
+          （标 _volume_capped_out，下一信号重试——回测「延后至量足 bar」的实盘化）；
+        - SELL > 上限 → 缩量不取整手（A 股允许零股卖出）；上限 ≤ 0 → 放行
+          （风控卖出优先，薄量由部分成交+回填/超时链收敛）；
+        - 未启用 / 无快照量源 → 不干预（fail-open，iquant 通道量纲未标定）。
+        """
+        if not getattr(portfolio, "volume_limit_enabled", False):
+            return
+        ratio = getattr(portfolio, "volume_limit_ratio", None)
+        if not ratio or ratio <= 0:
+            return
+        bar_vol = self._volume_cap_shares(order.stock_code)
+        if not bar_vol or bar_vol <= 0:
+            return
+        cap_shares = int(ratio * Decimal(int(bar_vol)))
+        if order.quantity <= cap_shares:
+            return
+        lot = self._engine._lot(order.stock_code)
+        is_buy = order.trade_type.value == "BUY"
+        final_qty = (cap_shares // lot) * lot if is_buy else cap_shares
+        if final_qty >= lot or (not is_buy and final_qty > 0):
+            self._rec_live(
+                "volume_cap_shrink", "shrink", portfolio, order,
+                message="成交量约束：订单 %d 股 > 本 bar 上限 %d 股（成交 %d 手 ×%s），缩量至 %d 股"
+                        % (order.quantity, cap_shares, bar_vol, ratio, final_qty),
+            )
+            order.quantity = final_qty
+        elif is_buy:
+            order._volume_capped_out = True
+            self._rec_live(
+                "volume_cap", "block", portfolio, order,
+                message="成交量约束：请求 %d 股，本 bar 上限 %d 股不足一手（成交 %d 手 ×%s），BUY 拒单待重试"
+                        % (order.quantity, cap_shares, bar_vol, ratio),
+            )
+
+    def _intraday_reconcile_diffs(self, db: Session, positions: list) -> list:
+        """盘中对账差异集：(code, 虚拟聚合量, 真实量)，仅差异项。
+
+        在途单（DB submitted/partial）覆盖的代码跳过——提交到成交回填之间
+        的瞬时差异不是漂移（查 DB 而非内存 _pending_orders：重启后内存空、
+        DB 是耐久源）。导入对齐语义：导入后的仓已入虚拟账本，双方一致。"""
+        virt: Dict[str, int] = {}
+        for port in self.ctx.portfolios:
+            for ctx in (getattr(port, "strategies", None) or []):
+                for code, pos in (getattr(ctx, "positions", None) or {}).items():
+                    if pos.quantity:
+                        virt[code] = virt.get(code, 0) + pos.quantity
+        real: Dict[str, int] = {}
+        for r in positions:
+            if not isinstance(r, dict):
+                continue
+            code = _position_code(r)
+            if not code:
+                continue
+            try:
+                v = int(r.get("volume") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if v:
+                real[code] = v
+        inflight_codes = {
+            row[0] for row in db.query(LiveOrder.stock_code).filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.status.in_(["submitted", "partial"]),
+            ).all()
+        }
+        diffs = []
+        for code in sorted(set(virt) | set(real)):
+            if code in inflight_codes:
+                continue
+            v, rr = virt.get(code, 0), real.get(code, 0)
+            if v != rr:
+                diffs.append((code, v, rr))
+        return diffs
+
+    def _refresh_submit_price(self, order) -> None:
+        """提交前价格刷新：order.price 用实时最新价。
+
+        回测继承价 = 信号 bar 收盘价，跨日已过期（THS 审批价限价模式跳空
+        必不成交）。取 dispatcher 行情最新一根 bar 的 close；失败/无行情
+        fail-open 保持原价。"""
+        try:
+            bars = self._dispatcher.query_quote(
+                order.stock_code, period="1m", count=2)
+        except Exception:  # noqa: BLE001
+            return
+        if not bars:
+            return
+        close = bars[-1].get("close") if isinstance(bars[-1], dict) else None
+        try:
+            p = Decimal(str(close))
+        except Exception:  # noqa: BLE001
+            return
+        if p > 0:
+            order.price = p
 
     def _requote_after_cancel_converged(self, order_ids: list) -> None:
         """53/54 终态同步收敛的撤单 requote 挂点（deals 池；持 _book_lock 调用）。
@@ -1403,9 +2405,20 @@ class LiveEngine:
             # 离线恢复：丢弃离线期间积压的 bar/预热缓存，避免恢复首轮补发陈旧预警。
             if hasattr(self._bar_poller, "reset_baseline"):
                 self._bar_poller.reset_baseline()
+            if self._snapshot_synth is not None:
+                self._snapshot_synth.reset()
             self._preheat_cache.clear()
-        self._bar_poller.poll()
         now = now or now_shanghai()
+        # 行情轮询窗口（同 _tick_main）：收盘后/非交易日不拉行情；信号调度照常
+        # （调度是本地时点判断，不依赖行情，收盘后仍可能触发提醒执行）。
+        if self._quote_poll_active(now):
+            if self._quote_poll_paused:
+                self._quote_poll_paused = False
+                self._leave_quote_poll_pause(now)
+            self._bar_poller.poll()
+        elif not self._quote_poll_paused:
+            self._quote_poll_paused = True
+            self._enter_quote_poll_pause(now)
         if self._signal_scheduler is not None:
             for batch in self._signal_scheduler.due(now):
                 self._signal_scheduler.execute(batch)
@@ -1584,15 +2597,26 @@ class LiveEngine:
         # 1w/1mon 的 signal_cache 由注入路径提供、monitor 不重算，
         # 保留旧成单 SSE 避免前端丢信号；其余周期由 monitor 统一发。
         # 追价重下单非新信号（emit_signal=False），不重复推。
+        # 同一 (bar_time, 组合, 策略, 票, 信号) 只推一轮：daily_closer 依次驱动
+        # 1d/1w/1mon 会让同一批风控信号在 1w/1mon 各推一次（重复两轮）。
         if emit_signal and (self._signal_monitor is None or period in ("1w", "1mon")):
-            self._emit("signal", {
-                "portfolio_id": portfolio.portfolio_id,
-                "strategy_id": order.strategy_id,
-                "stock_code": order.stock_code,
-                "signal_name": order.signal_name,
-                "signal_type": order.signal_type.value if order.signal_type else None,
-                "bar_time": order.bar_time.isoformat() if order.bar_time else None,
-            })
+            sig_key = None
+            if order.bar_time is not None:
+                sig_key = (
+                    order.bar_time, portfolio.portfolio_id, order.strategy_id,
+                    order.stock_code,
+                    order.signal_type.value if order.signal_type else None,
+                    order.signal_name,
+                )
+            if self._first_emit_for_key(sig_key):
+                self._emit("signal", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "strategy_id": order.strategy_id,
+                    "stock_code": order.stock_code,
+                    "signal_name": order.signal_name,
+                    "signal_type": order.signal_type.value if order.signal_type else None,
+                    "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+                })
         # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
         # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
         # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
@@ -1639,7 +2663,41 @@ class LiveEngine:
         if (order.signal_bar_date is not None and order.bar_time is not None
                 and order.bar_time.date() <= order.signal_bar_date
                 and getattr(ctx, "risk_timing", "next_day") != "immediate"):
+            # A 源头幂等（长期防护）：同一 deferred 键只保留一行。2026-11-04 实证
+            # 日线轮被重复驱动 → 同股同向 deferred 重复落库（重复止损卖单）。已存在
+            # 同键行 → 跳过落库，打可读日志指出已存在行 id（不静默）；仅作用在
+            # deferred 落库层，不影响已提交/已成交流程。
+            dup = self._find_duplicate_deferred_row(db, order)
+            if dup is not None:
+                logger.warning(
+                    "defer duplicate skipped (session %s): portfolio=%s strategy=%s "
+                    "%s %s qty=%s signal_bar_date=%s; existing deferred row id=%s",
+                    self.session_id, order.portfolio_id, order.strategy_id,
+                    order.trade_type.value, order.stock_code, order.quantity,
+                    order.signal_bar_date, dup.id,
+                )
+                # 内部幂等提示不推给工作台（用户可见事件只保留决策/信号本身）：
+                # 同键 deferred 已由首轮 decision 事件承载，这里只留日志。
+                # 该行若尚未在内存队列（如未经 recover 的场景）则接管进队，避免
+                # 既有行既不执行也不清理；已在队则直接丢弃本次重复单。
+                if not any(getattr(o, "_deferred_row_id", None) == dup.id
+                           for o in self._signal_bar_deferred):
+                    order._deferred_row_id = dup.id
+                    self._signal_bar_deferred.append(order)
+                return
             self._signal_bar_deferred.append(order)
+            # P2 持久化：deferred 落库（status=deferred），重启 recover 重建
+            # 内存队列——否则日线级止损/信号单随重启消失、永不执行
+            # （2026-11-03 实证：止损 defer 57 次零执行）。行 id 挂单上，
+            # 放行转 submitted 时删除旧行（防同一逻辑单双行）。
+            try:
+                lo = self._persist_order_submitted(db, order, status="deferred")
+                db.commit()
+                order._deferred_row_id = lo.id
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                logger.exception(
+                    "deferred order persist failed (session %s)", self.session_id)
             self._rec_live(
                 "signal_bar_date", "defer", portfolio, order,
                 message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
@@ -1656,8 +2714,17 @@ class LiveEngine:
         # B-2 策略级敞口上限：与回测 _exposure_kwargs 完全同式透传
         # （strategy_position_value/strategy_capital_limit），多策略上限之和
         # 可超 100% 时实盘敞口不再系统性大于回测。
+        # （提交价不在此刷新：分钟级信号价=最新完成 bar 收盘（C6 刻意语义），
+        # 真正跨日过期的 deferred 放行单在 _release_signal_bar_deferred 刷新。）
+        # BUY 审批资金对齐：min(虚拟现金, 真实可用×0.98)（快照表缓存；
+        # 无快照 → None → 虚拟口径原行为）。
+        cash_cap = None
+        if self._latest_account_cash is not None:
+            cash_cap = (self._latest_account_cash * Decimal("0.98")).quantize(
+                Decimal("0.01"))
         capped = self._engine.cap_quantity(
             order, portfolio.account, pos,
+            available_cash_cap=cash_cap,
             **self._exposure_kwargs(portfolio, ctx),
         )
         if capped is None:
@@ -1667,6 +2734,11 @@ class LiveEngine:
             )
             return
         order.quantity = capped
+        # 成交量约束（实盘化，对齐回测 #2）：快照合成 bar 量 × volume_limit_ratio。
+        # BUY 薄量拒单标 _volume_capped_out → 不落库不进在途（量足后的信号重试）。
+        self._apply_volume_cap(order, portfolio)
+        if getattr(order, "_volume_capped_out", False):
+            return
         # 跨重启去重门（D6）：同 (组合/策略/股票/bar_time/方向) 已有未完结单则跳过。
         # 根因：14:30 后页面停止/再启动 = Core 重启 = 新 LiveEngine = 实例内存丢失，
         # 1d/1w/1mon 会被重新驱动到同一 bar_time，且 order_id=live_order.id（自增 PK）
@@ -1801,6 +2873,12 @@ class LiveEngine:
         if self._maybe_split_order(db, portfolio, order, ctx, period):
             return
         # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
+        # 放行的 deferred 单：删除 B-1 时落库的 deferred 旧行（防同一逻辑单双行；
+        # 行 id 随单挂在 _deferred_row_id，重启恢复重建的单无此标记）
+        _dr = getattr(order, "_deferred_row_id", None)
+        if _dr:
+            db.query(LiveOrder).filter(LiveOrder.id == _dr).delete()
+            order._deferred_row_id = None
         live_order = self._persist_order_submitted(db, order)
         self._pending_orders[live_order.id] = live_order
         # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
@@ -1819,6 +2897,15 @@ class LiveEngine:
         # THS file_builtin 入队标记：place_order 秒回 None 但指令已写入
         # 交接文件时非 None（=本单确定性 order_id）。其它通道恒 None。
         enqueued_oid: Optional[str] = None
+        # 入队标记哨兵：本次 execute 若在前置审批就失败，place_order 根本不会被调用，
+        # dispatcher 的 last_enqueued_order_id 会残留「上一单」的值。比较哨兵后
+        # 只有本次新写入的标记才算入队，避免把 approval failed 误判成已受理。
+        prev_enqueued_oid = getattr(self._dispatcher, "last_enqueued_order_id", None)
+        # 「已受理未认领」哨兵（TDX）：place_order 柜台受理成功但回查窗口内委托表
+        # 未见该单 → 返回 None 并留本单 order_id 标记。与入队哨兵同理，只有本次
+        # 新写入的标记才有效，避免残留值把 approval failed 误判成已受理。
+        prev_unconfirmed_oid = getattr(
+            self._dispatcher, "last_unconfirmed_order_id", None)
         try:
             # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
             # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
@@ -1888,12 +2975,60 @@ class LiveEngine:
             db.commit()
             return
         if trade is None:
+            # TDX：柜台已受理（ErrorId=0）但委托表暂未见该单——**保持 submitted**，
+            # 绝不能判 rejected（真实在途单会脱离跟踪：无 ref、成交不回填、无法撤，
+            # 虚拟持仓/现金与柜台脱节）。后续 poll_deals 每轮仍做 legacy 模糊认领，
+            # 最坏 180s expire 收口；SELL 先扣本 bar 可用量防同 bar 二次卖出。
+            unconfirmed_oid = getattr(
+                self._dispatcher, "last_unconfirmed_order_id", None)
+            if (unconfirmed_oid and unconfirmed_oid != prev_unconfirmed_oid
+                    and unconfirmed_oid == self._dispatcher.order_id(order)):
+                live_order.bridge_order_id = self._dispatcher.order_id(order)
+                # 受理应答已带柜台委托号（掘金 cl_ord_id）时同样受理即落库：桥的
+                # /orders 回读常常当场查不到该单（当日委托查询不含废单、桥重启丢
+                # 内存台账），不能因此丢掉唯一的精确认领键。DB 是记帐真相。
+                broker_oid = getattr(self._dispatcher, "last_broker_order_id", None)
+                if broker_oid and live_order.order_ref is None:
+                    live_order.order_ref = str(broker_oid)
+                # 原因优先取 dispatcher 的可读线索（HTTP 桥：超时/无委托标识/回查
+                # 未确认；TDX：委托表暂未见），无则回退通道无关文案。
+                live_order.error_message = (
+                    getattr(self._dispatcher, "last_unconfirmed_message", None)
+                    or "已受理未认领：委托表暂未见，等待回填/超时收口"
+                )
+                self._rec_live(
+                    "order_unconfirmed", "warn", portfolio, order,
+                    message="柜台已受理但暂未认领委托号，保持 submitted 等待回填",
+                )
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "strategy_id": live_order.strategy_id,
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "status": "submitted",
+                    "quantity": live_order.quantity,
+                    "price": float(live_order.price) if live_order.price is not None else None,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                    "error_message": live_order.error_message,
+                })
+                if order.trade_type == TradeType.SELL:
+                    self._t1_checker.consume_available(
+                        order.stock_code, order.quantity)
+                db.commit()
+                logger.warning(
+                    "order accepted but unclaimed: id=%s %s %s qty=%s (session %s)",
+                    live_order.id, order.trade_type.value, order.stock_code,
+                    live_order.quantity, self.session_id,
+                )
+                return
             # THS file_builtin：place_order 已把指令写入交接文件并秒回 None
             # → 本单已受理入队，保持 submitted 等内置执行器执行 + UI 回填
             # 链路确认成交（执行失败单由执行器落 results rejected 回执，
             # 残留 submitted 单由 180s expire 兜底标 rejected）。
             enqueued_oid = getattr(self._dispatcher, "last_enqueued_order_id", None)
-            if enqueued_oid and enqueued_oid == self._dispatcher.order_id(order):
+            if (enqueued_oid and enqueued_oid != prev_enqueued_oid
+                    and enqueued_oid == self._dispatcher.order_id(order)):
                 logger.info(
                     "order enqueued to ths handoff: id=%s %s %s qty=%s (session %s)",
                     live_order.id, order.trade_type.value, order.stock_code,
@@ -1923,6 +3058,14 @@ class LiveEngine:
                 return
         # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
         live_order.bridge_order_id = self._dispatcher.order_id(order)
+        # 受理即落柜台委托号（掘金 cl_ord_id）：DB 是记帐真相——桥进程重启会丢内存
+        # 台账（废单/已成交行当日委托查询也不回显），只有 DB 里的 order_ref 重启后仍
+        # 能精确认领；后续 /orders、/deals 均按该 ref 匹配，无需再靠模糊匹配。
+        # 注意：bridge_order_id 保持确定性 oid（其前 20 位是写进柜台的 remark 认领键），
+        # 不能被 cl_ord_id 覆盖，两者语义不同。
+        broker_oid = getattr(self._dispatcher, "last_broker_order_id", None)
+        if broker_oid and live_order.order_ref is None:
+            live_order.order_ref = str(broker_oid)
         # THS file_builtin：指令刚入队、执行器尚未真正下单，立即回查只会
         # 碰到 120s 认领窗内的同形状旧单（误绑 → 成交回填张冠李戴）。
         # ref 留 None，执行器下单后由 /deals 回填周期再定位（彼时本单是
@@ -1989,11 +3132,33 @@ class LiveEngine:
         n = min(n, order.quantity)  # 防子单 0 股（阈值极小/股数极少时）
         if n <= 1:
             return False
-        base = order.quantity // n
-        rem = order.quantity - base * n
+        # 子单量必须整手：A 股（含可转债）买卖申报为 100 股（转债 10 张）整数倍
+        # （余额不足一手一次性卖出除外）；科创板 688/689、北交所 4/8/92 允许
+        # 1 股递增，不受整手约束。原实现直接 vol//n 均分——1000 股拆 3 笔得
+        # 334/333/333，柜台按「非 100 整数倍」直接拒单，整组子单失败。
+        # 故可整手拆分时按整手均分（余数按整手补给前几笔），否则回退按股均分。
+        lot = 10 if order.stock_code[:2] in ("11", "12") else 100
+        use_lot = (
+            order.quantity % lot == 0
+            and not order.stock_code.startswith(("688", "689", "4", "8", "92"))
+        )
+        if use_lot:
+            total_lots = order.quantity // lot
+            n = min(n, total_lots)
+            if n <= 1:
+                return False
+            base_lots = total_lots // n
+            rem_lots = total_lots - base_lots * n
+            quantities = [
+                (base_lots + (1 if i < rem_lots else 0)) * lot for i in range(n)
+            ]
+        else:
+            base = order.quantity // n
+            rem = order.quantity - base * n
+            quantities = [base + (1 if i < rem else 0) for i in range(n)]
         children: List[OrderEvent] = []
-        for i in range(n):
-            child = replace(order, quantity=base + (1 if i < rem else 0))
+        for i, qty in enumerate(quantities):
+            child = replace(order, quantity=qty)
             child._split_child = True
             if child.bar_time is not None:
                 child.bar_time = child.bar_time + timedelta(milliseconds=i)
@@ -2181,11 +3346,55 @@ class LiveEngine:
                     and order.bar_time is not None
                     and order.bar_time.date() < bar_date):
                 order.bar_time = bar.bar_time
+                # 价格刷新：deferred 单的价格是信号 bar（昨日）收盘，跨日已过期
+                # ——THS 审批价限价模式跳空必不成交。刷新为实时最新价
+                # （TDX latest/QMT 对手价本就忽略该字段，仅审批口径受益）。
+                self._refresh_submit_price(order)
                 released.append(order)
             else:
                 remaining.append(order)
         self._signal_bar_deferred = remaining
         return released
+
+    def _find_duplicate_deferred_row(
+        self, db: Session, order: OrderEvent
+    ) -> Optional[LiveOrder]:
+        """A 源头幂等：查同键已存在的 deferred 落库行（无则返回 None）。
+
+        键 = (组合, 策略, 股票, 方向, signal_bar_date, 数量)。相对需求给的 4 元组
+        (portfolio_strategy_id, stock_code, trade_type, signal_bar_date) 多带
+        strategy_id 与 quantity，理由是存在合法的同日同向多笔：
+        - strategy_id：同一组合内多策略可各持同一只票，同日各自触发止损/减仓
+          （positions 按策略独立维护）。4 元组会把第二笔合法卖单误判为重复丢弃，
+          导致该策略持仓卖不掉；
+        - quantity：同策略同日分批减仓（reduce_ratio 分档止盈）需要多笔，仅按方向
+          去重会吞掉后一档。
+        重启重复驱动产生的是字段全同的同一逻辑单，仍会被拦下（2026-11-04 的 6 条
+       重复卖单即 portfolio/strategy/代码/方向/日期/数量全同）。
+
+        deferred 落库时 signal_bar_date 恒等于 bar_time 当日（defer 闸门定义），
+        故用 bar_time 当日区间查。
+        """
+        d = order.signal_bar_date
+        if d is None:
+            return None
+        start = datetime.combine(d, datetime.min.time())
+        return (
+            db.query(LiveOrder)
+            .filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.status == "deferred",
+                LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                LiveOrder.strategy_id == order.strategy_id,
+                LiveOrder.stock_code == order.stock_code,
+                LiveOrder.trade_type == order.trade_type.value.lower(),
+                LiveOrder.quantity == order.quantity,
+                LiveOrder.bar_time >= start,
+                LiveOrder.bar_time < start + timedelta(days=1),
+            )
+            .order_by(LiveOrder.id)
+            .first()
+        )
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:
         """B-2 策略级敞口上限（#3，与 BacktestEngine._exposure_kwargs 完全同式）。
@@ -2241,6 +3450,9 @@ class LiveEngine:
     def _drain_decisions(self, db, portfolio: Portfolio) -> None:
         """把本 bar 缓冲的决策闸门事件落 LiveDecisionEvent + 推 SSE，一次 commit。
 
+        同一 (bar_time, 组合, 策略, 票, 闸门, 动作, 参数) 只保留首条——daily_closer
+        用同一份日线快照依次驱动 1d/1w/1mon，风控会在每个周期重跑一遍，事件级去重
+        避免同一决策被落库/推送三轮（去重只作用于观测链路，不影响交易本身）。
         失败不影响交易主链路（仅观测）：回滚本批事件行、记异常，不抛出。
         """
         events = self._recorder.drain()
@@ -2248,6 +3460,14 @@ class LiveEngine:
             return
         try:
             for ev in events:
+                key = None
+                if ev.bar_time is not None:
+                    key = (
+                        ev.bar_time, ev.portfolio_id, ev.strategy_id,
+                        ev.stock_code, ev.gate, ev.action, ev.param_name,
+                    )
+                if not self._first_emit_for_key(key):
+                    continue
                 db.add(LiveDecisionEvent(
                     live_session_id=self.session_id,
                     gate=ev.gate,
@@ -2357,8 +3577,9 @@ class LiveEngine:
     # 下列方法为薄委托：实现已迁入 core.engine.live.order_machine.OrderStateMachine。
     # 同名方法/静态方法保留于此，既有调用点与测试直连（engine._poll_deals()、
     # engine._backfill_order(...)、engine._match_by_remark(...) 等）穿透到协作者。
-    def _persist_order_submitted(self, db: Session, order: OrderEvent) -> LiveOrder:
-        return self._order_machine.persist_order_submitted(db, order)
+    def _persist_order_submitted(self, db: Session, order: OrderEvent,
+                                 status: str = "submitted") -> LiveOrder:
+        return self._order_machine.persist_order_submitted(db, order, status=status)
 
     def _try_match_order_ref(self, live_order: LiveOrder, claimed_refs=None,
                              orders=None) -> None:
@@ -2499,6 +3720,143 @@ class LiveEngine:
         # D4：读回熔断计数（重启不丢累计次数，达 3 次转手动恢复）归 BreakerService
         # （0010 步骤 4）；预置 counts_written 避免首 bar 重复落库。
         self._breaker.restore_counts(db, ports_by_id)
+        # P2 持久化恢复：deferred 日线单重建内存队列（并删除 DB 行——转移语义，
+        # 放行时会以 submitted 重新落库）。重建失败的单记日志跳过（防坏行阻断
+        # 其余恢复）；删除后到下次落库前的崩溃窗口极小，可接受。
+        deferred_rows = db.query(LiveOrder).filter(
+            LiveOrder.live_session_id == self.session_id,
+            LiveOrder.status == "deferred",
+        ).all()
+        today = now_shanghai().date()
+        # 恢复行元快照（id/组合/策略/代码/方向/bar 日/数量）：行在 commit 时被删除，
+        # 生产 SessionLocal 为 expire_on_commit=True（删除后访问属性会报错），告警所需
+        # 字段须在 commit 前取好。
+        kept_meta: List[tuple] = []
+        stale_dropped = 0
+        for lo in deferred_rows:
+            # C 陈旧 deferred 丢弃（恢复期兜底）：bar_time 早于「昨日」的单不再执行
+            # ——多为前日及更早残留（旧版本重复驱动遗留），跨多日后放行等于拿过期
+            # 信号追单。置 canceled + 原因，不转入内存、不提交、不删行（保留审计）。
+            # 阈值 = 1 天：保住「当日 defer、次日放行」的既有语义（昨日单仍在窗口内，
+            # 恢复后由次日首 bar 正常放行）。
+            if lo.bar_time is not None and lo.bar_time.date() < today - timedelta(days=1):
+                lo.status = "canceled"
+                lo.error_message = (
+                    "stale_restart: 陈旧 deferred 单（bar_time=%s，早于 %s），"
+                    "重启恢复时丢弃" % (lo.bar_time, (today - timedelta(days=1)).isoformat())
+                )
+                stale_dropped += 1
+                logger.warning(
+                    "recover: drop stale deferred id=%s %s %s bar_time=%s "
+                    "(session %s; older than yesterday)",
+                    lo.id, lo.trade_type, lo.stock_code, lo.bar_time, self.session_id,
+                )
+                continue
+            try:
+                order = OrderEvent(
+                    strategy_id=lo.strategy_id,
+                    portfolio_id=lo.portfolio_strategy_id,
+                    stock_code=lo.stock_code,
+                    trade_type=TradeType(lo.trade_type.upper()),
+                    signal_type=(SignalType(lo.signal_type)
+                                 if lo.signal_type else SignalType.CLOSE),
+                    quantity=lo.quantity,
+                    price=lo.price,
+                    bar_time=lo.bar_time,
+                    signal_name=lo.signal_name or "",
+                    # defer 的定义即 signal_bar_date=bar_time 当日（放行条件
+                    # bar_time.date() < 当前 bar 日期由此成立）
+                    signal_bar_date=lo.bar_time.date() if lo.bar_time else None,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "deferred row rebuild failed id=%s (session %s)",
+                    lo.id, self.session_id)
+                continue
+            self._signal_bar_deferred.append(order)
+            db.delete(lo)
+            kept_meta.append((
+                lo.id, lo.portfolio_strategy_id, lo.strategy_id, lo.stock_code,
+                (lo.trade_type or "").lower(),
+                lo.bar_time.date() if lo.bar_time else None, lo.quantity,
+            ))
+        if deferred_rows:
+            db.commit()
+            logger.info(
+                "recover: %d deferred daily-signal order(s) restored (session %s); "
+                "%d stale dropped", len(kept_meta), self.session_id, stale_dropped)
+        # D 恢复期异常告警（走既有 risk 事件流；只提示人工确认，不阻断启动）：
+        # ① 重建条数超阈值：疑似日线轮被重复驱动 / 旧重复行未清理；
+        # ② 同键多行（A 幂等键穿透，旧版本遗留）：同股同向同量同日多笔，可能是重复
+        #    买卖单。分组键与 A 的去重键一致（含 strategy/quantity），避免把「同组合
+        #    多策略各自止损」「同策略分批减仓」这类合法多笔误报为异常。
+        if kept_meta:
+            if len(kept_meta) > DEFERRED_RECOVER_ALERT_THRESHOLD:
+                codes = sorted({m[3] for m in kept_meta})
+                msg = (
+                    "重启恢复发现 %d 条 deferred 日线单（阈值 %d），涉及 %s："
+                    "疑似日线轮被重复驱动或旧重复行未清理，请人工确认后继续交易"
+                    % (len(kept_meta), DEFERRED_RECOVER_ALERT_THRESHOLD, "、".join(codes))
+                )
+                logger.warning("recover: %s (session %s)", msg, self.session_id)
+                self._emit("risk", {
+                    "session_id": self.session_id,
+                    "rule": "deferred_recover_volume",
+                    "count": len(kept_meta),
+                    "threshold": DEFERRED_RECOVER_ALERT_THRESHOLD,
+                    "stock_codes": codes,
+                    "message": msg,
+                })
+            groups: Dict[tuple, List[tuple]] = {}
+            for m in kept_meta:
+                # 键 = (组合, 策略, 代码, 方向, bar 日, 数量)
+                groups.setdefault((m[1], m[2], m[3], m[4], m[5], m[6]), []).append(m)
+            for key, metas in groups.items():
+                if len(metas) < 2:
+                    continue
+                row_ids = [m[0] for m in metas]
+                msg = (
+                    "重启恢复发现同键 deferred 多行（%s %s %s 数量=%s）：row id=%s，"
+                    "疑似重复买卖单，需人工确认是否清理"
+                    % (key[2], (key[3] or "").upper(), key[4], key[5], row_ids)
+                )
+                logger.warning("recover: %s (session %s)", msg, self.session_id)
+                self._emit("risk", {
+                    "session_id": self.session_id,
+                    "rule": "deferred_recover_duplicate",
+                    "stock_code": key[2],
+                    "trade_type": (key[3] or "").upper(),
+                    "bar_date": key[4].isoformat() if key[4] else None,
+                    "quantity": key[5],
+                    "count": len(metas),
+                    "row_ids": row_ids,
+                    "message": msg,
+                })
+        # 日切幂等跨重启：当日日线信号已落库 → 恢复 DailyCloser 内存标记，
+        # 防启动重驱动当日日线轮重复 defer/trigger（2026-11-03 实证 57 条重复）。
+        _today = now_shanghai().date()
+        _has_today = db.query(LiveSignal.id).filter(
+            LiveSignal.live_session_id == self.session_id,
+            LiveSignal.bar_time == datetime.combine(_today, datetime.min.time()),
+        ).first()
+        if _has_today:
+            self._closer.last_daily_bar_date = _today
+            logger.info(
+                "recover: today's daily bar already driven, skip re-drive "
+                "(session %s)", self.session_id)
+        # 启动期顺序：先导入外部持仓，再对账。recover 的虚拟账本只来自 live_trades
+        # 重放，柜台原有持仓（有仓无账）此刻尚未导入；直接对账会产出
+        # 「virtual=0 / real=5300」假差异（重启瞬间旧照片 + 假告警）。
+        # 读取失败/导入异常不吞问题：跳过导入，仍按原逻辑对账，真实差异照旧保留。
+        try:
+            overview = self._read_account_overview()
+            if overview is not None:
+                _, positions = overview
+                self._import_external_positions(db, positions, now_shanghai())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "recover: startup external position import failed (session %s)",
+                self.session_id)
         # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
         self._reconcile_positions()
 
@@ -2518,10 +3876,15 @@ class LiveEngine:
         except BridgeUnavailableError:
             logger.warning("reconcile skipped: bridge offline (session %s)", self.session_id)
             return
-        # 查询成功才清空旧差异：桥离线跳过时保留上次结果（API 可见性不闪空）
-        self._reconcile_mismatches = []
+        if rows is None:
+            # 读失败 ≠ 真空仓：保留上次对账结果，不能把 real 当 0 算差异。
+            logger.warning(
+                "reconcile skipped: positions unavailable (session %s): %s",
+                self.session_id,
+                getattr(self._dispatcher, "last_error", "") or "unknown")
+            return
         real: Dict[str, int] = {}
-        for r in rows or []:
+        for r in rows:
             inst = r.get("instrument")
             exch = r.get("exchange")
             vol = r.get("volume")
@@ -2534,14 +3897,13 @@ class LiveEngine:
                     if pos.quantity == 0:
                         continue
                     virtual[code] = virtual.get(code, 0) + pos.quantity
+        diffs = []
         for code in sorted(set(real) | set(virtual)):
             v = virtual.get(code, 0)
             r = real.get(code, 0)
             if v == r:
                 continue
-            self._reconcile_mismatches.append(
-                {"code": code, "virtual": v, "real": r, "diff": v - r}
-            )
+            diffs.append((code, v, r))
             # I-7（audit）：差异推 risk 事件（形状照既有 risk：rule + message）
             self._emit("risk", {
                 "rule": "reconcile_mismatch",
@@ -2555,6 +3917,22 @@ class LiveEngine:
                 "reconcile mismatch (session %s) %s: virtual=%d real=%d diff=%d",
                 self.session_id, code, v, r, v - r,
             )
+        self._set_reconcile_mismatches(diffs)
+
+    def _set_reconcile_mismatches(
+        self, diffs, computed_at: Optional[datetime] = None
+    ) -> None:
+        """整体替换对账面（空集也清空——旧照片不能留到下一次对账）。
+
+        只在成功算得差异时调用；读取/计算失败路径不调用 → 保留旧值与旧时间戳。
+        computed_at 为本次差异的计算时点，每行携带，前端据此显示「算于何时」。
+        """
+        stamp = (computed_at or now_shanghai()).isoformat()
+        self._reconcile_mismatches = [
+            {"code": code, "virtual": v, "real": r, "diff": v - r,
+             "computed_at": stamp}
+            for code, v, r in diffs
+        ]
 
     def _maybe_reconcile_after_close(self, now: Optional[datetime] = None) -> None:
         """I-7（audit）：每日收盘清扫完成后复查一次对账（幂等，每交易日一次）。

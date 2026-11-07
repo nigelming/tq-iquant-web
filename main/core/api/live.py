@@ -16,7 +16,7 @@ from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.live_engine import LiveEngine
 try:
     from core.engine.ths_ui_dispatcher import ThsUiDispatcher
-except Exception:  # pragma: no cover - 依赖缺失时仍可走 iQuant 桥
+except Exception:  # pragma: no cover - 依赖缺失时仍可走 QMT 桥
     ThsUiDispatcher = None  # type: ignore
 # 业务逻辑已下沉到 core.services.live_service（与 backtest_service 同一范式）。
 # 路由层仅留 HTTP 壳：参数校验 + asyncio 任务调度 + 调 service + ok/err 翻译。
@@ -51,7 +51,7 @@ from core.services.live_service import (  # noqa: E402
 
 
 def _dispatcher_cls():
-    """旧行为兼容：按 config.ths_ui.enabled 选通道（同花顺 UI / iQuant HTTP 桥）。
+    """旧行为兼容：按 config.ths_ui.enabled 选通道（同花顺 UI / QMT 通道）。
 
     enabled=false（默认）时返回本模块的 HttpBridgeDispatcher（测试 monkeypatch 生效）；
     enabled=true 且依赖可用时返回 ThsUiDispatcher。新会话请用 session.engine 显式选择。
@@ -63,20 +63,12 @@ def _dispatcher_cls():
     return HttpBridgeDispatcher
 
 
-def _dispatcher_cls_for(session):
-    """按 session 生效引擎选 dispatcher 类：iquant 保留 HttpBridgeDispatcher（测试可 patch），
-    其余引擎交给 svc.make_dispatcher 按 engine 构造。"""
-    if svc.session_engine(session) == "iquant":
-        return HttpBridgeDispatcher
-    return None
-
-
 def _build_engine(session_id: int, db: Session, mode: str = "simulation",
                   dispatcher_cls=None) -> LiveEngine:
     """薄 wrapper：绑定 db_session_factory=SessionLocal + 当前配置选出的 dispatcher。
 
     dispatcher_cls 显式传入时优先（测试 monkeypatch 直调）；否则沿用旧的全局通道选择
-    （ths_ui.enabled → 同花顺，否则 iQuant 桥）。新会话请经 /sessions/{id}/start
+    （ths_ui.enabled → 同花顺，否则 QMT 桥）。新会话请经 /sessions/{id}/start
     由 session 生效引擎决定通道。
     """
     return svc.build_engine(
@@ -210,15 +202,12 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         # I-6（audit）：同步重活（建引擎 / heartbeat 通道探测 / preflight / recover 重放）
         # 经线程池执行——事件循环不被阻塞（TQ/桥探测失败要等超时，秒级冻结会拖垮 SSE）。
         # 先取齐纯值，避免 worker 线程访问 loop 线程加载的 ORM 实例属性。
-        # 兜底沿用原语义：execution_mode 为空（迁移前历史会话）按 "auto" 解析。
         mode = session.mode
-        exec_mode = session.execution_mode or "auto"
-        dispatcher_cls = None if exec_mode == "alert" else _dispatcher_cls_for(session)
         engine, _session, error = await run_in_threadpool(
             lambda: svc.start_session(
                 db, session_id, _ENGINES, mode,
                 db_session_factory=SessionLocal,
-                dispatcher_cls=dispatcher_cls,
+                dispatcher_cls=None,
             ),
         )
         if error is not None:
@@ -283,8 +272,8 @@ def channel_test(data: Optional[dict] = None):
     """只读连通性探测：读一次持仓 / ping 一次。不产生下单。"""
     data = data or {}
     channel = data.get("channel") or "ths_ui"
-    if channel not in ("ths_ui", "iquant_bridge", "tdx_tq"):
-        return err(400, "channel 非法，仅支持 ths_ui / iquant_bridge / tdx_tq")
+    if channel not in ("ths_ui", "iquant_bridge", "tdx_tq", "goldminer_bridge"):
+        return err(400, "channel 非法，仅支持 goldminer_bridge / iquant_bridge / ths_ui / tdx_tq")
     return ok(svc.test_channel(channel, data.get("mode") or "simulation"))
 
 
@@ -424,3 +413,24 @@ async def session_stream(session_id: int, request: Request, db: Session = Depend
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@router.get("/watchdog-status")
+def watchdog_status():
+    """进程内引擎存活监控的只读状态。
+
+    ``last_scan_at`` 长时间不前进（> 2 个扫描周期）即说明扫描线程自身卡死/
+    已退出——这是外部（前端/运维）判断「监控自己死了」的唯一可读信号。
+    watchdog 未启动时返回 running=false，不报 500。
+    """
+    from core.engine.live.engine_watchdog import current_watchdog
+    watchdog = current_watchdog()
+    if watchdog is None:
+        return ok({
+            "running": False,
+            "last_scan_at": None,
+            "last_scan_duration_ms": None,
+            "scan_count": 0,
+            "active_alarms": [],
+        })
+    return ok(watchdog.status())

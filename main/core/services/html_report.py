@@ -518,9 +518,12 @@ def _crisis_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
     cats = ["逆势上涨", "跌得少", "跟着跌", "跌更多"]
     counts = q.get("counts") or {}
     avg_ret = q.get("avg_ret") or {}
+    avg_bench = q.get("avg_bench") or {}
     cat_rows, cat_cls = [], []
     for cat in cats:
-        b = avg_ret.get(cat)
+        # b 取分档基准均值（缺该字段的历史记录回退到 down_avg_b 之外仅在
+        # 合计行使用；此处缺失即显示 —，不再误填策略均值）。
+        b = avg_bench.get(cat)
         s = avg_ret.get(cat)
         cat_rows.append([
             esc(cat), str(counts.get(cat, 0)),

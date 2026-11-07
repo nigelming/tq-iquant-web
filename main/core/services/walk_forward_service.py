@@ -46,6 +46,13 @@ def build_walk_forward_windows(
     每窗 {index(1 起), start, end, train: {start, end}, test: {start, end}}；
     train/test 切分点 = 窗口起点 + train_years 年。不足一个完整窗口返回 []。
     """
+    # test_years <= 0 会让 w_start 不前进（死循环）；train_years <= 0 会产生
+    # 空训练段（IS/OOS 切分失去意义）。两者均为非法入参，入口直接拒绝。
+    if train_years <= 0 or test_years <= 0:
+        raise ValueError(
+            f"walk-forward 训练/验证年数必须为正整数（train={train_years}, "
+            f"test={test_years}）"
+        )
     windows: List[dict] = []
     i = 0
     while True:

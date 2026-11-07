@@ -26,7 +26,7 @@
   TDX 倒推写法如 REF(C,BARSLAST(cond))）；其余窗口族仍要求常量
 - 批次 8：XMA/HHVLLV/MEDIAN/UPDOWN/MAX6/NEWSAR/DRAWNULL/TFILTER/TTFILTER；
   时间周期 WEEKOFYEAR/PERIOD（PERIOD 需 period 上下文；SEASON/MIN1..MIN60 为
-  跨周期引用锚点、WEEK 不在 iQuant 运行时函数表，作为裸函数仍显式报错；
+  跨周期引用锚点、WEEK 不在 QMT 运行时函数表，作为裸函数仍显式报错；
   星期序号用 WEEKDAY）；
   大盘引用 INDEXC/O/H/L/V/A（需 index_frames 注入对齐后的指数 OHLCV）
 - 批次 9a：跨周期引用 FIELD#PERIOD（如 C#WEEK/HIGH#DAY）——需 period_frames
@@ -112,9 +112,9 @@ _BARE_FUNCS = {
     "FROMOPEN", "TOTALFZNUM", "USEDDATANUM",
     # 批次 8：时间分量补全 / 周期编号 / 大盘引用 / null 占位
     # 注 1：SEASON 为「跨周期季线引用符号」（引用函数族），非季度函数；MIN1..MIN60
-    # 同为跨周期引用锚点且不在 iQuant 运行时函数表（TQVERIFY8B 导入实测报
+    # 同为跨周期引用锚点且不在 QMT 运行时函数表（TQVERIFY8B 导入实测报
     # 未知字符串）——均显式报错，待批次 9 跨周期引用实现后按锚点语义接入。
-    # 注 2：WEEK 不在国信 iQuant 运行时函数表（TQVERIFY8B 导入实测报未知字符串，
+    # 注 2：WEEK 不在 QMT 通道运行时函数表（TQVERIFY8B 导入实测报未知字符串，
     # 同 DAYOFWEEK 先例），为保持回测/实盘词表一致已移除；星期序号用 WEEKDAY。
     "WEEKOFYEAR", "PERIOD",
     "INDEXC", "INDEXO", "INDEXH", "INDEXL", "INDEXV", "INDEXA",
@@ -358,12 +358,21 @@ class _Parser:
 # ---------------------------------------------------------------- 求值
 
 def _as_bool(v: Any) -> Any:
-    """值 → 布尔（Series[Boolean] null→False / 标量 bool）。"""
+    """值 → 布尔（Series[Boolean] null→False / 标量 bool）。
+
+    NaN 与 null 同语义一律视为「不成立」：`NaN != 0` 在 IEEE 下为真，若原样
+    参与判断会把坏数据（停牌/取数失败产生的 NaN 价格）当条件成立，与比较运算
+    （NaN 恒 0）结论相反。
+    """
     if isinstance(v, pl.Series):
         if v.dtype == pl.Boolean:
             return v.fill_null(False)
+        if v.dtype in (pl.Float32, pl.Float64):
+            v = v.fill_nan(None)
         return (v != 0).fill_null(False)
-    return v != 0
+    if v is None:
+        return False
+    return bool(v != 0 and v == v)
 
 
 def _bool_f64(b: Any) -> Any:
@@ -379,12 +388,32 @@ def _broadcast(v: Any, n: int) -> pl.Series:
     return pl.Series("v", [v] * n, dtype=pl.Float64)
 
 
-def _window(v: Any, fname: str) -> int:
+# 周期参数硬上限：TA 类函数多为 O(bar 数 × 窗口) 的滚动实现，超大窗口
+# （如 MA(C, 10_000_000)）会让单只股票的求值卡死数十秒，回测持
+# _BACKTEST_LOCK 期间整个平台无响应。真实公式不存在超过该量级的窗口。
+MAX_WINDOW = 50000
+
+
+def _window(v: Any, fname: str, allow_zero: bool = False) -> int:
+    """取周期参数。
+
+    0 只对显式定义「全历史」语义的函数合法（REF 的 shift(0) 取当前值、
+    HHV/LLV/SUM/COUNT/EXIST 的 cum 口径，HHVLLV/MEDIAN/TFILTER/TTFILTER
+    各自实算口径），由调用点传 allow_zero=True。
+    其余函数给 0 时 polars 会静默返回全 null（如 MA(C,0)）或除以 0 得 inf，
+    信号永不触发且无任何报错——必须显式拒绝。
+    """
     if isinstance(v, pl.Series):
         raise FormulaEvalError(f"{fname} 的周期参数必须为常量，不能是序列")
     n = int(v)
     if n < 0:
         raise FormulaEvalError(f"{fname} 的周期参数不能为负数: {n}")
+    if n == 0 and not allow_zero:
+        raise FormulaEvalError(
+            f"{fname} 的周期参数不能为 0（该函数无 0=全历史语义）")
+    if n > MAX_WINDOW:
+        raise FormulaEvalError(
+            f"{fname} 的周期参数过大: {n}（上限 {MAX_WINDOW}）")
     return n
 
 
@@ -488,6 +517,8 @@ class _Evaluator:
             # USEDDATANUM 暂按同值（TQVERIFY6 K12 实证）
             return pl.Series("v", [float(n)] * n, dtype=pl.Float64)
         if name == "ISLASTBAR":
+            if n == 0:
+                return pl.Series("v", [], dtype=pl.Float64)
             return pl.Series("v", [0.0] * (n - 1) + [1.0], dtype=pl.Float64)
         # ---- 时间分量族（依赖 df 的 datetime 列）
         if name in ("YEAR", "MONTH", "DAY", "HOUR", "MINUTE"):
@@ -730,7 +761,10 @@ class _Evaluator:
             v = self.eval(node[2], env)
             if node[1] == "-":
                 return -v
-            return _bool_f64(~_as_bool(v))  # not
+            b = _as_bool(v)
+            # 标量不能走 `~`：Python `~True == -2`、`~False == -1` 皆真，
+            # 会让 NOT 恒返回 1.0。标量用逻辑取反，序列沿用位取反。
+            return _bool_f64(~b if isinstance(b, pl.Series) else not b)  # not
         if tag == "bin":
             op = node[1]
             l = self.eval(node[2], env)
@@ -782,14 +816,14 @@ class _Evaluator:
                 if isinstance(n, pl.Series):
                     # 批次 7：动态偏移（如 REF(C,BARSLAST(cond))，TDX 倒推写法）
                     return _ref_dyn(xs, n.cast(pl.Int64, strict=False))
-                return xs.shift(_window(n, name))
+                return xs.shift(_window(n, name, allow_zero=True))
             if name in ("HHV", "LLV"):
                 x, n = args
                 x = _require_series(x, name)
                 if isinstance(n, pl.Series):
                     # 批次 7：动态窗口（如 LLV(C,BARSLAST(cond)+1)）
                     return _hll_dyn(x, n.cast(pl.Int64, strict=False), name == "HHV")
-                w = _window(n, name)
+                w = _window(n, name, allow_zero=True)
                 if w == 0:
                     return x.cum_max() if name == "HHV" else x.cum_min()
                 fn = x.rolling_max if name == "HHV" else x.rolling_min
@@ -816,7 +850,7 @@ class _Evaluator:
                 if name == "SUM" and isinstance(n, pl.Series):
                     # 批次 7：动态窗口（如 SUM(X,BARSLAST(cond))）；COUNT/EVERY 仍要求常量
                     return _sum_dyn(x, n.cast(pl.Int64, strict=False))
-                w = _window(n, name)
+                w = _window(n, name, allow_zero=True)
                 if name == "SUM":
                     return x.cum_sum() if w == 0 else _rolling(x.rolling_sum, w, min_periods=1)
                 b = (x.fill_null(0) != 0).cast(pl.Float64)
@@ -867,7 +901,9 @@ class _Evaluator:
             if name in ("ABS", "SQRT"):
                 (x,) = args
                 if isinstance(x, pl.Series):
-                    return x.abs() if name == "ABS" else x.sqrt()
+                    # 负数开方同为 NaN（模块约定 NaN → null）：否则 NaN 会被
+                    # `_as_bool` 当条件成立，信号与比较运算结论相反。
+                    return x.abs() if name == "ABS" else x.sqrt().fill_nan(None)
                 return abs(x) if name == "ABS" else _sqrt_scalar(x)
             if name in ("MAX", "MIN"):
                 a, b = args
@@ -884,7 +920,7 @@ class _Evaluator:
             if name == "EXIST":
                 x, n = args
                 b = (_require_series(x, name).fill_null(0) != 0).cast(pl.Float64)
-                w = _window(n, name)
+                w = _window(n, name, allow_zero=True)
                 # TDX 部分窗口（F20 实证）
                 return b.cum_max() if w == 0 else _rolling(b.rolling_max, w, min_periods=1)
             if name in ("BARSSINCE", "BARSCOUNT"):
@@ -930,19 +966,23 @@ class _Evaluator:
                 return math.exp(x) if name == "EXP" else float((x > 0) - (x < 0))
             if name == "POW":
                 x, y = args
+                # 负底数分数次幂产生 NaN（模块约定 NaN → null）；不打平会让
+                # `_as_bool`（原实现 NaN 即真）把无效值当条件成立。
                 if isinstance(x, pl.Series) and isinstance(y, pl.Series):
                     return (
                         pl.DataFrame({"a": x, "b": y})
                         .select(pl.col("a").pow(pl.col("b")))
                         .to_series(0)
+                        .fill_nan(None)
                     )
                 if isinstance(x, pl.Series):
-                    return x.pow(y)
+                    return x.pow(y).fill_nan(None)
                 if isinstance(y, pl.Series):
                     return (
                         pl.DataFrame({"y": y})
                         .select(pl.lit(x, dtype=pl.Float64).pow(pl.col("y")))
                         .to_series(0)
+                        .fill_nan(None)
                     )
                 return x ** y
             if name == "WMA":
@@ -1023,7 +1063,9 @@ class _Evaluator:
                 return _cmp_f64(a, lo_op, b) * _cmp_f64(a, hi_op, c)
             if name == "NOT":
                 (x,) = args
-                return _bool_f64(~_as_bool(x))
+                b = _as_bool(x)
+                # 同 unary not：标量 `~bool` 恒真，须用逻辑取反。
+                return _bool_f64(~b if isinstance(b, pl.Series) else not b)
             if name in ("HOD", "LOD"):
                 x, n = args
                 return _rank_in_window(
@@ -1132,12 +1174,13 @@ class _Evaluator:
                 return _xma(_require_series(x, name), _window(n, name))
             if name == "HHVLLV":
                 x, t, n1, n2 = args
-                return _hhvllv(_require_series(x, name), _window(t, name),
-                               _window(n1, name), _window(n2, name))
+                return _hhvllv(_require_series(x, name), _window(t, name, allow_zero=True),
+                               _window(n1, name, allow_zero=True),
+                               _window(n2, name, allow_zero=True))
             if name == "MEDIAN":
                 x, mm, n = args
-                return _median(_require_series(x, name), _window(mm, name),
-                               _window(n, name))
+                return _median(_require_series(x, name), _window(mm, name, allow_zero=True),
+                               _window(n, name, allow_zero=True))
             if name == "UPDOWN":
                 (x,) = args
                 return _updown(_require_series(x, name))
@@ -1154,13 +1197,13 @@ class _Evaluator:
             if name == "TFILTER":
                 a, b, n = args
                 return _tfilter(_require_series(a, name), _require_series(b, name),
-                                _window(n, name))
+                                _window(n, name, allow_zero=True))
             if name == "TTFILTER":
                 k0, k1, k2, k3, n = args
                 return _ttfilter(
                     [_require_series(k0, name), _require_series(k1, name),
                      _require_series(k2, name), _require_series(k3, name)],
-                    _window(n, name))
+                    _window(n, name, allow_zero=True))
         except FormulaEvalError:
             raise
         except Exception as e:  # polars 内部异常包装，避免裸栈
@@ -1184,6 +1227,19 @@ def _cmp_f64(l: Any, py_op: str, r: Any) -> Any:
             b = getattr(l, py_op)(r)
         return _bool_f64(b.fill_null(False))
     return _bool_f64(getattr(l, py_op)(r))
+
+
+def _parse_expr(src: str):
+    """词法分析 + 递归下降解析。
+
+    嵌套过深（如数百层括号/NOT 链）会触发 Python RecursionError——它不属于
+    FormulaEvalError，调用方按公式错误捕获时会漏掉，冒泡成 500 或中断批量
+    校验循环。统一转为可读的公式错误。
+    """
+    try:
+        return _Parser(_tokenize(src)).parse()
+    except RecursionError:
+        raise FormulaEvalError("表达式嵌套过深（超出解析深度上限），请简化公式")
 
 
 def _require_series(v: Any, fname: str) -> pl.Series:
@@ -1993,6 +2049,11 @@ def _sum_dyn(x: pl.Series, n: pl.Series) -> pl.Series:
         cums[i + 1] = cums[i] + (v if v is not None and v == v else 0.0)
     for i, ni in enumerate(ns):
         w = 0 if (ni is None or ni != ni) else int(ni)
+        if w < 0:
+            # 负窗口无 TDX 语义：原实现 max(0, i-w+1) 变成取「未来数据」并返回
+            # 负和（静默前视）。置 null，与静态路径拒绝负值保持同等安全。
+            out[i] = None
+            continue
         lo = 0 if w == 0 else max(0, i - w + 1)
         out[i] = cums[i + 1] - cums[lo]
     return pl.Series("v", out, dtype=pl.Float64)
@@ -2022,6 +2083,8 @@ def _hll_dyn(x: pl.Series, n: pl.Series, high: bool) -> pl.Series:
         if ni is None or ni != ni:
             continue  # 窗口无效 → 输出 null（队列照常维护）
         w = int(ni)
+        if w < 0:
+            continue  # 负窗口无语义（同 _sum_dyn）：输出 null，不取未来数据
         lo = 0 if w == 0 else max(0, i - w + 1)
         while dq and dq[0][0] < lo:
             dq.popleft()
@@ -2252,7 +2315,7 @@ def cross_periods_of(src: str) -> set:
         return periods
     for d in defs:
         try:
-            ast = _Parser(_tokenize(d.expr)).parse()
+            ast = _parse_expr(d.expr)
         except FormulaEvalError:
             continue
         _walk_cross(ast, periods)
@@ -2294,7 +2357,7 @@ def xref_names_of(src: str) -> set:
         return names
     for d in defs:
         try:
-            ast = _Parser(_tokenize(d.expr)).parse()
+            ast = _parse_expr(d.expr)
         except FormulaEvalError:
             continue
         _walk_xref(ast, names)
@@ -2344,7 +2407,7 @@ def evaluate_outputs(src: str | list[Definition], df: pl.DataFrame, *,
     for d in defs:
         expr_src = d.expr
         try:
-            ast = _Parser(_tokenize(expr_src)).parse()
+            ast = _parse_expr(expr_src)
             val = ev.eval(ast, env)
         except FormulaEvalError as e:
             raise FormulaEvalError(f"第 {d.line} 行 [{d.name}] {e}") from e
@@ -2493,7 +2556,7 @@ def syntax_check(src: str) -> dict:
         if d.op == ":":
             outputs.append(d.name)
         try:
-            ast = _Parser(_tokenize(d.expr)).parse()
+            ast = _parse_expr(d.expr)
         except FormulaEvalError as e:
             errors.append(f"第 {d.line} 行 [{d.name}] {e}")
             continue

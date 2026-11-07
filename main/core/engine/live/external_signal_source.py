@@ -39,7 +39,12 @@ _COL_FORMULA = 7
 
 def _exchange_for(code: str) -> str:
     """6 位代码推断交易所后缀（与 tdx_tq_dispatcher._exchange_for / live_service
-    _normalize_external_symbol 同口径：6/5/9→SH、4/8→BJ、其余→SZ）。"""
+    _normalize_external_symbol 同口径：92→BJ（北交所新股段）、11→SH（沪可转债）、
+    6/5/9→SH、4/8→BJ、其余→SZ）。"""
+    if code.startswith("92"):
+        return "BJ"
+    if code.startswith("11"):
+        return "SH"
     if code.startswith(("6", "5", "9")):
         return "SH"
     if code.startswith(("4", "8")):
@@ -48,7 +53,7 @@ def _exchange_for(code: str) -> str:
 
 
 def normalize_external_symbol(code: str) -> str:
-    """预警文件 6 位代码 → 平台统一带后缀格式（920718 → 920718.SH）。
+    """预警文件 6 位代码 → 平台统一带后缀格式（920718 → 920718.BJ）。
 
     已带后缀原样返回；非 6 位数字且无后缀返回空串（调用方丢弃该行）。
     """

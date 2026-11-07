@@ -336,7 +336,15 @@ def compute_persistence(
     benchmark_closes: Dict[str, Dict[datetime.date, Decimal]],
     benchmark_code: str,
     benchmark_name: str,
+    utilization_series: Optional[Dict[datetime.date, Decimal]] = None,
 ) -> dict:
+    """持续性检验。
+
+    utilization_series（可选）：每日仓位利用率（market_value/total_value，仅
+    total_value>0 的交易日），口径与 Evaluator._compute_utilization 一致；
+    分年平均仓位利用率用于观察敞口上限随净值膨胀的收紧趋势（容量衰减视角）。
+    未传（老调用）→ 各年该字段 None。
+    """
     dates = sorted(nav_series)
     if not dates:
         return {"status": "failed", "error": "组合日净值为空，无法计算持续性检验"}
@@ -364,6 +372,11 @@ def compute_persistence(
             if gross_loss > 0:
                 profit_factor = round(gross_profit / gross_loss, 4)
         turnover, cost_ratio = _year_turnover_cost(trades, y, nav_series)
+        # 分年平均仓位利用率：仅统计有值日（缺值/停牌日不按 0 摊入）
+        utils = ([utilization_series[d] for d in dts
+                  if d in utilization_series and nav_series[d] > 0]
+                 if utilization_series else [])
+        avg_util = round(_f(sum(utils) / len(utils)), 4) if utils else None
         excess, bench_returns = {}, {}
         for code in all_codes:
             closes = benchmark_closes.get(code)
@@ -378,6 +391,7 @@ def compute_persistence(
             "sharpe": sharpe, "calmar": calmar,
             "win_rate": win_rate, "profit_factor": profit_factor,
             "turnover": turnover, "cost_ratio": cost_ratio,
+            "avg_position_utilization": avg_util,
             "excess": excess, "bench_returns": bench_returns,
         })
     d6, v6 = _rolling_annualized(nav_series, ROLLING_6M_DAYS)

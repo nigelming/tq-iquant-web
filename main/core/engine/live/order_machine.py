@@ -20,9 +20,11 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Callable, Dict, Optional
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ..position import Position
+from ..format import dec_money, dec_price
 from ..event import OrderEvent, TradeEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
 from ...config import load_config
@@ -35,14 +37,14 @@ from .timing import _parse_insert_utc, now_shanghai
 logger = logging.getLogger("core.engine.live.order_machine")
 
 # submitted 但始终匹配不到桥 order_ref 的单的失效阈值（秒）。
-# passorder 受理后桥侧若从未出现该委托（被 iQuant 静默丢弃/拒单），order_ref 永远为 None，
+# passorder 受理后桥侧若从未出现该委托（被 QMT 静默丢弃/拒单），order_ref 永远为 None，
 # 超过此时长判定失效，避免无限轮询陈旧单（含跨重启遗留单）。
 _ORDER_REF_MATCH_TIMEOUT = timedelta(seconds=180)
 # 模糊匹配（仅用于无 bridge_order_id 的遗留单）的时间窗：候选委托的柜台插入时间
 # 不得早于本单 created_at 超过此时长。挡住跨会话遗留的同代码同向同量旧单（真机 bug：
 # 新单 11:21 创建时真单尚未可查，被匹配到 09:55 的遗留单 → 回填错成交、真单丢失）。
 _ORDER_INSERT_TOLERANCE = timedelta(seconds=120)
-# iQuant ORDER 实时表 m_nOrderStatus（官方码，D:\iquant xtconstant.py / API 文档 10643）：
+# QMT ORDER 实时表 m_nOrderStatus（官方码，D:\iquant xtconstant.py / API 文档 10643）：
 #   48=未报 49=待报 50=已报 51=已报待撤 52=部成待撤 53=部撤(终态) 54=已撤(终态)
 #   55=部成(非终态!剩余仍在撮合) 56=已成(终态) 57=废单(终态) 255=未知
 # 关键：55 是「部成」非终态，绝不能当撤单——否则剩余后续成交会重复 apply/丢单。
@@ -59,6 +61,92 @@ _ORDER_STATUS_TERMINAL_REJECTED = (57,)
 # 不加模型列——DB 持久化，Core 重启后仍可识别（区别于进程内 set）。
 _CANCEL_REQUESTED_TAG = "超时撤单请求中："
 
+# HTTP 桥超长兜底窗口（秒）：超过该窗口仍无法在委托表/成交表追溯 → 收口为 rejected，
+# 释放「同股同向在途门」（否则卡住的止损卖单会一直挡住后续风控卖出）。
+# 基准恒为提交时间（created_at），不随重复检查顺延；可用
+# config.yaml 的 goldminer.untraceable_grace_seconds 覆盖（缺键/非法回退本值）。
+_UNTRACEABLE_GRACE_SECONDS = 600
+# error_message 标记前缀：180s~grace 内保持 pending（bridge_order_untraceable:），
+# 超过 grace 收口为已拒（bridge_order_untraceable_expired:）。
+# 迟到回填按公共前缀 "bridge_order_untraceable" 识别这两类单（不得只认 pending 类）。
+_UNTRACEABLE_MARKER = "bridge_order_untraceable"
+_UNTRACEABLE_PENDING_MARKER = "bridge_order_untraceable:"
+_UNTRACEABLE_EXPIRED_MARKER = "bridge_order_untraceable_expired:"
+# 迟到回填纠正后的 error_message 前缀（审计用：该单曾被收口但柜台迟到成交）。
+_LATE_FILL_MARKER = "late_fill_after_untraceable:"
+
+# 柜台侧无平台委托的成交（人工/外部下单）补记：LiveOrder 标记 + 幂等键前缀。
+# 幂等键放 bridge_order_id（String(32)）：「ext:<order_ref>」优先（同一外部委托的
+# 多笔分笔成交聚合到一行），无 order_ref 时退化为 trade_id。
+_EXTERNAL_DEAL_MARKER = "bridge_unmatched:"
+_EXTERNAL_KEY_PREFIX = "ext:"
+
+
+def _deal_code(deal: dict) -> str:
+    """成交回报行的代码归一：symbol 优先，桥通道回退 instrument+exchange。
+
+    与 live_engine._position_code 同一口径（桥 /deals 行只有 instrument/exchange）。
+    """
+    if not isinstance(deal, dict):
+        return ""
+    code = str(deal.get("symbol") or "").strip()
+    if code:
+        return code
+    inst = str(deal.get("instrument") or "").strip()
+    exch = str(deal.get("exchange") or "").strip()
+    if inst and exch:
+        return "%s.%s" % (inst, exch)
+    return ""
+
+
+# QMT 方向字段（2026-11-06 实测修正）：DEAL/ORDER 的 m_nDirection 是
+# EEntrustBS，**对股票恒为 48**（迅投官方文档：股票此值始终是 48），用它判买卖
+# 会把卖单当买单（实测 t-sell-0001 601827 卖出 100 股也返回 48）。真正区分
+# 股票买卖的是 m_nOffsetFlag（EOffset_Flag_Type）：48=买入/开仓，
+# 49/50/51/52/53/54=卖出/平仓/平今/平昨/强平/强减/本地强平。
+_OFFSET_BUY = (48,)
+_OFFSET_SELL = (49, 50, 51, 52, 53, 54)
+# 兼容口径（仅当 offset 缺失时用）：23/24 = 股票买卖 opType，0/1 = 部分接口的方向枚举
+_DIRECTION_BUY = ("23", "0", "buy", "b")
+_DIRECTION_SELL = ("24", "1", "sell", "s")
+
+
+def _deal_trade_type(deal: dict) -> str:
+    """成交方向归一：side → offset_flag/m_nOffsetFlag → direction；判定不了返回 ''。
+
+    桥新版本每行给 ``side``（"BUY"/"SELL"）与 ``offset_flag``；旧版本只有
+    ``direction``（股票恒 48，不可用）。这里对未知值一律返回空串，由调用方
+    告警并跳过——**绝不默认买入**（否则卖单会变成加仓）。
+    """
+    if not isinstance(deal, dict):
+        return ""
+    side = str(deal.get("side") or "").strip().lower()
+    if side in ("buy", "b"):
+        return "buy"
+    if side in ("sell", "s"):
+        return "sell"
+    offset = deal.get("offset_flag")
+    if offset is None:
+        offset = deal.get("m_nOffsetFlag")
+    if offset is not None:
+        try:
+            off = int(float(str(offset).strip()))
+        except (TypeError, ValueError):
+            off = None
+        if off in _OFFSET_BUY:
+            return "buy"
+        if off in _OFFSET_SELL:
+            return "sell"
+    raw = deal.get("trade_type")
+    if raw is None:
+        raw = deal.get("direction")
+    value = str(raw).strip().lower()
+    if value in _DIRECTION_BUY:
+        return "buy"
+    if value in _DIRECTION_SELL:
+        return "sell"
+    return ""
+
 
 class OrderStateMachine:
     """委托状态机：持久化 → 匹配 order_ref → 轮询 /deals 回填 → 终态/超时收口。
@@ -71,10 +159,15 @@ class OrderStateMachine:
     避免嵌套持锁语义混乱（锁序恒为 book_lock → get_tdx_lock，无死锁）。
     """
 
-    def __init__(self, ctx: EngineContext, emit: Callable[[str, dict], None]):
+    def __init__(self, ctx: EngineContext, emit: Callable[[str, dict], None],
+                 resolve_attribution: Optional[Callable[[str], Optional[tuple]]] = None):
         self._ctx = ctx
         # SSE 事件发射回调（LiveEngine 注入 self._emit，走 EventBus）。
         self._emit = emit
+        # 外部成交归属解析：code -> (portfolio_strategy_id, strategy_id) 或 None。
+        # 与 _import_external_positions 同一口径（LiveEngine 注入 _strategy_ctx_for_code），
+        # 未注入时退化为「首个组合的首个策略」，都没有则该笔成交只记 WARN 不入库。
+        self._resolve_attribution = resolve_attribution
         # 切片5（I4）：Core 重启后从 DB 挂回的未完结 LiveOrder（submitted/partial），
         # 主循环 poll_deals 据此轮询 /deals 回填。key=LiveOrder.id。
         # 运行中 _handle_bar 发单也计入、拒单弹出；每轮回合重查 DB 同步（G7）。
@@ -88,11 +181,16 @@ class OrderStateMachine:
     # ------------------------------------------------------------------
     # 持久化 / 匹配
     # ------------------------------------------------------------------
-    def persist_order_submitted(self, db: Session, order: OrderEvent) -> LiveOrder:
-        """写 LiveOrder(status=submitted)，不写 LiveTrade（回填确认成交才写）。
+    def persist_order_submitted(self, db: Session, order: OrderEvent,
+                                status: str = "submitted") -> LiveOrder:
+        """写 LiveOrder(status 默认 submitted)，不写 LiveTrade（正确成交后另写）。
 
-        提交时序（G1/I4）：_handle_bar 先调本方法 + commit，再发 passorder——
-        崩在 passorder 已发、未确认窗口时 DB 至少有 submitted 记录供挂回。
+        status="deferred"（P2 持久化）：B-1 延期单落库——重启 recover 重建
+        内存 deferred 队列后删除该行（转移语义）。否则日线级止损/信号单随
+        重启消失、永不执行（2026-11-03 实证：止损 defer 57 次零执行）。
+
+        提交时（G1/I4）：_handle_bar 先落库 + commit，再发 passorder（万一
+        passorder 已发但未确认成功，DB 里永远有 submitted 记录兜底）。
         """
         live_order = LiveOrder(
             live_session_id=self._ctx.session_id,
@@ -105,7 +203,7 @@ class OrderStateMachine:
             quantity=order.quantity,
             filled_quantity=0,
             filled_price=None,
-            status="submitted",
+            status=status,
             signal_name=order.signal_name or None,
             signal_type=order.signal_type.value if order.signal_type else None,
             bar_time=order.bar_time,
@@ -152,6 +250,16 @@ class OrderStateMachine:
         supports_remark = getattr(self._ctx.dispatcher, "supports_remark", True)
         if bridge_oid and supports_remark:
             ref = self.match_by_remark(orders, bridge_oid[:20], claimed)
+            if ref is None:
+                # ① 精确再试一次：GET /orders?order_id=<bridge_order_id>。桥支持按
+                # cl_ord_id/order_ref/order_id/remark 任一匹配；柜台「当日委托查询」
+                # 对废单/秒成单可能不回显全量行，精确查询仍能命中（避免退化到
+                # 模糊匹配误绑）。只在 remark 全量匹配落空时发这一次请求。
+                try:
+                    rows = self._ctx.dispatcher.query_orders(order_id=bridge_oid)
+                except BridgeUnavailableError:
+                    rows = []
+                ref = self.match_by_remark(rows, bridge_oid[:20], claimed)
         else:
             ref = self.match_legacy_fuzzy(live_order, orders, claimed)
         if ref is not None:
@@ -253,16 +361,36 @@ class OrderStateMachine:
         db = self._ctx.db_session_factory()
         session_id = self._ctx.session_id
         try:
+            # 待处理单 = 在途（submitted/partial）+ 已被收口但可能迟到成交的桥单
+            # （rejected 且 error_message 带 bridge_order_untraceable 前缀）。后者必须
+            # 继续参与 order_ref/remark 匹配，否则收口后柜台迟到成交永远无法纠正。
             pending = (
                 db.query(LiveOrder)
                 .filter(
                     LiveOrder.live_session_id == session_id,
-                    LiveOrder.status.in_(["submitted", "partial"]),
+                    or_(
+                        LiveOrder.status.in_(["submitted", "partial"]),
+                        and_(
+                            LiveOrder.status == "rejected",
+                            LiveOrder.error_message.like(
+                                _UNTRACEABLE_MARKER + "%"),
+                        ),
+                    ),
                 )
                 .all()
             )
             if not pending:
                 self.sync_pending_orders(db)  # 无在途单 → 清空计数（G7）
+                # 无在途单也必须查 /deals：柜台侧人工/外部成交没有平台委托记录，
+                # 这是它们唯一能入库的路径（2026-11-06 实证：8790 手工买卖两笔已
+                # 成交，平台成交列表 0 条、last_backfill_time 永久为空）。
+                try:
+                    deals = self._ctx.dispatcher.query_deals()
+                except BridgeUnavailableError:
+                    return []  # 桥离线：下轮重试，不动任何状态
+                self.last_backfill_time = now_shanghai()  # 轮询存活标记（0 条也写）
+                self.record_external_deals(db, deals)
+                db.commit()
                 return []
             # 0. 一次 /orders 查询，复用于 order_ref 定位 + 撤单终态同步（避免每笔单各查一次）。
             #    桥离线时 orders=None：定位与终态同步都跳过，本单留 submitted 下轮重试；
@@ -294,7 +422,7 @@ class OrderStateMachine:
             #    need_ref  = 已定位 order_ref 的单（主路径，按 order_ref 过滤 deals）
             #    need_remark = order_ref 始终匹配不上（/orders 实时表无此单）但有
             #                  bridge_order_id 的单 → 按 remark 直连 /deals 回填（修复 A）。
-            #    修复 A 背景（真机 2026-08-19 id45/46）：iQuant get_trade_detail_data(ORDER)
+            #    修复 A 背景（真机 2026-08-19 id45/46）：QMT get_trade_detail_data(ORDER)
             #    对已成交单不可靠（成交后从 ORDER 实时表移除），Core 轮询 /orders 拿不到
             #    order_ref → 旧逻辑走到超时 rejected 且成交不回填。但 /deals（DEAL 表）保留
             #    全部已成交记录且 DEAL 对象带 m_strRemark，故 order_ref 匹配失败的单改按
@@ -306,32 +434,36 @@ class OrderStateMachine:
                 lo for lo in pending
                 if lo.order_ref is None and lo.bridge_order_id
             ]
-            if need_ref or need_remark:
-                try:
-                    deals = self._ctx.dispatcher.query_deals()
-                except BridgeUnavailableError:
-                    deals = None  # 桥离线：本轮换过成交回填，但终态同步仍可据 /orders 推进
-                if deals is not None:
-                    # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
-                    for lo in need_ref:
-                        matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
-                        if not matched:
-                            continue
-                        self.backfill_order(db, lo, matched)
-                    # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
-                    # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
-                    # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
-                    for lo in need_remark:
-                        if lo.status not in ("submitted", "partial"):
-                            continue  # 主路径已回填，不重复
-                        expected_remark = lo.bridge_order_id[:20]
-                        matched = [d for d in deals if d.get("remark") == expected_remark]
-                        if not matched:
-                            continue
-                        self.backfill_order(db, lo, matched)
-                    db.commit()
-            else:
-                deals = None
+            # 每轮都查一次 /deals：既回填在途单（need_ref / need_remark 两类），
+            # 也补记柜台侧没有平台委托的成交（人工/外部下单，见 2c）。
+            try:
+                deals = self._ctx.dispatcher.query_deals()
+            except BridgeUnavailableError:
+                deals = None  # 桥离线：本轮跳过成交回填，但终态同步仍可据 /orders 推进
+            if deals is not None:
+                # 轮询存活标记：成功取到 /deals 即更新（本轮 0 条成交也算），
+                # 供「成交回填轮询是否在跑」判读；旧实现只在真回填时才写 → 恒为空。
+                self.last_backfill_time = now_shanghai()
+                # 2a. 主路径：有 order_ref 的单按 order_ref 过滤 deals
+                for lo in need_ref:
+                    matched = [d for d in deals if d.get("order_ref") == lo.order_ref]
+                    if not matched:
+                        continue
+                    self.backfill_order_or_late_fill(db, lo, matched)
+                # 2b. 修复 A：order_ref 匹配不上的单按 remark 直连 /deals 回填。
+                # 跳过已被主路径回填（status 已转 filled/partial）的单；remark 匹配键 =
+                # bridge_order_id[:20] = 桥 passorder 写入委托/成交的 m_strRemark。
+                for lo in need_remark:
+                    if lo.status not in ("submitted", "partial", "rejected"):
+                        continue  # 主路径已回填，不重复
+                    expected_remark = lo.bridge_order_id[:20]
+                    matched = [d for d in deals if d.get("remark") == expected_remark]
+                    if not matched:
+                        continue
+                    self.backfill_order_or_late_fill(db, lo, matched)
+                # 2c. 柜台已成交但平台无对应在途单（人工/外部下单）→ 补记入库
+                self.record_external_deals(db, deals)
+                db.commit()
             # 3. 终态同步（第一层自愈）：成交回填后，按 /orders m_nOrderStatus 把
             #    53部撤/54全撤→canceled、57废单→rejected 转出 submitted。必须在 deals 回填
             #    之后——否则 backfill_order 会把刚标的 canceled 覆盖回 partial。53部撤的部分
@@ -353,12 +485,190 @@ class OrderStateMachine:
             db.rollback()
             db.close()
 
+    def backfill_order_or_late_fill(self, db: Session, live_order: LiveOrder,
+                                    matched_deals: list) -> None:
+        """成交回填统一入口：若该单此前已被「不可追溯」收口为 rejected，纠正并告警。
+
+        背景：超长兜底窗口（``_UNTRACEABLE_GRACE_SECONDS``）把毫无踪迹的桥单收口为
+        rejected 以释放同股同向在途门。若柜台随后才回显该笔成交（迟到回报/桥恢复），
+        必须允许纠正——否则 DB 已拒、柜台已成交，虚拟持仓/现金与真实账户脱节。
+        纠正动作 = 正常 ``backfill_order``（状态 filled/partial、写/更新 LiveTrade、
+        filled 才 apply）+ 一条 ``late_fill_after_untraceable`` risk 事件（避免重复：
+        纠正后 status 不再是 rejected，后续轮次不会再次触发）。
+        """
+        was_untraceable = (
+            live_order.status == "rejected"
+            and (live_order.error_message or "").startswith(_UNTRACEABLE_MARKER)
+        )
+        self.backfill_order(db, live_order, matched_deals)
+        if not was_untraceable or live_order.status == "rejected":
+            return  # 无实际成交（total_qty<=0）→ 仍 rejected，不误报纠正
+        filled = int(live_order.filled_quantity or 0)
+        live_order.error_message = (
+            "%s 已收口为已拒的委托出现迟到成交，已纠正并记账（%d/%d 股），"
+            "请核对柜台与持仓" % (_LATE_FILL_MARKER, filled, int(live_order.quantity or 0))
+        )
+        logger.warning(
+            "late fill after untraceable: order %s %s %s corrected to %s "
+            "(filled=%d/%d)",
+            live_order.id, live_order.trade_type, live_order.stock_code,
+            live_order.status, filled, int(live_order.quantity or 0),
+        )
+        self._emit("risk", {
+            "session_id": self._ctx.session_id,
+            "rule": "late_fill_after_untraceable",
+            "order_id": live_order.id,
+            "bridge_order_id": live_order.bridge_order_id,
+            "broker_order_id": live_order.order_ref,
+            "stock_code": live_order.stock_code,
+            "trade_type": (live_order.trade_type or "").upper(),
+            "quantity": filled,
+            "submitted_at": (
+                live_order.created_at.isoformat() if live_order.created_at else None),
+            "message": (
+                "已按不可追溯收口（rejected）的委托出现迟到成交：平台单号 %s，"
+                "柜台单号 %s，%s %s %d 股，已纠正为 %s 并正常记账，请核对柜台与持仓"
+                % (live_order.id, live_order.order_ref or "-", live_order.stock_code,
+                   (live_order.trade_type or "").upper(), filled, live_order.status)
+            ),
+        })
+
+    def record_external_deals(self, db: Session, deals: list) -> int:
+        """补记柜台侧没有平台委托的成交（人工/外部下单），按幂等键去重入库。
+
+        背景（2026-11-06 实证）：在 8790 柜台/客户端手工下了买单与卖单，桥 /deals
+        两条 status=56 成交、持仓已变；平台成交/委托列表 0 条——旧实现只在「有在途
+        单」时才查 /deals，且只按 order_ref/remark 认领在途单，柜台侧人工成交没有任何
+        入口（既不跳过也不告警，纯静默丢失）。
+
+        认领判定：deal 的 order_ref 命中本 session 任一 LiveOrder.order_ref，或 remark
+        命中任一 bridge_order_id[:20]，即视为平台委托的成交，交给 2a/2b 回填；两者都
+        不命中的就是外部成交，在此补记。
+
+        幂等：bridge_order_id = ``ext:<order_ref>``（无 order_ref 退化为 trade_id），
+        每轮按该键查已存在的补记单——已补且成交量未增则跳过；成交量增加（分笔成交）
+        则复用现有单重新聚合，不会重复入库、也不会漏掉后到的分笔。
+
+        记账口径（2026-11-06 二次修正）：**只留痕，不 apply 到虚拟账本**。
+        外部成交往往在 60s 桥持仓快照「之前/之间」完成，快照里的 volume/cost 已经
+        包含它；若再 apply 一次就变成双计（实测 000001 虚拟=200/桥实际=100）。
+        虚拟账本的数量与成本由 ``_mirror_bridge_positions`` 按桥 /positions 镜面
+        覆盖，这里只写 LiveOrder/LiveTrade + 更新 ``strategy_cost`` 归因。
+        归属：与 ``_import_external_positions`` 同一解析器；解析不到策略则跳过并告警
+        （LiveOrder.portfolio_strategy_id/strategy_id 非空外键，不能凭空造）。
+        """
+        if not deals:
+            return 0
+        session_id = self._ctx.session_id
+        rows = db.query(LiveOrder.order_ref, LiveOrder.bridge_order_id).filter(
+            LiveOrder.live_session_id == session_id,
+        ).all()
+        # 补记单自己也带 order_ref，必须排除在「已认领」之外，否则同一外部委托的
+        # 后到分笔会被误判成平台单而永远不再聚合。
+        claimed_refs = set(
+            r[0] for r in rows
+            if r[0] and not str(r[1] or "").startswith(_EXTERNAL_KEY_PREFIX))
+        claimed_remarks = set(
+            str(r[1])[:20] for r in rows
+            if r[1] and not str(r[1]).startswith(_EXTERNAL_KEY_PREFIX))
+
+        groups: Dict[str, list] = {}
+        for d in deals:
+            if not isinstance(d, dict):
+                continue
+            ref = str(d.get("order_ref") or "").strip()
+            remark = str(d.get("remark") or "").strip()
+            if ref and ref in claimed_refs:
+                continue
+            if remark and remark in claimed_remarks:
+                continue
+            code = _deal_code(d)
+            if not code:
+                continue
+            key = ref or remark or "%s|%s" % (code, d.get("trade_id") or d.get("trade_time"))
+            groups.setdefault(key, []).append(d)
+
+        recorded = 0
+        for key, group in groups.items():
+            deal_id = str(group[0].get("trade_id") or "").strip()
+            dedupe_key = (_EXTERNAL_KEY_PREFIX + (key or deal_id))[:32]
+            code = _deal_code(group[0])
+            trade_type = _deal_trade_type(group[0])
+            qty = sum(int(d.get("volume") or 0) for d in group)
+            if qty <= 0:
+                continue
+            if trade_type not in ("buy", "sell"):
+                # 方向不可判定：绝不默认买入（旧实现把 48 一律当买，卖单变加仓）。
+                # 只告警跳过，不写任何账（也不 apply）。
+                logger.warning(
+                    "external deal skipped: unknown direction %r "
+                    "(side=%r offset_flag=%r, %s qty=%d session %s)",
+                    group[0].get("direction"), group[0].get("side"),
+                    group[0].get("offset_flag"), code, qty, session_id)
+                continue
+            existing = db.query(LiveOrder).filter(
+                LiveOrder.live_session_id == session_id,
+                LiveOrder.bridge_order_id == dedupe_key,
+            ).first()
+            if existing is not None:
+                if int(existing.filled_quantity or 0) >= qty:
+                    continue  # 已完整补记，幂等跳过
+                self.backfill_order(db, existing, group, apply=False)  # 后到分笔：重新聚合
+                continue
+            target = None
+            if self._resolve_attribution is not None:
+                target = self._resolve_attribution(code)
+            if target is None:
+                logger.warning(
+                    "external deal not attributable: %s %s x%d (session %s) — "
+                    "no portfolio strategy to book it, skipped",
+                    trade_type, code, qty, session_id)
+                continue
+            pid, sid = target
+            amount = sum(Decimal(str(d.get("amount") or 0)) for d in group)
+            avg_price = (amount / Decimal(qty)) if amount > 0 else Decimal("0")
+            trade_time = self.parse_trade_time(group[-1])
+            live_order = LiveOrder(
+                live_session_id=session_id,
+                portfolio_strategy_id=pid,
+                strategy_id=sid,
+                stock_code=code,
+                trade_type=trade_type,
+                # order_type 长度 10：external 是对外可辨识的「非策略下单」标记
+                order_type="external",
+                price=avg_price,
+                quantity=qty,
+                status="submitted",  # 交给 backfill_order 按成交量转 filled
+                error_message=(
+                    _EXTERNAL_DEAL_MARKER
+                    + "柜台成交无对应平台委托（人工/外部下单），仅补记留痕；"
+                      "持仓数量/成本以桥快照为准，不重复记账"),
+                signal_name="external_deal",
+                bar_time=trade_time,
+                order_ref=str(group[0].get("order_ref") or "").strip() or None,
+                bridge_order_id=dedupe_key,
+            )
+            db.add(live_order)
+            db.flush()  # 取 id 供 LiveTrade 外键 + 事件
+            self.backfill_order(db, live_order, group, apply=False)
+            recorded += 1
+            logger.info(
+                "external deal recorded (ledger untouched): trade_id=%s %s %s "
+                "qty=%d price=%s (order %s, session %s, source=bridge_unmatched)",
+                deal_id or "-", trade_type, code, qty, avg_price,
+                live_order.id, session_id)
+        if recorded:
+            logger.info(
+                "external deals backfilled: %d (session %s, source=bridge_unmatched)",
+                recorded, session_id)
+        return recorded
+
     def sync_terminal_order_status(self, db: Session, pending: list,
                                    orders: Optional[list],
                                    deals: Optional[list]) -> list:
         """终态同步（第一层自愈）：据 /orders 的 m_nOrderStatus 转出 submitted。
 
-        iQuant 收盘自动撤 / GUI 手动撤 / 柜台废单后，ORDER 实时表里该单 status 变终态：
+        QMT 收盘自动撤 / GUI 手动撤 / 柜台废单后，ORDER 实时表里该单 status 变终态：
           53=部撤（部分成交后撤剩余）、54=全撤（无成交）、57=废单（柜台拒单）。
           55=部成是**非终态**（剩余仍在撮合），不在此处理——误判会提前 cancel 真实在途单，
           剩余成交后重复 apply/丢单（2026-08-24 据官方码修正，旧代码误把 55 当部撤）。
@@ -468,6 +778,109 @@ class OrderStateMachine:
                 cancel_converged.append(lo)
         return cancel_converged
 
+    # ------------------------------------------------------------------
+    # 超长兜底窗口 / 收口前的最后一次追溯
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _untraceable_grace_seconds() -> int:
+        """超长兜底窗口（秒）：goldminer.untraceable_grace_seconds，缺键/非法回退 600。
+
+        注意只读配置、不写回；config.yaml 未加该键时行为与模块常量一致。
+        """
+        try:
+            gm = load_config().get("goldminer") or {}
+            value = int(gm.get("untraceable_grace_seconds", _UNTRACEABLE_GRACE_SECONDS))
+            return value if value > 0 else _UNTRACEABLE_GRACE_SECONDS
+        except (TypeError, ValueError):
+            return _UNTRACEABLE_GRACE_SECONDS
+        except Exception:  # noqa: BLE001 — 配置读取故障不阻断主 tick
+            return _UNTRACEABLE_GRACE_SECONDS
+
+    @staticmethod
+    def _rows_for_order(live_order: LiveOrder, rows: Optional[list]) -> list:
+        """从 /orders 结果里筛出确实属于本单的行（remark/柜台号/平台单号任一命中）。"""
+        remark = (live_order.bridge_order_id or "")[:20]
+        oid = live_order.bridge_order_id
+        ref = live_order.order_ref
+        out = []
+        for o in rows or []:
+            if not isinstance(o, dict):
+                continue
+            if o.get("source") not in (None, "BRIDGE"):
+                continue
+            matched = False
+            if remark and o.get("remark") == remark:
+                matched = True
+            if ref and o.get("order_ref") == ref:
+                matched = True
+            if oid:
+                for key in ("cl_ord_id", "order_id", "entrust_id", "ref",
+                            "order_ref"):
+                    if str(o.get(key) or "") == oid:
+                        matched = True
+                        break
+            if matched:
+                out.append(o)
+        return out
+
+    def _probe_untraceable_trace(self, live_order: LiveOrder,
+                                 deals_cache: Optional[list],
+                                 deals_online: bool = True):
+        """收口前最后一次追溯（防误杀）：精确 /orders + /deals（order_ref/remark）。
+
+        返回 ``(traced, matched_deals, query_ok)``：
+          - traced：委托表确实存在本单（含部成/已成/已撤）→ 交给既有回填/终态同步；
+          - matched_deals：/deals 命中的成交（迟到成交/正常回填用，非空即不得收口）；
+          - query_ok：追溯查询本身可用；桥离线/查询异常时为 False → 禁止收口。
+        命中 `/orders` 时顺带认领 order_ref（此前为 None），让后续终态同步/成交回填
+        能按柜台单号精确匹配。
+        """
+        query_ok = deals_online
+        matched_deals: list = []
+        remark = (live_order.bridge_order_id or "")[:20]
+        # ① /deals：优先 order_ref（若有），否则 remark（bridge_order_id[:20]）。
+        if deals_cache is None:
+            try:
+                deals_cache = self._ctx.dispatcher.query_deals()
+            except BridgeUnavailableError:
+                deals_cache = []
+                query_ok = False
+        if live_order.order_ref:
+            matched_deals = [
+                d for d in deals_cache if d.get("order_ref") == live_order.order_ref]
+        if not matched_deals and remark:
+            matched_deals = [d for d in deals_cache if d.get("remark") == remark]
+        # ② /orders 精确查询（按 cl_ord_id/order_id/remark 任一匹配）。
+        target = live_order.order_ref or live_order.bridge_order_id
+        rows: list = []
+        if target:
+            try:
+                rows = self._ctx.dispatcher.query_orders(order_id=target)
+            except BridgeUnavailableError:
+                rows = []
+                query_ok = False
+        rows = self._rows_for_order(live_order, rows)
+        if rows:
+            if live_order.order_ref is None:
+                ref = next(
+                    (str(o.get("order_ref")) for o in rows if o.get("order_ref")),
+                    None,
+                )
+                if ref:
+                    live_order.order_ref = ref
+            if live_order.order_ref and not matched_deals:
+                try:
+                    by_ref = self._ctx.dispatcher.query_deals(
+                        order_id=live_order.order_ref)
+                except BridgeUnavailableError:
+                    by_ref = []
+                    query_ok = False
+                matched_deals = [
+                    d for d in by_ref if d.get("order_ref") == live_order.order_ref]
+                if not matched_deals and remark:
+                    matched_deals = [d for d in by_ref if d.get("remark") == remark]
+        return bool(rows), matched_deals, query_ok
+
     def expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         """陈旧单失效：始终匹配不到 order_ref 且超过阈值的 submitted/partial 单 → rejected。
 
@@ -482,7 +895,7 @@ class OrderStateMachine:
         try/commit/rollback/finally close，同 _persist_breaker_count 模式）。
 
         修复 A+（真机 2026-08-21 id54-58）：超时单标 rejected 前，先按 remark 查 /deals
-        兜底一次——iQuant 秒成后 ORDER 实时表移除单的 order_ref 永远 None，旧逻辑直接
+        兜底一次——QMT 秒成后 ORDER 实时表移除单的 order_ref 永远 None，旧逻辑直接
         rejected 但其实 /deals（DEAL 表）有成交记录。兜底命中则 backfill_order 转 filled，
         不 reject；真空单（/deals 也无成交）才 rejected。这同时覆盖两条调用路径
         （poll_deals 的顺序 bug + _tick_main 饿死场景不查 /deals）——两处调 expire 都兜底。
@@ -500,12 +913,14 @@ class OrderStateMachine:
                 .all()
             )
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        # 修复 A+：超时单标 rejected 前，先按 remark 查 /deals 兜底一次——iQuant 秒成后
+        # 修复 A+：超时单标 rejected 前，先按 remark 查 /deals 兜底一次——QMT 秒成后
         # ORDER 实时表移除单的 order_ref 永远 None，旧逻辑直接 rejected 但 /deals（DEAL 表）
         # 其实有成交记录。兜底命中则 backfill_order 转 filled 不 reject；真空单
         # （/deals 也无成交）才 rejected。同时覆盖两条调用路径（poll_deals 顺序 bug +
         # _tick_main 饿死场景不查 /deals）。deals 只在确有超时待兜底单时 lazy 查一次，复用。
         deals_cache: Optional[list] = None  # None=未查；list=已查（含空列表），全循环复用
+        deals_online = True  # 桥离线时禁止收口（查不到 ≠ 不存在，防误杀）
+        grace = self._untraceable_grace_seconds()
         for lo in pending:
             if lo.order_ref is not None or lo.status not in ("submitted", "partial"):
                 continue
@@ -521,6 +936,7 @@ class OrderStateMachine:
                         deals_cache = self._ctx.dispatcher.query_deals()
                     except BridgeUnavailableError:
                         deals_cache = []  # 桥离线：本单及后续超时单都无法兜底，退回 reject
+                        deals_online = False
                 expected_remark = lo.bridge_order_id[:20]
                 matched = [d for d in deals_cache if d.get("remark") == expected_remark]
                 if matched:
@@ -531,6 +947,129 @@ class OrderStateMachine:
                         lo.id, lo.trade_type, lo.stock_code, int(age.total_seconds()),
                     )
                     continue
+            # 桥通道（supports_remark=True：掘金/QMT 通道）：
+            #   - 180s~grace：无法追溯时**不自动驳回也不伪造成交**（柜台当日委托查询
+            #     不含废单、桥进程重启丢内存台账，但真实委托可能仍在柜台在途）；
+            #     保持 pending，一次性发 risk 事件由人工核对（DB 是记帐真相）。
+            #   - ≥grace：收口前最后一次追溯（精确 /orders + /deals，防误杀），
+            #     仍毫无踪迹才 rejected，释放同股同向在途门（否则卡住的止损卖单会
+            #     一直挡住后续风控卖出）；迟到成交由 poll_deals 的迟到回填兜底纠正。
+            # 非 remark 通道（通达信/同花顺 UI）维持原「超时收口 rejected」语义不变。
+            if getattr(self._ctx.dispatcher, "supports_remark", False):
+                if age >= timedelta(seconds=grace):
+                    traced, late_deals, query_ok = self._probe_untraceable_trace(
+                        lo, deals_cache, deals_online)
+                    if late_deals:
+                        self.backfill_order(db, lo, late_deals)
+                        logger.info(
+                            "expire: order %s %s %s rescued via final trace "
+                            "(age %ds >= grace %ds, /deals matched)",
+                            lo.id, lo.trade_type, lo.stock_code,
+                            int(age.total_seconds()), grace,
+                        )
+                        continue
+                    if not query_ok:
+                        # 桥离线/查询异常：无法确认「确实不存在」，禁止收口，保持 pending
+                        lo.error_message = _UNTRACEABLE_PENDING_MARKER + (
+                            "桥查询不可用（已 %ds），无法确认委托是否存在，保持 pending"
+                            % int(age.total_seconds()))
+                        logger.warning(
+                            "expire: order %s %s %s final trace unavailable (bridge "
+                            "offline) — keep pending",
+                            lo.id, lo.trade_type, lo.stock_code,
+                        )
+                        continue
+                    if traced:
+                        # 委托表确实存在本单（部成/已成/已撤）：交给既有回填/终态同步，
+                        # 不得按「不可追溯」收口；order_ref 已在 probe 内认领（如有）。
+                        logger.info(
+                            "expire: order %s %s %s traceable in order table after %ds "
+                            "— keep for terminal/deal sync",
+                            lo.id, lo.trade_type, lo.stock_code,
+                            int(age.total_seconds()),
+                        )
+                        continue
+                    # 确实毫无踪迹：收口 rejected，释放同股同向在途门（不生成成交、不动账）
+                    self.pending_orders.pop(lo.id, None)
+                    lo.status = "rejected"
+                    lo.error_message = _UNTRACEABLE_EXPIRED_MARKER + (
+                        "超过 %d 分钟无法在柜台查询到该委托（平台单号 %s / 柜台单号 %s），"
+                        "已置已拒以释放同股同向在途门，请人工核对柜台"
+                        % (max(1, grace // 60), lo.bridge_order_id or lo.id,
+                           lo.order_ref or "-")
+                    )
+                    logger.warning(
+                        "expire: order %s %s %s untraceable_expired (age %ds >= grace "
+                        "%ds) — rejected to release in-flight gate",
+                        lo.id, lo.trade_type, lo.stock_code,
+                        int(age.total_seconds()), grace,
+                    )
+                    self._emit("order", {
+                        "portfolio_id": lo.portfolio_strategy_id,
+                        "order_id": lo.id,
+                        "status": "rejected",
+                        "stock_code": lo.stock_code,
+                        "trade_type": (lo.trade_type or "").upper(),
+                        "quantity": lo.quantity,
+                        "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
+                        "error_message": lo.error_message,
+                    })
+                    self._emit("risk", {
+                        "session_id": session_id,
+                        "rule": "bridge_order_untraceable_expired",
+                        "order_id": lo.id,
+                        "bridge_order_id": lo.bridge_order_id,
+                        "broker_order_id": lo.order_ref,
+                        "stock_code": lo.stock_code,
+                        "trade_type": (lo.trade_type or "").upper(),
+                        "quantity": lo.quantity,
+                        "submitted_at": (
+                            lo.created_at.isoformat() if lo.created_at else None),
+                        "grace_seconds": grace,
+                        "message": (
+                            "委托超过 %d 分钟仍无法在柜台追溯（平台单号 %s，柜台单号 %s，"
+                            "%s %s %s 股，提交于 %s），已收口为已拒以释放同股同向在途门；"
+                            "迟到成交将自动纠正，请人工核对柜台"
+                            % (max(1, grace // 60), lo.id, lo.order_ref or "-",
+                               lo.stock_code, (lo.trade_type or "").upper(), lo.quantity,
+                               lo.created_at.isoformat() if lo.created_at else "-")
+                        ),
+                    })
+                    continue
+                marker = _UNTRACEABLE_PENDING_MARKER
+                if not (lo.error_message or "").startswith(marker):
+                    age_s = int(age.total_seconds())
+                    lo.error_message = marker + (
+                        "柜台委托表与成交表均查不到该单（已 %ds），保持 pending 待人工核对"
+                        % age_s)
+                    logger.warning(
+                        "expire: order %s %s %s untraceable (no order_ref within %ds, "
+                        "no /deals remark match) — keep pending",
+                        lo.id, lo.trade_type, lo.stock_code, age_s,
+                    )
+                    self._emit("risk", {
+                        "session_id": session_id,
+                        "rule": "bridge_order_untraceable",
+                        "order_id": lo.id,
+                        "bridge_order_id": lo.bridge_order_id,
+                        "broker_order_id": lo.order_ref,
+                        "stock_code": lo.stock_code,
+                        "trade_type": (lo.trade_type or "").upper(),
+                        "quantity": lo.quantity,
+                        "submitted_at": (
+                            lo.created_at.isoformat() if lo.created_at else None),
+                        "grace_seconds": grace,
+                        "message": (
+                            "委托无法追溯：委托表与成交表均查不到（平台订单 %s，"
+                            "cl_ord_id=%s，%s %s %s 股，提交于 %s），保持 pending，"
+                            "超过 %d 分钟仍不可追溯将收口为已拒，请人工核对柜台"
+                            % (lo.id, lo.order_ref or "-", lo.stock_code,
+                               (lo.trade_type or "").upper(), lo.quantity,
+                               lo.created_at.isoformat() if lo.created_at else "-",
+                               max(1, grace // 60))
+                        ),
+                    })
+                continue
             lo.status = "rejected"
             lo.error_message = (
                 "order match timeout: no bridge order_ref within %ds"
@@ -572,7 +1111,7 @@ class OrderStateMachine:
 
         对 submitted/partial 且**已有 order_ref** 的单：now - created_at ≥
         ``tq_trade.cancel_unfilled_minutes``（默认 3 分钟；<=0 完全跳过=禁用）→
-        ``dispatcher.cancel_order(ref, code)``。通道无 cancel_order（如 iQuant 桥）→ 跳过。
+        ``dispatcher.cancel_order(ref, code)``。通道无 cancel_order（如 QMT 桥）→ 跳过。
         partial 单同样适用（撤剩余量，已成交部分由回填收割）。
 
         cancel 成功后的收敛顺序（**绝不立即标 canceled 丢已成交量**）：
@@ -598,7 +1137,7 @@ class OrderStateMachine:
             return []
         cancel = getattr(self._ctx.dispatcher, "cancel_order", None)
         if not callable(cancel):
-            return []  # 通道不支持撤单（iQuant 桥等）：完全跳过
+            return []  # 通道不支持撤单（QMT 桥等）：完全跳过
         if pending is None:
             pending = (
                 db.query(LiveOrder)
@@ -797,14 +1336,19 @@ class OrderStateMachine:
             return Decimal("0")
         return amount * rate
 
-    def backfill_order(self, db: Session, live_order: LiveOrder, matched_deals: list) -> None:
+    def backfill_order(self, db: Session, live_order: LiveOrder,
+                       matched_deals: list, apply: bool = True) -> None:
         """据成交回报回填 LiveOrder + LiveTrade + apply_trade（G2/G6）。
 
         聚合 order_ref 下全部成交：总成交量/总金额/总佣金，成交均价 = 金额/量。
         filled（成交量 ≥ 委托量）→ status=filled + apply_trade（首次用真实价/量/佣金）；
         partial（成交量 < 委托量）→ status=partial，写/更新 LiveTrade 但不 apply
         （等最终 filled 或撤单，避免部分成交误动持仓）。
-        """
+
+        ``apply=False``（外部/人工成交补记）：只写 LiveOrder/LiveTrade 留痕 +
+        推 SSE 事件，**不动虚拟持仓与现金**——数量/成本由 60s 桥快照镜面覆盖，
+        避免「桥持仓已含该成交 + 平台再 apply」的双计（2026-11-06 实测
+        000001 虚拟=200/实际=100）。"""
         total_qty = sum(int(d.get("volume") or 0) for d in matched_deals)
         if total_qty <= 0:
             return  # 无实际成交（可能已撤），下轮重查
@@ -890,10 +1434,39 @@ class OrderStateMachine:
             })
 
         # filled：回填确认后 apply_trade（submitted 阶段未 apply，此处首次落持仓）
-        if live_order.status == "filled":
+        if apply and live_order.status == "filled":
             self.apply_filled_trade(
                 live_order, avg_price, total_qty, total_amount, total_commission
             )
+        elif not apply and live_order.order_type == "external":
+            # 外部成交补记：数量/成本由桥快照镜面覆盖，这里只把**增量**成交
+            # 记入 strategy_cost 归因（双口径展示用，不参与止损/止盈触发）。
+            delta = total_qty - prev_qty
+            if delta > 0:
+                # 增量成交按比例分摊佣金，归因均价 =（成交额 + 分摊手续费）/ 股数
+                comm_delta = (total_commission * Decimal(delta) / Decimal(total_qty)
+                              if total_qty else Decimal("0"))
+                portfolio = next(
+                    (p for p in self._ctx.portfolios
+                     if p.portfolio_id == live_order.portfolio_strategy_id), None)
+                ctx = (portfolio.find_strategy(live_order.strategy_id)
+                       if portfolio is not None else None)
+                pos = ctx.positions.get(live_order.stock_code) if ctx else None
+                if pos is not None:
+                    pos.note_strategy_trade(TradeEvent(
+                        strategy_id=live_order.strategy_id,
+                        portfolio_id=live_order.portfolio_strategy_id,
+                        stock_code=live_order.stock_code,
+                        trade_type=TradeType((live_order.trade_type or "").upper()),
+                        price=avg_price,
+                        quantity=delta,
+                        amount=avg_price * Decimal(delta),
+                        commission=comm_delta,
+                        stamp_duty=Decimal("0"),
+                        trade_time=trade_time,
+                        signal_type=(SignalType(live_order.signal_type)
+                                     if live_order.signal_type else None),
+                    ))
 
     @staticmethod
     def parse_trade_time(deal: dict) -> datetime:
@@ -966,7 +1539,7 @@ class OrderStateMachine:
                 "strategy_id": live_order.strategy_id,
                 "stock_code": live_order.stock_code,
                 "quantity": pos.quantity,
-                "avg_cost": float(pos.avg_cost),
-                "market_value": float(pos.avg_cost * pos.quantity),
+                "avg_cost": float(dec_price(pos.avg_cost) or 0),
+                "market_value": float(dec_money(pos.avg_cost * pos.quantity) or 0),
                 "pnl": 0,
             })
