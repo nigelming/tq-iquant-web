@@ -66,3 +66,19 @@ docs/risk/
 live/bridge/diag_*.py
 # THS file handoff runtime files (local only)
 data/ths/
+
+# Local runtime data / one-off diagnostics (2026-11-07)
+main/data/
+main/_ab_result.json
+main/_pool2021.json
+main/nuitka-crash-report.xml
+main/scripts_rerun_fix.py
+main/core/tests/tdx_compare/last_report.json
+main/core/tests/unit/test_dbg_pywinauto.py
+
+# Editor / agent session state
+.trae/
+.superpowers/
+
+# TODO(待确认): 根目录 scripts/ 是本地运维脚本，是否入库尚未决定；确认后再取消注释
+# scripts/
