@@ -1,10 +1,10 @@
-"""iQuant 桥 /quote 拉取根数验证 — 验证 count=250 period=1d 实际能返回多少根。
+"""QMT 桥 /quote 拉取根数验证 — 验证 count=250 period=1d 实际能返回多少根。
 
 走桥 HTTP（8790），即引擎实盘真实走的路径（HttpBridgeDispatcher.query_quote）。
 桥 /quote 透传 count 给 xtdata.get_market_data_ex(count=count)，不做截断。
 
 验证点：
-  A. GET /ping —— 桥是否在线（确认 iQuant 客户端 + 仿真桥策略在跑）
+  A. GET /ping —— 桥是否在线（确认 QMT 客户端 + 仿真桥策略在跑）
   B. GET /quote?code=&period=1d&count=250 —— 实际返回根数
      - 打印 len(bars)、首尾 stime 跨度、首尾 3 行 OHLCV
   C. 诊断：若 len < 250，区分原因
@@ -19,7 +19,7 @@
   uv run python scripts/verify_quote_count.py --code 600000.SH --period 1d --count 250
   uv run python scripts/verify_quote_count.py --port 8791           # 实盘桥
 
-注意：纯标准库，无需 xtquant，不在 iQuant 客户端内跑。前提：桥策略已加载启动、监听端口。
+注意：纯标准库，无需 xtquant，不在 QMT 客户端内跑。前提：桥策略已加载启动、监听端口。
 """
 import argparse
 import json
@@ -103,7 +103,7 @@ def _bar_summary(bars, n=3):
 
 
 def main():
-    p = argparse.ArgumentParser(description="iQuant 桥 /quote 拉取根数验证")
+    p = argparse.ArgumentParser(description="QMT 桥 /quote 拉取根数验证")
     p.add_argument("--code", default="000001.SZ", help="股票代码（带后缀，默认 000001.SZ）")
     p.add_argument("--period", default="1d", help="K 线周期（默认 1d，可 1m/5m/15m/30m/1h/1d）")
     p.add_argument("--count", type=int, default=250, help="请求根数（默认 250）")
@@ -119,7 +119,7 @@ def main():
     status, body, raw = _get(base_url, "/ping")
     if status is None:
         print("[FAIL] %s" % raw)
-        print("       → 桥未启动？确认 iQuant 客户端在运行 + 仿真桥策略已加载启动（监听 %d）" % args.port)
+        print("       → 桥未启动？确认 QMT 客户端在运行 + 仿真桥策略已加载启动（监听 %d）" % args.port)
         return 1
     print("[HTTP %d] %s" % (status, json.dumps(body, ensure_ascii=False) if body else raw))
     if not (body and body.get("ok")):
@@ -166,7 +166,7 @@ def main():
     want = args.count
     if got == 0:
         print("[WARN] 0 根 —— 非交易时段/本地无该周期数据/代码不存在。")
-        print("       1d 历史需 iQuant 客户端已下载过日线（download_history_data 才能取到）。")
+        print("       1d 历史需 QMT 客户端已下载过日线（download_history_data 才能取到）。")
     elif got >= want:
         print("[OK] 达到请求根数 %d，count 参数生效，本地数据充足。" % want)
     else:
@@ -185,7 +185,7 @@ def main():
                           % (want, 30))
                     print("       本地日线缓存不足 → xtdata 只能返回已有的。这与「count 上限」无关。")
                     print("       若要拉满 250 根：需扩大 download_history_data 的起始时间（HISTORY_DAYS 调大），")
-                    print("       或在 iQuant 客户端先手动补下载对应周期的历史数据。")
+                    print("       或在 QMT 客户端先手动补下载对应周期的历史数据。")
                 elif got == 10:
                     print("     → 判定：拿到 10 根 = 桥默认 QUOTE_COUNT，count 参数可能没透传！检查脚本/桥。")
                 else:

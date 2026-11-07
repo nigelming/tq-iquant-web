@@ -14,7 +14,7 @@
   - 最早 bar 时间 < 今天 → 桥能拉历史，实盘公式注入数据充足
   - 最早 bar 时间 = 今天 → 桥只能拉当天，实盘公式注入数据不足，需另想办法
 
-用法（需 iQuant 桥在跑 + 客户端登录）：
+用法（需 QMT 桥在跑 + 客户端登录）：
   cd main
   uv run python scripts/verify_quote_history.py
   uv run python scripts/verify_quote_history.py --code 600000.SH --count1m 1200 --count5m 240
@@ -117,12 +117,12 @@ def main():
         r = httpx.get(args.base_url + "/ping", timeout=5)
         if r.status_code != 200 or not (r.json() or {}).get("ok"):
             print("[FAIL] 桥 /ping 不通：HTTP %s body=%s" % (r.status_code, r.text[:200]))
-            print("       确认 iQuant 桥在跑（127.0.0.1:8790）+ 客户端登录")
+            print("       确认 QMT 桥在跑（127.0.0.1:8790）+ 客户端登录")
             return 1
         print("[OK] 桥 /ping 正常")
     except Exception as e:
         print("[FAIL] 连不上桥：", e)
-        print("       确认 iQuant 桥在跑（127.0.0.1:8790）+ 客户端登录")
+        print("       确认 QMT 桥在跑（127.0.0.1:8790）+ 客户端登录")
         return 1
 
     # 构造 (period, count) 列表

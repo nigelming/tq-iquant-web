@@ -14,7 +14,7 @@
   - 最晚 bar 日期 == 今天，Close 不变 → 当天快照但盘中未刷新（或盘外）
   - 最晚 bar 日期 < 今天 → 仅到昨日收盘
 
-用法（需 iQuant 桥在跑 + 客户端登录）：
+用法（需 QMT 桥在跑 + 客户端登录）：
   cd main
   uv run python scripts/verify_1d_snapshot.py
   uv run python scripts/verify_1d_snapshot.py --code 600000.SH --count 10 --interval 5

@@ -142,14 +142,14 @@ def main():
         "chcp 936 >nul",
         "setlocal",
         'cd /d "%~dp0"',
-        "title 创懿量化交易平台",
+        "title 创懿私募基金量化投资平台",
         "",
         "rem ===== 1. 程序已在运行（8888端口监听中）则直接打开浏览器 =====",
         'netstat -ano -p TCP | findstr /C:":8888 " | findstr /C:"LISTENING" >nul 2>nul',
         "if %errorlevel%==0 goto already",
         "",
         "rem ===== 2. 启动主程序（不阻塞，后台运行）=====",
-        "echo 正在启动创懿量化交易平台，请稍候...",
+        "echo 正在启动创懿私募基金量化投资平台，请稍候...",
         'start "" "tq-iquant.exe"',
         "",
         "rem ===== 3. 等待服务就绪，最多约30秒 =====",
@@ -195,7 +195,7 @@ def main():
     print("\n=== Step 7: 创建 README-分发说明.txt ===")
     readme = dist_dir / "README-分发说明.txt"
     readme.write_text(
-        "创懿量化交易平台 — 分发说明\r\n"
+        "创懿私募基金量化投资平台 — 分发说明\r\n"
         "========================\r\n"
         "\r\n"
         "1. 双击「启动.bat」运行程序\r\n"
