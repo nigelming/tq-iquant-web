@@ -1,4 +1,4 @@
-# -*- coding: gbk -*-
+# -*- coding: utf-8 -*-
 # passorder_test.py - minimal passorder smoke test for the sim account
 # =====================================================
 # Tests whether a passorder call from a strategy reaches the broker queue
