@@ -162,14 +162,15 @@ def test_tr71_regime_table_states(market):
     assert bear["strategy_return"] == pytest.approx(_compound(sc, 45, 59), rel=1e-9)
     assert bear["strategy_return"] < 0
     assert bear["benchmark_return"] < 0
-    assert bear["max_drawdown"] == pytest.approx(sc[59] / sc[45] - 1, rel=1e-6)
+    # 回撤统一为正号口径（与 robustness._max_drawdown 一致，0=无回撤）
+    assert bear["max_drawdown"] == pytest.approx(1 - sc[59] / sc[45], rel=1e-6)
 
     reb = table["rebound"]
     assert reb["weeks"] == 5
     assert reb["ratio"] == pytest.approx(5 / 50)
     assert reb["strategy_return"] < 0            # 反弹不弹
     assert reb["excess_return"] < 0              # 跑输反弹的基准
-    assert -0.05 < reb["max_drawdown"] < -0.01
+    assert 0.01 < reb["max_drawdown"] < 0.05
 
     rng = table["range"]
     assert rng["weeks"] == 15

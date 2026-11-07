@@ -372,8 +372,10 @@ def test_user_block_replace_mode_order_delete_ensure_send(client, monkeypatch):
                    ("send", "MYBK", ["000001.SZ"], False)]
 
 
-def test_user_block_replace_delete_failure_best_effort(client, monkeypatch):
-    # replace 模式 delete_sector 抛异常 → warning 不阻断，继续 ensure→send
+def test_user_block_replace_delete_failure_503(client, monkeypatch):
+    # replace 模式 delete_sector 抛异常 → 覆写前提（先清空成功）不成立，必须 503。
+    # 不能 best-effort 继续写入：旧成分股残留会与新成分股追加合并，随后
+    # sync_pool 会把残留票同步进策略股票池（真钱风险）。
     log = []
 
     def fake_delete(self, block_code):
@@ -392,9 +394,9 @@ def test_user_block_replace_delete_failure_best_effort(client, monkeypatch):
     _patch_data(monkeypatch, "send_user_block", fake_send)
     body = client.post("/api/tdx/user-block", json={
         "block_code": "MYBK", "stock_codes": ["000001.SZ"]}).json()
-    assert body["code"] == 0
-    assert body["data"]["mode"] == "replace"
-    assert log == ["ensure", "send"]
+    assert body["code"] == 503
+    assert "删除板块失败" in body["message"]
+    assert log == []
 
 
 def test_user_block_append_mode_no_delete(client, monkeypatch):

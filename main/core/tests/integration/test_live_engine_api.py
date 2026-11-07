@@ -112,23 +112,29 @@ class _MockRecorder:
 
 @pytest.fixture
 def mock_bridge(monkeypatch):
-    """把 live API 构造的 HttpBridgeDispatcher 替换为 MockTransport 版本。"""
+    """把 live API / live_service 构造的 HttpBridgeDispatcher 替换为 MockTransport 版本。
+
+    engine=goldminer 时 start_session 走 live_service.make_dispatcher（模块内
+    HttpBridgeDispatcher），而 _build_engine 直调走 live_api._dispatcher_cls()，
+    两处都要 patch，否则会打到真实 7801。
+    """
     rec = _MockRecorder()
 
     real_cls = live_api.HttpBridgeDispatcher
 
     def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
         client = httpx.Client(transport=httpx.MockTransport(rec.handler))
-        return real_cls(base_url=base_url, client=client)
+        return real_cls(base_url=base_url, client=client, channel=kw.get("channel"))
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+    monkeypatch.setattr(live_svc, "HttpBridgeDispatcher", fake_constructor)
     return rec
 
 
 def _create_session(c, name="live-test", portfolio_ids=(1,), mode="simulation",
-                    execution_mode="auto", engine="iquant", live_capital=None):
-    """本文件为 iQuant 桥测试（mock_bridge）——显式钉住 engine="iquant"，
-    不依赖本地 config.yaml 的 tq_trade.default_engine（批次 A 后默认 tdx，
+                    execution_mode="auto", engine="goldminer", live_capital=None):
+    """本文件为 HTTP 桥测试（mock_bridge）——显式钉住 engine="goldminer"（HTTP 桥
+    通道），不依赖本地 config.yaml 的 tq_trade.default_engine（批次 A 后默认 tdx，
     落到 tdx 会走真实 TDX 预检/公式冒烟，桥 mock 完全失效）。"""
     payload = {
         "name": name, "portfolio_ids": list(portfolio_ids), "mode": mode,
@@ -264,16 +270,21 @@ class _FakeTdxDispatcher:
         return []
 
 
-def test_two_non_ths_sessions_run_in_parallel(client, mock_bridge):
-    """M1 多会话并行（B6 改资源互斥）：两个非 ths 会话先后 start → 都注册运行。"""
+def test_two_non_ths_sessions_run_in_parallel(client, mock_bridge, monkeypatch):
+    """M1 多会话并行：非 ths 的**不同引擎**（goldminer 桥 + tdx）可并行运行。
+
+    同引擎双会话仍被 `_start_conflict` 409 拒绝（同一真实账户双份记账），
+    故此处按「会话引擎不同」构造，与本文件其余桥测试一致。
+    """
     c, Session = client
     db = Session()
     ps1 = _seed(db)
     ps2 = _seed_extra_portfolio(db)
     db.close()
+    monkeypatch.setattr(live_svc, "TdxTqDispatcher", _FakeTdxDispatcher)
 
-    sid1 = _create_session(c, portfolio_ids=(ps1,))
-    sid2 = _create_session(c, portfolio_ids=(ps2,))
+    sid1 = _create_session(c, portfolio_ids=(ps1,), engine="goldminer")
+    sid2 = _create_session(c, portfolio_ids=(ps2,), engine="tdx")
 
     assert c.post("/api/live/sessions/%d/start" % sid1).json()["data"]["status"] == "running"
     assert c.post("/api/live/sessions/%d/start" % sid2).json()["data"]["status"] == "running"
@@ -284,15 +295,16 @@ def test_two_non_ths_sessions_run_in_parallel(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid2)
 
 
-def test_overlapping_portfolio_sessions_start_allowed(client, mock_bridge):
-    """M1 复制交易语义：同组合挂多个运行中会话 → 启动不拒（各会话独立虚拟账本）。"""
+def test_overlapping_portfolio_sessions_start_allowed(client, mock_bridge, monkeypatch):
+    """M1 复制交易语义：同组合挂多个会话（不同引擎）→ 启动不拒（独立虚拟账本）。"""
     c, Session = client
     db = Session()
     ps_id = _seed(db)
     db.close()
+    monkeypatch.setattr(live_svc, "TdxTqDispatcher", _FakeTdxDispatcher)
 
-    sid1 = _create_session(c, portfolio_ids=(ps_id,))
-    sid2 = _create_session(c, portfolio_ids=(ps_id,))
+    sid1 = _create_session(c, portfolio_ids=(ps_id,), engine="goldminer")
+    sid2 = _create_session(c, portfolio_ids=(ps_id,), engine="tdx")
 
     assert c.post("/api/live/sessions/%d/start" % sid1).json()["code"] == 0
     resp = c.post("/api/live/sessions/%d/start" % sid2)
@@ -656,7 +668,7 @@ def test_create_and_build_engine_wires_signal_file_source(client, mock_bridge):
 
     resp = c.post("/api/live/sessions", json={
         "name": "ext", "portfolio_ids": [ps_id], "mode": "simulation",
-        "execution_mode": "auto", "engine": "iquant",
+        "execution_mode": "auto", "engine": "goldminer",
         "signal_file_path": "D:/ths/alert.txt",
     })
     assert resp.status_code == 200
@@ -898,10 +910,10 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
     monkeypatch.setattr(live_api, "_dispatcher_cls", lambda: fake_constructor)
 
     # simulation / live：创建对应 mode 的 session 后直接调 _build_engine
-    # （显式钉 engine=iquant：消除对本地 tq_trade.default_engine 的隐性依赖）
+    # （显式钉 engine=goldminer：HTTP 桥通道，消除对本地 default_engine 的隐性依赖）
     for mode, expected in [("simulation", "http://127.0.0.1:8790"),
                            ("live", "http://127.0.0.1:8791")]:
-        sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode, engine="iquant")
+        sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode, engine="goldminer")
         db2 = Session()
         try:
             live_api._build_engine(sid, db2, mode)
@@ -911,7 +923,7 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
 
     # unknown：create_session 白名单会拒，用已存在的 simulation session 直接调 _build_engine
     # 传 unknown mode，验证兜底走仿真桥（防误传走到真实资金桥）。
-    sim_sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="iquant")
+    sim_sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="goldminer")
     db3 = Session()
     try:
         live_api._build_engine(sim_sid, db3, "unknown")
@@ -920,8 +932,8 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
     assert captured["base_url"] == "http://127.0.0.1:8790", "unknown mode 应兜底仿真桥，实际 %s" % captured["base_url"]
 
 
-def test_start_session_routes_engine_to_live_bridge(client, monkeypatch):
-    """start_session 传 session.mode 给 _build_engine → 实盘 session 走 8791 桥。"""
+def test_start_session_routes_engine_to_bridge(client, monkeypatch):
+    """start_session 按会话引擎构造桥：goldminer 走 config.goldminer.base_url（7801）。"""
     c, Session = client
     db = Session()
     ps_id = _seed(db)
@@ -933,17 +945,18 @@ def test_start_session_routes_engine_to_live_bridge(client, monkeypatch):
     def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
         captured["base_url"] = base_url
         client_ = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"ok": True})))
-        return real_cls(base_url=base_url, client=client_)
+        return real_cls(base_url=base_url, client=client_, channel=kw.get("channel"))
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+    # 启动路由经 live_service.make_dispatcher 构造（模块内全局），两处都要 patch
+    monkeypatch.setattr(live_svc, "HttpBridgeDispatcher", fake_constructor)
 
-    # A-6 后全局默认引擎为 tq_trade.default_engine（tdx）；本测试验证 iQuant 桥按
-    # mode 选桥址，显式指定 engine=iquant 不依赖全局默认。
-    sid = _create_session(c, portfolio_ids=(ps_id,), mode="live", engine="iquant")
+    # 显式 engine=goldminer（HTTP 桥），不依赖全局 default_engine（tdx）
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="live", engine="goldminer")
     resp = c.post("/api/live/sessions/%d/start" % sid)
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
-    assert captured["base_url"] == "http://127.0.0.1:8791"
+    assert captured["base_url"] == live_svc.goldminer_config()["base_url"]
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
@@ -1043,16 +1056,17 @@ def test_start_session_rejected_when_bridge_offline(client, monkeypatch):
     def fake_constructor(base_url="http://127.0.0.1:8790", **kw):
         # /ping 走 MockTransport 但返回 503 → heartbeat() 见 status_code != 200 返回 False
         client_ = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(503)))
-        return real_cls(base_url=base_url, client=client_)
+        return real_cls(base_url=base_url, client=client_, channel=kw.get("channel"))
 
     monkeypatch.setattr(live_api, "HttpBridgeDispatcher", fake_constructor)
+    monkeypatch.setattr(live_svc, "HttpBridgeDispatcher", fake_constructor)
 
-    # 同上（A-6）：显式 engine=iquant，验证 iQuant 桥离线 503，不依赖全局默认引擎。
-    sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="iquant")
+    # 显式 engine=goldminer：验证 HTTP 桥离线时 503，不依赖全局默认引擎。
+    sid = _create_session(c, portfolio_ids=(ps_id,), mode="simulation", engine="goldminer")
     resp = c.post("/api/live/sessions/%d/start" % sid)
     body = resp.json()
     assert body["code"] == 503
-    assert "桥未启动" in body["message"]
+    assert "应答格式不符" in body["message"]
     # 未建引擎、session 仍非 running
     assert sid not in live_api._ENGINES
     detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
@@ -1221,7 +1235,7 @@ def test_concurrent_start_same_session_registers_single_engine(
     ps_id = _seed(db)
     session = _LiveSession(
         name="conc-start", mode="simulation", status="stopped",
-        engine="iquant", execution_mode="auto",
+        engine="goldminer", execution_mode="auto",
     )
     db.add(session)
     db.flush()

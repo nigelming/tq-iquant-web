@@ -161,7 +161,7 @@ class TestErrors:
             evaluate_outputs("X:TDXW(C,5);", df)
 
     def test_funcs_not_in_runtime(self, df):
-        # DAYOFWEEK/TOTALBARCOUNT 不在 iQuant 运行时函数表（TQVERIFY6 导入
+        # DAYOFWEEK/TOTALBARCOUNT 不在 QMT 运行时函数表（TQVERIFY6 导入
         # 实测报未知字符串），为保持回测/实盘词表一致已移除，求值层必须显式报错
         with pytest.raises(FormulaEvalError, match="DAYOFWEEK"):
             evaluate_outputs("X:DAYOFWEEK;", df)
@@ -1307,9 +1307,9 @@ class TestBatch8TimePeriod:
       w = (rd - rd 所年锚点周一).days // 7 + 1
     - PERIOD：周期编号 1m=0, 5m=1, 15m=2, 30m=3, 60m(1h)=4, 1d=5, 1w=6, 1mon=7
       （需 evaluate_outputs 注入 period 上下文）
-    - SEASON/MIN1..MIN60：跨周期引用锚点且 MIN 族不在 iQuant 运行时函数表
+    - SEASON/MIN1..MIN60：跨周期引用锚点且 MIN 族不在 QMT 运行时函数表
       （TQVERIFY8B 导入实测）→ 显式报错，批次 9 接入
-    - WEEK：不在 iQuant 运行时函数表 → 显式报错，星期序号用 WEEKDAY
+    - WEEK：不在 QMT 运行时函数表 → 显式报错，星期序号用 WEEKDAY
     """
 
     @pytest.fixture()
@@ -1326,7 +1326,7 @@ class TestBatch8TimePeriod:
         })
 
     def test_week_rejected_not_in_runtime(self, dt_df):
-        # WEEK 不在国信 iQuant 运行时函数表（TQVERIFY8 导入实测报未知字符串，
+        # WEEK 不在 QMT 通道运行时函数表（TQVERIFY8 导入实测报未知字符串，
         # 同 DAYOFWEEK 先例），为保持回测/实盘词表一致已移除；星期序号用 WEEKDAY
         with pytest.raises(FormulaEvalError, match="WEEK"):
             evaluate_outputs("X:WEEK;", dt_df)
@@ -1367,7 +1367,7 @@ class TestBatch8TimePeriod:
         assert _vals(out, "P") == [5.0] * 5   # 实证：日线编号=5
 
     def test_min_symbols_rejected_not_in_runtime(self, dt_df):
-        # MIN1..MIN60 为跨周期引用锚点且不在 iQuant 运行时函数表
+        # MIN1..MIN60 为跨周期引用锚点且不在 QMT 运行时函数表
         # （TQVERIFY8B 导入实测报未知字符串）——显式报错，批次 9 按锚点语义接入
         with pytest.raises(FormulaEvalError, match="MIN5"):
             evaluate_outputs("X:MIN5;", dt_df)
@@ -1765,3 +1765,22 @@ class TestSourceLint:
         r = syntax_check("X:CLOSE;")
         assert r["ok"] is True
         assert r["errors"] == []
+
+
+def test_zero_window_rejected_for_rolling_functions(df):
+    """MA(C,0) 在 polars 下静默全 null（不报错）→ 信号永不触发，必须显式拒绝。"""
+    with pytest.raises(FormulaEvalError, match="不能为 0"):
+        evaluate_outputs("X:MA(C,0);", df)
+
+
+def test_ref_zero_window_keeps_current_bar_semantics(df):
+    """REF 的 0 是合法语义（取当前 bar），不得被零窗口校验误伤。"""
+    out = evaluate_outputs("X:REF(C,0);", df)
+    assert out["X"].to_list() == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_deep_nesting_reports_formula_error_not_recursion(df):
+    """数百层括号触发 RecursionError → 应转成可读公式错误，而非冒泡成 500。"""
+    src = "X:" + "(" * 400 + "C" + ")" * 400 + ";"
+    with pytest.raises(FormulaEvalError, match="嵌套过深"):
+        evaluate_outputs(src, df)

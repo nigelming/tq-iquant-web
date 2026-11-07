@@ -1,6 +1,6 @@
 """TdxTqDispatcher 映射逻辑测试（用假 tqcenter 模块，不启动通达信）。
 
-覆盖 Core 契约：委托/持仓/资金字段归一化（通达信字段名与 iQuant 不同）、
+覆盖 Core 契约：委托/持仓/资金字段归一化（通达信字段名与 QMT 不同）、
 下单链路（order_stock → 回查 Wtbh 认领）、无 remark 时的 legacy 匹配所需插入时间，
 以及下单失败/半自动确认模式的明确报错。
 """
@@ -116,6 +116,8 @@ def test_normalize_symbol_exchange_suffix():
     assert normalize_symbol("000001") == "000001.SZ"
     assert normalize_symbol("600000") == "600000.SH"
     assert normalize_symbol("430047") == "430047.BJ"
+    # 92xxxx 为北交所新股段（不得按 9 开头落 SH）
+    assert normalize_symbol("920718") == "920718.BJ"
     assert normalize_symbol("000001.SZ") == "000001.SZ"
 
 
@@ -226,7 +228,14 @@ def test_place_order_resolves_ref_and_enables_legacy_match(fake, no_quote):
     assert OrderStateMachine.match_legacy_fuzzy(live_order, [row], set()) == "W900"
 
 
-def test_place_order_rejects_when_order_not_in_orders_table(fake, no_quote):
+def test_place_order_keeps_submitted_when_order_not_in_orders_table(fake, no_quote):
+    """柜台已受理（ErrorId=0）但回查窗口内委托表未见该单 → **不得当拒单**。
+
+    拒单会让引擎把订单标 rejected 并移出在途集合：真实在途单从此无 ref、
+    无成交回填、无法撤单（虚拟持仓/现金与柜台脱节，SELL 还会二次卖出）。
+    正确行为：返回 None + last_unconfirmed_order_id，引擎保持 submitted，
+    由 deals 轮询 legacy 模糊认领，最坏 180s 超时收口。
+    """
     d = TdxTqDispatcher()
     fake.orders = []
     order = SimpleNamespace(
@@ -236,15 +245,31 @@ def test_place_order_rejects_when_order_not_in_orders_table(fake, no_quote):
     )
     fake.order_result = 0
     fake.msg = "已提交"
-    with pytest.raises(BridgeOrderRejected) as ei:
-        d.place_order(order)
-    assert "委托列表未见该单" in str(ei.value)
+    assert d.place_order(order) is None
+    assert d.last_unconfirmed_order_id
+    assert "未认领" in d.last_error
 
 
 def test_place_order_flags_half_auto_confirm_mode(fake, no_quote):
-    d = TdxTqDispatcher()
+    """待确认态且自动确认失败 → 明确拒单文案（含「交易信号」定位提示）。"""
+
+    class _FailConfirmer:
+        def __init__(self):
+            self.specs = []
+
+        def snapshot_rows(self):
+            return ()
+
+        def confirm(self, spec, is_submitted=None, deadline=None,
+                    on_clicked=None, baseline=None):
+            self.specs.append(spec)
+            return SimpleNamespace(ok=False, detail="未找到「交易信号」窗口",
+                                   clicks=0, stale=0)
+
+    confirmer = _FailConfirmer()
+    d = TdxTqDispatcher(confirmer=confirmer)
     fake.orders = []
-    fake.msg = "待用户确认"
+    fake.msg = "已发送信号至客户端，待用户确认！"
     order = SimpleNamespace(
         strategy_id=1, portfolio_id=2, stock_code="000001",
         trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
@@ -252,7 +277,119 @@ def test_place_order_flags_half_auto_confirm_mode(fake, no_quote):
     )
     with pytest.raises(BridgeOrderRejected) as ei:
         d.place_order(order)
-    assert "下单确认" in str(ei.value)
+    assert "交易信号" in str(ei.value)
+    # 确认器收到本次委托的识别特征（代码/方向/数量）
+    assert confirmer.specs and confirmer.specs[0].code6 == "000001"
+    assert confirmer.specs[0].direction == "buy"
+    assert confirmer.specs[0].volume == 1000
+
+
+def test_place_order_keeps_submitted_when_clicked_but_not_claimed(fake, no_quote):
+    """已点『发送』但 deadline 内委托表未见该单 → 不可判拒单（保持 submitted）。
+
+    点击成功只代表信号已发送，委托表刷新可能滞后；判拒单会让引擎丢弃在途单
+    跟踪，下一根 bar 可能重复报单（SELL 双重卖出）。
+    """
+
+    class _ClickedNoRef:
+        def snapshot_rows(self):
+            return ()
+
+        def confirm(self, spec, is_submitted=None, deadline=None,
+                    on_clicked=None, baseline=None):
+            if on_clicked:
+                on_clicked()
+            return SimpleNamespace(
+                ok=False, detail="已点击『发送』，但超时内委托表仍未出现该单",
+                clicks=1, stale=0)
+
+    d = TdxTqDispatcher(confirmer=_ClickedNoRef())
+    fake.orders = []
+    fake.msg = "已发送信号至客户端，待用户确认！"
+    order = SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=None,
+    )
+    assert d.place_order(order) is None
+    assert d.last_unconfirmed_order_id
+    assert "未认领" in d.last_error
+
+
+def test_place_order_pending_with_auto_confirm_off_raises(fake, no_quote):
+    """关闭自动确认（tq_trade.auto_confirm_dialog=false）→ 明确报错提示手动发送。"""
+    d = TdxTqDispatcher(auto_confirm_dialog=False)
+    fake.orders = []
+    fake.msg = "已发送信号至客户端，待用户确认！"
+    order = SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=None,
+    )
+    with pytest.raises(BridgeOrderRejected) as ei:
+        d.place_order(order)
+    assert "自动确认已关闭" in str(ei.value)
+
+
+def test_place_order_auto_confirms_and_returns_trade(fake, no_quote):
+    """待确认态 → 自动点『发送』→ 委托表出现该单 → 正常返回成交事件。"""
+
+    class _OkConfirmer:
+        def __init__(self, after_click):
+            self.after_click = after_click
+            self.specs = []
+
+        def snapshot_rows(self):
+            return ()
+
+        def confirm(self, spec, is_submitted=None, deadline=None,
+                    on_clicked=None, baseline=None):
+            self.specs.append(spec)
+            self.after_click()
+            ok = bool(is_submitted and is_submitted())
+            return SimpleNamespace(ok=ok, detail="已点击发送", clicks=1, stale=0)
+
+    fake.orders = []
+    fake.msg = "已发送信号至客户端，待用户确认！"
+    confirmer = _OkConfirmer(lambda: fake.orders.append(
+        _order(code="000001", flag=0, ref="W777", price=10.5, vol=1000)))
+    d = TdxTqDispatcher(confirmer=confirmer)
+    order = SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=None,
+    )
+    trade = d.place_order(order)
+    assert trade is not None
+    assert trade.quantity == 1000
+    assert "W777" in d._claimed_refs
+
+
+def test_place_order_skips_confirm_when_value_2(fake, no_quote):
+    """Value=2（直接成功）不进入 UI 确认路径。"""
+
+    class _SpyConfirmer:
+        def __init__(self):
+            self.called = False
+
+        def snapshot_rows(self):
+            return ()
+
+        def confirm(self, *a, **kw):
+            self.called = True
+            return SimpleNamespace(ok=True, detail="", clicks=0, stale=0)
+
+    spy = _SpyConfirmer()
+    fake.order_result = {"ErrorId": "0", "Value": 2, "Msg": "委托成功"}
+    fake.orders = [_order(code="000001", flag=0, ref="W888", price=10.5, vol=1000)]
+    d = TdxTqDispatcher(confirmer=spy)
+    order = SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=None,
+    )
+    assert d.place_order(order) is not None
+    assert spy.called is False
 
 
 def test_place_order_failure_returns_rejected(fake, no_quote):

@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from decimal import Decimal
 
 from core.engine.portfolio import Portfolio
@@ -117,8 +117,39 @@ def test_on_bar_zero_close_skips_order():
         bar_time=datetime(2026, 7, 30, 13, 5),
     )
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []  # close=0 不下单，不抛 DivisionByZero
+
+
+def test_on_bar_zero_close_does_not_emit_fake_stop_loss():
+    """停牌 bar close=0 不得先算盈亏：真机曾产出 -100% 假止损（601989/000939/002013）。
+
+    风控必须先校验价格有效性（close>0），无效时只记一条 risk_skip_no_price，
+    不发 STOP_LOSS、不写假 decision。
+    """
+    from core.engine.decision import DecisionRecorder
+
+    port, ctx = _portfolio_with_strategy(
+        "000001.SZ", [], stop_loss=Decimal("0.05"))
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+
+    bar = BarEvent(
+        stocks={"000001.SZ": {
+            "open": Decimal("0"), "high": Decimal("0"),
+            "low": Decimal("0"), "close": Decimal("0"), "volume": 0,
+        }},
+        bar_time=datetime(2026, 7, 30, 13, 5),
+    )
+    orders = port.on_bar(bar, signal_cache=None)
+
+    assert orders == []
+    events = rec.drain()
+    assert any(ev.gate == "risk_skip_no_price" for ev in events)
+    assert not any(ev.gate == "stop_loss" for ev in events)
 
 
 def test_on_bar_stop_loss_prioritized_over_formula_close():
@@ -178,7 +209,7 @@ def test_on_bar_no_signal_no_order():
     )
     bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": -1}]}  # 不触发
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -308,7 +339,7 @@ def test_add_signal_below_threshold_skipped():
 
     bar = _bar("000001.SZ", "9.6", datetime(2026, 7, 30, 15, 0))
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -327,7 +358,7 @@ def test_add_signal_exceeds_max_count_skipped():
 
     bar = _bar("000001.SZ", "9.0", datetime(2026, 7, 30, 15, 0))  # 跌 10% ≥ threshold
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -397,7 +428,7 @@ def test_add_signal_threshold_minus_one_still_respects_max_count():
 
     bar = _bar("000001.SZ", "9.0", datetime(2026, 7, 30, 15, 0))  # 跌 10%（drop 失效不看）
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -446,7 +477,7 @@ def test_open_signal_respects_max_positions():
         bar_time=datetime(2026, 7, 30, 15, 0),
     )
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -556,7 +587,7 @@ def test_open_signal_ignored_when_stock_already_held():
     ctx.positions["000001.SZ"] = pos
     bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
     cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
-    orders = port.on_bar(bar, signal_cache=cache)
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
     assert orders == []
 
 
@@ -1494,3 +1525,107 @@ def test_regime_bull_relaxes_trailing_stop():
     port.current_regime = "bull"
     orders = port.on_bar(_bar_95(), signal_cache={})
     assert orders == []
+
+
+# ---- 风控与周期解耦（盘中价风控实盘化）：非本策略周期 bar 仅跑风控、信号锁周期 ----
+
+def _portfolio_1d_with_holdings(stop_loss=Decimal("0.1"), trailing=Decimal("0")):
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    ctx.formula_signals = []
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=stop_loss,
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=trailing,
+    )
+    port.strategies.append(ctx)
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+    return port, ctx, pos
+
+
+def test_intraday_bar_triggers_stop_loss_for_daily_strategy():
+    """1m 盘中 bar（period=1m）驱动 1d 策略持仓 → 跌破止损按盘中价触发 SELL
+    （实盘快照合成 bar 盘中风控；回测日线数据无 1m bar 行为不变）。"""
+    port, ctx, _pos = _portfolio_1d_with_holdings(stop_loss=Decimal("0.1"))
+    # 盘中价 8.8：相对成本 10 亏 12% > 止损 10%
+    bar = _bar("000001.SZ", "8.8", datetime(2026, 7, 30, 10, 31))
+    bar.period = "1m"
+    orders = port.on_bar(bar, signal_cache={}, period="1m")
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.SELL
+    assert orders[0].quantity == 1000
+    assert orders[0].signal_type == SignalType.STOP_LOSS
+
+
+def test_intraday_bar_does_not_trigger_formula_signal_for_daily_strategy():
+    """周期锁不变：1m bar 不触发 1d 策略的公式信号（防混合周期前视）。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    ctx.formula_signals = [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.1"),
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 10, 31))
+    bar.period = "1m"
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "open_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache, period="1m")
+    assert orders == []        # 无持仓 + 信号被周期锁抑制
+
+
+def test_period_matched_bar_behavior_unchanged():
+    """周期匹配（1d bar）→ 信号+风控照常（回归保护）。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    ctx.formula_signals = [{"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1}]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.1"),
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 1000, datetime(2026, 7, 29, 9, 30)))
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "10.5", datetime(2026, 7, 30, 15, 0))
+    bar.period = "1d"
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "close_sig", "value": 1}]}
+    orders = port.on_bar(bar, signal_cache=cache)
+    assert len(orders) == 1
+    assert orders[0].signal_type == SignalType.CLOSE   # 公式信号正常（非风控抑制）
+
+
+def test_intraday_trailing_stop_uses_realtime_high():
+    """盘中移动止损：1m bar 逐根刷新 highest_price（只升不降），回撤超阈值
+    按盘中价触发——峰值序列与回测同规则（update_high），价格源更细。"""
+    port, ctx, pos = _portfolio_1d_with_holdings(trailing=Decimal("0.05"))
+    # 峰值先抬高：两根盘中上涨 bar
+    for px in ("10.5", "11.0"):
+        bar = _bar("000001.SZ", px, datetime(2026, 7, 30, 10, 31))
+        bar.period = "1m"
+        assert port.on_bar(bar, signal_cache={}, period="1m") == []
+    assert pos.highest_price == Decimal("11.0")
+    # 回撤 bar：10.4 / 11.0 = 5.45% > 5% → 触发
+    bar = _bar("000001.SZ", "10.4", datetime(2026, 7, 30, 10, 35))
+    bar.period = "1m"
+    orders = port.on_bar(bar, signal_cache={}, period="1m")
+    assert len(orders) == 1
+    assert orders[0].signal_type == SignalType.TRAILING_STOP

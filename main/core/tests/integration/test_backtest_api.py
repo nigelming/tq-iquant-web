@@ -833,6 +833,30 @@ def test_post_recompute_market_regime_not_found(client):
     assert body["code"] == 404
 
 
+def test_post_validation_crisis_recompute_returns_payload(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    record_id = _post_backtest(c, ps_id).json()["data"]["record_id"]
+    monkeypatch.setattr(
+        bt_api, "_svc_recompute_validation_crisis",
+        lambda db, rid: {"status": "ok",
+                         "crisis": [{"key": "2018_tradewar", "verdict": "defensive"}]},
+    )
+    body = c.post(f"/api/backtest/records/{record_id}/validation-crisis/recompute").json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "ok"
+    assert body["data"]["crisis"][0]["key"] == "2018_tradewar"
+
+
+def test_post_validation_crisis_recompute_not_found(client):
+    c, _ = client
+    body = c.post("/api/backtest/records/999999/validation-crisis/recompute").json()
+    assert body["code"] == 404
+
+
 def test_post_recompute_evaluation_returns_payload(client, monkeypatch):
     c, Session = client
     db = Session()

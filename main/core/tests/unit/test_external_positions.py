@@ -127,7 +127,7 @@ def test_external_positions_dispatcher_exception_returns_empty():
 
 
 def test_external_positions_missing_get_positions_returns_empty():
-    """dispatcher 无 get_positions（如 iQuant 桥）→ 无外部行，不抛错。"""
+    """dispatcher 无 get_positions（如 QMT 桥）→ 无外部行，不抛错。"""
     eng = _virtual_engine(object())
     assert live_service.engine_external_positions(eng) == []
 
@@ -174,7 +174,7 @@ def test_ths_get_positions_normalizes_to_universal_shape():
             super().__init__()
             self._connected = True
 
-        def _read_position_rows(self):
+        def _read_position_rows(self, max_age: float = 0.0):
             return [
                 {"symbol": "000001", "name": "平安银行", "volume": 1000,
                  "available": 0, "cost": 10.0, "price": 10.5,
@@ -202,7 +202,7 @@ def test_ths_service_reads_ths_positions_as_external():
             super().__init__()
             self._connected = True
 
-        def _read_position_rows(self):
+        def _read_position_rows(self, max_age: float = 0.0):
             return [
                 {"symbol": "600519", "name": "贵州茅台", "volume": 100,
                  "available": 100, "cost": 1700.0, "price": 1750.0,

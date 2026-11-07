@@ -61,7 +61,7 @@ def _seed_pool(db):
     return ps.id
 
 
-@pytest.mark.parametrize("engine_key", ["iquant", "tdx", "ths"])
+@pytest.mark.parametrize("engine_key", ["goldminer", "tdx", "ths", "iquant"])
 def test_create_and_list_session_engine(client, engine_key):
     c, _ = client
     r = c.post("/api/live/sessions",
@@ -88,13 +88,76 @@ def test_channel_endpoint_accepts_engine_query(client):
     assert body["code"] == 0
     assert body["data"]["engine"] == "tdx"
     assert body["data"]["active"] == "tdx_tq"
-    assert [e["key"] for e in body["data"]["engines"]] == ["iquant", "tdx", "ths"]
+    assert [e["key"] for e in body["data"]["engines"]] == [
+        "goldminer", "tdx", "ths", "iquant"]
 
 
 def test_channel_test_rejects_unknown_channel(client):
     c, _ = client
     body = c.post("/api/live/channel/test", json={"channel": "foo"}).json()
     assert body["code"] == 400
+
+
+def test_channel_test_accepts_iquant_bridge(client, monkeypatch):
+    """QMT 桥已恢复接入：/channel/test 不再被「已退役」拒单，按 mode 选桥址。"""
+    from core.services import live_service as svc
+
+    class FakeBridge:
+        def __init__(self, **kw):
+            self.base_url = kw.get("base_url")
+
+        def heartbeat(self):
+            return True
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
+    c, _ = client
+    body = c.post(
+        "/api/live/channel/test",
+        json={"channel": "iquant_bridge", "mode": "live"},
+    ).json()
+    assert body["code"] == 0
+    assert body["data"]["ok"] is True
+    assert body["data"]["channel"] == "iquant_bridge"
+    # 桥址取自本机 config.yaml（live 腿端口随账户切换 8790/8791 变化），只验 mode 路由
+    assert body["data"]["base_url"] == svc.iquant_config()["live"]
+
+
+def test_start_iquant_session_probes_iquant_bridge(client, monkeypatch):
+    """iquant 会话的 /start 经 make_dispatcher 构造桥；桥未就绪给 503 且提示可区分。"""
+    from core.services import live_service as svc
+    from core.api import live as live_api
+
+    class OfflineBridge:
+        channel = "iquant_bridge"
+        last_probe_error = "refused"
+
+        def __init__(self, **kw):
+            pass
+
+        def heartbeat(self):
+            return False
+
+        def query_calendar(self):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", OfflineBridge)
+    c, Session = client
+    db = Session()
+    ps_id = _seed_pool(db)
+    db.close()
+    body = c.post(
+        "/api/live/sessions",
+        json={"name": "iq", "mode": "simulation", "engine": "iquant",
+              "execution_mode": "auto", "portfolio_ids": [ps_id]},
+    ).json()
+    sid = body["data"]["id"]
+    resp = c.post("/api/live/sessions/%d/start" % sid).json()
+    assert resp["code"] == 503
+    assert "QMT 通道" in resp["message"]
+    assert sid not in live_api._ENGINES
 
 
 def test_start_tdx_session_reports_not_ready(client, monkeypatch):

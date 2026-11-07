@@ -82,7 +82,7 @@ def _bar(stock, close, bar_time):
 
 
 class _Recorder:
-    """MockTransport：/order /ping /positions 受理成功（iQuant 桥对照用）。"""
+    """MockTransport：/order /ping /positions 受理成功（QMT 桥对照用）。"""
 
     def handler(self, request):
         path = request.url.path
@@ -235,6 +235,44 @@ def test_handle_bar_file_mode_order_stays_submitted(tmp_path):
     # submitted 阶段不 apply：持仓/现金不变
     assert ctx.positions[STOCK].quantity == 0
     assert port.account.cash == Decimal("100000")
+    db.close()
+    disp.close()
+
+
+def test_handle_bar_stale_enqueue_marker_not_treated_as_enqueued(tmp_path):
+    """上一单的入队标记残留不能把本次审批失败误判成「已入队」。
+
+    file 模式 last_enqueued_order_id 是 dispatcher 实例状态：若本次 execute 在前置
+    审批就失败（place_order 根本没被调用），标记仍是上一单的 oid。同一 bar 同形状
+    重下（order_id 相同）时，旧逻辑会把本次判为 submitted 留在途，实际指令没入队。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(STOCK, "9.3", BAR_TIME)
+
+    engine._handle_bar(port, bar)
+    db = factory()
+    first = db.query(LiveOrder).one()
+    assert first.status == "submitted"
+    stale_oid = disp.last_enqueued_order_id
+    assert stale_oid == first.bridge_order_id
+
+    # 模拟第一单已被超时收割（canceled），内存在途集合清空；本次发单前置审批失败
+    first.status = "canceled"
+    db.commit()
+    with engine._book_lock:
+        engine._pending_orders.clear()
+    engine._engine.execute = lambda *a, **k: None
+
+    engine._handle_bar(port, bar)
+
+    rows = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    assert len(rows) == 2
+    assert rows[1].status == "rejected"
+    assert rows[1].error_message == "approval failed"
+    assert disp.last_enqueued_order_id == stale_oid  # 本次未真正入队
     db.close()
     disp.close()
 

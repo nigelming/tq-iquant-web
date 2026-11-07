@@ -130,7 +130,7 @@ def test_stop_swallows_dispatcher_close_error():
 
 
 def test_stop_tolerates_dispatcher_without_close():
-    """无 close 的通道（如 iQuant HttpBridgeDispatcher）→ 跳过，不抛。"""
+    """无 close 的通道（如 QMT HttpBridgeDispatcher）→ 跳过，不抛。"""
     disp = FakeDispatcher()
     disp.close = None  # 模拟无 close 的通道
     eng = LiveEngine(

@@ -1,4 +1,4 @@
-{创懿量化 内置引擎对比验证公式 8B：批次8时间/周期符号运行时存在性与取值实证——WEEKOFYEAR/PERIOD（WEEK、MIN1..MIN60 不在 iQuant 运行时函数表已移除）；N03-N07 为 TTFILTER N=1..4 映射探测线（循环 4bar 信号：买开→卖平→卖开→买平，逐 bar 遍历四态）。整段复制到通达信技术指标公式，公式名 TQVERIFY8B}
+{创懿量化 内置引擎对比验证公式 8B：批次8时间/周期符号运行时存在性与取值实证——WEEKOFYEAR/PERIOD（WEEK、MIN1..MIN60 不在 QMT 运行时函数表已移除）；N03-N07 为 TTFILTER N=1..4 映射探测线（循环 4bar 信号：买开→卖平→卖开→买平，逐 bar 遍历四态）。整段复制到通达信技术指标公式，公式名 TQVERIFY8B}
 N01:WEEKOFYEAR,NODRAW;
 N02:PERIOD,NODRAW;
 SA:=MOD(BARSCOUNT(C),4)=1;

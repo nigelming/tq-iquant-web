@@ -1075,6 +1075,30 @@ def test_volume_limit_shrinks_buy_to_participation_cap():
     assert events[0]["action"] == "shrink" and events[0]["stock_code"] == stock
 
 
+def test_volume_limit_shrinks_buy_to_whole_lot():
+    """上限非整手时按手向下取整成交（A 股买入必须整手）。
+
+    bar2 Volume=1500 股 → 上限 int(0.1×1500)=150 股；买入缩量须取整到 100 股，
+    否则会成交 150 股，留下非整手持仓（后续卖出按手校验会卡死）。
+    """
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 1500),
+    ])
+    port, ctx = _volume_portfolio(enabled=True)
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].quantity == 100
+    assert trades[0].quantity % 100 == 0
+    events = [d for d in result["decisions"] if d["gate"] == "volume_cap_shrink"]
+    assert len(events) == 1
+    assert events[0]["final_qty"] == 100
+
+
 def test_volume_limit_defers_when_cap_below_one_lot():
     """上限不足一手 → 延后至量足 bar 成交（每订单仅首次记 1 条 defer 事件）。
 

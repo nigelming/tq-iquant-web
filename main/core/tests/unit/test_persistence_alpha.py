@@ -155,6 +155,37 @@ def test_risk_within_noise_band_is_not_worsening():
         _row(2024, nav_return=0.50, excess=0.10, sharpe=2.0, calmar=5.0, mdd=0.10),
         _row(2025, nav_return=0.40, excess=0.11, sharpe=1.9, calmar=4.9, mdd=0.105),
     ]
-    v = decide_verdict(years, "000300.SH", "沪深300")
+    v = decide_verdict(years, "000300.SH")
     assert v["signals"][1]["status"] == "good"
     assert v["level"] == "style_pendulum"
+
+
+def test_per_year_avg_position_utilization():
+    """传入利用率序列 → 分年平均仓位利用率（口径同 Evaluator：tv>0 日的 mv/tv 均值）。"""
+    nav = dict(_mk_year(2024, [1.001] * 240))
+    util = {d: (Decimal("0.6") if i % 2 == 0 else Decimal("0.4"))
+            for i, d in enumerate(sorted(nav))}
+    out = compute_persistence(nav, [], {}, "000300.SH", "沪深300",
+                              utilization_series=util)
+    y = out["years"][0]
+    assert y["avg_position_utilization"] is not None
+    assert abs(y["avg_position_utilization"] - 0.5) < 1e-6
+
+
+def test_per_year_utilization_missing_series_is_none():
+    """未传利用率序列（老调用/老数据）→ 该字段 None，行为兼容。"""
+    nav = dict(_mk_year(2024, [1.001] * 240))
+    out = compute_persistence(nav, [], {}, "000300.SH", "沪深300")
+    assert out["years"][0]["avg_position_utilization"] is None
+
+
+def test_per_year_utilization_partial_days_skipped():
+    """某几日缺利用率（停牌/无估值）→ 只对有值日均摊，不按 0 计入。"""
+    nav = dict(_mk_year(2024, [1.001] * 240))
+    dates = sorted(nav)
+    util = {d: Decimal("0.25") for d in dates[:100]}   # 仅前 100 日有值，全部 0.25
+    out = compute_persistence(nav, [], {}, "000300.SH", "沪深300",
+                              utilization_series=util)
+    y = out["years"][0]
+    assert y["avg_position_utilization"] is not None
+    assert abs(y["avg_position_utilization"] - 0.25) < 1e-6

@@ -14,9 +14,19 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 
-from core.engine.live.external_signal_source import ExternalSignalFileSource
+from core.engine.live.external_signal_source import (
+    ExternalSignalFileSource, normalize_external_symbol)
 
 NAMES = {"分时突击"}
+
+
+def test_normalize_external_symbol_bse_92_prefix():
+    """920xxx 属北交所新股段 → .BJ（原实现按 9 开头误归一成 .SH）。"""
+    assert normalize_external_symbol("920718") == "920718.BJ"
+    assert normalize_external_symbol("600000") == "600000.SH"
+    assert normalize_external_symbol("000001") == "000001.SZ"
+    assert normalize_external_symbol("430047") == "430047.BJ"
+    assert normalize_external_symbol("920718.BJ") == "920718.BJ"
 
 # 固定测试时钟基准：早于用例全部信号时间（游标与 lookback 窗口均放行），
 # 供解析/去重/公式匹配等基础用例使用。

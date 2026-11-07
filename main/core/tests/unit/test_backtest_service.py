@@ -2137,6 +2137,183 @@ def test_build_crisis_verification_exposed_when_low_cash_loss():
     assert w["verdict"] == "exposed"
 
 
+def test_crisis_windows_tightened_boundaries():
+    """窗口收紧（去恢复期稀释）：2020 止于 3 月、23-24 起于 1 月、2025 止于 4 月。"""
+    span = {w["key"]: (w["start"], w["end"]) for w in svc.CRISIS_WINDOWS}
+    assert span["2020_covid"] == ("2020-01-01", "2020-03-31")
+    assert span["2024_liquidity"] == ("2024-01-01", "2024-02-29")
+    assert span["2025_tradewar"] == ("2025-04-01", "2025-04-30")
+
+
+def test_crisis_window_excludes_recovery_tail():
+    """恢复期快照不参与窗口计算：2020-04 反弹不得把 exposed 翻成 defensive。"""
+    snaps = [
+        _snap(date(2020, 1, 2), 100, 5, 4000),
+        _snap(date(2020, 3, 31), 85, 5, 3400),   # 急跌 -15%，现金 5%
+        _snap(date(2020, 4, 30), 105, 5, 3600),  # 4 月修复（旧窗口纳入 → +5% 防御）
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2020_covid"][0]
+    assert w["end"] == "2020-03-31"
+    assert w["strategy_return"] < 0
+    assert w["verdict"] == "exposed"
+
+
+def test_crisis_window_excludes_pre_shock_drift():
+    """23-24 流动性危机窗口自 2024-01-01 起：11-12 月阴跌漂移不进窗。"""
+    snaps = [
+        _snap(date(2023, 11, 15), 100, 20, 3500),  # 旧窗口起点（阴跌漂移）
+        _snap(date(2023, 12, 29), 108, 20, 3580),  # 年末反弹
+        _snap(date(2024, 1, 31), 105, 10, 3450),   # 1 月微盘崩
+        _snap(date(2024, 2, 8), 101, 10, 3390),    # 雪球/DMA 去杠杆底部
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2024_liquidity"][0]
+    assert w["start"] == "2024-01-01"
+    # 新窗 108→101 = -6.5% exposed；旧窗 100→101 = +1% 防御（稀释）
+    assert w["strategy_return"] < 0
+    assert w["verdict"] == "exposed"
+
+
+def test_crisis_window_excludes_v_shaped_recovery():
+    """2025 贸易战窗口止于 04-30：5-7 月 V 型反弹不进窗（急跌单月即危机）。"""
+    snaps = [
+        _snap(date(2025, 3, 31), 100, 30, 3900),
+        _snap(date(2025, 4, 7), 92, 60, 3620),    # 关税暴跌日
+        _snap(date(2025, 4, 30), 94, 55, 3700),
+        _snap(date(2025, 7, 31), 112, 30, 4080),  # 反弹新高（旧窗口纳入 → +12% 防御）
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2025_tradewar"][0]
+    assert w["end"] == "2025-04-30"
+    assert w["strategy_return"] < 0
+    assert w["verdict"] == "exposed"
+
+
+def test_crisis_outperform_benchmark_counts_as_defensive():
+    """危机中亏损但显著跑赢基准（≥5pp）且现金不高 → defensive（相对口径兜底）。
+
+    benchmark_return 为窗口内首末日比值：3800→3300 = -13.2%，
+    策略 -6% → 跑赢 7.2pp ≥ 5pp。"""
+    snaps = [
+        _snap(date(2017, 12, 29), 100, 50, 4000),
+        _snap(date(2018, 6, 1), 95, 50, 3800),
+        _snap(date(2018, 12, 28), 94, 45, 3300),
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2018_tradewar"][0]
+    assert w["strategy_return"] < 0
+    assert w["min_cash_ratio"] < 0.70
+    assert w["verdict"] == "defensive"
+    assert "跑赢" in w["reason"]
+
+
+def test_crisis_windows_supplemented_from_2008():
+    """补充 2008 起标志性危机窗口（部分回测区间可早至 2008）。"""
+    span = {w["key"]: (w["start"], w["end"]) for w in svc.CRISIS_WINDOWS}
+    assert span["2008_gfc"] == ("2008-01-01", "2008-12-31")
+    assert span["2010_eurozone"] == ("2010-04-01", "2010-07-31")
+    assert span["2013_cash_squeeze"] == ("2013-06-01", "2013-07-31")
+    assert span["2021_crowded_unwind"] == ("2021-02-18", "2021-03-31")
+    assert span["2022_multi_shock"] == ("2022-01-01", "2022-04-30")
+
+
+def test_crisis_new_window_computes_verdict():
+    """新增窗口命中快照即出判定（2013 钱荒：策略 -8% vs 基准 -13.5%，跑赢 5.5pp ≥ 5pp → defensive）。
+
+    两侧同起点：策略用 5/31 净值 100 → 7/31 92，基准同起点 2600 → 2250，
+    口径必须一致（原实现基准只在窗口内取，会系统性偏移超额，翻转 5pp 判定）。
+    """
+    snaps = [
+        _snap(date(2013, 5, 31), 100, 30, 2600),
+        _snap(date(2013, 6, 25), 88, 30, 2300),   # 钱荒底
+        _snap(date(2013, 7, 31), 92, 30, 2250),   # 7 月弱势整理
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2013_cash_squeeze"][0]
+    assert w["start"] == "2013-06-01" and w["end"] == "2013-07-31"
+    assert w["strategy_return"] == pytest.approx(-0.08)
+    assert w["benchmark_return"] == pytest.approx(2250 / 2600 - 1)
+    assert w["min_cash_ratio"] < 0.70
+    assert w["verdict"] == "defensive"
+
+
+def test_crisis_outperform_below_threshold_stays_exposed():
+    """跑赢不足 5pp（-6% vs -5.3% = -0.7pp）→ 仍 exposed。"""
+    snaps = [
+        _snap(date(2017, 12, 29), 100, 50, 4000),
+        _snap(date(2018, 6, 1), 96, 50, 3800),
+        _snap(date(2018, 12, 28), 94, 45, 3600),  # 基准 3800→3600 = -5.3%
+    ]
+    w = [c for c in svc.build_crisis_verification(snaps) if c["key"] == "2018_tradewar"][0]
+    assert w["strategy_return"] < 0
+    assert w["benchmark_return"] < 0
+    assert w["min_cash_ratio"] < 0.70
+    assert w["verdict"] == "exposed"
+
+
+def test_recompute_validation_crisis_refreshes_windows(db_session):
+    """离线刷新验证结论 crisis 块：新窗口/新判定生效，capacity/oos 原样保留。"""
+    rec, ps = _seed_record(db_session)
+    rec.validation_json = json.dumps({
+        "capacity": ["容量预警：xxx"],
+        "crisis": [{"key": "2015_crash", "verdict": "defensive"}],  # 旧冻结结果
+        "oos": {"run_id": 7},
+    }, ensure_ascii=False, default=str)
+    # 2018 窗口：策略 -6% vs 基准 3800→3300 = -13.2%（跑赢 7.2pp）→ 相对分支 defensive
+    for d, tv, cash, bv in (
+        (date(2017, 12, 29), 100, 50, 4000),
+        (date(2018, 6, 1), 95, 50, 3800),
+        (date(2018, 12, 28), 94, 45, 3300),
+    ):
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(tv)), cash=Decimal(str(cash)),
+            market_value=Decimal(str(tv - cash)), benchmark_value=Decimal(str(bv)),
+        ))
+    db_session.commit()
+
+    out = svc.recompute_validation_crisis(db_session, rec.id)
+    assert out["status"] == "ok"
+    assert out["crisis"] and out["crisis"][0]["key"] == "2018_tradewar"
+    w2018 = out["crisis"][0]
+    assert w2018["verdict"] == "defensive" and "跑赢" in w2018["reason"]
+    payload = json.loads(rec.validation_json)
+    assert payload["capacity"] == ["容量预警：xxx"]
+    assert payload["oos"] == {"run_id": 7}
+    assert payload["crisis"] == out["crisis"]
+
+
+def test_recompute_validation_crisis_creates_payload_when_absent(db_session):
+    """老记录无 validation_json → 构造 {capacity:[], crisis, oos:None}。"""
+    rec, ps = _seed_record(db_session)
+    for d, tv, cash, bv in (
+        (date(2013, 5, 31), 100, 30, 2600),
+        (date(2013, 6, 25), 88, 30, 2300),   # 钱荒底
+        (date(2013, 7, 31), 92, 30, 2250),
+    ):
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(tv)), cash=Decimal(str(cash)),
+            market_value=Decimal(str(tv - cash)), benchmark_value=Decimal(str(bv)),
+        ))
+    db_session.commit()
+
+    out = svc.recompute_validation_crisis(db_session, rec.id)
+    assert out["status"] == "ok"
+    payload = json.loads(rec.validation_json)
+    assert payload["capacity"] == []
+    assert payload["oos"] is None
+    assert [c["key"] for c in payload["crisis"]] == ["2013_cash_squeeze"]
+    assert payload["crisis"][0]["verdict"] == "defensive"
+
+
+def test_recompute_validation_crisis_missing_record_returns_none(db_session):
+    assert svc.recompute_validation_crisis(db_session, 9999) is None
+
+
+def test_recompute_validation_crisis_failed_without_snapshots(db_session):
+    rec, _ = _seed_record(db_session)
+    out = svc.recompute_validation_crisis(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "快照" in out["error"]
+
+
 def test_build_validation_verdict_includes_all_blocks():
     """验证结论聚合三块：capacity + crisis + oos。"""
     from core.models import WalkForwardRun as _WF
@@ -2183,6 +2360,109 @@ def test_capacity_warning_shows_real_amount_not_zero_yi():
     msg = warns[0]
     assert "20.0 万" in msg and "14.0 万" in msg
     assert "0.00" not in msg
+
+
+# ---------------------------------------------------------------------------
+# 敞口上限预警（单仓上限×持仓数 vs 净值规模）+ 验证结论离线重算
+# ---------------------------------------------------------------------------
+def _ceiling_snaps():
+    """4 日快照：净值 100万→250万，利用率恒 0.5；期末净值 250 万。"""
+    out = []
+    for i, (d, tv, mv) in enumerate((
+        (date(2024, 1, 2), 1_000_000, 500_000),
+        (date(2024, 1, 3), 1_500_000, 750_000),
+        (date(2024, 1, 4), 2_000_000, 1_000_000),
+        (date(2024, 1, 5), 2_500_000, 1_250_000),
+    )):
+        out.append({"snap_date": d, "total_value": Decimal(str(tv)),
+                    "cash": Decimal(str(tv - mv)), "market_value": Decimal(str(mv))})
+    return out
+
+
+def test_capacity_ceiling_warning_fires_when_below_half_equity():
+    """敞口上限 100 万 < 期末净值 250 万的 50% → 敞口上限预警（含利用率数值）。"""
+    warns = svc.build_capacity_warnings(
+        [], None, {}, "dynamic", None,
+        snapshots=_ceiling_snaps(), exposure_ceiling=Decimal("1_000_000"),
+    )
+    hit = [w for w in warns if "敞口上限预警" in w]
+    assert len(hit) == 1
+    assert "40%" in hit[0]          # 100万 / 250万
+    assert "50.0%" in hit[0]        # 利用率
+    assert "max_order_amount" in hit[0]
+
+
+def test_capacity_ceiling_warning_silent_when_ceiling_loose():
+    """敞口上限 ≥ 期末净值 50% → 不预警（上限未约束弹性）。"""
+    warns = svc.build_capacity_warnings(
+        [], None, {}, "dynamic", None,
+        snapshots=_ceiling_snaps(), exposure_ceiling=Decimal("2_000_000"),
+    )
+    assert not any("敞口上限预警" in w for w in warns)
+
+
+def test_capacity_ceiling_warning_absent_without_ceiling_or_snaps():
+    """未配置单仓上限（None）或缺快照 → 无该预警、不抛错（老调用行为不变）。"""
+    assert not any("敞口上限预警" in w for w in svc.build_capacity_warnings(
+        [], None, {}, "dynamic", None, snapshots=_ceiling_snaps()))
+    assert not any("敞口上限预警" in w for w in svc.build_capacity_warnings(
+        [], None, {}, "dynamic", None, exposure_ceiling=Decimal("1")))
+    assert svc.build_capacity_warnings([], None, {}, "dynamic", None) == []
+
+
+def test_capacity_ceiling_warning_reads_orm_snapshots():
+    """snapshots 传 ORM 行（属性访问）与 dict 同样可用（离线重算路径）。"""
+    rows = [SimpleNamespace(snap_date=s["snap_date"], total_value=s["total_value"],
+                            market_value=s["market_value"], cash=s["cash"])
+            for s in _ceiling_snaps()]
+    warns = svc.build_capacity_warnings(
+        [], None, {}, "dynamic", None,
+        snapshots=rows, exposure_ceiling=Decimal("1_000_000"),
+    )
+    assert any("敞口上限预警" in w for w in warns)
+
+
+def test_recompute_validation_rebuilds_all_blocks(db_session):
+    """离线重算验证结论：capacity（集中度+敞口上限）+ crisis + oos 全量重建并落库。"""
+    rec, ps = _seed_record(db_session)
+    strat = db_session.query(Strategy).filter_by(portfolio_id=ps.id).one()
+    strat.max_order_amount = Decimal("200000")     # ceiling = 5 × 20万 = 100万
+    db_session.commit()
+    rec.validation_json = json.dumps(
+        {"capacity": ["旧容量告警"], "crisis": [], "oos": {"run_id": 1}},
+        ensure_ascii=False)
+    # 2024-01 流动性危机窗口 + 期末净值 250 万（ceiling 占比 40% < 50%）
+    for d, tv, mv, bv in (
+        (date(2024, 1, 2), 1_000_000, 500_000, 3400),
+        (date(2024, 1, 31), 950_000, 475_000, 3200),
+        (date(2024, 2, 8), 920_000, 460_000, 3150),
+        (date(2024, 2, 29), 2_500_000, 1_250_000, 3300),
+    ):
+        db_session.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=d, total_value=Decimal(str(tv)), cash=Decimal(str(tv - mv)),
+            market_value=Decimal(str(mv)), benchmark_value=Decimal(str(bv)),
+        ))
+    db_session.commit()
+
+    out = svc.recompute_validation(db_session, rec.id)
+    assert out["status"] == "ok"
+    payload = json.loads(rec.validation_json)
+    assert any("敞口上限预警" in w for w in payload["capacity"])
+    assert not any("旧容量告警" in w for w in payload["capacity"])
+    assert "2024_liquidity" in [c["key"] for c in payload["crisis"]]
+    assert payload["oos"] is None
+
+
+def test_recompute_validation_missing_record_returns_none(db_session):
+    assert svc.recompute_validation(db_session, 9999) is None
+
+
+def test_recompute_validation_failed_without_snapshots(db_session):
+    rec, _ = _seed_record(db_session)
+    out = svc.recompute_validation(db_session, rec.id)
+    assert out["status"] == "failed"
+    assert "快照" in out["error"]
 
 
 def test_evaluation_reproducible_from_stored_snapshots(db_session, monkeypatch):
@@ -2694,6 +2974,10 @@ def test_run_backtest_regime_reuses_benchmark_series(db_session, monkeypatch):
     db_session.commit()
 
     _patch_common_backtest_deps(monkeypatch)
+    # 信号缓存走桩：否则 build_signal_cache 走真实 TQ 公式 → TDXConnectionError
+    monkeypatch.setattr(svc, "build_signal_cache",
+                        lambda ps, klines, db=None, start=None, diagnostics=None,
+                        dividend_mode="front": {})
     monkeypatch.setattr(svc.BacktestEngine, "run",
                         lambda self, portfolio, **kw: _fake_engine_result())
 
@@ -2726,6 +3010,10 @@ def test_run_backtest_no_regime_still_calls_benchmark(db_session, monkeypatch):
     db_session.commit()
 
     _patch_common_backtest_deps(monkeypatch)
+    # 信号缓存走桩：否则 build_signal_cache 走真实 TQ 公式 → TDXConnectionError
+    monkeypatch.setattr(svc, "build_signal_cache",
+                        lambda ps, klines, db=None, start=None, diagnostics=None,
+                        dividend_mode="front": {})
     monkeypatch.setattr(svc.BacktestEngine, "run",
                         lambda self, portfolio, **kw: _fake_engine_result())
 

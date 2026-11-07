@@ -24,6 +24,9 @@ def test_gem_and_star_twenty_percent():
 def test_bse_thirty_percent():
     assert _limit_ratio_for("430047.BJ") == Decimal("0.30")
     assert _limit_ratio_for("830799.BJ") == Decimal("0.30")
+    # 92xxxx 为北交所新股段，同 30%（原实现漏判，按 9 开头误落 10%）
+    assert _limit_ratio_for("920718.BJ") == Decimal("0.30")
+    assert _limit_ratio_for("920000") == Decimal("0.30")
 
 
 def test_plain_code_without_suffix():

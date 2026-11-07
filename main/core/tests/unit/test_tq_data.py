@@ -120,6 +120,37 @@ def test_get_pools_empty(patch_tq):
     assert TQData().get_stock_pools() == []
 
 
+def test_sector_calls_do_not_self_deadlock(patch_tq):
+    """回归：板块/成分股查询不得自死锁。
+
+    get_stock_pools/get_pool_stocks 外层持 _tdx_lock（非重入 threading.Lock），
+    私有 _get_pools/_get_stocks 曾再次取同一把锁 → 同线程重入永久挂起，并让
+    回测/实盘所有 TQ 调用连带阻塞。用子线程 + join 超时把「挂起」转成可见失败
+    （真死锁时 pytest 只会卡住不报错）。
+    """
+    import threading
+
+    fake = patch_tq(
+        sectors=[{"Code": "TQCS", "Name": "tq自选"}],
+        stocks_map={"TQCS": [{"Code": "600000.SH", "Name": "浦发银行"}]},
+    )
+    done = {}
+
+    def _run():
+        tdx = TQData()
+        done["pools"] = tdx.get_stock_pools()
+        done["stocks"] = tdx.get_pool_stocks("TQCS")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "板块查询自死锁（get_tdx_lock 被同线程重入）"
+    assert done["pools"] == [{"code": "TQCS", "name": "tq自选"}]
+    assert done["stocks"] == [{"stock_code": "600000.SH", "stock_name": "浦发银行"}]
+    # SDK 调用确实穿过 fake（参数口径同线上：block_type=1, list_type=1）
+    assert fake.last_call == {"block_code": "TQCS", "block_type": 1, "list_type": 1}
+
+
 # ---------------------------------------------------------------------------
 # get_pool_stocks — 传板块 Code，解析成分股 {Code,Name}
 # ---------------------------------------------------------------------------

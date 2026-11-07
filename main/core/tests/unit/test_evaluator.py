@@ -577,3 +577,13 @@ def test_position_structure_none_without_payload():
     result = Evaluator().evaluate(snaps)
     assert result["max_single_weight"] is None
     assert result["hhi"] is None
+
+
+def test_returns_from_rows_skips_nonpositive_prev():
+    """前一日总资产为 0/负（退化快照）时跳过该日：Decimal 除法会抛 ZeroDivisionError。"""
+    rows = [
+        {"total_value": Decimal("0")},
+        {"total_value": Decimal("100000")},
+        {"total_value": Decimal("110000")},
+    ]
+    assert Evaluator._returns_from_rows(rows) == [0.1]

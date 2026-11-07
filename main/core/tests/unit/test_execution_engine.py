@@ -462,6 +462,39 @@ def test_execute_sell_bond_t0_same_day_fills():
     assert pos.quantity == 0
 
 
+def test_execute_sell_odd_lot_clear_is_allowed():
+    """持仓本身不足一手时允许一次性清仓（A 股零股规则）。
+
+    缩量历史残仓（如 30 股）若按整手阈值拒单会永远卖不掉；清仓意图
+    （qty == 持仓量）时放行，部分可用不足仍按原逻辑拒单。
+    """
+    acc = Account(Decimal("100000"))
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 30, datetime(2026, 7, 29, 9, 30)))
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.SELL, "000001.SZ", 30, "10",
+                   bar_time=datetime(2026, 7, 30, 10, 0))
+    trade = engine.execute(order, acc, pos)
+    assert trade is not None
+    assert trade.quantity == 30
+    assert pos.quantity == 0
+
+
+def test_execute_sell_partial_available_below_lot_still_blocked():
+    """可用不足一手但并非清仓（持仓更大）→ 仍拒单（既有 T+1 保守语义不变）。"""
+    acc = Account(Decimal("100000"))
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 50, datetime(2026, 7, 29, 9, 30)))
+    pos.apply_trade(_buy("10", 950, datetime(2026, 7, 30, 9, 30)))  # 当日买入 950 锁定
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.SELL, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 30, 10, 0))
+    assert engine.execute(order, acc, pos) is None
+    assert pos.quantity == 1000
+
+
 def test_fit_buy_qty_to_cash_bond_lot():
     """费用兜底缩量按 10 张：现金 1550、价 100 → 10 张可行；lot=100 → 0。"""
     dispatcher = SimulatedDispatcher(open_prices={})
