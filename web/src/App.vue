@@ -84,7 +84,7 @@ function coreDotClass(): string {
 // 浏览器标题
 watch(
   () => route.name,
-  () => { document.title = '创懿量化回测平台 · ' + (titles[route.name as string] || '创懿量化') },
+  () => { document.title = '创懿私募基金量化投资平台 · ' + (titles[route.name as string] || '创懿私募基金') },
   { immediate: true },
 )
 
@@ -108,7 +108,7 @@ onUnmounted(() => {
     <aside class="sidebar">
       <div class="sidebar-header">
         <div class="sidebar-brand">
-          <h1 class="sidebar-title">创懿量化</h1>
+          <h1 class="sidebar-title">创懿私募基金</h1>
           <div class="sidebar-subtitle">CHUANGYI QUANT</div>
         </div>
       </div>
@@ -161,7 +161,7 @@ onUnmounted(() => {
     </aside>
     <div class="main-container">
       <header class="topbar">
-        <h1 class="app-banner"><span class="wb-1">创懿私募基金</span><span class="wb-2">量化回测平台</span></h1>
+        <h1 class="app-banner"><span class="wb-1">创懿私募基金</span><span class="wb-2">量化投资平台</span></h1>
       </header>
       <main class="content"><router-view /></main>
     </div>

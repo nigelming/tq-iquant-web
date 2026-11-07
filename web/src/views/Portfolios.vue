@@ -33,10 +33,20 @@ const editingStrategyId = ref<number | null>(null)
 const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
-// 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 交集（open-questions Q4）+ C6 三段式：
+// 周期取 TQ 公式支持 ∩ QMT 桥 xtdata 交集（open-questions Q4）+ C6 三段式：
 // 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；1w/1mon 走通达信注入。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
+// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认沪深300）
+const BENCHMARK_OPTIONS = [
+  { code: '000300.SH', name: '沪深300' },
+  { code: '000905.SH', name: '中证500' },
+  { code: '000852.SH', name: '中证1000' },
+  { code: '000688.SH', name: '科创50' },
+  { code: '399006.SZ', name: '创业板指' },
+  { code: '000001.SH', name: '上证指数' },
+  { code: '399001.SZ', name: '深证成指' },
+]
 const ROLES = [
   { value: 'independent', label: '独立' },
   { value: 'master', label: '主策略' },
@@ -113,7 +123,7 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
-    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'text', placeholder: '000300.SH' },
+    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比；TQ 指数日线可取，默认沪深300' },
     { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
   ]},
   { title: '风控参数', fields: [
@@ -626,6 +636,7 @@ function fieldVisible(fld: { showIf?: string | { key: string; equals: unknown } 
 // 下拉选项源
 function optionsOf(src: string | undefined, pid?: number) {
   if (!src) return []
+  if (src === 'benchmarks') return BENCHMARK_OPTIONS.map(b => ({ value: b.code, label: `${b.name}（${b.code}）` }))
   if (src === 'pools') return stockPools.value.map(p => ({ value: p.id, label: `${p.name}（${p.code}）` }))
   if (src === 'strategyPools') return [
     { value: null, label: '继承组合级' },

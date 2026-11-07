@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { getSystemConfigs, updateSystemConfigs, testLiveChannel, type SystemConfig } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 
-// 与 core/config.py _defaults() 对齐：回测字段 tdx_path、iQuant 字段 iquant_path、
+// 与 core/config.py _defaults() 对齐：回测字段 tdx_path、QMT 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
 // iquant_bridge.simulation/live.base_url(双桥地址：仿真8790/实盘8791，按 session 模式选桥)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
@@ -34,6 +34,11 @@ const DEFAULTS: SystemConfig = {
     default_engine: 'tdx',
     cancel_unfilled_minutes: 3,
   },
+  goldminer: {
+    base_url: 'http://127.0.0.1:7801',
+    token: '',
+    account_id: '',
+  },
 }
 
 const config = ref<SystemConfig>(JSON.parse(JSON.stringify(DEFAULTS)))
@@ -63,6 +68,11 @@ onMounted(async () => {
       iquant_bridge: {
         simulation: { base_url: data.iquant_bridge?.simulation?.base_url ?? DEFAULTS.iquant_bridge.simulation.base_url },
         live: { base_url: data.iquant_bridge?.live?.base_url ?? DEFAULTS.iquant_bridge.live.base_url },
+      },
+      goldminer: {
+        base_url: data.goldminer?.base_url ?? DEFAULTS.goldminer!.base_url,
+        token: data.goldminer?.token ?? DEFAULTS.goldminer!.token,
+        account_id: data.goldminer?.account_id ?? DEFAULTS.goldminer!.account_id,
       },
       ths_ui: {
         enabled: data.ths_ui?.enabled ?? DEFAULTS.ths_ui.enabled,
@@ -158,34 +168,30 @@ function testTdx() { return testChannel('tdx_tq') }
               <input v-model="config.tdx_path" placeholder="D:\new_tdx64" />
             </div>
 
-            <h3 class="cfg-h">iQuant</h3>
+            <h3 class="cfg-h">掘金量化桥（goldminer）</h3>
             <p class="cfg-desc">
-              iQuant 客户端安装目录，实盘桥策略所在（HTTP 桥 8790 仿真 / 8791 实盘）
+              桥策略（goldminer_bridge.py）跑在掘金终端内，本地 HTTP 服务供平台下单/查询。
+              令牌与账户 ID 须与掘金终端登录的仿真账户一致；修改后重启后端生效。
             </p>
             <div class="field">
-              <label>iQuant 目录</label>
-              <input v-model="config.iquant_path" placeholder="D:\iquant" />
-            </div>
-
-            <h3 class="cfg-h">实盘桥</h3>
-            <p class="cfg-desc">
-              iQuant 客户端内两个桥策略的 HTTP 地址，按 session 模式选桥（仿真→仿真桥，实盘→实盘桥），绑 loopback 单用户，无鉴权
-            </p>
-            <div class="field">
-              <label>仿真桥地址（虚拟资金）</label>
-              <input v-model="config.iquant_bridge.simulation.base_url" placeholder="http://127.0.0.1:8790" />
+              <label>桥服务地址</label>
+              <input v-model="config.goldminer.base_url" placeholder="http://127.0.0.1:7801" />
             </div>
             <div class="field">
-              <label>实盘桥地址（真实资金）</label>
-              <input v-model="config.iquant_bridge.live.base_url" placeholder="http://127.0.0.1:8791" />
+              <label>掘金 Token</label>
+              <input v-model="config.goldminer.token" placeholder="掘金终端「账户管理」中的 token" />
+            </div>
+            <div class="field">
+              <label>账户 ID</label>
+              <input v-model="config.goldminer.account_id" placeholder="仿真账户 ID（长线法宝）" />
             </div>
           </section>
 
           <section v-show="activeGroup === 'ths'">
             <h3 class="cfg-h">同花顺 UI 下单通道</h3>
             <p class="cfg-desc">
-              启用后，实盘 session 改由同花顺独立交易客户端（xiadan.exe）执行下单：回测平台生成信号，
-              同花顺只负责成交。关闭时仍走 iQuant HTTP 桥（默认）。需保存后测试。
+              启用后，实盘 session 改由同花顺独立交易客户端（xiadan.exe）执行下单：投资平台生成信号，
+              同花顺只负责成交。关闭时实盘会话在「新建实盘」中另选引擎（通达信 TQ / 掘金量化 / 同花顺）。需保存后测试。
             </p>
             <div class="field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -281,7 +287,7 @@ function testTdx() { return testChannel('tdx_tq') }
               <label>默认交易引擎</label>
               <select v-model="config.tq_trade!.default_engine">
                 <option value="tdx">通达信 TQ（tdx）</option>
-                <option value="iquant">iQuant HTTP 桥（iquant）</option>
+                <option value="goldminer">掘金量化 HTTP 桥（goldminer）</option>
                 <option value="ths">同花顺 UI 自动化（ths）</option>
               </select>
               <p class="cfg-hint">新建实盘会话未显式选引擎时使用</p>

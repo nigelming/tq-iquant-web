@@ -1210,6 +1210,7 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     expect(rowValue('信息比率')).toBe('0.56')
     expect(rowValue('上行捕获率')).toBe('92.0%')
     expect(rowValue('下行捕获率')).toBe('71.0%')
+    expect(rowValue('单位敞口上行效率')).toBe('1.08×')   // 0.92 / 0.85
     expect(rowValue('超额最大回撤')).toBe('-3.20%')
     // 磨损与仓位
     expect(rowValue('年化换手率（双边）')).toBe('3.25×/年')
@@ -2823,8 +2824,8 @@ describe('Backtest.vue — 持续性检验 section', () => {
         data: {
           status: 'completed', error: null,
           years: [
-            { year: 2024, is_partial: false, nav_return: 0.6, max_drawdown: 0.08, sharpe: 2.5, calmar: 7.0, win_rate: 0.6, profit_factor: 1.9, turnover: 2.0, cost_ratio: 0.001, excess: { '000300.SH': 0.3 }, bench_returns: {} },
-            { year: 2025, is_partial: false, nav_return: 0.3, max_drawdown: 0.2, sharpe: 1.0, calmar: 1.5, win_rate: 0.45, profit_factor: 1.2, turnover: 3.5, cost_ratio: 0.002, excess: { '000300.SH': 0.05 }, bench_returns: {} },
+            { year: 2024, is_partial: false, nav_return: 0.6, max_drawdown: 0.08, sharpe: 2.5, calmar: 7.0, win_rate: 0.6, profit_factor: 1.9, turnover: 2.0, cost_ratio: 0.001, avg_position_utilization: 0.633, excess: { '000300.SH': 0.3 }, bench_returns: {} },
+            { year: 2025, is_partial: false, nav_return: 0.3, max_drawdown: 0.2, sharpe: 1.0, calmar: 1.5, win_rate: 0.45, profit_factor: 1.2, turnover: 3.5, cost_ratio: 0.002, avg_position_utilization: 0.356, excess: { '000300.SH': 0.05 }, bench_returns: {} },
           ],
           rolling: { dates: ['2024-06-01'], strat_6m: [0.12], strat_12m: [0.08], bench_12m: [0.06] },
           benchmarks: [{ code: '000300.SH', name: '沪深300', is_main: true, available: true }],
@@ -2858,6 +2859,11 @@ describe('Backtest.vue — 持续性检验 section', () => {
     expect(w.findAll('.p-signal.st-bad').length).toBe(3)
     expect(w.text()).toContain('分年度超额收益')
     expect(w.text()).toContain('沪深300')
+    // 分年度指标矩阵：仓位利用率列（容量衰减视角）
+    expect(w.text()).toContain('仓位利用率')
+    expect(w.text()).toContain('63.3%')
+    expect(w.text()).toContain('35.6%')
+    expect(w.text()).toContain('敞口上限（持仓数×单仓上限）')
 
     // 箭头本身必须是可点热区（历史 bug：只有点标题文字才能折叠/展开）
     const pCaret = pHeader!.find('.ca-caret')

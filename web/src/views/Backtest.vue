@@ -1936,9 +1936,9 @@ async function onDelete(id: number) {
 function backToList() {
   currentRecord.value = null
   detail.value = null
-  // 销毁图表实例，避免内存泄漏
-  equityChart?.dispose(); equityChart = null
-  drawdownChart?.dispose(); drawdownChart = null
+  // 详情页共 20+ 个图表实例，全部随详情销毁——只 dispose 两个会残留
+  // 其余实例（模块级变量仍持有），反复进出详情会累积泄漏。
+  disposeAllCharts()
 }
 
 // 详情页「样本外验证 未执行 → 立即发起验证」：把当前回测的组合/名称/区间/评估口径
@@ -1996,6 +1996,10 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
     ? m.annual_return / m.volatility : null
+  // 单位敞口上行效率：上行捕获率 ÷ Beta。>1 = 每 1 份市场敞口捕获的涨幅超过
+  // 市场本身（持仓个股平均强于指数，选股贡献）；<1 = 弹性弱于指数。
+  const upPerBeta = m.beta != null && m.beta > 0 && m.up_capture_ratio != null
+    ? m.up_capture_ratio / m.beta : null
   return [
     { label: '总收益', value: pct(m.total_return), cls: valueClass(m.total_return) },
     { label: '年化收益', value: pct(m.annual_return), cls: valueClass(m.annual_return) },
@@ -2026,6 +2030,12 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '信息比率', value: num(m.information_ratio, 2), cls: valueClass(m.information_ratio) },
     { label: '上行捕获率', value: pct1(m.up_capture_ratio), cls: 'text-blue' },
     { label: '下行捕获率', value: pct1(m.down_capture_ratio), cls: 'text-blue' },
+    {
+      label: '单位敞口上行效率',
+      value: upPerBeta == null ? '—' : `${num(upPerBeta, 2)}×`,
+      cls: 'text-blue',
+      hint: '上行捕获率 ÷ Beta：每 1 份市场敞口捕获的上涨幅度倍数。>1 表示持仓个股平均强于指数（超额来自选股）；<1 表示弹性弱于指数',
+    },
     { label: '超额最大回撤', value: pct(m.excess_max_drawdown), cls: valueClass(m.excess_max_drawdown) },
 
     _group('磨损与仓位'),
@@ -2944,6 +2954,7 @@ function disposeAllCharts() {
   stQuadChart?.dispose(); stQuadChart = null
   iaExpChart?.dispose(); iaExpChart = null
   rbHistChart?.dispose(); rbHistChart = null
+  pRollingChart?.dispose(); pRollingChart = null
 }
 
 watch(theme, () => {
@@ -4628,7 +4639,7 @@ watch(theme, () => {
             <table>
               <thead><tr>
                 <th>年份</th><th>交易日</th><th>收益</th><th>最大回撤</th><th>夏普</th><th>卡玛</th>
-                <th>胜率</th><th>盈亏比</th><th>换手×（双边）</th><th>成本/日均净值</th>
+                <th>胜率</th><th>盈亏比</th><th>换手×（双边）</th><th>成本/日均净值</th><th>仓位利用率</th>
               </tr></thead>
               <tbody>
                 <tr v-for="y in (pData.years ?? [])" :key="y.year">
@@ -4642,10 +4653,15 @@ watch(theme, () => {
                   <td>{{ num(y.profit_factor, 2) }}</td>
                   <td>{{ y.turnover == null ? '-' : num(y.turnover, 2) + '×' }}</td>
                   <td>{{ pct1(y.cost_ratio) }}</td>
+                  <td>{{ y.avg_position_utilization == null ? '-' : pct1(y.avg_position_utilization) }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <p class="ca-note" style="margin-top:6px;color:var(--ink-soft)">
+            仓位利用率 = 持仓市值/总净值（年均）。逐年走低 = 敞口上限（持仓数×单仓上限）随净值膨胀收紧，
+            绝对收益的规模摊薄主要来自这里；低利用率同时是回撤保护的来源。
+          </p>
 
           <div class="section-title" style="font-size:13px">分年度超额收益（vs 组合基准 + 宽基）</div>
           <div class="table-wrap">

@@ -43,7 +43,14 @@ describe('formatEvent', () => {
   it('formats position', () => {
     expect(formatEvent('position', {
       stock_code: '600000.SH', quantity: 600, avg_cost: 10.2, market_value: 6120,
-    })).toBe('600000.SH 600股 成本10.2 市值6120')
+    })).toBe('600000.SH 600股 成本10.200 市值6120.00')
+  })
+
+  it('formats position market_value to 2 decimals (no float tail)', () => {
+    expect(formatEvent('position', {
+      stock_code: '600000.SH', quantity: 600, avg_cost: 10.2,
+      market_value: 30870.800010000003,
+    })).toBe('600000.SH 600股 成本10.200 市值30870.80')
   })
 
   it('formats risk (max_drawdown / daily_loss)', () => {

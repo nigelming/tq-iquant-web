@@ -1,4 +1,4 @@
-import axios from 'axios'
+﻿import axios from 'axios'
 
 export const api = axios.create({ baseURL: '/api' })
 
@@ -546,6 +546,7 @@ export interface PersistenceYearRow {
   profit_factor: number | null
   turnover: number | null
   cost_ratio: number | null
+  avg_position_utilization?: number | null
   excess: Record<string, number | null>
   bench_returns: Record<string, number | null>
 }
@@ -1596,6 +1597,9 @@ export interface LivePositionItem {
   strategy_id?: number | null
   // 来源：strategy=策略持仓（缺省按 strategy）/ external=账户原有持仓
   source?: string
+  // 归属：pool=在组合股票池内 / fallback=不在池内、按兜底规则挂到首个组合；
+  // 旧数据/旧接口缺省时按 pool 降级（不显示徽标）
+  attribution?: 'pool' | 'fallback'
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {
@@ -1678,6 +1682,7 @@ export interface LiveSessionItem {
   engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
+  engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
   live_capital?: number | null  // 会话级实盘资金基准（元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null
@@ -1692,10 +1697,12 @@ export interface ReconcileMismatch {
   virtual: number
   real: number
   diff: number
+  // 本次差异的计算时点（ISO）；旧数据/旧接口可能缺省
+  computed_at?: string
 }
 
-// 实盘交易引擎：iquant(国信iQuant HTTP桥) / tdx(通达信TQ) / ths(同花顺UI自动化)
-export type LiveEngineKey = 'iquant' | 'tdx' | 'ths'
+// 实盘交易引擎：iquant(QMT 通道) / tdx(通达信TQ) / ths(同花顺UI自动化)
+export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'goldminer'
 
 // 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
 export type LiveExecutionMode = 'alert' | 'auto'
@@ -1708,6 +1715,11 @@ export interface LiveSessionCreate {
   portfolio_ids: number[]
   live_capital?: number | null  // 实盘资金基准（元）；空=null=用组合初始资金
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
+}
+
+export async function getLiveSession(sessionId: number) {
+  const res = await api.get<ApiResponse<Record<string, any>>>(`/live/sessions/${sessionId}`)
+  return res.data.data
 }
 
 export async function getLiveSessions() {
@@ -1775,6 +1787,11 @@ export interface SystemConfig {
     simulation: { base_url: string }
     live: { base_url: string }
   }
+  goldminer: {
+    base_url: string
+    token: string
+    account_id: string
+  }
   ths_ui: ThsUiConfig
   tq_trade: TqTradeConfig
 }
@@ -1792,6 +1809,7 @@ export interface LiveChannelInfo {
   active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
   label: string
   online: boolean | null
+  engine_running?: boolean  // 无运行引擎时为 false（此时 online=null，不做在线判定）
   engines: LiveChannelEngine[]
   ths_ui: ThsUiConfig
   bridge: { simulation: string; live: string }

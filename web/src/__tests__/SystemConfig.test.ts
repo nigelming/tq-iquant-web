@@ -66,10 +66,8 @@ describe('SystemConfig.vue', () => {
     const inputs = w.findAll('input')
     const v = (el: any) => (el.element as HTMLInputElement).value
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('tdx')))).toBe('D:\\new_tdx64')
-    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('iquant')))).toBe('D:\\iquant')
     expect(v(inputs.find(i => i.attributes('placeholder')?.includes('dev.db')))).toBe('data/dev.db')
-    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('8790')))).toBe('http://127.0.0.1:8790')
-    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('8791')))).toBe('http://127.0.0.1:8791')
+    expect(v(inputs.find(i => i.attributes('placeholder')?.includes('7801')))).toBe('http://127.0.0.1:7801')
     expect(w.text()).toContain('最大并发回测')
     w.unmount()
   })

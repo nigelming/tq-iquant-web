@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import {
-  orderEventToRow, orderHistoryToRows,
+  orderEventToRow, orderHistoryToRows, upsertOrderRow,
   tradeEventToRow, tradeHistoryToRows,
   upsertPositionRows, positionHistoryToRows, prependCapped, positionRowKey,
+  parseBeijingTime, beijingDayKey, filterRowsByRange, summarizeDecisionRows,
+  rangeStartTs,
 } from '../utils/liveWorkbench'
 
 describe('liveWorkbench', () => {
@@ -154,5 +156,162 @@ describe('liveWorkbench', () => {
     expect(capped).toHaveLength(200)
     expect(capped[0]).toBe(-1)
     expect(capped[199]).toBe(198)
+  })
+
+  describe('upsertOrderRow', () => {
+    it('同一 order_id 多次状态事件原地更新，只保留一行', () => {
+      const first = upsertOrderRow([], {
+        order_id: 7, trade_type: 'BUY', stock_code: '600000.SH',
+        status: 'submitted', quantity: 100, price: 10.5,
+        bar_time: '2026-08-05T10:30:00',
+      }, '10:30:00')
+      expect(first).toHaveLength(1)
+      const second = upsertOrderRow(first, {
+        order_id: 7, trade_type: 'BUY', stock_code: '600000.SH',
+        status: 'filled', filled_quantity: 100, filled_price: 10.5,
+      }, '10:31:00')
+      expect(second).toHaveLength(1)
+      expect(second[0].status).toBe('filled')
+      // 成交回报事件不带 price → 保留原委托价
+      expect(second[0].price).toBe(10.5)
+      expect(second[0].filled_quantity).toBe(100)
+      expect(second[0].order_id).toBe(7)
+    })
+
+    it('不同 order_id / 无 order_id 均新建行', () => {
+      const rows = upsertOrderRow([], { order_id: 1, stock_code: 'A', status: 'submitted' })
+      const next = upsertOrderRow(rows, { order_id: 2, stock_code: 'B', status: 'submitted' })
+      expect(next).toHaveLength(2)
+      const noId = upsertOrderRow(next, { stock_code: 'C', status: 'submitted' })
+      expect(noId).toHaveLength(3)
+    })
+  })
+
+  describe('时间口径统一为 Asia/Shanghai', () => {
+    it('UTC → 北京（跨日边界 11-04 23:00Z = 11-05 07:00）', () => {
+      const r = parseBeijingTime('2026-11-04T23:00:00+00:00')
+      expect(r.text).toBe('07:00:00')
+      expect(beijingDayKey(r.ts!)).toBe('2026-11-05')
+    })
+
+    it('+08:00 显式时区原样（上海墙钟）', () => {
+      expect(parseBeijingTime('2026-11-05T09:50:00+08:00').text).toBe('09:50:00')
+    })
+
+    it('无时区旧数据降级：不猜时区、保留原样且 ts=null', () => {
+      const r = parseBeijingTime('2026-11-05T09:50:00')
+      expect(r.ts).toBeNull()
+      expect(r.text).toBe('09:50:00')
+    })
+
+    it('缺失/非法时间不抛错', () => {
+      expect(parseBeijingTime(null)).toEqual({ ts: null, text: '' })
+      expect(parseBeijingTime('not-a-time')).toEqual({ ts: null, text: '' })
+    })
+  })
+
+  describe('时间区间筛选（北京自然日）', () => {
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const row = (iso: string | null) => {
+      const ts = iso ? Date.parse(iso) : null
+      return { ts, name: iso ?? 'legacy' }
+    }
+
+    it('今日：只保留北京当日；近3日/近7日逐级放宽；全部保留', () => {
+      const rows = [
+        row('2026-11-05T09:00:00+08:00'),   // 今日
+        row('2026-11-04T09:00:00+08:00'),   // 昨日
+        row('2026-11-02T09:00:00+08:00'),   // 3 天前
+        row('2026-10-29T09:00:00+08:00'),   // 7 天前
+      ]
+      // 近3日 = 11-03/04/05；近7日 = 10-30 ~ 11-05
+      expect(filterRowsByRange(rows, 'today', NOW)).toHaveLength(1)
+      expect(filterRowsByRange(rows, '3d', NOW)).toHaveLength(2)
+      expect(filterRowsByRange(rows, '7d', NOW)).toHaveLength(3)
+      expect(filterRowsByRange(rows, 'all', NOW)).toHaveLength(4)
+    })
+
+    it('区间起点是北京当日 00:00（= 前一日 UTC 16:00）', () => {
+      expect(rangeStartTs('today', NOW)).toBe(Date.parse('2026-11-05T00:00:00+08:00'))
+    })
+
+    it('ts 缺失的旧数据降级保留（不被筛掉）', () => {
+      const rows = [row('2026-11-05T09:00:00+08:00'), row(null)]
+      expect(filterRowsByRange(rows, 'today', NOW)).toHaveLength(2)
+    })
+  })
+
+  describe('summarizeDecisionRows 聚合随筛选重算', () => {
+    const mk = (id: number, ts: number, gate: string) => ({
+      key: -id, time: '', ts, gate, layer: 'risk', action: 'sell',
+      stock_code: '600000.SH', strategy_id: 1, param_name: gate,
+      param_value: 5, actual_value: 4.9, requested_qty: 100, final_qty: 100,
+      message: '',
+    })
+
+    it('按 (gate,param_name) 聚合数量/股票数/首次末次', () => {
+      const now = Date.parse('2026-11-05T10:00:00+08:00')
+      const rows = [
+        mk(1, now - 3600_000, 'stop_loss'),
+        mk(2, now - 7200_000, 'stop_loss'),
+        mk(3, now - 1800_000, 'max_drawdown'),
+        mk(4, Date.parse('2026-10-30T09:00:00+08:00'), 'stop_loss'),
+      ]
+      const today = summarizeDecisionRows(filterRowsByRange(rows, 'today', now))
+      const sl = today.find((s) => s.gate === 'stop_loss')!
+      expect(sl.count).toBe(2)                       // 不是全时段 3
+      expect(sl.stock_count).toBe(1)
+      expect(today.find((s) => s.gate === 'max_drawdown')!.count).toBe(1)
+
+      const all = summarizeDecisionRows(filterRowsByRange(rows, 'all', now))
+      expect(all.find((s) => s.gate === 'stop_loss')!.count).toBe(3)
+    })
+  })
+
+  describe('成交转化（触发次数 vs 成交笔数，按 order_id 去重）', () => {
+    const now = Date.parse('2026-11-05T10:00:00+08:00')
+    const dec = (id: number, code: string, gate = 'stop_loss') => ({
+      key: -id, time: '', ts: now, gate, layer: 'risk', action: 'sell',
+      stock_code: code, strategy_id: 1, param_name: gate,
+      param_value: 5, actual_value: 4.9, requested_qty: 100, final_qty: 100,
+      message: '',
+    })
+    const order = (id: number, code: string, status: string) => ({
+      key: -id, order_id: id, stock_code: code, status, ts: now,
+    }) as any
+
+    it('同一订单多次重复触发/多条状态事件 → 只算 1 笔成交', () => {
+      const rows = [dec(1, '600000.SH'), dec(2, '600000.SH'), dec(3, '600000.SH'), dec(4, '600000.SH')]
+      const orders = [order(7, '600000.SH', 'filled'), order(7, '600000.SH', 'partial')]
+      const s = summarizeDecisionRows(rows, orders)[0]
+      expect(s.count).toBe(4)
+      expect(s.filled_count).toBe(1)
+      expect(s.conversion_rate).toBeCloseTo(0.25)
+    })
+
+    it('未传 orders（旧调用/旧数据）→ 两列 null 降级', () => {
+      const s = summarizeDecisionRows([dec(1, '600000.SH')])[0]
+      expect(s.filled_count).toBeNull()
+      expect(s.conversion_rate).toBeNull()
+    })
+
+    it('非本组股票 / 未成交委托不计；0 成交 → 转化率 0', () => {
+      const s = summarizeDecisionRows(
+        [dec(1, '600000.SH')],
+        [order(1, '000001.SZ', 'filled'), order(2, '600000.SH', 'submitted')],
+      )[0]
+      expect(s.filled_count).toBe(0)
+      expect(s.conversion_rate).toBe(0)
+    })
+
+    it('成交笔数随筛选区间变化（区间外委托被筛掉 → 0，切全部 → 1）', () => {
+      const old = Date.parse('2026-11-04T09:00:00+08:00')
+      const oldOrder = { ...order(9, '600000.SH', 'filled'), ts: old }
+      const decRows = [dec(1, '600000.SH')]
+      // 今日区间：昨日成交不计入
+      expect(summarizeDecisionRows(decRows, filterRowsByRange([oldOrder], 'today', now))[0].filled_count).toBe(0)
+      // 全部区间：会计入
+      expect(summarizeDecisionRows(decRows, filterRowsByRange([oldOrder], 'all', now))[0].filled_count).toBe(1)
+    })
   })
 })

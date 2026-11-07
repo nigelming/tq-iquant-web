@@ -432,7 +432,7 @@ onMounted(load)
           <td>
             <button @click="openEdit(f)" class="btn btn-sm btn-primary">编辑</button>
             <button @click="openTestRun(f)" class="btn btn-sm" style="margin-left:6px" title="任选股票/周期/bar 数跑一遍公式，看各输出线的触发统计">试算</button>
-            <button @click="openNorm(f)" class="btn btn-sm norm-entry" style="margin-left:6px" title="改造为回测平台可接收的信号标识（±1/±2/0 离散输出线）">信号标准化</button>
+            <button @click="openNorm(f)" class="btn btn-sm norm-entry" style="margin-left:6px" title="改造为投资平台可接收的信号标识（±1/±2/0 离散输出线）">信号标准化</button>
             <button @click="remove(f.id)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
           </td>
         </tr>
