@@ -163,7 +163,15 @@ results.jsonl，在途单停留 submitted 直到超时——即时消费让工�
 4. **无 cancel 通道的超时兜底**：执行器不提供撤单时，超时在途单由引擎 expire
    （180s）标 rejected 收口——执行器可依赖该兜底，不必自行实现超时逻辑；
 5. **读写纪律**：只消费 `read_pending_orders()` 返回的指令（游标已推进，禁止
-   自行回扫）；results 追加行必须带 `order_id` 才能进 done 表与被引擎匹配。
+   自行回扫）；results 追加行必须带 `order_id` 才能进 done 表与被引擎匹配；
+6. **跨引擎 UI 互斥**：UI 自动化通道（tdx / ths）的物理键鼠操作必须串行，
+   共用 `core/engine/live/win_dialog_scope.py` 的 `UI_AUTO_LOCK`
+   （`threading.RLock`）。**该锁只保证同一后端进程内互斥**：另一个后端进程、
+   独立探针脚本、用户手工操作都不排队。因此任何 UI 安全结论都必须配「点击前
+   遮挡校验」（`WindowFromPoint` + `GetAncestor(GA_ROOT)`，被挡则拉前台复检，
+   仍被挡就 fail-closed 中止），不能只依赖锁。锁序恒定
+   `_GRID_LOCK`（通道内 GUI 锁）→ `UI_AUTO_LOCK`（跨通道）；获取一律带超时，
+   超时即「本轮不点、下轮重试」。
 
 ## 7. 通道接入指南
 

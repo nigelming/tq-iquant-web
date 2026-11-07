@@ -1,8 +1,8 @@
-# 0009 实盘交易桥 — iQuant 客户端内 HTTP 桥（形态二）
+# 0009 实盘交易桥 — QMT 客户端内 HTTP 桥（形态二）
 
 > 状态：**可行性已验证**（桥 v6 真机跑通，HTTP 24-39ms 秒回 + `passorder` 返回 0 受理成功），待实施
 > 日期：2026-08-04
-> 接续：0008 实盘引擎模拟撮合已打通（模拟下单）→ 本计划把 0008「次期 NatsDispatcher + iQuant 网关」重构为「客户端内 HTTP 桥」，打通**真实下单/查单/查持仓/查资金 + 1m/5m 行情拉取**
+> 接续：0008 实盘引擎模拟撮合已打通（模拟下单）→ 本计划把 0008「次期 NatsDispatcher + QMT 网关」重构为「客户端内 HTTP 桥」，打通**真实下单/查单/查持仓/查资金 + 1m/5m 行情拉取**
 > 验证：`live/bridge/iquant_bridge.py` v6（HTTP 秒回 + passorder 受理成功，模拟模式）；环境约束见 [[iquant-bridge-env-constraints]]
 
 ## 1. 背景与目标
@@ -10,18 +10,18 @@
 **为什么换方案**（对比 miniQMT / TDX，均为真机验证结论）：
 - **miniQMT（形态三）不可行**：个人账户开通 miniQMT 后**只有行情数据权限、无交易权限**（交易权限仅机构可申请），且当前环境缺 `xtminiqmt.exe`。见 [[iquant-miniqmt-auth-requirement]]。
 - **TDX 无真分钟 bar**：0008 验证风险点 9 定论 TDX 侧 1m 实盘不可行（`subscribe_quote` 废代码、`get_market_data` 盘中只有昨天、snapshot 漏 tick）。
-- **iQuant 客户端内策略（形态二）可行**：策略在已登录客户端内运行，**天然认证**；`passorder`/`get_history_data`/`get_trade_detail_data` 均为官方策略 API，已验证 `passorder` 真实受理。
+- **QMT 客户端内策略（形态二）可行**：策略在已登录客户端内运行，**天然认证**；`passorder`/`get_history_data`/`get_trade_detail_data` 均为官方策略 API，已验证 `passorder` 真实受理。
 
-**目标**：以「iQuant 客户端内 Python 策略做 HTTP 桥」为个人账户的真实交易 + 1m/5m 行情通道，Core 通过 HTTP 调用桥，打通实盘全链路。
+**目标**：以「QMT 客户端内 Python 策略做 HTTP 桥」为个人账户的真实交易 + 1m/5m 行情通道，Core 通过 HTTP 调用桥，打通实盘全链路。
 
 **不在本计划范围**：
 - 多周期合成之外的复杂聚合（仅 1m→5m 起步）
-- iQuant 订阅推送回调（`subscribe_quote` 依赖框架回调，init 阻塞下不可靠，**本方案一律用拉取**）
+- QMT 订阅推送回调（`subscribe_quote` 依赖框架回调，init 阻塞下不可靠，**本方案一律用拉取**）
 - 前端实盘监控大改（保留 0008 的 `LiveSessions.vue`，桥状态并入）
 
 ## 2. 已验证结论（真机实测，2026-08-04）
 
-### 2.1 iQuant 嵌入 Python 环境三大限制
+### 2.1 QMT 嵌入 Python 环境三大限制
 1. **`threading.Thread` 线程不执行**：`start()` 不报错但线程函数从不执行（`thread alive` 从未打印，连接全 CLOSE_WAIT）。
 2. **`handlebar` 仅启动瞬间高频**：模拟模式启动时历史 K 线回放（57ms 内 5000+ tick），回放完成后停止调用。
 3. **`run_time` 回调未被调用**：定义后日志无输出。
@@ -53,7 +53,7 @@ passorder(opType:int, 0, accountID:str, orderCode:str, prType:int,
 └──────────────────────────┬──────────────────────────────────┘
                            │ HTTP + JSON（统一响应格式）
                            ▼
-┌─ iQuant 客户端内桥策略 (Python 3.6, live/bridge/) ───────────┐
+┌─ QMT 客户端内桥策略 (Python 3.6, live/bridge/) ───────────┐
 │  init 阻塞主循环 = 单线程事件循环                              │
 │   ├─ HTTP 层：非阻塞 accept + 分帧解析/响应                   │
 │   ├─ 路由层：/ping /order /positions /account /orders        │
@@ -107,7 +107,7 @@ def init(ContextInfo):
 ### 4.4 请求处理管线（每帧）
 ```
 收齐请求帧 → 鉴权 → 白名单校验 → 路由 → 参数/限额校验
-→ 调 iQuant API → 组装响应 → 写审计日志 → 返回
+→ 调 QMT API → 组装响应 → 写审计日志 → 返回
 ```
 失败逐层短路：鉴权不过 401、白名单/限额不过 403、参数非法 400、API 异常 500。
 
@@ -136,7 +136,7 @@ def place_order(params):
 
 #### 4.5.3 行情（拉取非订阅）
 - Core 定时（如 15s）调 `GET /quote`，桥读内存缓存返回 OHLCV。
-- 桥 `_tick_jobs` 每秒调 `get_history_data` 刷新缓存，避免每次穿 iQuant API。
+- 桥 `_tick_jobs` 每秒调 `get_history_data` 刷新缓存，避免每次穿 QMT API。
 
 #### 4.5.4 白名单 + 限额（止损线）
 ```python
@@ -168,7 +168,7 @@ token/HMAC secret 从环境变量或权限收紧的本地文件读（`load_secre
 
 ### 5.2 bar 完成检测 — 相对变化法（不依赖任何绝对时钟）
 - DataFrame 的 `stime` 是 yyyymmddHHMMSS 的 **bar 结束时间**（如 10:08:00 = 10:07–10:08 那根结束）；`time` 是毫秒/秒时间戳。`parse_bar_time` 优先 `stime`（14 位串），次选 `time`（按 Asia/Shanghai +8 显式转换，不依赖本机时区），兼容验证脚本观察到的字段名。
-- **★ 不用 `stime <= now`，不用 iQuant 时间，不用本机时间 ★**：绝对时钟比较依赖两个不同时钟（bar 时钟 + Core 时钟），Core 部署在 UTC → 全当进行中哑火；本机时钟跑偏 → 漏信号/未来函数。后果不可预知且静默。
+- **★ 不用 `stime <= now`，不用 QMT 时间，不用本机时间 ★**：绝对时钟比较依赖两个不同时钟（bar 时钟 + Core 时钟），Core 部署在 UTC → 全当进行中哑火；本机时钟跑偏 → 漏信号/未来函数。后果不可预知且静默。
 - **相对变化判定**：一根 bar 不再是「该股票最新一根」时，它就完成了。
   ```
   第 N 次拉取:  [..., 10:08, 10:09]           ← 10:09 最新(进行中)
@@ -210,25 +210,25 @@ Core 每 15s 调 GET /quote?period=1m&count=10
 | 成交状态不回传 | Core 轮询 `/deals` 状态机 |
 | 行情实时性（模拟 vs 真实） | 开盘后实测（§12 待验证点） |
 | 券商程序化风控 | 下单限频、交易时段过滤 |
-| iQuant 客户端版本更新改 API | 桥代码集中、文档记录签名，适配更新 |
+| QMT 客户端版本更新改 API | 桥代码集中、文档记录签名，适配更新 |
 | Core Bug 变真实交易 | 模拟撮合充分验证 → 小额真实灰度 |
 
-## 8. 合规边界（不篡改 iQuant）
+## 8. 合规边界（不篡改 QMT）
 
-- **零篡改**：不改 `D:\iQuant\` 任何安装文件、不 hook/注入进程、不绕过认证、不碰 xtquant RPC。
-- 使用 iQuant **官方策略机制**（策略编辑器 + 官方 API `passorder`/`get_history_data`/`get_trade_detail_data`）。
+- **零篡改**：不改 `D:\QMT\` 任何安装文件、不 hook/注入进程、不绕过认证、不碰 xtquant RPC。
+- 使用 QMT **官方策略机制**（策略编辑器 + 官方 API `passorder`/`get_history_data`/`get_trade_detail_data`）。
 - `init` 阻塞是"非预期但合法"的策略代码写法。
-- **待确认**：①外部程序 HTTP 驱动策略下单是否在 iQuant 条款/券商政策内；②程序化交易是否需报备。低频自用一般合规，建议向客户经理确认。
+- **待确认**：①外部程序 HTTP 驱动策略下单是否在 QMT 条款/券商政策内；②程序化交易是否需报备。低频自用一般合规，建议向客户经理确认。
 
 ## 9. 与 0008 的关系
 
 - `OrderDispatcher` 接口已就绪（[execution_engine.py](main/core/engine/execution_engine.py)）。新增 `HttpBridgeDispatcher` 实现该接口，替换 `SimulatedDispatcher`（模拟撮合）→ `HttpBridgeDispatcher`（真实下单），`handle_bar` 引擎核心**不改**。
 - `live/iguant_gateway/`（NATS mock 网关）**废弃**，NATS 方案不再需要。
-- 行情驱动从「TDX `subscribe_hq` + `get_market_snapshot`（1d）」扩展为「iQuant 桥 `get_history_data`（1m/5m/1d）」——0008 §3 数据流的 TDX 路径保留为备选。
+- 行情驱动从「TDX `subscribe_hq` + `get_market_snapshot`（1d）」扩展为「QMT 桥 `get_history_data`（1m/5m/1d）」——0008 §3 数据流的 TDX 路径保留为备选。
 
 ## 10. 关键文件
 
-**桥（iQuant 客户端内）**
+**桥（QMT 客户端内）**
 - `live/bridge/iquant_bridge.py` — v6 验证版 → 升级为正式版（§4 全部机制）
 - `live/bridge/README.md` — 部署/密钥/账号配置说明
 
@@ -247,9 +247,9 @@ Core 每 15s 调 GET /quote?period=1m&count=10
 
 每切片：先写失败测试 → 实现 → 绿 → 回归。
 
-### 切片 1：桥正式版（iQuant 策略，Mock 单测）
+### 切片 1：桥正式版（QMT 策略，Mock 单测）
 桥升级：端点全量 + 鉴权 + 幂等 + 白名单/限额 + 审计 + 行情缓存 + 事件循环（非阻塞 accept）。
-单测（Mock iQuant 内置函数）：
+单测（Mock QMT 内置函数）：
 - `test_ping`、`test_order_dry_run`
 - `test_order_idempotent`（同 order_id 重复请求返回原结果，不重复 passorder）
 - `test_auth_reject`（无 token/错 token → 401）
@@ -300,8 +300,8 @@ Core 每 15s 调 GET /quote?period=1m&count=10
 ## 13. 验证
 
 - 后端：`uv run pytest` 全绿（新 test_http_bridge_dispatcher/test_bar_poller + 既有测试无回归）
-- E2E（用户本地，需 iQuant 客户端运行桥）：
+- E2E（用户本地，需 QMT 客户端运行桥）：
   1. 启动桥策略 → Core 起实盘 session
   2. Core 心跳检测桥在线 → 行情通道拉 1m → 信号 → 真实下单（先模拟模式）→ 查单/成交回报 → live_trades 落库
-  3. 停掉 iQuant 客户端 → Core 检测桥离线 → 暂停下单
+  3. 停掉 QMT 客户端 → Core 检测桥离线 → 暂停下单
   4. 开盘日验证 1m 行情实时性（待验证点）

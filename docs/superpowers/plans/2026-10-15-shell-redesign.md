@@ -538,7 +538,7 @@ Expected: FAIL —— `.dash-hero` 不存在、文本缺少 `CHUANGYI QUANT`。
       <div class="frame-body">
         <p v-if="cfg" style="margin:0;color:var(--ink-soft);line-height:1.8">
           通达信路径：{{ cfg.tdx_path }}<br>
-          iQuant 路径：{{ cfg.iquant_path }}<br>
+          QMT 路径：{{ cfg.iquant_path }}<br>
           仿真桥：{{ cfg.iquant_bridge.simulation.base_url }}<br>
           实盘桥：{{ cfg.iquant_bridge.live.base_url }}
         </p>

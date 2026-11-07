@@ -154,11 +154,11 @@
 2. **所有支持周期内存注入与正常自取完全等价**,**链路无需特殊处理**,直接拉原生 bar 注入。
 3. **count=200 对所有支持周期均足够**(分钟/小时/日线信号触发充分;月线等长周期历史根数本就少于 200,正常)。
 
-### iQuant 桥端周期(2026-08-07 源码定论,补交集)
+### QMT 桥端周期(2026-08-07 源码定论,补交集)
 
-实盘 period 一路透传:`ctx.period` → 桥 `/quote?period=` → `xtdata.get_market_data_ex(period=)` 拉 bar → 同一 `ctx.period` → `formula_set_data` + `process_mul_zb` 喂 TQ。**两端必须用同一个 period 字符串**,故实盘可配 = TQ 支持 ∩ iQuant 桥支持。
+实盘 period 一路透传:`ctx.period` → 桥 `/quote?period=` → `xtdata.get_market_data_ex(period=)` 拉 bar → 同一 `ctx.period` → `formula_set_data` + `process_mul_zb` 喂 TQ。**两端必须用同一个 period 字符串**,故实盘可配 = TQ 支持 ∩ QMT 桥支持。
 
-iQuant 侧有三套 period 说法,**桥实际用 xtdata 那套**(`live/bridge/iquant_bridge.py:_fetch_quote`):
+QMT 侧有三套 period 说法,**桥实际用 xtdata 那套**(`live/bridge/iquant_bridge.py:_fetch_quote`):
 
 | 来源 | 周期 | 桥用? |
 |---|---|---|
@@ -172,7 +172,7 @@ iQuant 侧有三套 period 说法,**桥实际用 xtdata 那套**(`live/bridge/iq
 
 ### 实盘可配周期交集表
 
-| 周期 | TQ 公式(真机验) | iQuant 桥 xtdata | 实盘可配? |
+| 周期 | TQ 公式(真机验) | QMT 桥 xtdata | 实盘可配? |
 |---|---|---|---|
 | `1m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
 | `5m` | ✅ | ✅ 白名单本地 | ✅ 稳 |
@@ -202,7 +202,7 @@ iQuant 侧有三套 period 说法,**桥实际用 xtdata 那套**(`live/bridge/iq
 
 **根因**:`1w/1mon` 不在 xtdata 本地读取白名单 → 走 `get_market_data_ex_ori` 远程分支 → 返回 None → xtdata 内部代码迭代 None 抛 `'NoneType' object is not iterable`(`_fetch_quote` except 捕获打印 `[BRIDGE] xtdata FAIL`)。**不是"空数据"、不是"periodstr error"**。
 
-**定论**:`1w/1mon` iQuant 桥端**拉不到**,但 **TQ+通达信本身支持**(真机验过注入与自取等价)。故实盘 **不走桥 /quote**,session 启动时改走 `TQFormula.compute(period="1w"/"1mon")`(正常自取链路,让 TQ 从通达信拉数据算),14:30 与 1d 统一触发下单(→ live-flow-checklist C3 三段式模式 (C)、C6)。`VALID_PERIODS` 据此**扩到 8 个**`{1m,5m,15m,30m,1h,1d,1w,1mon}`。决策3"等开盘验过再加" → **验过,改走通达信放行**。
+**定论**:`1w/1mon` QMT 桥端**拉不到**,但 **TQ+通达信本身支持**(真机验过注入与自取等价)。故实盘 **不走桥 /quote**,session 启动时改走 `TQFormula.compute(period="1w"/"1mon")`(正常自取链路,让 TQ 从通达信拉数据算),14:30 与 1d 统一触发下单(→ live-flow-checklist C3 三段式模式 (C)、C6)。`VALID_PERIODS` 据此**扩到 8 个**`{1m,5m,15m,30m,1h,1d,1w,1mon}`。决策3"等开盘验过再加" → **验过,改走通达信放行**。
 
 ### 相关代码位置
 

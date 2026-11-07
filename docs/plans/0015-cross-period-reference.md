@@ -7,7 +7,7 @@
 
 ## 0.2 9b 在线实证结论（TQVERIFY9B，2026-10-21）
 
-- **E5/E6 实证通过**（用户通达信实测）：`TESTA.A1`（跨公式）与 `TESTA.A1#WEEK`（跨公式+跨周期组合）均编译执行通过——国信 iQuant 内嵌通达信接受 `NAME.LINE[#PERIOD]` 全部语法形态
+- **E5/E6 实证通过**（用户通达信实测）：`TESTA.A1`（跨公式）与 `TESTA.A1#WEEK`（跨公式+跨周期组合）均编译执行通过——QMT 通道内嵌通达信接受 `NAME.LINE[#PERIOD]` 全部语法形态
 - **7 条线实证语义**（TESTA 内容=A1:CLOSE;）：R01≡C、R02≡REF(C,5)、R03≡MA(C,5)、R04≡C#WEEK（零差异，与 L01 同语义）、R05≡HHV(C#WEEK,8)（零差异，与 L11 同语义）、R07≡0（TESTA.A1-C 恒等）——resolver 求值路径与 FIELD#PERIOD 对齐器口径完全一致
 - **R06 已知差**（CROSS(TESTA.A1,MA(TESTA.A1,5))，11/8473 根）：探针实证 11 根前一根 C==MA5 全为数学平局（prevC−MA5=0，当根间距充分）——TDX 内部 MA 浮点求和尾差把平局判为「已上穿」不触发 CROSS，内置整数分定点平局精确相等触发。批次 1 F15 已实证不可复现（四种求和口径均无法全复现），声明 known
 - 全量回归：单元 1180 passed；在线对比 TQVERIFY1-9B 全部 PASSED（18 passed）
@@ -24,7 +24,7 @@
 
 ## 0.1 9a 在线实证结论（TQVERIFY9，2026-10-20）
 
-- **E1 实证通过**：国信 iQuant 内嵌通达信接受 `FIELD#PERIOD` 后缀语法（TQVERIFY9 导入成功，12 条线全部编译执行）
+- **E1 实证通过**：QMT 通道内嵌通达信接受 `FIELD#PERIOD` 后缀语法（TQVERIFY9 导入成功，12 条线全部编译执行）
 - **E7 实证**：TQ 周线时间戳为「该周最后交易日」标（现代=周五；1991-1992 早期周六/周日也交易日，标周六/周日）。对齐器改为**日历归算**（`_period_window_start`：周线归算周一 00:00、月线归算当月 1 日、日线当日 00:00、分钟不变），免疫标法差异
 - **E8 实证**：价格字段（C/O/H/L）跨周期引用=所属上级 bar **整根终值**（含周内未来引用，与用户定调一致）；**VOL 例外**：`V#WEEK`/`V#MONTH` 为**上级窗口内逐日累计**（不含未来，周一=当日量、周五=周总量），`_cross_volume_series` 特殊实现
 - **known 豁免**（279 根，全部 ≤bar524，1991-1993）：① 早期周六/周日交易日历（TDX 周线周日换根、行时间戳周六/周日标，与自然周一分桶及 TQ 周线行分周不一致）；② 1993-05 除权周（bar531 除权日同源），TDX 内部跨周期对除权周 OHLC 预调整而 TQ 周线 df 为原始价；③ V#WEEK 累计起点同步偏移。现代段（1997+）零差异
@@ -40,7 +40,7 @@
 | API/前端 | `FormulaCreate.no_leak_cross`（默认 False）、serialize/create/update、Formulas.vue 勾选（仅 engine=builtin 时显示，默认不勾）、api/index.ts 类型 |
 | 测试 | 单测 TestBatch9CrossPeriod 14 例 + TestCrossPeriodSyntax 4 例；TQVERIFY9.txt（12 条线）+ harness 拉周/月线注入 period_frames + test_tqverify9_matches_builtin |
 
-**待用户操作**：在通达信公式管理器导入 `main/core/tests/tdx_compare/TQVERIFY9.txt`（公式名 TQVERIFY9，技术指标-其他类型）。若编辑器报「未知字符串/语法错误」→ E1 实证失败（iQuant 不支持 `#` 语法），9a 需重新评估语法形态；导入成功 → 跑 `uv run pytest core/tests/integration/test_tdx_formula_compare.py -v -s`（cwd=main，需通达信在线）完成 12 条线逐 bar 对比（重点 E7 周线时间戳惯例、E8 所属取值语义，预期按实际口径修对齐器）。
+**待用户操作**：在通达信公式管理器导入 `main/core/tests/tdx_compare/TQVERIFY9.txt`（公式名 TQVERIFY9，技术指标-其他类型）。若编辑器报「未知字符串/语法错误」→ E1 实证失败（QMT 不支持 `#` 语法），9a 需重新评估语法形态；导入成功 → 跑 `uv run pytest core/tests/integration/test_tdx_formula_compare.py -v -s`（cwd=main，需通达信在线）完成 12 条线逐 bar 对比（重点 E7 周线时间戳惯例、E8 所属取值语义，预期按实际口径修对齐器）。
 
 9b（跨公式引用 `NAME.LINE`）待 9a 在线闭环后启动（前置 E5/E6 实证）。
 
@@ -71,7 +71,7 @@
 
 ## 3. TDX 实证清单（需用户在通达信公式编辑器实测）
 
-> 批次 6/7 教训：词典≠运行时函数表。`#` 是**操作符**不是函数，理论上不受函数表约束，但国信 iQuant 内嵌版编译器是否接受该语法**未经实证**，是本批次的 P0 前置。
+> 批次 6/7 教训：词典≠运行时函数表。`#` 是**操作符**不是函数，理论上不受函数表约束，但 QMT 通道内嵌版编译器是否接受该语法**未经实证**，是本批次的 P0 前置。
 
 **P0（9a 动工前必须实证）**：
 
@@ -154,7 +154,7 @@ evaluate_outputs(src, df, *, period=None, index_frames=None,
 
 - **引擎零改动**：对齐后序列长度=base df 高度，信号照常写入 `(strat.id, code, base_bar_time)` 键；W4 `(datetime, period)` 路由不受影响（跨周期信号已折算到 base bar_time）
 - **实盘零改动**：bridge/TQ 路径不触碰
-- **TQ 路径回测零改动**：`engine="tq"` 公式不进 builtin 分支，跨周期语法由通达信自行处理（若 iQuant 支持）
+- **TQ 路径回测零改动**：`engine="tq"` 公式不进 builtin 分支，跨周期语法由通达信自行处理（若 QMT 支持）
 
 ## 6. 分期实施建议
 
@@ -178,7 +178,7 @@ evaluate_outputs(src, df, *, period=None, index_frames=None,
 
 | 风险 | 应对 |
 |---|---|
-| E1 实证不过（iQuant 不支持 `#` 语法） | 9a 重新评估语法形态（引号式/函数式）或降级为仅跨公式引用；**评估阶段即卡口，避免白做** |
+| E1 实证不过（QMT 不支持 `#` 语法） | 9a 重新评估语法形态（引号式/函数式）或降级为仅跨公式引用；**评估阶段即卡口，避免白做** |
 | 周线 bar 时间戳惯例未实证（E7） | 对齐器按相邻时间戳分桶实现，不硬编码「周一 00:00」假设 |
 | 回测初期上级序列不足 | 输出 null → 无信号（与 TQ 预热语义一致），文档标注 |
 | `"1h"` 与 `"60m"` 双写法 | 映射表两写法均收 |

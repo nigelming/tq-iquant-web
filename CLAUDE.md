@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概况
 
-创懿量化交易平台 — 桥接通达信(TDX)回测数据与国信 iQuant 实盘交易的单用户量化系统。无鉴权，所有接口直接可访问。
+创懿私募基金量化投资平台 — 桥接通达信(TDX)回测数据与 QMT 通道实盘交易的单用户量化系统。无鉴权，所有接口直接可访问。
 
 **权威业务规则文档**：[AGENTS.md](AGENTS.md) 记录了完整的业务规则、API 规范、并发模型与数据库设计。当前实现状态（模型、API 路由、引擎骨架、前端视图均已落地）见下方"实现状态"。
 
@@ -15,18 +15,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 核心架构（4 模块，2 个 Python 环境）
 
 ```
-Core (main/, Python 3.13) ──HTTP──→ iQuant 桥策略 (live/bridge/, iQuant 客户端内 Python 3.6)
+Core (main/, Python 3.13) ──HTTP──→ QMT 桥策略 (live/bridge/, QMT 客户端内 Python 3.6)
   └─ 同进程嵌入 TQ 模块（通达信，直接函数调用 + polars DataFrame）
 Web 前端 (web/, Vue 3 + Vite) ←HTTP/SSE→ Core (FastAPI)
 shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 ```
 
 - **`main/`** — FastAPI Core + 嵌入式 TQ 模块。事件驱动引擎（polars 核心）。用 `uv` 管理依赖。
-- **`live/`** — iQuant 客户端内运行的桥策略（HTTP 桥，见 [docs/plans/0009-iquant-http-bridge.md](docs/plans/0009-iquant-http-bridge.md)）。iQuant 自带 Python 3.6.8，桥代码须兼容 3.6（无 f-string 等需谨慎，纯标准库实现 HTTP 层）。用 `uv` 管理依赖（仅开发/验证脚本用，桥策略本身无第三方依赖）。
+- **`live/`** — QMT 客户端内运行的桥策略（HTTP 桥，见 [docs/plans/0009-iquant-http-bridge.md](docs/plans/0009-iquant-http-bridge.md)）。QMT 自带 Python 3.6.8，桥代码须兼容 3.6（无 f-string 等需谨慎，纯标准库实现 HTTP 层）。用 `uv` 管理依赖（仅开发/验证脚本用，桥策略本身无第三方依赖）。
 - **`shared/`** — `tq_iquant_shared` 包，通过 `[tool.uv.sources]` 路径依赖 `../shared` 引入。
 - **`web/`** — Vue 3 + Vite + Pinia + axios + TypeScript。白色侧边栏+顶栏布局。
 
-> **架构变更（2026-08）**：原 NATS 网关方案已废弃，Core↔iQuant 改为 HTTP 桥（形态二：iQuant 客户端内策略，`init` 阻塞主循环）。详见计划 0009。原 `live/iguant_gateway/` NATS mock 网关已删除。
+> **架构变更（2026-08）**：原 NATS 网关方案已废弃，Core↔QMT 改为 HTTP 桥（形态二：QMT 客户端内策略，`init` 阻塞主循环）。详见计划 0009。原 `live/iguant_gateway/` NATS mock 网关已删除。
 
 ### ⚠️ shared/ 兼容性硬约束
 
@@ -34,7 +34,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 
 ### 通信拓扑
 
-- **Core ↔ iQuant**：HTTP + JSON（`127.0.0.1:8790`，iQuant 客户端内桥策略），端点 `/ping`/`/order`/`/positions`/`/account`/`/orders`/`/deals`/`/quote`，鉴权 + 白名单 + 限额 + 审计。详见 [docs/plans/0009-iquant-http-bridge.md](docs/plans/0009-iquant-http-bridge.md)
+- **Core ↔ QMT**：HTTP + JSON（`127.0.0.1:8790`，QMT 客户端内桥策略），端点 `/ping`/`/order`/`/positions`/`/account`/`/orders`/`/deals`/`/quote`，鉴权 + 白名单 + 限额 + 审计。详见 [docs/plans/0009-iquant-http-bridge.md](docs/plans/0009-iquant-http-bridge.md)
 - **Core ↔ 通达信**：同进程直接调用，polars DataFrame 进程内传递
 - **Web ↔ Core**：HTTP（开发期 Vite proxy `/api` → `localhost:8000`）+ SSE 实盘实时推送（`GET /api/live/sessions/{id}/stream`）
 
@@ -64,7 +64,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 **已实现（较完整）**：
 - 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束/回测增强/`live_sessions.engine` 等后续迁移；head = `c3f7a1b9d402`）
 - 7 个 API 路由模块已注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status 全部可用（回测、实盘 CRUD + start/stop + SSE 流）
-- iQuant HTTP 桥 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
+- QMT 通道 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
 - 同花顺 UI 执行通道 `ThsUiDispatcher`（可选，`ths_ui.enabled`；UIA 切「资金股票/当日委托」+ 剪贴板取数，Windows 内置 OCR 自动过复制验证码；`query_quote/query_calendar` 复用 TQ；无备注列，Core 走 legacy 模糊匹配）。双模式 `execute_mode`：`file_builtin`（默认，文件交接层 `core/engine/live/ths_handoff.py`——signal/decision/risk 落 JSONL、place_order 入 `orders.jsonl` 秒回 None、内置执行线程按 `execute_interval_seconds` 消费指令、回执落 `results.jsonl`）/ `direct`（同步直呼原行为）
 - 通达信 TQ 交易通道 `TdxTqDispatcher`（[main/core/engine/tdx_tq_dispatcher.py](main/core/engine/tdx_tq_dispatcher.py)）：`tq.stock_account` / `query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `order_stock`，与回测取数共用同一条 TQ 连接；委托表无备注列且无时间列 → `supports_remark=False`，下单后回查 `Wtbh` 认领并在进程内记录提交时间供 legacy 模糊匹配；半自动「下单确认」模式显式拒单告警
 - 实盘引擎按会话可选：`live_sessions.engine`（iquant/tdx/ths，NULL=历史会话按全局默认解析：`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置回退旧行为 `ths_ui.enabled` 判定；miniQMT 通道已移除，历史 qmt 会话经 `session_engine` 白名单回退到默认引擎），`/api/live/channel` 返回引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher

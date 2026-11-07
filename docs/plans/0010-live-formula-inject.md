@@ -10,7 +10,7 @@
 
 回测公式计算走 `TQFormula.compute` → `tq.formula_process_mul_zb`（SDK **自取 `.lc1` 本地分钟文件**自算，`backtest.py:394`），预先算全段信号填 `signal_cache`，再逐 bar 查表（`backtest_engine.py:68`）。
 
-实盘的 bar 来自 iQuant 桥 `xtdata.get_market_data_ex`（有今天实时），但公式引擎在通达信侧（读 `.lc1`，盘中只有昨日及更早，今天实时不入 `.lc1`）。**两个 SDK、两个数据源，闭环断在「实盘实时 bar 喂不进通达信公式引擎」**。
+实盘的 bar 来自 QMT 桥 `xtdata.get_market_data_ex`（有今天实时），但公式引擎在通达信侧（读 `.lc1`，盘中只有昨日及更早，今天实时不入 `.lc1`）。**两个 SDK、两个数据源，闭环断在「实盘实时 bar 喂不进通达信公式引擎」**。
 
 ### 1.2 已验证的解法：内存注入（不写本地文件）
 
@@ -89,7 +89,7 @@ uv run python scripts/verify_quote_history.py --code 600000.SH --count1m 1200 --
 └─────────────────────────────────────────────────────────────────────┘
         │ bridge HTTP /quote                    │ get_tq() 回测版通达信
         ▼                                       ▼
-┌─ iQuant 桥 (127.0.0.1:8790) ──┐    ┌─ 通达信 new_tdx64 ────────────┐
+┌─ QMT 桥 (127.0.0.1:8790) ──┐    ┌─ 通达信 new_tdx64 ────────────┐
 │  xtdata.get_market_data_ex     │    │  formula_set_data 内存注入     │
 │  count=N 拉历史+实时 bar        │    │  formula_process_mul_zb 算公式 │
 └────────────────────────────────┘    └────────────────────────────────┘
@@ -187,7 +187,7 @@ def _fill_signal_cache(self, portfolio, bar):
 3. **单测**：`cd main && uv run pytest core/tests/unit/test_live_engine.py core/tests/unit/test_tq_formula.py -v` → 全绿
 4. **集成测**：`uv run pytest core/tests/integration/test_live_engine_api.py -v` → 全绿
 5. **全量回归**：`uv run pytest` → 既有不回归（6 个 backtest TDX 环境失败保持不变）
-6. **E2E（用户本地，需 iQuant 桥 + 通达信回测版）**：
+6. **E2E（用户本地，需 QMT 桥 + 通达信回测版）**：
    - 起桥 → Core 起实盘 session → 拉 1m bar → `_fill_signal_cache` 注入算 MACROSSPRO → 公式信号触发下单 → live_trades 落库
    - 对比实盘信号与 `verify_formula_inject.py` 注入调用结果一致
 

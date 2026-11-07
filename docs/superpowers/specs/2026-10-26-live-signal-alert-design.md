@@ -63,7 +63,7 @@
 - `auto` 模式 P0 只支持 `signal_frequency == period`，复用现有 `LiveEngine` 的
   bar/日终驱动；`signal_frequency != period` 时启动 503，提示「全自动自定义频率留待 P2，
   当前请用半自动 alert」。
-- alert 模式的行情固定走同进程 TQ，不依赖 iQuant 桥；`session.engine` 在 alert 下仅作
+- alert 模式的行情固定走同进程 TQ，不依赖 QMT 桥；`session.engine` 在 alert 下仅作
   记录，auto 下才决定交易通道。
 
 ## 关键事实
@@ -272,7 +272,7 @@ class TQAlert:
 ### `alert`（默认，半自动）
 
 - 启动不要求交易账号/下单通道在线；必须有行情源（TDX 客户端运行 + TQ 可用）。
-- 行情固定走 `AlertDataDispatcher`（TQ），不依赖 iQuant 桥。
+- 行情固定走 `AlertDataDispatcher`（TQ），不依赖 QMT 桥。
 - 不调用 `Portfolio.on_bar`、不调用 `ExecutionEngine`、不下单。
 - 仍按调度算公式、匹配信号、落 `live_signals`、`send_warn`、发 SSE。
 - `AlertDataDispatcher.place_order()` 直接抛错，防止未来误调用下单。
@@ -572,7 +572,7 @@ P0 先保证 API 与 SSE；前端可先用现有事件日志查看。
 - 不做基于手工持仓的止损/止盈预警（P0）。
 - 不做 Web 确认下单（P0）。
 - 不补发 Core 宕机期间的历史预警。
-- 不改 iQuant 桥、不改现有自动交易通道。
+- 不改 QMT 桥、不改现有自动交易通道。
 - 不做多用户/多通道通知路由（单用户本地工具）。
 
 ## 风险与待验证
@@ -587,7 +587,7 @@ P0 先保证 API 与 SSE；前端可先用现有事件日志查看。
 | alert 模式无持仓 | 手工下单平台不记账，无法算止损/止盈 | P0 只做公式信号；P2 做持仓同步 |
 | 周线信号重绘 | 若在周内求值，未完成周线会变 | alert 周一 09:00 用上周完成周线；auto P0 仍沿用日终驱动，P2 对齐 |
 | 回测/实盘口径 | TQ 回测与实盘 `end_time` 不一致 | P0 记录差异；P2 对齐并加测试 |
-| alert 行情独立 | alert 固定走 TQ，与 iQuant 桥的实时 bar 可能有细微差异 | 公式与预警本就以 TQ 为准；文档明确 alert 不使用桥行情 |
+| alert 行情独立 | alert 固定走 TQ，与 QMT 桥的实时 bar 可能有细微差异 | 公式与预警本就以 TQ 为准；文档明确 alert 不使用桥行情 |
 | auto 自定义频率 | P0 auto 只支持 `signal_frequency == period` | 启动 503 明确提示；P2 对齐 |
 | 启动晚于计划时点 | 09:00 信号在 09:05 启动会错过 | `catch_up_minutes=30` 内补算；超窗跳过并汇总 |
 

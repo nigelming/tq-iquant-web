@@ -3,7 +3,7 @@
 > 基于 `system-plan-draft.md` 设计文档生成。TDD 驱动，pytest + vitest。
 > 每步先写测试，再写实现。
 
-> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期实施草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关 / `NatsDispatcher`）已全部废弃**，Core↔iQuant 改为 iQuant 客户端内 HTTP 桥。下文凡涉及 NATS 的内容仅作历史记录，不再实施。
+> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期实施草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关 / `NatsDispatcher`）已全部废弃**，Core↔QMT 改为 QMT 客户端内 HTTP 桥。下文凡涉及 NATS 的内容仅作历史记录，不再实施。
 
 ---
 
@@ -48,7 +48,7 @@
 | 5.3 策略 API+前端 | ✅ | strategies.py 全路由 + Portfolios.vue |
 | 5.4 回测 API+前端 | ⚠️ | `POST /api/backtest` 在且同步跑完；**409 并发冲突未实现**（无锁、非 ProcessPoolExecutor，与 CLAUDE.md 描述不符） |
 | 6.1 实盘引擎 | ✅ | LiveEngine 完整实现（切片 1-5 TDD） |
-| 6.2 iQuant 网关 | ✅ | 改 HTTP 桥（原 NATS 网关废弃）；桥端字段/账号/模式已真机验证 |
+| 6.2 QMT 网关 | ✅ | 改 HTTP 桥（原 NATS 网关废弃）；桥端字段/账号/模式已真机验证 |
 | 6.3 实盘 API+前端+SSE | ✅ | SSE 后端全（B5）+ 前端消费（B4：事件日志 + 持仓/委托/成交工作台 + 历史加载）；orders/trades/positions 历史查询端点已补（B4b） |
 | 7.1 系统配置 | ✅ | GET/PUT configs + SystemConfig.vue |
 | 7.2 首页仪表盘 | ⚠️ | `/api/status` 在；前端无仪表盘页 |
@@ -609,10 +609,10 @@ class SimulatedDispatcher(OrderDispatcher):
     """回测：按 next_bar.open 模拟成交"""
 
 class NatsDispatcher(OrderDispatcher):
-    """实盘：通过 NATS 发往 iQuant 网关"""
+    """实盘：通过 NATS 发往 QMT 网关"""
 
 class T1Checker(ABC):
-    """T+1 接口：回测直接返回持仓，实盘查 iQuant"""
+    """T+1 接口：回测直接返回持仓，实盘查 QMT"""
     @abstractmethod
     def get_available_shares(self, stock_code: str, portfolio_id: int) -> int
 
@@ -620,7 +620,7 @@ class SimulatedT1Checker(T1Checker):
     """回测：持仓量即可卖出"""
 
 class LiveT1Checker(T1Checker):
-    """实盘：查 iQuant 实际可用股数"""
+    """实盘：查 QMT 实际可用股数"""
 
 class ExecutionEngine:
     def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker)
@@ -819,7 +819,7 @@ class LiveEngine:
     session_id: int
     portfolios: List[Portfolio]          # 多个组合策略
     tq_data: TQData                       # TDX 数据（通过 tqcenter）
-    nats_client: NatsClient              # iQuant 通信
+    nats_client: NatsClient              # QMT 通信
     sse_manager: SSEManager               # SSE 实时推送
 
     async def start(self) -> None
@@ -839,7 +839,7 @@ async def recover(self) -> None:
     """Core 重启恢复"""
     # 1. 查 live_session_portfolios → 加载配置
     # 2. 聚合 live_trades → 重算虚拟持仓 + 虚拟现金
-    # 3. 通过 NATS 查 iQuant 实际持仓，交叉验证
+    # 3. 通过 NATS 查 QMT 实际持仓，交叉验证
     # 4. 重建 TQ 订阅（所有 portfolio 股票并集）
     # 5. 查询未完成订单状态
 ```
@@ -853,7 +853,7 @@ def test_virtual_position_recovery():
     assert engine.portfolios[0].positions["000001.SZ"].quantity == expected_qty
 ```
 
-### 6.2 iQuant 网关
+### 6.2 QMT 网关
 
 ```
 live/iguant_gateway/
@@ -945,7 +945,7 @@ GET    /api/status
 ```
 
 **步骤**：
-1. 状态聚合（Core 运行状态 + TQ 状态 + iQuant 网关状态 + NATS 状态）
+1. 状态聚合（Core 运行状态 + TQ 状态 + QMT 网关状态 + NATS 状态）
 2. 前端仪表盘页面
 
 ### 7.3 日志/监控/告警（骨架）

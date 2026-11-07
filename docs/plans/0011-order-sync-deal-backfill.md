@@ -55,7 +55,7 @@ Core 下单 → 桥 passorder 受理(返回0)
 ### 2.2 DEAL/ORDER 字段齐全（G4 定案）
 
 **DEAL 对象**（桥 `query_deals` 已改，`iquant_bridge.py:245`）：
-| 字段 | iQuant 属性 | 说明 |
+| 字段 | QMT 属性 | 说明 |
 |---|---|---|
 | order_ref | m_strOrderRef | 匹配键 |
 | order_sysid | m_strOrderSysID | 合同号 |
@@ -73,7 +73,7 @@ Core 下单 → 桥 passorder 受理(返回0)
 | order_type | m_strOrderStrategyType | 函数下单/常规下单 |
 
 **ORDER 对象**（桥 `query_orders` 已改，`iquant_bridge.py:215`）：
-| 字段 | iQuant 属性 | 说明 |
+| 字段 | QMT 属性 | 说明 |
 |---|---|---|
 | order_ref | m_strOrderRef | 匹配键 |
 | order_sysid | m_strOrderSysID | 合同号 |
@@ -578,7 +578,7 @@ uv run alembic revision --autogenerate -m "add_order_ref_to_live_order"
 2. **单测**：`uv run pytest core/tests/unit/ -v` → 全绿（既有 + 新增）
 3. **集成测**：`uv run pytest core/tests/integration/ -v` → 全绿
 4. **全量回归**：`uv run pytest` → 既有不回归
-5. **E2E（用户本地，需 iQuant 桥 + 实盘模式）**：
+5. **E2E（用户本地，需 QMT 桥 + 实盘模式）**：
    - 起桥（实盘模式）→ Core 起实盘 session → 下单 → LiveOrder status=submitted
    - 等 30s → _poll_deals 回填 → LiveOrder status=filled + LiveTrade 有真实价/佣金
    - 验证虚拟持仓/现金与桥 /positions 对账一致

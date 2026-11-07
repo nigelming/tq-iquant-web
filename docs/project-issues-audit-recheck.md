@@ -108,7 +108,7 @@
 | 44 | ✅ **已修** | AGENTS.md:96 "约 97% 代码复用" → "核心逻辑共用 + 实盘独有对账/熔断/SSE/周期边界处理" |
 | 43 | ✅ **不再适用** | token 鉴权已于 `a0f0515` 整体移除，`iquant_bridge.py` 文件头写 "no auth token is required"，`check_auth`/`TOKEN`/`x-auth-token`/`compare_digest`/`hmac` 全零命中。时序侧信道前提消失，关闭 |
 
-附带清理（同在 AGENTS.md，一并修订）：L18 "WebSocket"→"SSE"（与 L60 自相矛盾）、L112 `live/iguant_gateway/`（已删除）→ `live/bridge/` iQuant HTTP 桥。
+附带清理（同在 AGENTS.md，一并修订）：L18 "WebSocket"→"SSE"（与 L60 自相矛盾）、L112 `live/iguant_gateway/`（已删除）→ `live/bridge/` QMT 通道。
 
 验证：后端测试 369 passed（删 2 个 EventBus 测试，371→369）、grep `signal_engine|event_bus` 在 `main/core/` 零残留。
 

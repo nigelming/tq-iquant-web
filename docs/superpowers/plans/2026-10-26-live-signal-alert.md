@@ -12,7 +12,7 @@
 
 - 实盘信号只接受通达信导入公式：`Formula.engine == "tq"`；`builtin` 仅回测/研究，alert 启动必须 503。
 - `alert` 模式绝不调用 `Portfolio.on_bar`、`ExecutionEngine` 或任何下单 dispatcher；`AlertDataDispatcher.place_order()` 必须抛错。
-- `alert` 模式行情固定走同进程 TQ；不使用 iQuant 桥。
+- `alert` 模式行情固定走同进程 TQ；不使用 QMT 桥。
 - 新会话默认 `execution_mode=alert`；迁移前已有会话写 `auto`，保持升级前行为。
 - `Strategy.signal_frequency` 不得细于 `Strategy.period`；`auto` 下 P0 必须 `signal_frequency == period`（NULL 视为 period），否则启动 503。
 - `1w/1mon` 在 P0 只允许 `signal_data_end=completed`；不得用未完成周/月 bar。
