@@ -233,6 +233,19 @@ def test_create_formula_invalid_trigger_value(client):
     assert resp.json()["code"] == 400
 
 
+def test_create_formula_accepts_tdx_trigger_values(client):
+    """trigger_value -2/-1/1/2（通达信 buy=2/sell=-2）均被接受。"""
+    c, Session = client
+    for tv in (2, 1, -1, -2):
+        payload = {
+            "name": f"TV{tv}", "content": "X",
+            "signals": [{"signal_name": "x", "signal_type": "OPEN", "trigger_value": tv}],
+        }
+        resp = c.post("/api/formulas", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0, f"trigger_value={tv} 应被接受"
+
+
 def test_create_formula_trigger_zero_rejected(client):
     """trigger_value=0 被拒：0 是公式无信号常态值，配置后每根 bar 都会匹配。"""
     c, Session = client

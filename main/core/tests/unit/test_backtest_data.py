@@ -1086,6 +1086,22 @@ def test_build_signal_cache_multi_period_daily_strategy_uses_date_match(db_sessi
     assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) not in cache
 
 
+def test_convert_formula_output_warns_on_length_mismatch(caplog):
+    """#3：公式输出条数与 bar 数不一致时记 warning（不崩溃，多余输出丢弃）。"""
+    import logging
+    bar_times = [datetime(2026, 7, 28, 9, 35)]
+    raw = {"000001.SZ": {"open_sig": [
+        {"Date": "20260728", "Value": 1},
+        {"Date": "20260728", "Value": -1},
+    ]}}
+    with caplog.at_level(logging.WARNING):
+        entries = bt_api._convert_formula_output(
+            raw, 1, ["000001.SZ"], bar_times_by_code={"000001.SZ": bar_times},
+        )
+    assert (1, "000001.SZ", bar_times[0]) in entries
+    assert any("长度" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # engine=builtin：内置公式子集解释器分支（仅回测接线；engine 默认 tq 行为不变）
 # ---------------------------------------------------------------------------

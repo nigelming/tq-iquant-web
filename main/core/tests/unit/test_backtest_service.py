@@ -2661,6 +2661,28 @@ def test_resolve_crisis_benchmark_cases_without_db():
 
 
 # ---------------------------------------------------------------------------
+# 僵尸 running 记录恢复（#5）
+# ---------------------------------------------------------------------------
+def test_recover_stale_running_marks_old_running_as_failed(db_session):
+    from datetime import date, datetime, timedelta
+    from core.models.backtest_record import BacktestRecord
+
+    def _rec(status, created_at):
+        return BacktestRecord(
+            portfolio_strategy_id=1, name="run", status=status,
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+            created_at=created_at,
+        )
+
+    old = _rec("running", datetime.now() - timedelta(hours=2))
+    fresh = _rec("running", datetime.now())
+    db_session.add_all([old, fresh]); db_session.commit()
+    n = svc.recover_stale_running(db_session, max_age_minutes=30)
+    db_session.refresh(old); db_session.refresh(fresh)
+    assert n == 1
+    assert old.status == "failed"
+    assert fresh.status == "running"
+
 # 信号预检：build_signal_warnings（零信号 / 输出线缺失 / 公式报错）
 # 场景根因：30 分钟主图公式挂在 1d 策略上时公式不报错但全程零信号，
 # 回测静默 completed，用户无法判断"为什么没有交易"。

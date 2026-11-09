@@ -1147,6 +1147,7 @@ def test_execute_live_buy_without_fee_cfg_keeps_old_behavior():
                    bar_time=datetime(2026, 7, 29, 15, 0))
     trade = engine.execute(order, acc, pos, apply=False)
     assert trade is not None
+
     assert trade.quantity == 1000
     assert dispatcher.placed_qty == [1000]
 

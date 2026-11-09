@@ -910,6 +910,7 @@ def test_export_html_not_found(client):
     assert resp.json()["code"] == 404
 
 
+
 def test_get_record_detail_includes_crisis_alpha(client, monkeypatch):
     c, Session = client
     db = Session()

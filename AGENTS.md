@@ -82,7 +82,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 ## 业务规则（容易遗漏）
 
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
-- **复权方式**：回测支持三档复权模式（`dividend_mode`：`front` 前复权默认 / `back` 后复权 / `dual` 前复权信号+后复权记账，推荐）。前复权"加性压缩"会让长区间历史价逼近 0/转负（假收益），取数层已过滤 `Open/Close≤0` 与近零价（<0.01）伪影行
+- **复权方式**：回测支持三档复权模式（`dividend_mode`：`front` 前复权 / `back` 后复权 / `dual` 前复权信号+后复权记账，推荐）。TDX 前复权为「加性」且锚定查询 end 日期，长区间下高分红股（如 601225.SH）2020 年前 Close 被整体减到 ≤0/近零（最低 −5.44）——取数层已过滤 `Open/Close≤0` 与近零价（<0.01）伪影行，长区间回测建议用 `back`/`dual` 而非 `front`
 - **TQ 数据传递**：polars DataFrame 进程内传递，通过 tqcenter SDK 直连运行中通达信
 - **Core↔交易通道通信**：QMT 通道走 HTTP 桥（`127.0.0.1:8790`，账号 410038214257 / `STOCK`；QMT 是四条生产通道之一、平台按生产标准维护，但**该账户是 QMT 仿真账户、账户内为仿真资金**，不是真实资金；切真实资金须改桥文件 `ACCOUNT` / `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证。`iquant_bridge_live.py` 的 `8791` + 信用账户 `CREDIT` 保留但**非生产、未启用**），掘金走 HTTP 桥（`127.0.0.1:7801`）；桥策略受理下单/查单/持仓/资金，QMT 桥另提供行情拉取（掘金行情由平台走通达信快照合成）。端点见 [live/bridge/README.md](live/bridge/README.md)
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）

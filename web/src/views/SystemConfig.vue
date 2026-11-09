@@ -8,7 +8,7 @@ import PageHeader from '../components/PageHeader.vue'
 // iquant_bridge.simulation/live.base_url(两个模式位当前都指 8790；该账户为 QMT 仿真账户/仿真资金，8791 信用腿未启用)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
-  tdx_path: '',
+  tdx_path: 'D:\\zd_zyb',
   iquant_path: '',
   max_concurrent_backtest: 1,
   database: { sqlite_path: '' },

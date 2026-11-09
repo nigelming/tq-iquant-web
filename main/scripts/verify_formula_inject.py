@@ -25,7 +25,7 @@
   uv run python scripts/verify_formula_inject.py --periods 1m,5m,15m,30m,1h
 
 注意：
-  - 连回测版目录 D:/new_tdx64/PYPlugins（与实盘 BarPoller 同源）。
+  - 连回测版目录 D:/zd_zyb/PYPlugins（与实盘 BarPoller 同源）。
   - 占 run_id，跑完自动 tq.close()。
 """
 import argparse
@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 
 def _inject_paths():
     """注入回测版 tqcenter 路径到 sys.path。"""
-    pyplugins = "D:/new_tdx64/PYPlugins"
+    pyplugins = "D:/zd_zyb/PYPlugins"
     for sub in ("sys", "user"):
         p = pyplugins + "/" + sub
         if p not in sys.path:
@@ -271,7 +271,7 @@ def main():
         from tqcenter import tq
     except Exception as e:
         print("[FAIL] 无法 import tqcenter：", e)
-        print("       确认 D:/new_tdx64/PYPlugins 存在")
+        print("       确认 D:/zd_zyb/PYPlugins 存在")
         return 1
 
     conn_path = __file__.replace("\\", "/")
@@ -292,14 +292,14 @@ def main():
             ptr = _dll.InitConnect(fname, dpath, 0, get_python_version_number(), False)
             if not ptr or len(ptr) <= 0:
                 print("       [真因] InitConnect 返回空指针 → TPythClient 未响应")
-                print("       → 通达信回测版 (D:/new_tdx64) 未启动 或 未登录行情")
+                print("       → 通达信回测版 (D:/zd_zyb) 未启动 或 未登录行情")
             else:
                 ret = ptr.decode("utf-8", "ignore")
                 print("       [真因] InitConnect 原始返回：%s" % ret[:300])
         except Exception as e2:
             print("       [探查失败] %s" % e2)
         print("\n排查清单：")
-        print("  1. 通达信回测版 D:/new_tdx64 是否已启动并登录（看行情能否刷新）")
+        print("  1. 通达信回测版 D:/zd_zyb 是否已启动并登录（看行情能否刷新）")
         print("  2. 是否已有同名策略占用连接（关掉旧的再跑）")
         print("  3. TPythClient.dll 是否被通达信主进程加载（客户端须在跑）")
         return 1

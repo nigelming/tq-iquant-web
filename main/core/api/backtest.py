@@ -225,6 +225,8 @@ def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
     result = _svc_recompute_evaluation(db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
+    if result == "running":
+        return err(409, "回测运行中，请稍后再试")
     return ok(result)
 
 

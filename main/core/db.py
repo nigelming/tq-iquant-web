@@ -26,7 +26,8 @@ _db_file = _db_path()
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{_db_file.as_posix()}"
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 5},
 )
 SessionLocal = sessionmaker(bind=engine)
 
@@ -36,10 +37,8 @@ def _enable_sqlite_fk(dbapi_conn, connection_record):
     """SQLite 逐连接 PRAGMA：外键约束 + WAL 日志 + 写锁等待（#9）。
 
     foreign_keys=ON 让 ondelete CASCADE/RESTRICT 生效（默认关闭）；
-    journal_mode=WAL 读写不互斥，SSE 推送/轮询读与回测写并发时不再互相阻塞
-    （WAL 是库级持久设置，逐连接执行为幂等 no-op）；
-    busy_timeout=5000ms 写锁冲突时等待 5s 再报 database is locked，
-    消除回测落库与行情轮询并发写时的偶发锁冲突。
+    journal_mode=WAL 读写不互斥，SSE 推送/轮询读与回测写并发时不再互相阻塞；
+    busy_timeout=5000ms 写锁冲突时等待 5s 再报 database is locked。
     """
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")

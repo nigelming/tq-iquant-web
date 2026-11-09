@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -30,6 +30,7 @@ class BacktestEngine:
         klines: dict = None,
         signal_cache: dict = None,
         benchmark_data: object = None,
+        on_progress: Callable[[int], None] = None,
         regime_tracker=None,
         daily_close_peak_enabled: bool = False,
     ) -> dict:
@@ -38,6 +39,7 @@ class BacktestEngine:
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
         成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列），
         成交价取 price_index 中该 bar 的 Open（open_prices 死参数已移除，#12）。
+        on_progress：进度回调（#10），0–100 递增整数，末值 100，节流至最多约 100 次。
         regime_tracker：B5 可选因果市场状态跟踪器（CausalRegimeTracker，默认 None
         不启用）；逐 bar 喂当日基准收盘并把标签注入 portfolio.current_regime。
         daily_close_peak_enabled：可选保护（默认关）。开启后 peak/max_drawdown 只在
@@ -54,6 +56,8 @@ class BacktestEngine:
         portfolio.current_regime = None
 
         times = self._build_timeline(klines)
+        total_bars = len(times)
+        report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
         pending_orders: List[OrderEvent] = []
         trades: List[TradeEvent] = []
@@ -326,15 +330,16 @@ class BacktestEngine:
             #    （daily_loss 已在本 bar 起始 enter_day 补算，此处只做峰值/回撤）
             #    可选日末保护：混合周期下粗 bar 的 close 是周期末价（对当前时点是未来），
             #    只在当日最后一根 bar 更新 peak，避免其污染组合峰值/误触熔断。
-            allow_peak_update = True
             if daily_close_peak_enabled:
                 allow_peak_update = (
                     i + 1 >= len(times)
                     or times[i + 1][0].date() != t.date()
                 )
-            portfolio.risk_manager.update_peak(
-                total_value, t.date(), allow_peak_update=allow_peak_update,
-            )
+                portfolio.risk_manager.update_peak(
+                    total_value, t.date(), allow_peak_update=allow_peak_update,
+                )
+            else:
+                portfolio.risk_manager.update_peak(total_value, t.date())
 
             # 6. #1 涨跌停约束：用本 bar 有效收盘(>0) 刷新该周期前收表（下一 bar 判定用）。
             #    开关关闭时零判定开销（仅一次 dict 写入/票）。
@@ -342,6 +347,10 @@ class BacktestEngine:
                 close = ohlcv.get("close")
                 if close is not None and close > 0:
                     prev_close_map[(code, period)] = close
+
+            # 7. 进度上报：节流至最多约 100 次，末根 bar 必报 100（#10）。
+            if on_progress is not None and (i % report_every == 0 or i == total_bars - 1):
+                on_progress(int((i + 1) * 100 / total_bars))
 
         # 6. flush 最后一日的 pending 快照（无后续跨日触发）
         if pending_snap is not None:
