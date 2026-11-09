@@ -50,3 +50,12 @@ class TestBuildWalkForwardWindows:
     def test_indices_are_1_based(self):
         ws = build_walk_forward_windows(date(2020, 1, 1), date(2026, 1, 1), 3, 1)
         assert [w["index"] for w in ws] == [1, 2, 3]
+
+    def test_nonpositive_years_rejected(self):
+        """test_years=0 → 窗口起点永不推进（死循环）；train=0 → 无训练段。
+        入口必须显式 ValueError，不能挂着跑满 CPU。"""
+        import pytest
+        with pytest.raises(ValueError):
+            build_walk_forward_windows(date(2020, 1, 1), date(2026, 1, 1), 3, 0)
+        with pytest.raises(ValueError):
+            build_walk_forward_windows(date(2020, 1, 1), date(2026, 1, 1), 0, 1)

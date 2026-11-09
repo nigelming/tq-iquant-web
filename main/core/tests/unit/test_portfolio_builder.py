@@ -104,3 +104,57 @@ def test_portfolio_price_limit_check_defaults_on(db):
     assert ps.price_limit_check_enabled is True
     port = assemble_portfolio(ps, strategies, db)
     assert port.price_limit_check_enabled is True
+
+
+def test_assemble_max_holdings_and_trading_session_wiring(db):
+    """Fix2/Fix3：组合表 max_holdings / trading_session 装配进 Portfolio
+    （历史死配置首次接线，回测/实盘共用生效）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.max_holdings == 10  # ORM/server 默认
+    assert ps.trading_session == "full"
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.max_holdings == 10
+    assert port.trading_session == "full"
+
+    ps.max_holdings = 3
+    ps.trading_session = "pm"
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.max_holdings == 3
+    assert port.trading_session == "pm"
+
+
+def test_assemble_daily_loss_basis_defaults_equity(db):
+    """日内亏损分母默认 equity（昨收净值），builder 注入 risk_manager。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.daily_loss_basis == "equity"
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.risk_manager.daily_loss_on_equity_enabled is True
+
+
+def test_assemble_daily_loss_basis_initial(db):
+    """组合显式选 initial → 分母回落初始资金（旧口径）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.daily_loss_basis = "initial"
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.risk_manager.daily_loss_on_equity_enabled is False
+
+
+def test_assemble_initial_capital_override_applied(db):
+    """实盘资金基准：override 非 None → Account 以 override 起账（比率配置等比缩放基数）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    assert ps.initial_capital == Decimal("100000")  # 组合配置资金与实盘不同
+    port = assemble_portfolio(ps, strategies, db, initial_capital_override=1000000.0)
+    assert port.account.initial_capital == Decimal("1000000")
+    assert port.account.cash == Decimal("1000000")
+
+
+def test_assemble_initial_capital_override_none_keeps_ps_capital(db):
+    """override 缺省（None）→ 维持现行为：用组合自身 initial_capital。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.account.initial_capital == Decimal("100000")
+    assert port.account.cash == Decimal("100000")

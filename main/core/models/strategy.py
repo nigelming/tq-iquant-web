@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, ForeignKey, Numeric, DateTime
+from sqlalchemy import Boolean, Column, Float, Integer, String, ForeignKey, Numeric, DateTime
 from sqlalchemy.sql import func, text
 
 from .base import Base
@@ -12,6 +12,14 @@ class Strategy(Base):
     name = Column(String(100), nullable=False)
     formula_id = Column(Integer, ForeignKey("formulas.id", ondelete="RESTRICT"), nullable=False, index=True)
     period = Column(String(5), nullable=False)
+    # 信号推送频率（可等于或粗于 period）；NULL = 使用 period。
+    signal_frequency = Column(String(10), nullable=True)
+    # HH:MM；NULL = 按频率默认（1d=14:30，1w/1mon=09:00）。
+    signal_at = Column(String(5), nullable=True)
+    # 1-5，仅 1w 使用；NULL = 周一。
+    signal_weekday = Column(Integer, nullable=True)
+    # completed / current；NULL = 1w/1mon 用 completed，其余 current。
+    signal_data_end = Column(String(10), nullable=True)
     role = Column(String(15), nullable=False)
     # 自引用：slave 指向同组合 master。ondelete=RESTRICT（审计 #18）——业务规则禁止
     # "slave 无 master"的孤儿行，delete_strategy 已有 app 层预检，DB 层 RESTRICT 兜底。
@@ -44,5 +52,16 @@ class Strategy(Base):
     # #3 策略级敞口上限（默认关）：回测 BUY 审批加卡策略总持仓市值
     # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
     exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    # 实盘执行配置（批次1，全部向后兼容：默认关/保守默认）
+    # 单笔最大买入金额（元）：BUY 审批时金额超此值→缩量到该金额能买的整手股数
+    max_order_amount = Column(Float, nullable=True)
+    # 撤单后有限追价重下：超时撤单成功且未超次数 → 剩余量按 tick 追价重下
+    requote_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    requote_max_attempts = Column(Integer, default=2, server_default="2", nullable=False)
+    # TDX 大额拆单（本批次仅落配置管线，拆单逻辑批次 2 实现）
+    split_order_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    split_order_threshold = Column(Float, default=500000.0, server_default="500000.0", nullable=False)
+    # 风控/信号执行时点：next_day=当日信号次日执行（回测对齐，默认）/ immediate=当日确认立即执行
+    risk_timing = Column(String(15), default="next_day", server_default="next_day", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -46,6 +46,13 @@ def build_walk_forward_windows(
     每窗 {index(1 起), start, end, train: {start, end}, test: {start, end}}；
     train/test 切分点 = 窗口起点 + train_years 年。不足一个完整窗口返回 []。
     """
+    # test_years <= 0 会让 w_start 不前进（死循环）；train_years <= 0 会产生
+    # 空训练段（IS/OOS 切分失去意义）。两者均为非法入参，入口直接拒绝。
+    if train_years <= 0 or test_years <= 0:
+        raise ValueError(
+            f"walk-forward 训练/验证年数必须为正整数（train={train_years}, "
+            f"test={test_years}）"
+        )
     windows: List[dict] = []
     i = 0
     while True:
@@ -135,14 +142,13 @@ def run_walk_forward(db: Session, ps: PortfolioStrategy, req) -> dict:
             evaluation_profile=req.evaluation_profile,
             # 子回测不重复过 C7 门槛：WF 在此统一按窗评估
             is_oos_gate_enabled=False,
+            # run 级口径覆盖透传（None=跟随组合配置）
+            daily_loss_basis=getattr(req, "daily_loss_basis", None),
         )
         try:
-            result = run_backtest(db, ps, child_req)
+            # 归属在子回测创建时写入（崩溃窗口见 backtest_service.run_backtest 注释）
+            result = run_backtest(db, ps, child_req, walk_forward_run_id=run.id)
             child_id = result["record_id"]
-            child = db.get(BacktestRecord, child_id)
-            if child is not None:
-                child.walk_forward_run_id = run.id
-                db.commit()
             entry["record_id"] = child_id
 
             rb_row = safe_compute_robustness(db, child_id, oos_ratio=oos_ratio)

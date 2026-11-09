@@ -637,7 +637,6 @@ def test_pending_order_retries_until_next_same_period_bar():
     assert result["trades"][0].trade_time == d2
 
 
-
 # ===== 未来函数修复测试 =====
 # 日线信号 bar_time=00:00 在混合周期时间轴中排在当日分钟 bar 之前。
 # 修复：OrderEvent 携带 signal_bar_date，日线信号须在 t.date() > signal_bar_date 的下一交易日成交。
@@ -1044,6 +1043,148 @@ def test_price_limit_disabled_keeps_old_behavior():
 
 
 # ===========================================================================
+# Fix2 组合级 max_holdings 接线（on_bar OPEN 路径，回测/实盘共用一处生效）
+# ===========================================================================
+def test_max_holdings_rejects_open_when_portfolio_full():
+    """组合已持 3 只（去重计数，跨策略合并）、max_holdings=3 → 第 4 只 OPEN 被拒
+    + 决策事件（gate=max_holdings、layer=portfolio、message 含「组合持仓数 3/3」）。"""
+    stock = "600000.SH"  # 第 4 只：仅它有行情与信号
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    ctx.max_positions = 5  # 策略级闸不先触发，聚焦组合级 max_holdings
+    port.max_holdings = 3
+    from datetime import timedelta as _td
+    for code in ("000001.SZ", "000002.SZ", "000004.SZ"):
+        pos = Position(code)
+        pos.buy(1000, Decimal("10"), datetime(2026, 7, 28))
+        ctx.positions[code] = pos
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    assert result["trades"] == []  # 第 4 只 OPEN 被拒，无成交
+    events = [d for d in result["decisions"] if d["gate"] == "max_holdings"]
+    assert len(events) == 1
+    assert events[0]["layer"] == "portfolio"
+    assert events[0]["action"] == "block"
+    assert events[0]["stock_code"] == stock
+    assert "组合持仓数 3/3" in events[0]["message"]
+
+
+def test_max_holdings_unset_keeps_old_behavior():
+    """max_holdings=0（未启用，直接构造 Portfolio 默认）→ 不限，OPEN 照常成交。"""
+    stock = "600000.SH"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    assert port.max_holdings == 0
+    from datetime import timedelta as _td
+    for code in ("000001.SZ", "000002.SZ", "000004.SZ"):
+        pos = Position(code)
+        pos.buy(1000, Decimal("10"), datetime(2026, 7, 28))
+        ctx.positions[code] = pos
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    assert len(result["trades"]) == 1
+    assert not any(d["gate"] == "max_holdings" for d in result["decisions"])
+
+
+# ===========================================================================
+# Fix3 trading_session（full/am/pm）接线：非允许时段的 bar 跳过组合本轮
+# ===========================================================================
+def _intraday_klines(stock, rows):
+    """单股票 5m klines：rows = [(datetime, open, high, low, close, volume), ...]"""
+    df = pl.DataFrame({
+        "datetime": [r[0] for r in rows],
+        "Open": [r[1] for r in rows],
+        "High": [r[2] for r in rows],
+        "Low": [r[3] for r in rows],
+        "Close": [r[4] for r in rows],
+        "Volume": [r[5] for r in rows],
+    })
+    return {stock: {"5m": df}}
+
+
+def _pm_session_bars():
+    """两股票 5m 行情：600000.SH（持有中，上午收盘触发止损）+ 000001.SZ（下午 OPEN 目标）。"""
+    times = [
+        datetime(2026, 7, 30, 10, 0),
+        datetime(2026, 7, 30, 13, 30),
+        datetime(2026, 7, 30, 13, 35),
+    ]
+    rows_a = [
+        (times[0], Decimal("10.3"), Decimal("10.3"), Decimal("10.1"), Decimal("10.2"), 1000),
+        (times[1], Decimal("10.5"), Decimal("10.7"), Decimal("10.4"), Decimal("10.6"), 1000),
+        (times[2], Decimal("10.6"), Decimal("10.8"), Decimal("10.5"), Decimal("10.7"), 1000),
+    ]
+    rows_b = [
+        (times[0], Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.2"), 1000),
+        (times[1], Decimal("10.5"), Decimal("10.7"), Decimal("10.4"), Decimal("10.6"), 1000),
+        (times[2], Decimal("10.6"), Decimal("10.8"), Decimal("10.5"), Decimal("10.7"), 1000),
+    ]
+    k = _intraday_klines("600000.SH", rows_a)
+    k["000001.SZ"] = _intraday_klines("000001.SZ", rows_b)["000001.SZ"]
+    return k
+
+
+def test_trading_session_pm_skips_morning_bar():
+    """pm-only 组合：上午 bar 整轮跳过（无交易/无风控动作），下午正常。
+
+    上午收盘 10.2 较成本 11.0 亏 7.3% > 5% 止损线——full 会触发 SELL，pm 跳过；
+    下午 13:30 另一只股票的 OPEN 信号 → 13:35 成交。对照组 full：止损 SELL@10.5 +
+    BUY@10.6。⚠️ 行为变更注记：am/pm 组合既有回测结果会改变（历史死配置首次接线）。
+    """
+    held_stock = "600000.SH"
+    open_stock = "000001.SZ"
+    klines = _pm_session_bars()
+
+    def _make(session):
+        pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+        port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+        ctx = StrategyContext(
+            strategy_id=1, period="5m",
+            capital_ratio=Decimal("0.6"), max_positions=5,
+        )
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+        ]
+        ctx.strategy_risk = StrategyRiskManager(
+            stop_loss_ratio=Decimal("0.05"),
+            take_profit_ratio=Decimal("0.9"),
+            trailing_stop_ratio=Decimal("0"),
+        )
+        pos = Position(held_stock)
+        pos.buy(1000, Decimal("11.0"), datetime(2026, 7, 29))
+        ctx.positions[held_stock] = pos
+        port.strategies.append(ctx)
+        port.trading_session = session
+        return port, ctx
+
+    # pm-only：上午止损不触发、无 SELL；下午 OPEN 正常
+    port_pm, _ = _make("pm")
+    cache = {(1, open_stock, datetime(2026, 7, 30, 13, 30)): [{"name": "open_sig", "value": 1}]}
+    result_pm = BacktestEngine().run(port_pm, klines=klines, signal_cache=cache)
+    assert [t.trade_type for t in result_pm["trades"]] == [TradeType.BUY]
+    assert result_pm["trades"][0].stock_code == open_stock
+    assert result_pm["trades"][0].trade_time == datetime(2026, 7, 30, 13, 35)
+    assert result_pm["trades"][0].price == Decimal("10.6")
+    assert not any(d["gate"] == "stop_loss" for d in result_pm["decisions"])
+
+    # 对照 full（默认）：上午止损 SELL @13:30 open 10.5 + 下午 BUY @10.6
+    port_full, _ = _make("full")
+    result_full = BacktestEngine().run(port_full, klines=klines, signal_cache=cache)
+    assert [t.trade_type for t in result_full["trades"]] == [TradeType.SELL, TradeType.BUY]
+    assert result_full["trades"][0].stock_code == held_stock
+    assert result_full["trades"][0].price == Decimal("10.5")
+    assert any(d["gate"] == "stop_loss" for d in result_full["decisions"])
+
+
+# ===========================================================================
 # #2 成交量/流动性约束（volume_limit_enabled 默认关）：单 bar 成交量占比封顶
 # ===========================================================================
 def _volume_portfolio(enabled=True, ratio=Decimal("0.1")):
@@ -1074,6 +1215,30 @@ def test_volume_limit_shrinks_buy_to_participation_cap():
     events = [d for d in result["decisions"] if d["gate"] == "volume_cap_shrink"]
     assert len(events) == 1
     assert events[0]["action"] == "shrink" and events[0]["stock_code"] == stock
+
+
+def test_volume_limit_shrinks_buy_to_whole_lot():
+    """上限非整手时按手向下取整成交（A 股买入必须整手）。
+
+    bar2 Volume=1500 股 → 上限 int(0.1×1500)=150 股；买入缩量须取整到 100 股，
+    否则会成交 150 股，留下非整手持仓（后续卖出按手校验会卡死）。
+    """
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 1500),
+    ])
+    port, ctx = _volume_portfolio(enabled=True)
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].quantity == 100
+    assert trades[0].quantity % 100 == 0
+    events = [d for d in result["decisions"] if d["gate"] == "volume_cap_shrink"]
+    assert len(events) == 1
+    assert events[0]["final_qty"] == 100
 
 
 def test_volume_limit_defers_when_cap_below_one_lot():
@@ -1187,6 +1352,63 @@ def test_exposure_cap_disabled_fills_both():
     filled = {t.stock_code for t in result["trades"]}
     assert filled == {"000001.SZ", "000002.SZ"}
     assert not any(d["gate"] == "exposure_cap" for d in result["decisions"])
+
+
+# ===========================================================================
+# 策略级单笔最大买入金额（max_order_amount 默认 None 不限）：BUY 审批金额封顶
+# ===========================================================================
+def _amount_cap_klines():
+    """单股票 1d klines：open=close=10（信号 7/29 触发，7/30 成交）。"""
+    rows = [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.2"), Decimal("9.9"), Decimal("10"), 1000),
+    ]
+    return _klines("000001.SZ", rows)
+
+
+def _amount_cap_portfolio(max_order_amount):
+    """capital_ratio=0.6（策略资金 60000）、single_open_ratio=1.0（单笔 60000=6000 股）。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("0.6"), max_positions=5,
+        single_open_ratio=Decimal("1.0"),
+        max_order_amount=max_order_amount,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    return port, ctx
+
+
+def test_backtest_max_order_amount_caps_buy():
+    """max_order_amount=20000：6000 股请求 @10 → 缩至 2000 股 + order_amount_cap 事件。"""
+    port, _ = _amount_cap_portfolio(Decimal("20000"))
+    cache = {(1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=_amount_cap_klines(), signal_cache=cache)
+
+    assert len(result["trades"]) == 1
+    assert result["trades"][0].quantity == 2000
+    cap_events = [d for d in result["decisions"] if d["gate"] == "order_amount_cap"]
+    assert len(cap_events) == 1
+    assert cap_events[0]["action"] == "shrink"
+
+
+def test_backtest_max_order_amount_none_keeps_old_behavior():
+    """max_order_amount=None（默认）→ 6000 股照常全量成交，无金额事件。"""
+    port, _ = _amount_cap_portfolio(None)
+    cache = {(1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=_amount_cap_klines(), signal_cache=cache)
+
+    assert len(result["trades"]) == 1
+    assert result["trades"][0].quantity == 6000
+    assert not any(d["gate"] == "order_amount_cap" for d in result["decisions"])
 
 
 # ===========================================================================

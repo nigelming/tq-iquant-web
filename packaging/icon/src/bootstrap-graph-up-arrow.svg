@@ -1,0 +1,20 @@
+<!-- 候选 C：Bootstrap Icons 图标 graph-up-arrow（MIT License，可商用）
+     原始：https://github.com/twbs/icons （v1.x）
+     修改：加深蓝圆角底、填充改金色以适配桌面图标 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#16405F"/>
+      <stop offset="0.55" stop-color="#0B2440"/>
+      <stop offset="1" stop-color="#07182A"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F6D98C"/>
+      <stop offset="1" stop-color="#D9A33A"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="214" fill="url(#bg)"/>
+  <g transform="translate(112 112) scale(50)" fill="url(#gold)">
+    <path fill-rule="evenodd" d="M0 0h1v15h15v1H0zm10 3.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 .5.5v4a.5.5 0 0 1-1 0V4.9l-3.613 4.417a.5.5 0 0 1-.74.037L7.06 6.767l-3.656 5.027a.5.5 0 0 1-.808-.588l4-5.5a.5.5 0 0 1 .758-.06l2.609 2.61L13.445 4H10.5a.5.5 0 0 1-.5-.5"/>
+  </g>
+</svg>

@@ -3,7 +3,7 @@
 > 验证日期：2026-08-04（交易日 10:27-10:35 盘中）
 > 关联方案：[docs/plans/0008-live-engine-simulation-pipeline.md](0008-live-engine-simulation-pipeline.md)
 
-> ⚠️ **次期方案已变更（见 0009）**：本文档中关于「NATS 网关加行情通道」「miniQMT」的结论已被推翻——miniQMT 个人账户无交易权限，NATS 网关已废弃。最终采用「iQuant 客户端内 HTTP 桥」，行情用 `xtdata.get_market_data_ex` 拉取（非订阅）。以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) §12 为准。
+> ⚠️ **次期方案已变更（见 0009）**：本文档中关于「NATS 网关加行情通道」「miniQMT」的结论已被推翻——miniQMT 个人账户无交易权限，NATS 网关已废弃。最终采用「QMT 客户端内 HTTP 桥」，行情用 `xtdata.get_market_data_ex` 拉取（非订阅）。以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) §12 为准。
 
 > ⚠️ **通达信分版已废弃（2026-08-06）**：本文档验证所用的「实盘版通达信 `D:\new_tdx64_live`」**已不再使用**。全系统统一用回测版 `D:\new_tdx64`。原验证脚本 `verify_live_engine.py`（基于已废弃的 subscribe_hq 推送方案）已删除。当前公式注入验证用 [verify_formula_inject.py](../../main/scripts/verify_formula_inject.py)。
 
@@ -25,7 +25,7 @@
 | 7 | subscribe_hq 推送频率 | **实测：tick 级，每分钟约 20 次（每股约10次）** | snapshot 实时更新；1d 直接覆盖拼 bar，1m 用聚合器（tick 充足） |
 | 8 | snapshot Max/Min 是窗口内还是累计 | **实测：今日开盘至今累计（Max 单调不降、Min 单调不升）** | 1d 直接当日线 High/Low；1m 不能用 snapshot Max/Min |
 | 9 | 1m 真 bar 是否可得 | **定论：不可得。Now 是单点采样，漏 tick；无任何真分钟 bar 来源** | **1m 实盘不可行（硬约束）**；首期只能 1d |
-| 10 | iQuant 是否有 tick/分钟 bar | **源码+实测：有（xtquant.xtdata 独立模块，subscribe_quote period='tick'/'1m'）**，但需 miniQMT 客户端认证（账号+userdata_mini 不够，需 `xtminiqmt.exe` 运行） | 推翻风险点9 的 iQuant 侧限制；次期 1m 可走 iQuant，但需 NATS 网关加行情通道 + miniQMT 交易客户端启动登录（当前环境缺该进程，待用户在 iQuant 侧解决） |
+| 10 | QMT 是否有 tick/分钟 bar | **源码+实测：有（xtquant.xtdata 独立模块，subscribe_quote period='tick'/'1m'）**，但需 miniQMT 客户端认证（账号+userdata_mini 不够，需 `xtminiqmt.exe` 运行） | 推翻风险点9 的 QMT 侧限制；次期 1m 可走 QMT，但需 NATS 网关加行情通道 + miniQMT 交易客户端启动登录（当前环境缺该进程，待用户在 QMT 侧解决） |
 
 ## 逐项详述
 
@@ -214,21 +214,21 @@ SDK 仅两个订阅接口：
 **定论**：在此 SDK 下 **1m 实盘策略无真 bar 来源，不可行（硬约束，非「首期先做简单的」）**。首期只能 1d。
 
 **对方案的影响**：
-- 实盘首期范围**限定 1d**（且次期也需重新评估 1m 是否值得做——除非接入 iQuant 后有真 tick/分钟 bar 通道）。
+- 实盘首期范围**限定 1d**（且次期也需重新评估 1m 是否值得做——除非接入 QMT 后有真 tick/分钟 bar 通道）。
 - §3 数据流按 1d 落地：`subscribe_hq` 通知 → `get_market_snapshot` → 拼「当日实时日线 bar」→ `formula_format_data` → `formula_set_data` → `formula_process_mul_zb`。
 - 不引入 `BarAggregator`（1m 专用，且做了也不准）。
 - 策略周期=1d 的现有策略可直接上实盘；周期为 1m/5m 的策略需在实盘前确认是否改周期或暂不上实盘。
 
-### 风险点10：iQuant 端是否有真 tick/分钟 bar — 源码+实测（有接口，但需认证）
+### 风险点10：QMT 端是否有真 tick/分钟 bar — 源码+实测（有接口，但需认证）
 
-> 用户要求「去 iquant 目录下探索」「探索 iquant 是否有 tick 数据」。结论：**iQuant 有完整 tick/分钟 bar 行情接口，且可在独立进程调用（非 ContextInfo 专属），推翻风险点9「1m 无真 bar 来源」在 iQuant 侧的限制**——但启用需交易端认证，受限于账号登录。
+> 用户要求「去 iquant 目录下探索」「探索 iquant 是否有 tick 数据」。结论：**QMT 有完整 tick/分钟 bar 行情接口，且可在独立进程调用（非 ContextInfo 专属），推翻风险点9「1m 无真 bar 来源」在 QMT 侧的限制**——但启用需交易端认证，受限于账号登录。
 
-**A. iQuant Python API 文档**（`D:\iQuant\HTML\guosenPythonApiHelp\iQuant_Python_API_Doc.html`）列出的行情接口（`ContextInfo` 方法，跑在 iQuant 策略进程内）：
+**A. QMT Python API 文档**（`D:\QMT\HTML\guosenPythonApiHelp\QMT_Python_API_Doc.html`）列出的行情接口（`ContextInfo` 方法，跑在 QMT 策略进程内）：
 - `subscribe_quote(stock_code, period, dividend_type, callback)` — `period` 可选 **`'tick'`（分笔）**、`'1m'`/`'5m'`/`'15m'`、`'1d'`，还有 `'l2quoteaux'`（L2 快照）/`'l2transactioncount'`（L2 大单，需 L2 权限）。回调收 `{code: pd.DataFrame}`
 - `get_full_tick(stock_code=[])` — 拉最新分笔，返回 `lastPrice/open/high/low/askPrice1-5/bidPrice1-5/askVol/bidVol` 等
 - `unsubscribe_quote(subId)` / `get_all_subscription()`
 
-**B. 关键发现：`xtquant.xtdata` 是独立行情模块，脱离 ContextInfo 可用**（`D:\iQuant\bin.x64\Lib\site-packages\xtquant\xtdata.py`）。`mpython/pythonbalance.py` 直接 `from xtquant.xtdata import get_full_tick`——证明可在 iQuant 策略进程外调用。主要函数：
+**B. 关键发现：`xtquant.xtdata` 是独立行情模块，脱离 ContextInfo 可用**（`D:\QMT\bin.x64\Lib\site-packages\xtquant\xtdata.py`）。`mpython/pythonbalance.py` 直接 `from xtquant.xtdata import get_full_tick`——证明可在 QMT 策略进程外调用。主要函数：
 | 函数 | 能力 |
 |---|---|
 | `subscribe_quote(stock_code, period='tick'/'1m'/'1d', callback)` | 订阅行情，回调 `datas={stock:[data1,...]}`，返回订阅号 |
@@ -237,51 +237,51 @@ SDK 仅两个订阅接口：
 | `unsubscribe_quote(seq)` / `run()` | 反订阅 / 阻塞接收回调 |
 | `get_l2_quote`/`get_l2_order`/`get_l2_transaction` | Level2 实时行情/委托/成交 |
 
-连接机制：`get_client()` 自动连 `127.0.0.1:58610`（iQuant 行情服务，`xtdata.ini` 配置），无需手动 connect。
+连接机制：`get_client()` 自动连 `127.0.0.1:58610`（QMT 行情服务，`xtdata.ini` 配置），无需手动 connect。
 
 **C. 实测**（验证脚本 `live/scripts/verify_iquant_quote.py`，用 `live/` 的 Python 3.7）：
 - ✅ `from xtquant import xtdata` 在独立进程 import 成功（pyd 是 cp37，`live/` 环境匹配）
-- ✅ `get_client().is_connected() = True` — TCP 连上 58610（iQuant 客户端在跑，端口监听中）
+- ✅ `get_client().is_connected() = True` — TCP 连上 58610（QMT 客户端在跑，端口监听中）
 - ❌ `get_full_tick(['000001.SZ'])` 返回 `not authenticated` 错误 — **行情服务要求认证，光 TCP 连接不够**
 
 **D. 认证机制**（`xttrader.py` + `mpython/pythonbalance.py`）：
-iQuant 认证通过交易端完成：`XtQuantTrader(userdata_mini_path, session).start() → .connect() → .subscribe(StockAccount(account))`。`userdata_mini_path` = `D:/iQuant/userdata_mini`（已存在，含 `miniqmtShmQuoteCache` 行情共享内存），`account` = 交易账号。**交易端登录后行情端才有权限**。账号通过命令行传入（`pythonbalance.py` 从 `sys.argv` 拿），不在配置文件。
+QMT 认证通过交易端完成：`XtQuantTrader(userdata_mini_path, session).start() → .connect() → .subscribe(StockAccount(account))`。`userdata_mini_path` = `D:/QMT/userdata_mini`（已存在，含 `miniqmtShmQuoteCache` 行情共享内存），`account` = 交易账号。**交易端登录后行情端才有权限**。账号通过命令行传入（`pythonbalance.py` 从 `sys.argv` 拿），不在配置文件。
 
 **E. 用账号 110002348760 实测交易端认证 — 仍失败，根因定位**（2026-08-04 12:07-12:18 盘中）：
 
-验证脚本加 `XtQuantTrader(D:/iQuant/userdata_mini, session).start().connect().subscribe(StockAccount("110002348760"))` 后重测：
+验证脚本加 `XtQuantTrader(D:/QMT/userdata_mini, session).start().connect().subscribe(StockAccount("110002348760"))` 后重测：
 - ❌ `trader.connect() = -1`（交易端连接失败，非 0）
 - ❌ 认证后 `get_full_tick` 仍 `not authenticated`
 
 **进程/端口实测**（`wmic` + `netstat`）：
 | 端口 | 监听进程 | 可执行路径 | 角色 |
 |---|---|---|---|
-| 58610（行情） | PID 10440 | `D:\iQuant\bin.x64\miniquote.exe` | mini 行情客户端 |
-| 58600（交易） | PID 12776 | `D:\iQuant\bin.x64\XtItClient.exe` | 主客户端 |
+| 58610（行情） | PID 10440 | `D:\QMT\bin.x64\miniquote.exe` | mini 行情客户端 |
+| 58600（交易） | PID 12776 | `D:\QMT\bin.x64\XtItClient.exe` | 主客户端 |
 
 - 主客户端 `XtItClient.exe` **已登录账号 110002348760**（`userdata/log/XtClient_20260804.log` 有 `queryHistoryData ... account: 110002348760` 记录）—— 账号正确且已登录。
 - `bin.x64` 下 **无 `xtminiqmt.exe` / `XtMiniQmt.exe`**（只有 `miniquote.exe` + `XtItClient.exe` + `BrokerProxy.exe`）。`config/xtminiqmt.lua` 配置存在（`appName="XtMiniQmt"`）但对应可执行文件未安装。
 - `miniquote` 行情日志（`userdata_mini/log/XtMiniQuote_20260804.log`）：`IPythonApiServer::set rpc auth=true`（多次）+ 每次 xtdata 连上后 `IPythonApiServer::onConnected` 紧接 `IPythonApiServer::onError`（error 10054 对端强关）→ **行情服务端要求 RPC 认证，xtdata 客户端 TCP 连上后被以认证为由断开**。
 - `%USERPROFILE%\.xtquant` 目录**不存在**，`xtdata_config.client_guid=""` → `load_global_config()` 返回空，xtdata 走默认 58610 连接但无 RPC 认证握手。
 
-**根因定论**：iQuant 的 `xtquant`（xtdata 行情 + xttrader 交易）接口设计为**由 miniQMT 客户端 spawn 的策略进程使用**（`pythonbalance.py` 的 `by_cmd=0` 模式：`sys.argv` 由客户端填 `ud_path/session/account`，客户端预先在 `.xtquant\{guid}\` 建好 `xtdata.cfg`+`running_status` 完成认证握手）。**外部独立进程直连 58610/58600 会被 RPC 认证拒绝**，光有账号 + `userdata_mini` 路径 + `XtQuantTrader.connect()` 不够 —— 需要 **`xtminiqmt.exe`（miniQMT 交易客户端）独立运行并登录**，由它建立 58600 交易连接 + 58610 行情 RPC 认证上下文。
+**根因定论**：QMT 的 `xtquant`（xtdata 行情 + xttrader 交易）接口设计为**由 miniQMT 客户端 spawn 的策略进程使用**（`pythonbalance.py` 的 `by_cmd=0` 模式：`sys.argv` 由客户端填 `ud_path/session/account`，客户端预先在 `.xtquant\{guid}\` 建好 `xtdata.cfg`+`running_status` 完成认证握手）。**外部独立进程直连 58610/58600 会被 RPC 认证拒绝**，光有账号 + `userdata_mini` 路径 + `XtQuantTrader.connect()` 不够 —— 需要 **`xtminiqmt.exe`（miniQMT 交易客户端）独立运行并登录**，由它建立 58600 交易连接 + 58610 行情 RPC 认证上下文。
 
 **联网核实**（Tavily 搜 `xtquant get_full_tick not authenticated`）：
 - SkillHub 文档明确：「⚠️ Requires miniQMT running locally. xtdata communicates with miniQMT via TCP」
 - 国金QMT趟坑：miniQMT 是独立 `xtminiqmt.exe` 进程，需 `xtminiqmt.exe linkMini` 单独登录
 - 迅投知识库：`get_full_tick` 取「全推数据」是标准用法，前提 miniQMT 在跑
 
-**当前环境缺的是 miniQMT 交易客户端进程**（`xtminiqmt.exe` 未安装/未启动），主客户端 `XtItClient.exe` 登录的账号不能替代它。这是 iQuant 客户端的部署/登录配置问题，需用户在 iQuant 客户端侧解决（安装/启动 miniQMT 模式，或确认本版 iQuant 是否集成 miniQMT 并开启 Python API 权限），非代码层可解决。
+**当前环境缺的是 miniQMT 交易客户端进程**（`xtminiqmt.exe` 未安装/未启动），主客户端 `XtItClient.exe` 登录的账号不能替代它。这是 QMT 客户端的部署/登录配置问题，需用户在 QMT 客户端侧解决（安装/启动 miniQMT 模式，或确认本版 QMT 是否集成 miniQMT 并开启 Python API 权限），非代码层可解决。
 
 **对方案的影响（重大）**：
-- **iQuant 侧 1m/5m/tick 真 bar 可行**——`subscribe_quote(period='1m')` 能推真分钟 bar DataFrame，`period='tick'` 推真分笔。这**推翻风险点9「1m 无真 bar 来源」的 iQuant 侧限制**（TDX 侧仍不可行）。
-- **但需架构变更**：现有 NATS 网关（`live/iguant_gateway/main.py`）只有 5 个交易 subject，**无行情通道**。要让 Core 用 iQuant 行情，需：
+- **QMT 侧 1m/5m/tick 真 bar 可行**——`subscribe_quote(period='1m')` 能推真分钟 bar DataFrame，`period='tick'` 推真分笔。这**推翻风险点9「1m 无真 bar 来源」的 QMT 侧限制**（TDX 侧仍不可行）。
+- **但需架构变更**：现有 NATS 网关（`live/iguant_gateway/main.py`）只有 5 个交易 subject，**无行情通道**。要让 Core 用 QMT 行情，需：
   1. 网关用 `XtQuantTrader` 登录交易端完成认证（需账号 + `userdata_mini` 路径）
   2. 网关用 `xtdata.subscribe_quote(period='1m'/'tick')` 订阅，回调数据经 NATS 推回 Core
   3. Core 侧新增行情 subject + 消费逻辑
-- **前置条件（硬约束）**：上述架构变更成立的前提是 **miniQMT 交易客户端（`xtminiqmt.exe`）在网关进程所在机器上运行并登录账号**。当前环境该进程缺失，需用户先在 iQuant 侧部署/启动 miniQMT 并确认 `xtdata.get_full_tick` 不再报 `not authenticated`，才能继续 iQuant 行情方案。
-- **待用户确认**：①是否走 iQuant 行情（改架构）还是仍走 TQ-1d（首期简单）；②iQuant 账号/`userdata_mini` 配置怎么提供给网关；③是否有 L2 权限（决定能否用 `l2quoteaux`/千档盘口）；④**miniQMT 交易客户端能否在本机启动并登录**（决定 iQuant 行情方案是否可行）。
-- 验证脚本 `verify_iquant_quote.py` 已就绪（支持 `--account` CLI 传账号 + `XtQuantTrader` 交易端认证），C/D/E（subscribe 推送 + 历史 1m）需先在 iQuant 侧解决 miniQMT 认证才能跑通。
+- **前置条件（硬约束）**：上述架构变更成立的前提是 **miniQMT 交易客户端（`xtminiqmt.exe`）在网关进程所在机器上运行并登录账号**。当前环境该进程缺失，需用户先在 QMT 侧部署/启动 miniQMT 并确认 `xtdata.get_full_tick` 不再报 `not authenticated`，才能继续 QMT 行情方案。
+- **待用户确认**：①是否走 QMT 行情（改架构）还是仍走 TQ-1d（首期简单）；②QMT 账号/`userdata_mini` 配置怎么提供给网关；③是否有 L2 权限（决定能否用 `l2quoteaux`/千档盘口）；④**miniQMT 交易客户端能否在本机启动并登录**（决定 QMT 行情方案是否可行）。
+- 验证脚本 `verify_iquant_quote.py` 已就绪（支持 `--account` CLI 传账号 + `XtQuantTrader` 交易端认证），C/D/E（subscribe 推送 + 历史 1m）需先在 QMT 侧解决 miniQMT 认证才能跑通。
 
 ## 对 0008 方案的修订
 
@@ -290,10 +290,10 @@ iQuant 认证通过交易端完成：`XtQuantTrader(userdata_mini_path, session)
 1. **数据流改为「通知驱动 + 主动拉数」**（非 bar 推送驱动，非写文件）
 2. **数据源修正**：盘中实时数据走 `subscribe_hq` 通知 → `get_market_snapshot`（今日累计日线 OHLCV），**非 `get_market_data`**（后者盘中只有昨天，风险点4/5）。`get_market_data` 仅用于历史/盘后数据与回测
 3. **首期范围限定 1d**（风险点9 硬约束，TDX 侧）：snapshot 一发即拼当日日线 bar，零聚合、零差分、无新组件。**不引入 `BarAggregator`**；1m/5m 策略暂不可上实盘
-4. **次期 1m 可走 iQuant 行情**（风险点10）：iQuant `xtquant.xtdata` 有真 tick/1m bar 订阅，推翻 TDX 侧的 1m 限制，但需 NATS 网关加行情通道 + 交易端认证。**待用户决策是否改架构**
+4. **次期 1m 可走 QMT 行情**（风险点10）：QMT `xtquant.xtdata` 有真 tick/1m bar 订阅，推翻 TDX 侧的 1m 限制，但需 NATS 网关加行情通道 + 交易端认证。**待用户决策是否改架构**
 5. **`get_tq(mode)` 实现确认**：按 mode 注入对应路径，主进程 live / 回测子进程 backtest 天然隔离（现有架构满足）
 6. **100 只订阅上限**：首期不触及，文档标注
-7. **联调前置条件**：实盘版通达信需登录行情服务器、接收当日数据；iQuant 行情需交易端认证（账号 + `userdata_mini`）
+7. **联调前置条件**：实盘版通达信需登录行情服务器、接收当日数据；QMT 行情需交易端认证（账号 + `userdata_mini`）
 
 ## 验证脚本复用
 

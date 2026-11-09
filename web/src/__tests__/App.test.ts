@@ -102,7 +102,7 @@ describe('App.vue — 外壳结构', () => {
     await flushPromises()
     const banner = w.find('.topbar .app-banner')
     expect(banner.exists()).toBe(true)
-    expect(banner.text()).toContain('创懿私募基金量化回测平台')
+    expect(banner.text()).toContain('创懿私募基金量化投资平台')
   })
 })
 

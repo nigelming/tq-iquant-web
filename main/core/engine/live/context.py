@@ -15,12 +15,15 @@ live_engine.datetime。
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
 from ..portfolio import Portfolio
-from ..http_bridge_dispatcher import HttpBridgeDispatcher
+try:
+    from ..http_bridge_dispatcher import HttpBridgeDispatcher
+except Exception:
+    HttpBridgeDispatcher = Any  # type: ignore
 from .timing import now_shanghai
 
 
@@ -36,14 +39,14 @@ class EngineContext:
         self,
         session_id: int,
         portfolios: List[Portfolio],
-        dispatcher: HttpBridgeDispatcher,
+        dispatcher: Any,
         db_session_factory: Callable[[], Session],
         code_period_count: Optional[Dict[tuple, int]] = None,
         clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.session_id: int = session_id
         self.portfolios: List[Portfolio] = portfolios
-        self.dispatcher: HttpBridgeDispatcher = dispatcher
+        self.dispatcher: Any = dispatcher
         self.db_session_factory: Callable[[], Session] = db_session_factory
         # (code, period) -> 预热/分发最大 count（见 live_engine 中说明）
         self.code_period_count: Dict[tuple, int] = code_period_count or {}

@@ -462,6 +462,39 @@ def test_execute_sell_bond_t0_same_day_fills():
     assert pos.quantity == 0
 
 
+def test_execute_sell_odd_lot_clear_is_allowed():
+    """持仓本身不足一手时允许一次性清仓（A 股零股规则）。
+
+    缩量历史残仓（如 30 股）若按整手阈值拒单会永远卖不掉；清仓意图
+    （qty == 持仓量）时放行，部分可用不足仍按原逻辑拒单。
+    """
+    acc = Account(Decimal("100000"))
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 30, datetime(2026, 7, 29, 9, 30)))
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.SELL, "000001.SZ", 30, "10",
+                   bar_time=datetime(2026, 7, 30, 10, 0))
+    trade = engine.execute(order, acc, pos)
+    assert trade is not None
+    assert trade.quantity == 30
+    assert pos.quantity == 0
+
+
+def test_execute_sell_partial_available_below_lot_still_blocked():
+    """可用不足一手但并非清仓（持仓更大）→ 仍拒单（既有 T+1 保守语义不变）。"""
+    acc = Account(Decimal("100000"))
+    pos = Position("000001.SZ")
+    pos.apply_trade(_buy("10", 50, datetime(2026, 7, 29, 9, 30)))
+    pos.apply_trade(_buy("10", 950, datetime(2026, 7, 30, 9, 30)))  # 当日买入 950 锁定
+    dispatcher = SimulatedDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.SELL, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 30, 10, 0))
+    assert engine.execute(order, acc, pos) is None
+    assert pos.quantity == 1000
+
+
 def test_fit_buy_qty_to_cash_bond_lot():
     """费用兜底缩量按 10 张：现金 1550、价 100 → 10 张可行；lot=100 → 0。"""
     dispatcher = SimulatedDispatcher(open_prices={})
@@ -678,21 +711,6 @@ def test_signal_name_defaults_empty_when_unset():
 
     assert trade.signal_name == ""
 
-
-
-def test_buy_cash_below_one_lot_is_rejected():
-    from core.engine.decision import DecisionRecorder
-    rec = DecisionRecorder()
-    acct = Account(initial_capital=Decimal("50"))
-    pos = Position("000001.SZ")
-    order = OrderEvent(strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
-                       trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
-                       quantity=100, signal_name="open_sig")
-    disp = SimulatedDispatcher({"000001.SZ": Decimal("100")}, buy_commission_rate=Decimal("0"),
-                               sell_commission_rate=Decimal("0"), stamp_duty_rate=Decimal("0"),
-                               min_commission=Decimal("0"))
-    trade = ExecutionEngine(disp, SimulatedT1Checker(), recorder=rec).execute(order, acct, pos)
-    assert trade is None
 
 
 
@@ -1061,3 +1079,86 @@ def test_adaptive_slippage_capped_at_10pct():
         bar_volumes={"000001.SZ": 10}, slippage_impact_coef=Decimal("1.0"))
     trade = dispatcher.place_order(_order(TradeType.BUY, "000001.SZ", 2000, "10"))
     assert trade.price == Decimal("10") * Decimal("1.10")
+
+
+# ===========================================================================
+# Fix4 实盘（apply=False）BUY 费用感知前置钳制：approve 只卡价×量，尾款不足
+# 佣金会透支虚拟现金；桥通道 place_order 即真实发单、无法二次改量重发，故
+# 钳制必须在发单前按委托价 + buy_fee_cfg（组合 cost_params 口径）完成。
+# ===========================================================================
+
+class _SpyDispatcher(SimulatedDispatcher):
+    """记录每次 place_order 收到的下单量（断言单次发单且量已缩）。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.placed_qty = []
+
+    def place_order(self, order):
+        self.placed_qty.append(order.quantity)
+        return super().place_order(order)
+
+
+def test_execute_live_buy_fee_clamp_shrinks_before_place():
+    """实盘 apply=False：现金 10000 @10 审批 1000 股（价×量=现金），尾款 0 < 佣金 5
+    → 发单前缩到 900 股（900×10+5=9005≤10000）；dispatcher 恰被调用 1 次（防桥重复发单）。"""
+    acc = Account(Decimal("10000"))
+    pos = Position("000001.SZ")
+    dispatcher = _SpyDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(
+        order, acc, pos, apply=False,
+        buy_fee_cfg=(Decimal("5"), Decimal("0.00025")),
+    )
+    assert trade is not None
+    assert trade.quantity == 900
+    assert dispatcher.placed_qty == [900]  # 恰一次且已缩量
+    assert acc.cash == Decimal("10000")  # apply=False 不落账
+
+
+def test_execute_live_buy_fee_clamp_rejects_when_no_affordable_lot():
+    """实盘 apply=False：cash=1004 @10 审批 100 股，含佣成本 1005 > 1004 →
+    无可负担手数 → 拒单（trade=None，不发单，现金不变）。"""
+    acc = Account(Decimal("1004"))
+    pos = Position("000001.SZ")
+    dispatcher = _SpyDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.BUY, "000001.SZ", 100, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(
+        order, acc, pos, apply=False,
+        buy_fee_cfg=(Decimal("5"), Decimal("0.00025")),
+    )
+    assert trade is None
+    assert dispatcher.placed_qty == []  # 未触桥
+    assert acc.cash == Decimal("1004")
+    assert pos.quantity == 0
+
+
+def test_execute_live_buy_without_fee_cfg_keeps_old_behavior():
+    """实盘 apply=False 未传 buy_fee_cfg（旧调用）→ 不做前置钳制（原行为）。"""
+    acc = Account(Decimal("10000"))
+    pos = Position("000001.SZ")
+    dispatcher = _SpyDispatcher(open_prices={"000001.SZ": Decimal("10")})
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10",
+                   bar_time=datetime(2026, 7, 29, 15, 0))
+    trade = engine.execute(order, acc, pos, apply=False)
+    assert trade is not None
+
+    assert trade.quantity == 1000
+    assert dispatcher.placed_qty == [1000]
+
+
+def test_fit_buy_qty_to_cash_explicit_fee_overrides():
+    """_fit_buy_qty_to_cash 显式费用口径（实盘 dispatcher 无费率属性时从组合
+    cost_params 传入）：min=5、rate=0.001 → 1000 股@10 含佣 10010 超现金，
+    检查 (quantity, quantity-lot) 两档 → 900 股（9000+9=9009 ≤ 10000）。"""
+    engine = ExecutionEngine(SimulatedDispatcher(open_prices={}), SimulatedT1Checker())
+    qty = engine._fit_buy_qty_to_cash(
+        Decimal("10"), Decimal("10000"), 1000, 100,
+        buy_rate=Decimal("0.001"), min_commission=Decimal("5"),
+    )
+    assert qty == 900

@@ -17,9 +17,13 @@ class OrderDispatcher(ABC):
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         ...
 
-    def fill_price(self, order: OrderEvent) -> Optional[Decimal]:
-        """成交价（若可知）。默认 None=不重校验。回测 SimulatedDispatcher 覆盖。"""
-        return None
+    def execution_receipts(self) -> list:
+        """执行回执通道（文件交接层执行器专用）：默认无回执（[]）。
+
+        file_builtin 类 dispatcher 覆写：弹出暂存的执行失败回执，由
+        LiveEngine 在记账锁内消费（file 拒单即时可见，不等 180s expire）。
+        """
+        return []
 
 
 class T1Checker(ABC):
@@ -71,15 +75,6 @@ class SimulatedDispatcher(OrderDispatcher):
             / Decimal(int(vol))
         )
         return min(self.slippage + impact, Decimal("0.10"))
-
-    def fill_price(self, order: OrderEvent) -> Optional[Decimal]:
-        """含滑点的成交价，与 place_order 的定价算法一致；无价则 None。"""
-        price = self.open_prices.get(order.stock_code)
-        if not price:
-            return None
-        if order.trade_type.value == "BUY":
-            return price * (Decimal("1") + self.slippage)
-        return price * (Decimal("1") - self.slippage)
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
         price = self.open_prices.get(order.stock_code)
@@ -189,6 +184,8 @@ class ExecutionEngine:
         *,
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
+        max_order_amount: Optional[Decimal] = None,
+        available_cash_cap: Optional[Decimal] = None,
     ) -> Optional[int]:
         """审批/T+1 量上限：返回最终下单量（None=不通过不下单）。
 
@@ -201,7 +198,10 @@ class ExecutionEngine:
         时 BUY 可买额度 = min(现金, 上限 - strategy_position_value)——策略总持仓市值
         ≤ capital_ratio × 初始资金。缩量/拒单记 exposure_cap 闸门事件（敞口为 binding
         约束时），否则沿用 insufficient_funds/order_shrunk（现金为 binding 约束）。
-        """
+
+        available_cash_cap（实盘账户全貌对齐，可选，仅 BUY 生效）：非 None 时
+        现金上限取 min(账本现金, 该值)——真实账户可用资金（快照表 × 0.98 缓冲）
+        透传 approve_order.cash_override，防虚拟虚高导致柜台拒单。"""
         if order.trade_type.value == "BUY":
             lot = self._lot(order.stock_code)
             use_exposure = strategy_capital_limit is not None
@@ -213,6 +213,7 @@ class ExecutionEngine:
                 order.quantity, order.price or Decimal("0"), pos_value,
                 strategy_capital_limit_override=strategy_capital_limit if use_exposure else None,
                 lot_size=lot,
+                cash_override=available_cash_cap,
             )
             # binding 约束判定：敞口余量 < 现金 → 缩量/拒单归因于策略敞口上限
             exposure_binds = use_exposure and (
@@ -263,6 +264,33 @@ class ExecutionEngine:
                         message="资金不足缩量：请求 %d 股，按可用现金 %s 缩至 %d 股 @%s"
                                 % (order.quantity, fmt_money(account.cash), qty, fmt_price(order.price)),
                     )
+            # 策略级单笔最大买入金额（None=不限）：审批通过后金额封顶，
+            # 缩到该金额能买的整手股数（不足 1 手拒单）。仅 BUY 路径。
+            if (max_order_amount is not None and max_order_amount > 0
+                    and order.price and order.price > 0):
+                max_qty = int(float(max_order_amount) / float(order.price) / lot) * lot
+                if max_qty < qty:
+                    if max_qty < lot:
+                        self._rec_gate(
+                            "order_amount_cap", "reject", order, "capital_gate",
+                            requested=order.quantity, final=0,
+                            param_name="max_order_amount", param_value=float(max_order_amount),
+                            actual_value=float(order.price * qty),
+                            message="单笔最大金额拒单：%s 元上限按 %s 只能买 %d 股，不足 1 手"
+                                    % (fmt_money(max_order_amount),
+                                       fmt_price(order.price), max_qty),
+                        )
+                        return None
+                    self._rec_gate(
+                        "order_amount_cap", "shrink", order, "capital_gate",
+                        requested=order.quantity, final=max_qty,
+                        param_name="max_order_amount", param_value=float(max_order_amount),
+                        actual_value=float(order.price * max_qty),
+                        message="单笔最大金额缩量：请求 %d 股，%s 元上限按 %s 缩至 %d 股（整手）"
+                                % (order.quantity, fmt_money(max_order_amount),
+                                   fmt_price(order.price), max_qty),
+                    )
+                    qty = max_qty
             return qty
         if position is None or order.bar_time is None:
             return None
@@ -270,9 +298,16 @@ class ExecutionEngine:
             position, order.bar_time.date()
         )
         qty = min(order.quantity, available)
-        # SELL 手数随持仓（建仓时按标的类型定档：转债 10 张 / 股票 100 股）
+        # SELL 手数随持仓（建仓时按标的类型定档：转债 10 张 / 股票 100 股）。
+        # 例外：清仓且持仓本身不足一手（可转债 5 张、缩量历史残仓）——A 股允许
+        # 不足一手的余额一次性卖出，否则这类残仓永远卖不掉（可用不足的部分
+        # 仍按原逻辑拒单，保守语义不变）。
         sell_lot = position.lot_size
-        if qty < sell_lot:
+        is_odd_lot_clear = (
+            qty == position.quantity and position.quantity > 0
+            and qty < sell_lot
+        )
+        if qty < sell_lot and not is_odd_lot_clear:
             self._rec_gate(
                 "t1_insufficient", "block", order, "t1",
                 requested=order.quantity, final=qty,
@@ -293,7 +328,9 @@ class ExecutionEngine:
 
     def _fit_buy_qty_to_cash(
         self, price: Decimal, cash: Decimal, quantity: int,
-        lot_size: int = 100,
+        lot_size: int = 100, *,
+        buy_rate: Optional[Decimal] = None,
+        min_commission: Optional[Decimal] = None,
     ) -> int:
         """费用感知缩量：返回 ≤ quantity 的最大整手倍数，使
         成交额 + 佣金 ≤ 可用现金（approve_order 只卡 price×qty，未预留佣金，
@@ -301,20 +338,26 @@ class ExecutionEngine:
 
         lot_size（可选，默认 100=股票原行为）：可转债 10 张取整时传 10。
 
+        buy_rate / min_commission（可选，显式费用口径）：实盘 dispatcher 无
+        费率属性，由调用方从组合 cost_params 传入（LiveEngine）；缺省回退
+        dispatcher 属性，再缺省用历史硬编码值。
+
         只需检查 quantity 与 quantity-lot_size：每缩一手省下的金额
         远大于该手的佣金，故最大可行量只可能是这两者之一。
         """
         if price <= 0 or cash <= 0 or quantity < lot_size:
             return 0
-        buy_rate = getattr(
-            self._dispatcher, "buy_commission_rate", Decimal("0.00025")
-        )
-        min_comm = getattr(self._dispatcher, "min_commission", Decimal("5"))
+        if buy_rate is None:
+            buy_rate = getattr(
+                self._dispatcher, "buy_commission_rate", Decimal("0.00025")
+            )
+        if min_commission is None:
+            min_commission = getattr(self._dispatcher, "min_commission", Decimal("5"))
         for q in (quantity, quantity - lot_size):
             if q < lot_size:
                 continue
             amount = price * q
-            commission = max(min_comm, amount * buy_rate)
+            commission = max(min_commission, amount * buy_rate)
             if amount + commission <= cash:
                 return q
         return 0
@@ -328,6 +371,8 @@ class ExecutionEngine:
         *,
         strategy_position_value: Optional[Decimal] = None,
         strategy_capital_limit: Optional[Decimal] = None,
+        max_order_amount: Optional[Decimal] = None,
+        buy_fee_cfg: Optional[tuple] = None,
     ) -> Optional[TradeEvent]:
         """执行订单。
 
@@ -337,16 +382,59 @@ class ExecutionEngine:
         避免受理即成交的近似；I4 崩溃窗口下 DB 有 submitted 记录即可）。
 
         #3 策略级敞口上限（可选）：两个 strategy_* 参数透传 cap_quantity，默认 None
-        不启用（实盘 LiveEngine 不传 → 行为不变）。
+        不启用（实盘 LiveEngine._handle_bar 按策略 exposure_cap_enabled 同式传入，
+        回测/实盘行为一致）。
+
+        max_order_amount（可选，None=不限）：策略级单笔最大买入金额，透传
+        cap_quantity（回测/实盘双端同一闸门）。
+
+        buy_fee_cfg（可选，(最低佣金, 买入费率)，实盘从组合 cost_params 传入）：
+        实盘 BUY 费用感知前置钳制口径——approve_order 只卡价×量，尾款不足佣金
+        会透支虚拟现金（与回测 apply 段的费用兜底同一审批正确性语义）。桥通道
+        place_order 即真实发单、无法二次改量重发，故该钳制必须在发单前按委托价
+        完成；回测（apply=True）不传，维持成交后按实际成交价（含滑点+费用）的
+        最终兜底，行为不变。
         """
         capped = self.cap_quantity(
             order, account, position,
             strategy_position_value=strategy_position_value,
             strategy_capital_limit=strategy_capital_limit,
+            max_order_amount=max_order_amount,
         )
         if capped is None:
             return None
         order.quantity = capped
+
+        # 实盘（apply=False）BUY 费用感知前置钳制（发单前，防桥通道二次重发）：
+        # approve 只卡价×量，按委托价 + buy_fee_cfg 佣金口径缩到费用可覆盖的
+        # 最大整手倍数；不足一手拒单。与 apply 段的费用兜底同一审批正确性语义，
+        # 仅「落库 apply」差异保留。
+        if not apply and buy_fee_cfg is not None and order.trade_type == TradeType.BUY:
+            lot = self._lot(order.stock_code)
+            px = order.price or Decimal("0")
+            if px > 0:
+                fit_qty = self._fit_buy_qty_to_cash(
+                    px, account.cash, order.quantity, lot,
+                    buy_rate=buy_fee_cfg[1], min_commission=buy_fee_cfg[0],
+                )
+                if fit_qty < lot:
+                    self._rec_gate(
+                        "insufficient_funds", "reject", order, "capital_gate",
+                        requested=order.quantity, final=0,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="买入成本（含佣金）超可用现金：需 %s，可用 %s"
+                                % (fmt_money(px * order.quantity), fmt_money(account.cash)),
+                    )
+                    return None
+                if fit_qty < order.quantity:
+                    self._rec_gate(
+                        "order_shrunk", "shrink", order, "capital_gate",
+                        requested=order.quantity, final=fit_qty,
+                        param_name="cash", actual_value=float(account.cash),
+                        message="买入佣金超出尾款，缩量 %d → %d @ %s"
+                                % (order.quantity, fit_qty, fmt_price(px)),
+                    )
+                    order.quantity = fit_qty
 
         trade = self._dispatcher.place_order(order)
         if not trade:

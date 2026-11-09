@@ -500,6 +500,20 @@ def test_backfill_record_rejects_nonpositive_replayed_market_value(db_session):
     assert all(s.positions_json is None for s in rows)
 
 
+def test_backfill_record_provider_failure_returns_failed(db_session):
+    """取价异常不得外抛：本函数契约「绝不抛异常」，CLI 逐条循环调用。"""
+    rec = _seed_backfillable(db_session)
+
+    def _boom(*_a):
+        raise RuntimeError("TQ 连接断开")
+
+    out = backfill_record(db_session, rec.id, close_provider=_boom)
+    assert out["status"] == "failed"
+    assert "取价失败" in out["error"]
+    assert out["written"] is False
+    assert all(s.positions_json is None for s in _portfolio_snaps(db_session, rec))
+
+
 def test_backfill_record_skips_populated_unless_force(db_session):
     """positions_json 已回填 → 默认跳过；force=True 重跑覆盖。"""
     rec = _seed_backfillable(db_session)

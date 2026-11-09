@@ -8,20 +8,10 @@ from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1C
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
+# 涨跌停幅度口径迁至 market_rules（实盘 TdxTqDispatcher 涨跌停前置校验共用）；
+# 此处 re-export 保持既有 import 路径不破。
+from .market_rules import _limit_ratio_for, session_allows, session_allows_bar  # noqa: F401
 from tq_iquant_shared.constants import TradeType
-
-
-def _limit_ratio_for(stock_code: str) -> Decimal:
-    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8 前缀) 30%，其余 10%。
-
-    ST 5% 不特判（v1 偏宽松可接受：对 ST 股拦截区间偏宽，少拦不错拦）。
-    """
-    prefix = stock_code.split(".")[0]
-    if prefix.startswith(("300", "301", "688")):
-        return Decimal("0.20")
-    if prefix[:1] in ("4", "8"):
-        return Decimal("0.30")
-    return Decimal("0.10")
 
 
 # W4 按周期路由：同一时间戳可能同时存在多个周期（1d/1w/1mon 均为 00:00）。
@@ -42,15 +32,19 @@ class BacktestEngine:
         benchmark_data: object = None,
         on_progress: Callable[[int], None] = None,
         regime_tracker=None,
+        daily_close_peak_enabled: bool = False,
     ) -> dict:
         """逐 bar 回测主链路。
 
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
         成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列），
         成交价取 price_index 中该 bar 的 Open（open_prices 死参数已移除，#12）。
+        on_progress：进度回调（#10），0–100 递增整数，末值 100，节流至最多约 100 次。
         regime_tracker：B5 可选因果市场状态跟踪器（CausalRegimeTracker，默认 None
         不启用）；逐 bar 喂当日基准收盘并把标签注入 portfolio.current_regime。
-        on_progress：进度回调（#10），0–100 递增整数，末值 100，节流至最多约 100 次。
+        daily_close_peak_enabled：可选保护（默认关）。开启后 peak/max_drawdown 只在
+        当日最后一根 bar 更新，避免混合周期粗 bar 的周期末 close（未来价）污染峰值；
+        跨日 prev_close/daily_loss bookkeeping 仍每 bar 更新。纯 1d 行为不变。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
@@ -215,7 +209,15 @@ class BacktestEngine:
                                 vol_lot = lot_size_for(
                                     order.stock_code, portfolio.bond_lot_enabled
                                 )
-                                if cap_shares >= vol_lot:
+                                # A 股规则：买入必须整手，卖出允许零股。买入缩量
+                                # 必须先按手取整（否则会产生 137 股这类非整手持仓，
+                                # 后续 SELL 手数校验会把它当成不足一手而永远卖不掉）。
+                                is_buy = order.trade_type == TradeType.BUY
+                                final_qty = (
+                                    (cap_shares // vol_lot) * vol_lot
+                                    if is_buy else cap_shares
+                                )
+                                if final_qty >= vol_lot or (not is_buy and final_qty > 0):
                                     recorder.record(
                                         gate="volume_cap_shrink", layer="execution",
                                         action="shrink",
@@ -224,13 +226,13 @@ class BacktestEngine:
                                         stock_code=order.stock_code,
                                         bar_time=t,
                                         requested_qty=order.quantity,
-                                        final_qty=cap_shares,
+                                        final_qty=final_qty,
                                         message="成交量约束：订单 %d 股 > 本 bar 上限 %d 股"
-                                                "（当日成交 %s 股 ×%s），缩量成交"
+                                                "（当日成交 %s 股 ×%s），缩量至 %d 股成交"
                                                 % (order.quantity, cap_shares, bar_volume,
-                                                   portfolio.volume_limit_ratio),
+                                                   portfolio.volume_limit_ratio, final_qty),
                                     )
-                                    order.quantity = cap_shares
+                                    order.quantity = final_qty
                                 else:
                                     if id(order) not in volume_defer_recorded:
                                         volume_defer_recorded.add(id(order))
@@ -283,8 +285,17 @@ class BacktestEngine:
             # 3. portfolio.on_bar → 新订单入 pending（下一根同周期 bar 成交）
             #    period=P 只驱动 period 相同的策略，杜绝混合周期前视。
             #    deferred（未成交/未到期订单）需携带至后续 bar 合并。
-            new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
-            pending_orders = deferred + new_orders
+            #    trading_session（full/am/pm）时段闸：非允许时段的日内 bar 跳过本组合
+            #    本轮（风控/信号随 bar 跳过，不产生新交易；deferred/既有 pending
+            #    照常延后成交）。⚠️ 行为变更：am/pm 组合的日内回测结果会改变
+            #    （历史死配置首次接线）；full（默认）无影响。日线及以上 bar
+            #    （bar_time=00:00）不受时段过滤——否则 am/pm 组合的日线回测会
+            #    被整程跳过（session_allows_bar 的周期判定）。
+            if session_allows_bar(portfolio.trading_session, t.time(), period):
+                new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
+                pending_orders = deferred + new_orders
+            else:
+                pending_orders = deferred
 
             # 4. 日终快照（W4.4：每交易日至多一行，取当日最后一根 bar 的末值）
             total_value = portfolio.total_value(bar)
@@ -317,7 +328,18 @@ class BacktestEngine:
 
             # 5. 熔断检测：更新峰值/检测 max_drawdown，推进熔断次日恢复时序
             #    （daily_loss 已在本 bar 起始 enter_day 补算，此处只做峰值/回撤）
-            portfolio.risk_manager.update_peak(total_value, t.date())
+            #    可选日末保护：混合周期下粗 bar 的 close 是周期末价（对当前时点是未来），
+            #    只在当日最后一根 bar 更新 peak，避免其污染组合峰值/误触熔断。
+            if daily_close_peak_enabled:
+                allow_peak_update = (
+                    i + 1 >= len(times)
+                    or times[i + 1][0].date() != t.date()
+                )
+                portfolio.risk_manager.update_peak(
+                    total_value, t.date(), allow_peak_update=allow_peak_update,
+                )
+            else:
+                portfolio.risk_manager.update_peak(total_value, t.date())
 
             # 6. #1 涨跌停约束：用本 bar 有效收盘(>0) 刷新该周期前收表（下一 bar 判定用）。
             #    开关关闭时零判定开销（仅一次 dict 写入/票）。
@@ -326,7 +348,7 @@ class BacktestEngine:
                 if close is not None and close > 0:
                     prev_close_map[(code, period)] = close
 
-            # 7. 进度上报：节流至最多约 100 次，末根 bar 必报 100（#10）
+            # 7. 进度上报：节流至最多约 100 次，末根 bar 必报 100（#10）。
             if on_progress is not None and (i % report_every == 0 or i == total_bars - 1):
                 on_progress(int((i + 1) * 100 / total_bars))
 
@@ -373,14 +395,23 @@ class BacktestEngine:
 
         上限 = capital_ratio × 组合初始资金；策略持仓市值用 _price_snapshot 估值
         （上一 bar 已刷新，口径与审批用的信号 bar 收盘一致）。关闭返回空 dict，
-        execute 走默认 None（行为与旧逻辑一致）。实盘 LiveEngine 不调此方法。
+        execute 走默认 None（行为与旧逻辑一致）。实盘 LiveEngine 不调此方法——
+        其 _handle_bar 持有同式 _exposure_kwargs 透传（B-2 敞口实盘化）。
+
+        同时携带策略级单笔最大买入金额（可选 None=不限，照 exposure 同式透传，
+        回测/实盘双端 cap_quantity 生效）。
         """
-        if not getattr(ctx, "exposure_cap_enabled", False):
-            return {}
-        return {
-            "strategy_position_value": portfolio.holdings_value(ctx),
-            "strategy_capital_limit": ctx.capital_ratio * portfolio.account.initial_capital,
-        }
+        kwargs = {}
+        if getattr(ctx, "exposure_cap_enabled", False):
+            kwargs["strategy_position_value"] = portfolio.holdings_value(ctx)
+            kwargs["strategy_capital_limit"] = (
+                ctx.capital_ratio * portfolio.account.initial_capital
+            )
+        _moa = getattr(ctx, "max_order_amount", None)
+        kwargs["max_order_amount"] = (
+            Decimal(str(_moa)) if _moa is not None else None
+        )
+        return kwargs
 
     def _build_timeline(self, klines: dict) -> List[tuple]:
         """合并所有股票所有周期的时间轴，返回排序去重的 (datetime, period) 列表。

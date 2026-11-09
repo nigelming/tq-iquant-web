@@ -7,17 +7,32 @@ requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.18.5",
     "asyncpg>=0.31.0",
+    "ddddocr>=1.6.1",
     "fastapi>=0.140.13",
     "httpx>=0.28.1",
     "openpyxl>=3.1.5",
     "pandas>=3.0.5",
+    "pillow>=13.0.0",
     "polars>=1.43.1",
     "pydantic>=2.13.4",
+    "pyperclip>=1.11.0",
     "pytdx>=1.72",
+    "pywebview>=6.2.1",
+    "pywinauto>=0.6.9",
     "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.51",
     "tq-iquant-shared",
     "uvicorn[standard]>=0.51.0",
+    # 同花顺验证码 OCR：Windows 内置 OCR（WinRT）作为 ddddocr 的兜底
+    # （ddddocr 为默认优先路径，见 ths_ui_dispatcher._ocr_digits）。
+    "winrt-runtime>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-foundation>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-foundation-collections>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-globalization>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-graphics-imaging>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-media-ocr>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-storage>=3.2.1; sys_platform == 'win32'",
+    "winrt-windows-storage-streams>=3.2.1; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

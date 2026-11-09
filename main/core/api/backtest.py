@@ -77,6 +77,12 @@ class BacktestRequest(BaseModel):
     volume_limit_ratio: float | None = None
     # 容量上限 run 级覆盖（None=用组合默认）：临时封顶 dynamic 仓位资金基座
     equity_cap: float | None = None
+    # 日末 peak 保护（默认关）：开启后 peak/max_drawdown 只在当日最后一根 bar 更新，
+    # 避免混合周期粗 bar 的周期末 close 污染峰值；纯 1d 行为不变
+    daily_close_peak_enabled: bool = False
+    # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合配置）：
+    # equity=上一交易日收盘净值；initial=初始资金（旧口径，阈值恒定）
+    daily_loss_basis: str | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -100,6 +106,8 @@ class WalkForwardRequest(BaseModel):
     oos_gate_min_ratio: float = 0.5
     dividend_mode: str = "front"
     evaluation_profile: str = "absolute"
+    # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合）
+    daily_loss_basis: str | None = None
 
 
 class ParamPerturbRequest(BaseModel):
@@ -112,6 +120,8 @@ class ParamPerturbRequest(BaseModel):
     perturb_pct: float = 0.10
     dividend_mode: str = "front"
     evaluation_profile: str = "absolute"
+    # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合）
+    daily_loss_basis: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +149,9 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_market_regime as _svc_recompute_market_regime,
     recompute_evaluation as _svc_recompute_evaluation,
     recompute_robustness as _svc_recompute_robustness,
+    recompute_validation_crisis as _svc_recompute_validation_crisis,
+    recompute_validation as _svc_recompute_validation,
+    recompute_persistence as _svc_recompute_persistence,
     run_pool_comparison as _svc_run_pool_comparison,
 )
 from core.services.walk_forward_service import (  # noqa: E402
@@ -219,8 +232,47 @@ def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
 
 @router.post("/records/{record_id}/robustness/recompute")
 def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
-    """离线重算稳健性检验（年度/3年滚动/集中度/样本内外，不重跑回测）。"""
+    """离线重算稳健性检验（年度/3年滚动/集中度/样本内外，不触发回测）。"""
     result = _svc_recompute_robustness(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/validation-crisis/recompute")
+def recompute_record_validation_crisis(record_id: int, db: Session = Depends(get_db)):
+    """离线刷新验证结论的危机防御块（新窗口/新判定，仅用落库快照，不重跑回测）。"""
+    result = _svc_recompute_validation_crisis(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/validation/recompute")
+def recompute_record_validation(record_id: int, db: Session = Depends(get_db)):
+    """离线重算验证结论全量（capacity 含敞口上限维度 + crisis + oos，不重跑回测）。
+
+    capacity 从落库快照/评估/策略配置重建；ADV 容量预警需逐股日线（离线无
+    klines）→ 跳过。新回测完成时由 build_validation_verdict 自动含全部维度。
+    """
+    result = _svc_recompute_validation(db, record_id)
+    if result is None:
+        return err(404, "回测记录不存在")
+    return ok(result)
+
+
+@router.post("/records/{record_id}/persistence/recompute")
+def recompute_record_persistence(
+    record_id: int, benchmark_code: str | None = None, db: Session = Depends(get_db),
+):
+    """离线重算持续性检验（分年度超额/风险/交易结构 + 滚动年化，判定阿尔法衰减 vs 风格钟摆）。
+
+    benchmark_code：可选判定基准覆盖（默认组合基准）。仅影响本模块，不改组合配置。
+    """
+    try:
+        result = _svc_recompute_persistence(db, record_id, benchmark_code=benchmark_code)
+    except ValueError as e:
+        return err(400, str(e))
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -239,6 +291,12 @@ def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_d
         return err(400, "请至少选择一个备选股票池")
     if req.start_date >= req.end_date:
         return err(400, f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}")
+    # 未来日期 TQ 拉不到行情：提前拦截，避免每池各跑一轮才失败（多池耗时放大）
+    today = date.today()
+    if req.start_date > today:
+        return err(400, f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）")
+    if req.end_date > today:
+        return err(400, f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）")
     if req.dividend_mode not in ("front", "back", "dual"):
         return err(400, f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}")
 
@@ -286,8 +344,14 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
+    if not req.name.strip():
+        return "回测名称不能为空"
     if req.dividend_mode not in ("front", "back", "dual"):
         return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.evaluation_profile not in ("absolute", "relative"):
+        return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # C7：门槛比例须在 [0.1, 2]（<0.1 过松失意义，>2 要求 OOS 两倍于 IS 已失合理性）
     if not (0.1 <= req.oos_gate_min_ratio <= 2):
         return f"IS/OOS 门槛比例须在 [0.1, 2] 区间，收到 {req.oos_gate_min_ratio}"
@@ -300,6 +364,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     # 容量上限 run 级覆盖：必须 > 0
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限/用组合默认），收到 {req.equity_cap}"
+    # 日内亏损熔断分母口径 run 级覆盖：None=跟随组合，显式值仅限 equity/initial
+    if req.daily_loss_basis is not None and req.daily_loss_basis not in ("equity", "initial"):
+        return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
+                f"收到 {req.daily_loss_basis!r}")
     return None
 
 
@@ -343,14 +411,21 @@ def _validate_walk_forward_request(req: WalkForwardRequest) -> Optional[str]:
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
     if req.dividend_mode not in ("front", "back", "dual"):
         return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.evaluation_profile not in ("absolute", "relative"):
+        return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     if req.train_years < 1:
         return f"训练窗口须 ≥ 1 年，收到 {req.train_years}"
     if req.test_years < 1:
         return f"验证窗口须 ≥ 1 年，收到 {req.test_years}"
     if not (0.1 <= req.oos_gate_min_ratio <= 2):
         return f"IS/OOS 门槛比例须在 [0.1, 2] 区间，收到 {req.oos_gate_min_ratio}"
+    if req.daily_loss_basis not in (None, "equity", "initial"):
+        return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
+                f"收到 {req.daily_loss_basis!r}")
     return None
 
 
@@ -412,11 +487,18 @@ def _validate_param_perturb_request(req: ParamPerturbRequest) -> Optional[str]:
     today = date.today()
     if req.start_date > today:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
     if req.dividend_mode not in ("front", "back", "dual"):
         return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.evaluation_profile not in ("absolute", "relative"):
+        return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # 扰动幅度上限 50%：再大已不是"微"扰，且 int 参数缩放失真严重
     if not (0 < req.perturb_pct <= 0.5):
         return f"扰动幅度须在 (0, 0.5] 区间，收到 {req.perturb_pct}"
+    if req.daily_loss_basis not in (None, "equity", "initial"):
+        return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
+                f"收到 {req.daily_loss_basis!r}")
     return None
 
 

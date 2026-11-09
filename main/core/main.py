@@ -11,8 +11,15 @@ from core.api.backtest import router as backtest_router
 from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
+from core.api.tdx import router as tdx_router
 from core.logging_config import setup_logging
-from core.services.backtest_service import recover_stale_running_backtests
+from core.services.backtest_service import (
+    recover_stale_running_backtests, recover_stale_running_batch_runs,
+)
+from core.services.live_service import (
+    ENGINES, recover_stale_running_live_sessions,
+)
+from core.engine.live.engine_watchdog import EngineWatchdog
 from core.services.auto_shutdown import arm as arm_auto_shutdown
 
 
@@ -30,17 +37,39 @@ async def lifespan(app: FastAPI):
     # #5: 清理上次进程崩溃/重启残留的僵尸 running 回测记录（同步内联执行，
     # 正常退出不残留 running；残留即崩溃）。统一标 failed + 附说明，避免前端
     # 永久显示"运行中"且无法重新发起（_BACKTEST_LOCK 是进程内锁，重启已释放）。
+    with SessionLocal() as db:
+        n = recover_stale_running_backtests(db)
+        if n:
+            logger.warning("启动恢复：%d 条僵尸 running 回测已标记 failed", n)
+        # 批量任务 run（walk-forward / 参数微扰）同理：崩溃残留 running 会导致
+        # 面板永久"运行中"且删除被 409 守卫拦截。
+        n2 = recover_stale_running_batch_runs(db)
+        if n2:
+            logger.warning("启动恢复：%d 条僵尸 running 批量任务（walk-forward/参数微扰）已标记 failed", n2)
+        # 实盘同类缺陷（2026-11-04 实证）：后端重启不会自动恢复引擎，但 DB 仍留
+        # status=running → 工作台显示「运行中」而 bridge-status=not_running。
+        # 冷启动时引擎注册表必为空，安全统一置 stopped（逐条日志留原因），
+        # 由用户手动重新启动。
+        n3 = recover_stale_running_live_sessions(db)
+        if n3:
+            logger.warning("启动恢复：%d 个僵尸 running 实盘会话已置 stopped", n3)
+    # 进程内引擎存活监控（daemon 线程，30s 扫描）：只发现 + 告警（logger/SSE），
+    # 不干预交易。冷启动注册表为空时安全空转；进程本身崩溃时该线程随之消失，
+    # 需外部 watchdog（scripts/ops/watch_live_backend.ps1）兜底。
+    watchdog = None
     try:
-        with SessionLocal() as db:
-            n = recover_stale_running_backtests(db)
-            if n:
-                logger.warning("启动恢复：%d 条僵尸 running 回测已标记 failed", n)
-    except Exception:
-        logger.exception("recover_stale_running_backtests failed")
+        watchdog = EngineWatchdog(lambda: ENGINES)
+        watchdog.start()
+        logger.info("实盘引擎存活监控已启动（进程内，30s 扫描）")
+    except Exception:  # noqa: BLE001 — 监控启动失败不得阻断主服务
+        logger.exception("实盘引擎存活监控启动失败（主服务继续运行）")
+        watchdog = None
     yield
+    if watchdog is not None:
+        watchdog.stop()
 
 
-app = FastAPI(title="创懿量化交易平台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="创懿私募基金量化投资平台", version="1.0.0", lifespan=lifespan)
 
 app.include_router(stock_pools_router)
 app.include_router(formulas_router)
@@ -49,6 +78,7 @@ app.include_router(backtest_router)
 app.include_router(live_router)
 app.include_router(system_router)
 app.include_router(status_router)
+app.include_router(tdx_router)
 
 
 @app.exception_handler(Exception)

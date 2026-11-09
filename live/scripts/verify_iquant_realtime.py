@@ -1,6 +1,6 @@
 # -*- coding: gbk -*-
 """
-iQuant 盘中实时行情验证 v2（改用 get_market_data_ex）
+QMT 盘中实时行情验证 v2（改用 get_market_data_ex）
 =====================================================
 对应 docs/plans/0009-iquant-http-bridge.md §12 待验证点。
 
@@ -25,7 +25,7 @@ v2 用官方推荐接口重新验证：
 import time
 
 # ================= 可配置 =================
-ACCOUNT = "110002348760"      # TODO: 改成你自己的资金账号
+ACCOUNT = "410038214257"      # QMT 仿真普通账户（桥 8790，ACCOUNT_TYPE=STOCK）
 CODES = ["600000.SH"]         # 观察股票
 POLL_INTERVAL = 10            # 动态验证间隔（秒）
 DOWNLOAD_START = "20260801"   # 补历史的起始日（YYYYMMDD）

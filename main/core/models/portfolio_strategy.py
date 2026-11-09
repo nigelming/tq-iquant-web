@@ -14,6 +14,11 @@ class PortfolioStrategy(Base):
     initial_capital = Column(Numeric(15, 2), default=500000, server_default="500000", nullable=False)
     max_drawdown = Column(Numeric(5, 4), default=0.2000, server_default="0.2000", nullable=False)
     daily_loss_limit = Column(Numeric(5, 4), default=0.0500, server_default="0.0500", nullable=False)
+    # 日内亏损熔断分母口径：
+    # equity（默认）= 上一交易日收盘净值 × daily_loss_limit，阈值随净值滚动（修正口径）；
+    # initial = initial_capital × daily_loss_limit，阈值恒定（旧行为——净值涨大后
+    # 一天 0.2% 的波动就会锁死整日不开仓，属口径缺陷，故默认已改为 equity）。
+    daily_loss_basis = Column(String(10), default="equity", server_default="equity", nullable=False)
     max_holdings = Column(Integer, default=10, server_default="10", nullable=False)
     min_commission = Column(Numeric(10, 2), default=5, server_default="5", nullable=False)
     buy_commission_rate = Column(Numeric(8, 6), default=0.000250, server_default="0.000250", nullable=False)

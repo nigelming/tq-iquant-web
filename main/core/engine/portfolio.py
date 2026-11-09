@@ -126,6 +126,14 @@ class Portfolio:
         # bond_lot_enabled：转债最小交易单位 10 张（股票仍 100 股）。
         self.bond_t0_enabled: bool = False
         self.bond_lot_enabled: bool = False
+        # 组合级最大持仓数（组合表字段，历史死配置首次接线）：OPEN 开新仓前按
+        # 组合全部策略持仓去重股票数判定，≥ 上限拒绝新开仓。0=不限（直接构造
+        # Portfolio 的引擎单测默认不受限）；builder 从组合表装配。
+        self.max_holdings: int = 0
+        # 组合交易时段（full/am/pm，组合表字段，历史死配置首次接线）：
+        # am=09:30–11:30、pm=13:00–15:00、full=不筛（默认）。回测按 bar 时间、
+        # 实盘按墙钟过滤（窗口定义见 market_rules.session_allows）。
+        self.trading_session: str = "full"
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""
@@ -204,6 +212,12 @@ class Portfolio:
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
+                # 周期不匹配：仅跑风控（止损/止盈/移动止损按当前 bar 价盘中核算
+                # 与执行），公式信号仍锁策略周期（W4 防混合周期前视语义不变）。
+                # 实盘快照合成 1m bar → 日线策略持仓获得盘中风控；回测日线数据
+                # 无 1m bar → 行为与历史一致；混合周期回测 → 双端盘中风控统一。
+                orders.extend(self._process_strategy(
+                    ctx, bar, signal_cache, inflight, include_signals=False))
                 continue
             strat_orders = self._process_strategy(ctx, bar, signal_cache, inflight)
             orders.extend(strat_orders)
@@ -289,9 +303,18 @@ class Portfolio:
 
     def _process_strategy(
         self, ctx: StrategyContext, bar: BarEvent, signal_cache,
-        inflight: Dict[int, set],
+        inflight: Dict[int, set], include_signals: bool = True,
     ) -> List[OrderEvent]:
-        signals = ctx.get_signal(bar, signal_cache=signal_cache)
+        """单策略 bar 处理：公式信号 + 风控检查 → 合并排序 → 转订单。
+
+        include_signals=False（周期解耦盘中风控）：跳过公式信号评估，仅产出
+        风控单——非本策略周期的 bar 到来时按当前 bar 价核算止损/止盈/移动止损
+        （实盘快照合成 1m bar 盘中风控；信号周期锁不受影响）。
+        """
+        signals = (
+            ctx.get_signal(bar, signal_cache=signal_cache)
+            if include_signals else []
+        )
         # 风控检查：对每只持仓股票检查止损/止盈/移动止损
         risk_signals = self._check_risks(ctx, bar)
 
@@ -339,9 +362,20 @@ class Portfolio:
             if pos.quantity == 0 or stock_code not in bar.stocks:
                 continue
             close = bar.stocks[stock_code]["close"]
-            if close > Decimal("0"):
-                # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
-                pos.update_high(close)
+            if close <= Decimal("0"):
+                # 停牌/无数据 bar（TQ NaN → close=0）：先算盈亏会得到 -100% 的
+                # 假止损并污染信号流（2026-11-06 实测 601989/000939/002013）。
+                # 在风控计算之前拦截，只留一条可见的「跳过」记录。
+                self.recorder.record(
+                    gate="risk_skip_no_price", layer="strategy_risk", action="skip",
+                    portfolio_id=self.portfolio_id, strategy_id=ctx.strategy_id,
+                    stock_code=stock_code, bar_time=bar.bar_time,
+                    message="跳过风控：%s 无有效价格（close=%s），不计算盈亏、不发信号"
+                            % (stock_code, fmt_price(close)),
+                )
+                continue
+            # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
+            pos.update_high(close)
             # B5：移动止损阈值按市场状态解析（未开闸/非趋势态回落策略风控原值，行为不变）
             eff_trailing = ctx.effective_trailing_stop(self.current_regime)
             if risk_manager.check_stop_loss(pos, close):
@@ -358,8 +392,9 @@ class Portfolio:
                     param_name="stop_loss_ratio",
                     param_value=float(risk_manager.stop_loss_ratio),
                     actual_value=float(loss),
-                    message="止损：成本 %s 现价 %s 亏 %s" % (
-                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(loss)),
+                    message="止损：整仓成本 %s 现价 %s 亏 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(loss),
+                        pos.cost_note()),
                 )
             elif risk_manager.check_take_profit(pos, close):
                 profit = (close - pos.avg_cost) / pos.avg_cost if pos.avg_cost else Decimal("0")
@@ -375,8 +410,9 @@ class Portfolio:
                     param_name="take_profit_ratio",
                     param_value=float(risk_manager.take_profit_ratio),
                     actual_value=float(profit),
-                    message="止盈：成本 %s 现价 %s 盈 %s" % (
-                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(profit)),
+                    message="止盈：整仓成本 %s 现价 %s 盈 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(close), fmt_pct(profit),
+                        pos.cost_note()),
                 )
             elif risk_manager.check_trailing_stop(pos, close, ratio=eff_trailing):
                 drawdown = (
@@ -398,8 +434,9 @@ class Portfolio:
                         else risk_manager.trailing_stop_ratio
                     ),
                     actual_value=float(drawdown),
-                    message="移动止损：最高 %s 现价 %s 回撤 %s" % (
-                        fmt_price(pos.highest_price), fmt_price(close), fmt_pct(drawdown)),
+                    message="移动止损：整仓成本 %s 最高 %s 现价 %s 回撤 %s%s" % (
+                        fmt_price(pos.avg_cost), fmt_price(pos.highest_price),
+                        fmt_price(close), fmt_pct(drawdown), pos.cost_note()),
                 )
         return risks
 
@@ -525,6 +562,22 @@ class Portfolio:
                           message="OPEN 信号时本票已持仓 %d 股（加仓走 ADD），忽略开仓"
                                   % pos.quantity)
                 return []
+            # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
+            # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）
+            # ≥ max_holdings → 拒绝新开仓。ADD/减仓/清仓类不受影响；
+            # max_holdings<=0 视为未启用（直接构造 Portfolio 默认不限）。
+            port_codes = {
+                code for c in self.strategies
+                for code, p in c.positions.items() if p.quantity > 0
+            }
+            if self.max_holdings and len(port_codes) >= self.max_holdings:
+                self._rec("max_holdings", "portfolio", "block", ctx, sig, bar,
+                          param_name="max_holdings",
+                          param_value=float(self.max_holdings),
+                          actual_value=float(len(port_codes)),
+                          message="组合持仓数 %d/%d 已达上限，%s 不开新仓"
+                                  % (len(port_codes), self.max_holdings, sig.stock_code))
+                return []
             # 在途单计入（max_positions 超开修复，回测 id7 实测根因）：held 只数已成交
             # 持仓，同 bar 齐发的 OPEN / 实盘 submitted 未成交单不占位 → 超开后闸门
             # 永久拦截。inflight 含本 bar 已排队 + 上层注入的在途未成交 BUY。
@@ -580,6 +633,17 @@ class Portfolio:
             # 否则现价较成本下跌 ≥ threshold 才加（逢跌加仓，正常取值 1%~20%）。
             # max_add_count 加仓次数上限始终生效（第一道闸）；资金审批/熔断在执行层兜底。
             if pos is None or pos.quantity == 0:
+                return []
+            # 成本未知（继承仓桥侧未给 cost 且市值不可用 → avg_cost=0）：ADD 不能走。
+            # ① threshold 分支要除以 avg_cost，会抛 Decimal DivisionByZero，冒泡到
+            #    live_engine._on_bar 的 per-portfolio 兜底 → 该组合本 bar 全部策略
+            #    （含止损/止盈/移动止损）被整体跳过，信号存续时每根 bar 复现；
+            # ② 即便 threshold=-1 跳过回撤判断，加仓也会把 0 成本摊进加权均价，
+            #    之后止损/止盈基准失真。保守：记事件、不加仓。
+            if pos.avg_cost <= 0:
+                self._rec("add_cost_unknown", "signal_gate", "block", ctx, sig, bar,
+                          message="ADD 跳过：持仓成本未知（avg_cost=0），"
+                                  "无法判断回撤且加仓会污染加权成本")
                 return []
             if ctx.add_position_threshold != Decimal("-1"):
                 drop = (pos.avg_cost - close) / pos.avg_cost

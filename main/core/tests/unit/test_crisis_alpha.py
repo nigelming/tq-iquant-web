@@ -598,3 +598,19 @@ def test_sanitize_passes_through_plain_values():
         "a": 1, "b": "x", "c": [1, 2],
     }
     assert sanitize_for_json(None) is None
+
+
+def test_quadrant_avg_bench_uses_benchmark_returns():
+    """分档「基准平均」取基准周收益，而非策略均值（否则超额恒为 0）。"""
+    an = _analyzer(WEEKS_B, WEEKS_S)
+    q = an.quadrant_analysis()
+    assert q["avg_bench"]["逆势上涨"] == pytest.approx(-0.10)
+    assert q["avg_bench"]["逆势上涨"] != q["avg_ret"]["逆势上涨"]
+
+
+def test_clip_nonfinite_maps_to_neutral_50():
+    """NaN/Inf（样本退化时 pandas 均值可能给出）不得截断成 100 分。"""
+    assert ca_mod._clip(float("nan")) == pytest.approx(50.0)
+    assert ca_mod._clip(float("inf")) == pytest.approx(50.0)
+    assert ca_mod._clip(-5) == pytest.approx(0.0)
+    assert ca_mod._clip(120) == pytest.approx(100.0)

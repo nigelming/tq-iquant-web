@@ -11,6 +11,9 @@ class TDXConnectionError(Exception):
 
 
 _tdx_lock = threading.Lock()
+# 单例初始化专用锁：与 _tdx_lock 分开，避免「已持 _tdx_lock 的调用方再进
+# get_tq()」时自锁死。tqcenter 非线程安全，initialize 必须串行。
+_init_lock = threading.Lock()
 _tq = None
 _tq_initialized = False
 
@@ -60,17 +63,23 @@ def get_tq():
     需通达信（回测版 new_tdx64）已启动并登录行情。
     """
     global _tq, _tq_initialized
-    if _tq is None:
-        inject_tqcenter_path(_tdx_path())
-        _tq = _import_tq()
-    if not _tq_initialized:
-        try:
-            _tq.initialize(__file__)
-        except TDXConnectionError:
-            raise
-        except Exception as e:
-            raise TDXConnectionError(f"连接通达信失败，请确认通达信已启动并登录：{e}") from e
-        _tq_initialized = True
+    if _tq is not None and _tq_initialized:
+        return _tq
+    # 首次导入 + initialize 串行：两个线程并发进 initialize 会对同一 DLL 句柄
+    # 重复初始化（tqcenter 非线程安全）。快路径在上面，正常调用无锁开销。
+    with _init_lock:
+        if _tq is None:
+            inject_tqcenter_path(_tdx_path())
+            _tq = _import_tq()
+        if not _tq_initialized:
+            try:
+                _tq.initialize(__file__)
+            except TDXConnectionError:
+                raise
+            except Exception as e:
+                raise TDXConnectionError(
+                    f"连接通达信失败，请确认通达信已启动并登录：{e}") from e
+            _tq_initialized = True
     return _tq
 
 

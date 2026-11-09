@@ -121,15 +121,17 @@ def _run_one(db: Session, ps: PortfolioStrategy, req, run: ParamPerturbRun,
         evaluation_profile=req.evaluation_profile,
         # 微扰子回测不过 C7 门槛（非参数采纳场景）
         is_oos_gate_enabled=False,
+        # run 级口径覆盖透传（None=跟随组合配置）
+        daily_loss_basis=getattr(req, "daily_loss_basis", None),
     )
     entry = {"record_id": None, "status": None, "error": None}
     try:
-        result = run_backtest(db, ps, child_req, param_overrides=overrides)
+        # 归属在子回测创建时写入（崩溃窗口见 backtest_service.run_backtest 注释）
+        result = run_backtest(db, ps, child_req, param_overrides=overrides,
+                              param_perturb_run_id=run.id)
         child_id = result["record_id"]
         child = db.get(BacktestRecord, child_id)
         if child is not None:
-            child.param_perturb_run_id = run.id
-            db.commit()
             entry["status"] = child.status
         entry["record_id"] = child_id
         ev = (

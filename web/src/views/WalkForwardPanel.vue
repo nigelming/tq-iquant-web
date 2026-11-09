@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, reactive } from 'vue'
+import { ref, onMounted, reactive, computed } from 'vue'
 import {
   getWalkForwardRuns, getWalkForwardRun, runWalkForward, deleteWalkForwardRun,
   type PortfolioItem, type WalkForwardRunItem, type WalkForwardRequest,
@@ -30,8 +30,14 @@ function emptyForm(): WalkForwardRequest {
 }
 const form = reactive<WalkForwardRequest>(emptyForm())
 
+// 与 Backtest.vue errMsg 同口径：envelope 业务错误读 message，真实 HTTP 错误
+// （如并发槽 409）读 response.data.detail，避免裸出 axios 英文原生文案。
 function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
+  const err = e as { response?: { data?: { message?: unknown; detail?: unknown } }; message?: string }
+  const d = err?.response?.data
+  if (typeof d?.message === 'string' && d.message) return d.message
+  if (typeof d?.detail === 'string' && d.detail) return d.detail
+  return err?.message || '请求失败'
 }
 
 async function load() {
@@ -47,27 +53,52 @@ async function load() {
   }
 }
 
-function openForm() {
-  Object.assign(form, emptyForm())
+function openForm(prefill?: Partial<WalkForwardRequest>) {
+  Object.assign(form, emptyForm(), prefill ?? {})
   showForm.value = true
 }
 defineExpose({ openForm })
 
+// 前端预检：与后端 buildWalkForwardWindows 同口径——区间须 ≥ 训练+验证年数，
+// 否则提交后整轮 failed「区间不足一个完整窗口」（抢槽白跑，体验差）。
+function windowSpanError(): string | null {
+  if (!form.start_date || !form.end_date) return null
+  const need = form.train_years + form.test_years
+  const limit = new Date(form.start_date)
+  limit.setFullYear(limit.getFullYear() + need)
+  if (new Date(form.end_date) < limit) {
+    return `区间不足以构成一个完整窗口（需 ≥ 训练 ${form.train_years} 年 + 验证 ${form.test_years} 年），请延长区间或缩短窗口`
+  }
+  return null
+}
+
+const submitting = ref(false)
+
 async function submit() {
+  if (submitting.value) return
   if (!form.portfolio_strategy_id) { alert('请选择组合'); return }
   if (!form.name.trim()) { alert('请填写名称'); return }
   if (!form.start_date || !form.end_date) { alert('请填写起止日期'); return }
   if (form.start_date > form.end_date) { alert('开始日期不能晚于结束日期'); return }
+  const spanErr = windowSpanError()
+  if (spanErr) { alert(spanErr); return }
+  // WF 整轮同步执行且持全局回测并发槽：防重复点击（二次点击必 409）。
+  submitting.value = true
   try {
     const res = await runWalkForward({ ...form })
     if (res.status === 'failed') {
       alert('区间不足或执行失败：' + (res.error || ''))
+    } else {
+      // 同步执行无进度推送，完成后给出明确结果反馈
+      alert(`验证完成：${res.windows_passed}，${res.overall_pass ? '全窗通过' : '未全通过'}`)
     }
     showForm.value = false
     await load()
     emit('done')
   } catch (e) {
     alert(errText(e))
+  } finally {
+    submitting.value = false
   }
 }
 
@@ -94,11 +125,46 @@ function poolName(id: number): string {
   return props.portfolios.find((p) => p.id === id)?.name ?? `#${id}`
 }
 
+// 结果判读：把窗口表换算成可决策的结论（全窗通过与否 / 样本外超额 / 训练→验证衰减）。
+const readout = computed(() => {
+  const summary = detail.value?.summary
+  const ws = (summary?.windows ?? []).filter((w) => !w.error)
+  const cagrPairs = ws.filter((w) => w.is_cagr !== null && w.oos_cagr !== null)
+  const exPairs = ws.filter((w) => w.oos_return !== null && w.oos_benchmark_return !== null)
+  const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null)
+  const avgIs = mean(cagrPairs.map((w) => w.is_cagr as number))
+  const avgOos = mean(cagrPairs.map((w) => w.oos_cagr as number))
+  const avgEx = mean(exPairs.map((w) => (w.oos_return as number) - (w.oos_benchmark_return as number)))
+  // >0 表示验证段年化低于训练段，即参数存在时效衰减
+  const decay = avgIs !== null && avgOos !== null ? avgIs - avgOos : null
+
+  let level: 'good' | 'warn' | 'bad' = 'warn'
+  let verdict = '窗口数据不足，暂无法判读'
+  if (summary && ws.length) {
+    if (!summary.overall_pass) {
+      level = 'bad'
+      verdict = `存在未通过窗口（${summary.windows_passed} 通过，失败 ${summary.windows_failed} / 出错 ${summary.windows_errored}）：参数在后续时段失效或过拟合，建议缩短回看窗口、减少参数数量后再验证。`
+    } else if (avgEx !== null && avgEx <= 0) {
+      level = 'warn'
+      verdict = '全窗过门槛，但样本外平均未跑赢基准：门槛只防时段崩塌，不证明存在超额收益，实盘应按更低预期配置。'
+    } else {
+      level = 'good'
+      verdict = '全窗通过且样本外平均跑赢基准：参数在各验证时段表现稳定，可作为实盘候选。'
+    }
+  }
+  return { avgIs, avgOos, avgEx, decay, level, verdict, windows: ws.length }
+})
+
 onMounted(load)
 </script>
 
 <template>
   <div>
+    <p class="hint" style="color:var(--ink-soft);font-size:12px;margin:0 0 12px 0">
+      滚动前推：把区间切成「训练 N 年 + 验证 M 年」逐段前移，只有验证段（OOS）才算真实成绩。
+      全窗通过才视为稳健；某窗未通过说明参数在该时段已失效。
+    </p>
+
     <div v-if="errMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">{{ errMsg }}</div>
 
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
@@ -149,6 +215,24 @@ onMounted(load)
       <p v-if="detail.summary" class="ca-note" style="margin-bottom:8px;color:var(--gold)">
         OOS 仅防时段崩塌，不防全样本调参
       </p>
+
+      <div v-if="detail.summary" style="background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--ink-faint);border-radius:6px;padding:10px 12px;margin-bottom:12px"
+           :style="{ borderLeftColor: readout.level === 'good' ? 'var(--green)' : readout.level === 'bad' ? 'var(--red)' : 'var(--gold)' }">
+        <div style="font-weight:600;font-size:13px;margin-bottom:4px">结果判读</div>
+        <p style="margin:0 0 8px 0;font-size:12px;line-height:1.6">{{ readout.verdict }}</p>
+        <div style="display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--ink-soft);margin-bottom:8px">
+          <span>训练段平均年化 <b style="color:var(--ink)">{{ readout.avgIs === null ? DASH : fmtPct(readout.avgIs) }}</b></span>
+          <span>验证段平均年化 <b style="color:var(--ink)">{{ readout.avgOos === null ? DASH : fmtPct(readout.avgOos) }}</b></span>
+          <span>训练→验证衰减 <b style="color:var(--ink)">{{ readout.decay === null ? DASH : fmtSignedPct(readout.decay) }}</b></span>
+          <span>样本外平均超额 <b style="color:var(--ink)">{{ readout.avgEx === null ? DASH : fmtSignedPct(readout.avgEx) }}</b></span>
+        </div>
+        <ul style="margin:0;padding-left:16px;font-size:12px;line-height:1.7;color:var(--ink-soft)">
+          <li><b>IS 年化</b>：训练段成绩，仅供参考——参数就是在这段学出来的，偏高属正常。</li>
+          <li><b>OOS 年化</b>：验证段成绩，才是可外推的部分；与 IS 差距越小越可信。</li>
+          <li><b>OOS 收益 / OOS 基准</b>：同一验证段策略与基准的收益，差额为正才说明有选股或择时价值。</li>
+          <li><b>门槛</b>：要求 OOS 年化 ≥ IS 年化 × 门槛比例（默认 0.5）；未过表示该窗参数明显失效。</li>
+        </ul>
+      </div>
 
       <div v-if="detail.summary" class="table-wrap">
         <table>
@@ -215,8 +299,8 @@ onMounted(load)
           </div>
         </div>
         <div class="modal-actions">
-          <button @click="submit" class="btn btn-primary">确认</button>
-          <button @click="showForm = false" class="btn">取消</button>
+          <button @click="submit" class="btn btn-primary" :disabled="submitting">{{ submitting ? '运行中...' : '确认' }}</button>
+          <button @click="showForm = false" class="btn" :disabled="submitting">取消</button>
         </div>
       </div>
     </div>

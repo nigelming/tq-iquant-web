@@ -1,16 +1,16 @@
 # 整合多平台的量化回测和交易平台的设计草稿
 
-> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期设计草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关）已全部废弃**。Core↔iQuant 现改为 **iQuant 客户端内 HTTP 桥**（`127.0.0.1:8790`，`HttpBridgeDispatcher` + `BarPoller`）。下文凡涉及 NATS/natsio/网关 subject 的内容仅作历史记录，不再实施。iQuant 网关也由独立进程改为客户端内策略。
+> ⚠️ **架构已变更（2026-08，见 [docs/plans/0009-iquant-http-bridge.md](plans/0009-iquant-http-bridge.md)）**：本文档为早期设计草稿，其中 **NATS 通信拓扑（natsio / 5 个 subject / `live/iguant_gateway/` NATS 网关）已全部废弃**。Core↔QMT 现改为 **QMT 客户端内 HTTP 桥**（`127.0.0.1:8790`，`HttpBridgeDispatcher` + `BarPoller`）。下文凡涉及 NATS/natsio/网关 subject 的内容仅作历史记录，不再实施。QMT 网关也由独立进程改为客户端内策略。
 
 ## 1.项目架构和技术栈
 ### 1.1项目名称：创懿量化交易平台
 ### 1.2项目居于windows 10 专业版开发，开发语言为python
-### 1.3项目由四个模块组成：核心后端（内含通达信TQ模块）、国信iquant网关、web前端、natsio（仅用于核心后端↔iQuant网关通信）
+### 1.3项目由四个模块组成：核心后端（内含通达信TQ模块）、QMT 通道网关、web前端、natsio（仅用于核心后端↔QMT网关通信）
 ### 1.4项目建立两个uv环境：
     1、核心后端（含通达信TQ模块）、web前端：使用main环境，python版本为3.13
-    2、国信iquant网关：使用live环境，python版本为3.7
+    2、QMT 通道网关：使用live环境，python版本为3.7
 
-> **Python 版本说明**：国信 iQuant 自带的 Python 环境为 3.6.8，但其 xquant（xtquant）库也提供 Python 3.7 版本支持。live 环境使用 Python 3.7 而非 3.6.8，是因为 NATS 客户端库（nats-py）最低要求 Python 3.7。Python 3.6 已于 2021 年 EOL，不再获得安全更新和主流包支持。
+> **Python 版本说明**：QMT 通道自带的 Python 环境为 3.6.8，但其 xquant（xtquant）库也提供 Python 3.7 版本支持。live 环境使用 Python 3.7 而非 3.6.8，是因为 NATS 客户端库（nats-py）最低要求 Python 3.7。Python 3.6 已于 2021 年 EOL，不再获得安全更新和主流包支持。
 
 > **shared 包兼容性约束**：`shared/` 包被 main（Python 3.13）和 live（Python 3.7）共同引用，代码必须兼容 Python 3.7。约束：不得使用 walrus 运算符 `:=`（3.8+）、match 语句（3.10+）、`typing.Self`（3.11+）等高版本语法；数据结构定义使用 `dataclasses` 或 `pydantic v1`（pydantic v2 最低要求 Python 3.8，不兼容 live 环境）；类型注解使用 `typing` 模块（如 `List`、`Dict`），不使用 3.9+ 的内置泛型语法 `list[str]`。
 
@@ -74,7 +74,7 @@
     │   │   │   ├── evaluator.py       # Evaluator 回测评估
     │   │   │   ├── backtest_engine.py # BacktestEngine 回测引擎
     │   │   │   └── live_engine.py     # LiveEngine 实盘引擎
-    │   │   ├── nats_client/           # natsio 客户端（仅连接 iQuant）
+    │   │   ├── nats_client/           # natsio 客户端（仅连接 QMT）
     │   │       ├── __init__.py
     │   │       └── client.py
     │   │   ├── tq/                      # 通达信 TQ 模块（同进程，直接调用）
@@ -88,7 +88,7 @@
     │   │       └── integration/           # 集成测试（API 接口）
     ├── live/                          # live uv 环境 (Python 3.7)
     │   ├── pyproject.toml
-    │   └── iguant_gateway/            # 国信 iQuant 网关
+    │   └── iguant_gateway/            # QMT 通道网关
     │       ├── __init__.py
     │       ├── main.py                # 网关入口
     │       ├── trade/                 # 下单、持仓查询
@@ -155,13 +155,13 @@
     3、回调线程仅将信号投递到主事件循环，公式计算在独立线程池中执行，不阻塞回调线程
     4、Core 主事件循环接收信号 → SignalEngine → RiskManager → ExecutionEngine
 
-## 3.国信iquant网关
+## 3.QMT 通道网关
 ### 3.1 定位：独立运行的一个模块（live 环境，Python 3.7），用xquant库与iquant交互，通过natsio与核心后端通信
 
-> Python 版本说明：国信 iQuant 自带的 Python 环境为 3.6.8，但 xquant（xtquant）库也提供 Python 3.7 版本。live 环境使用 Python 3.7 是因为 NATS 客户端库最低要求 Python 3.7，且 Python 3.6 已 EOL。
+> Python 版本说明：QMT 通道自带的 Python 环境为 3.6.8，但 xquant（xtquant）库也提供 Python 3.7 版本。live 环境使用 Python 3.7 是因为 NATS 客户端库最低要求 Python 3.7，且 Python 3.6 已 EOL。
 ### 3.2 交易模式：
-    1、模拟：国信 iQuant 开设模拟账户，与当天实时行情同步，可进行仿真交易，无需真实资金
-    2、实盘：需在国信开立真实账户并注入资金，进行实际交易
+    1、模拟：QMT 通道开设模拟账户，与当天实时行情同步，可进行仿真交易，无需真实资金
+    2、实盘：需在券商开立真实账户并注入资金，进行实际交易
 ### 3.3 功能
     1、交易的下单执行（支持市价单和限价单）
     2、订单状态查询（pending/filled/partial/rejected/cancelled）
@@ -171,19 +171,19 @@
 ### 3.4 业务规则
     1、统一用带有后缀的股票代码，如000001.SZ
     2、所有交换的数据均通过natsio 交换
-    3、订单超时处理：下单后 30 秒内未收到成交回报，标记为 timeout 并查询 iQuant 订单状态
-    4、部分成交处理：iQuant 返回部分成交时，Core 更新 live_orders.filled_quantity，已成交部分记入 live_trades
-    5、拒绝处理：iQuant 返回拒绝时，记录 error_message 到 live_orders，不影响其他策略运行
+    3、订单超时处理：下单后 30 秒内未收到成交回报，标记为 timeout 并查询 QMT 订单状态
+    4、部分成交处理：QMT 返回部分成交时，Core 更新 live_orders.filled_quantity，已成交部分记入 live_trades
+    5、拒绝处理：QMT 返回拒绝时，记录 error_message 到 live_orders，不影响其他策略运行
 ### 3.5 待讨论问题
-    1、模拟和实盘是否都支持市价下单→需查阅国信 iQuant 文档确认
+    1、模拟和实盘是否都支持市价下单→需查阅 QMT 通道文档确认
 
 ### 3.6 网关生命周期
-iQuant 网关进程独立于 Core 运行，不随 Core 重启而退出：
+QMT 网关进程独立于 Core 运行，不随 Core 重启而退出：
 
-- **启动**：通过单独命令或系统服务管理，启动后连接 iQuant 并监听 NATS
-- **运行**：持续维持 iQuant 连接，处理来自 Core 的 NATS 请求（下单/查订单/撤单/查持仓）
+- **启动**：通过单独命令或系统服务管理，启动后连接 QMT 并监听 NATS
+- **运行**：持续维持 QMT 连接，处理来自 Core 的 NATS 请求（下单/查订单/撤单/查持仓）
 - **Core 重启**：网关不受影响，继续运行。Core 恢复后通过 NATS 重新连接网关，查询当前状态
-- **Core 宕机期间**：网关持续监控 iQuant 连接，但无新交易指令。订单成交状态暂存，Core 恢复后查询拉取
+- **Core 宕机期间**：网关持续监控 QMT 连接，但无新交易指令。订单成交状态暂存，Core 恢复后查询拉取
 - **关闭**：通过单独命令关闭网关，关闭前需确保所有实盘 session 已停止
 - **健康检查**：Core 定期（每 30 秒）通过 NATS 向网关发送 ping，连续 3 次无响应则标记网关离线，暂停交易
 
@@ -191,7 +191,7 @@ iQuant 网关进程独立于 Core 运行，不随 Core 重启而退出：
 ### 4.1 定位：与核心后端组成前后端分离的系统
 ### 4.2 风格：简洁的浅色风格
 ### 4.3 web页面的基本结构：分为左右结构，左边为两层的功能树，右边为展示
-    1、首页：展示核心后端、国信iquant网关 运行状态
+    1、首页：展示核心后端、QMT 通道网关 运行状态
     2、数据管理：包括股票池和公式管理
          股票池：从通达信同步股票池，获取股票池列表及股票清单，可持久化到数据库
         公式管理：新增、删除、编辑公式。公式运行后输出多个信号值（数量不定），每个信号可映射到四种操作类型（OPEN/ADD/REDUCE/CLOSE）之一，并定义触发值为 1 或 -1
@@ -203,7 +203,7 @@ iQuant 网关进程独立于 Core 运行，不随 Core 重启而退出：
 
 ## 5.核心后端
 ### 5.1 定位：系统的总调度平台，内含通达信TQ模块（同进程，直接调用），同时基于polars开发一个回测实盘共用的自研框架，对数据库进行操作
-### 5.2 调度平台：将前端请求处理后，本地调用TQ模块或通过natsio分发到国信iquant网关，并对它们的处理结果进行处理
+### 5.2 调度平台：将前端请求处理后，本地调用TQ模块或通过natsio分发到 QMT 通道网关，并对它们的处理结果进行处理
 ### 5.3 自研框架：以polars核心 事件触发的回测交易系统
 #### 5.3.1 交易的框架为：组合策略--策略，组合策略和策略都对应的风控参数
 #### 5.3.2 业务规则：
@@ -271,13 +271,13 @@ iQuant 网关进程独立于 Core 运行，不随 Core 重启而退出：
                      - 公式信号按策略 ID 升序处理
                      - 同策略内按信号类型：CLOSE > REDUCE > ADD > OPEN
                9）多组合策略虚拟持仓规则（仅实盘适用）：
-                  a）实盘 session 可包含多个组合策略（portfolio_strategy），共享同一个 iQuant 账户下单
+                  a）实盘 session 可包含多个组合策略（portfolio_strategy），共享同一个 QMT 账户下单
                   b）同一只股票可能被多个组合策略同时持有，实际 broker 账户合并为一笔持仓，系统内按组合策略拆分记账
                   c）虚拟持仓 Per Portfolio：每个组合策略独立维护 `(stock_code, quantity, avg_cost)`，仅存在于 LiveEngine 运行时内存中
                   d）卖出约束：组合策略只能卖出自己虚拟持仓范围内的数量。若组合策略 A 虚拟持仓 100 股 000001.SZ，系统阻止其卖出超过 100 股，即使实际账户有更多
                   e）成本计价：每个组合策略独立计算 avg_cost（仅统计自己买入的份额），互不干扰；卖出 P&L 基于各自的 avg_cost 计算
                 f）虚拟现金：组合策略可用资金 = `initial_capital - Σ(买入金额+佣金) + Σ(卖出金额-佣金-印花税)`（基于成本，非市值），各组合策略的现金互不共享。卖出释放的资金 T+0 可复用
-                g）实际账户现金：所有组合策略共享同一个 iQuant 账户。实际账户可用现金通过 NATS 向 iQuant 网关实时查询（`iquant.iguant.position.query`），不本地跟踪。下单前先检查组合级别虚拟现金，再检查账户级别实际现金
+                g）实际账户现金：所有组合策略共享同一个 QMT 账户。实际账户可用现金通过 NATS 向 QMT 网关实时查询（`iquant.iguant.position.query`），不本地跟踪。下单前先检查组合级别虚拟现金，再检查账户级别实际现金
                 h）恢复重算：Core 重启时，虚拟持仓和虚拟现金不从 DB 直接读取，而是从 `live_trades` 按 `portfolio_strategy_id` 聚合重算
                 i）跨组合策略信号执行顺序（同一 bar 内多组合策略同时产生信号时，确保结果确定）：
                    - 先处理所有组合策略的风控信号（止损/止盈/移动止损），再处理公式信号
@@ -401,7 +401,7 @@ Core 启动 → 扫描 DB 中 status=running 的 session → 对每个 session�
      virtual_cash = initial_capital - Σ(买入金额+费用) + Σ(卖出金额-费用)
      virtual_positions = 按 stock_code 汇总净买入量 + 加权均价
      （直接 SQL 聚合，在 millis 级别完成）
-  3. 通过 NATS 连接 iQuant 网关 → 查询实际账户持仓和未完成订单
+  3. 通过 NATS 连接 QMT 网关 → 查询实际账户持仓和未完成订单
    4. 虚拟持仓 vs 实际持仓交叉验证：
       - 各组合策略同一股票的虚拟持仓之和应等于实际账户持仓
       - 不一致时记录告警日志，校准策略：差额按各组合策略虚拟持仓量等比例分摊调整；若某股票所有组合策略虚拟持仓均为 0 但实际账户有持仓（Core 宕机期间手动下单），归入第一个组合策略并标记 `unattributed`
@@ -415,10 +415,10 @@ Core 启动 → 扫描 DB 中 status=running 的 session → 对每个 session�
 | 场景 | 处理 |
 |------|------|
 | Core 宕机期间漏 bar | 通达信无历史实时 bar 查询接口，漏掉的 bar 不做信号计算，从当前最新 bar 继续 |
-| iQuant 网关独立运行 | Core 重启不触发网关退出，网关持续维持 iQuant 连接和订单监控 (详见 3.6) |
-| Core 宕机期间订单成交 | 恢复后通过 iQuant 查询未完成订单状态，更新 live_orders |
+| QMT 网关独立运行 | Core 重启不触发网关退出，网关持续维持 QMT 连接和订单监控 (详见 3.6) |
+| Core 宕机期间订单成交 | 恢复后通过 QMT 查询未完成订单状态，更新 live_orders |
 | 虚拟现金重算精度 | 以 live_trades 为唯一数据源，确保恢复结果与宕机前一致 |
-| 恢复失败 | 通达信未启动 / iQuant 网关未运行 / NATS 不可达 → session 标记为 stopped，记录错误信息 |
+| 恢复失败 | 通达信未启动 / QMT 网关未运行 / NATS 不可达 → session 标记为 stopped，记录错误信息 |
 
 **虚拟持仓恢复 SQL 示例**：
 ```sql
@@ -622,7 +622,7 @@ HAVING net_quantity > 0
 | started_at | DATETIME | NULL，最近一次启动时间 |
 | stopped_at | DATETIME | NULL，最近一次停止时间 |
 
-一个 session 对应一个 iQuant 账户，可包含多个组合策略同时运行。
+一个 session 对应一个 QMT 账户，可包含多个组合策略同时运行。
 
 > **Core 重启恢复**：Core 启动时扫描所有 `status=running` 的 session，自动重建 TQ 订阅（1m/5m bar）和 NATS 连接。恢复失败（如通达信未启动）的 session 自动标记为 `stopped`。多天运行的 session 恢复细节详见「实盘恢复机制」（5.3.3 之后）。
 
@@ -800,10 +800,10 @@ engine/
 │   └── ExecutionEngine      # 共用：按比例缩减、不足1手放弃、资金不足放弃
 │       ├── OrderDispatcher  # 接口：下单
 │       ├── SimulatedDispatcher  # 回测：模拟成交，按 next_bar.open 填价
-│       └── NatsDispatcher   # 实盘：通过 NATS 发往 iQuant 网关
+│       └── NatsDispatcher   # 实盘：通过 NATS 发往 QMT 网关
 │   └── T1Checker            # 接口：T+1 检查
 │       ├── SimulatedT1Checker   # 回测：内部模拟检查
-│       └── LiveT1Checker    # 实盘：查 iQuant 实际可用股数
+│       └── LiveT1Checker    # 实盘：查 QMT 实际可用股数
 │
 ├── evaluator.py             # 回测评估
 │   └── Evaluator            # 读取 daily_snapshots → 计算 18 个指标 → 输出 BacktestEvaluation
@@ -813,7 +813,7 @@ engine/
 │
 └── live_engine.py           # 实盘引擎
     └── LiveEngine           # 管理多个 Portfolio 实例；TQ 回调接收 bar → 按 portfolio 分发信号 → 事件分发 → 执行
-                              # NATS 对接 iQuant 网关下单；订单状态跟踪（live_orders）；成交记录（live_trades）；SSE 推送
+                              # NATS 对接 QMT 网关下单；订单状态跟踪（live_orders）；成交记录（live_trades）；SSE 推送
 ```
 
 #### 5.5.3 数据库表与运行时对象对应关系
@@ -854,7 +854,7 @@ ExecutionEngine 是回测和实盘共用的核心执行逻辑（按比例缩减�
                     ┌───────────────┼───┐           ┌───────┴───────┐
                     │               │   │           │               │
             Simulated         Nats     (预留其他)   Simulated    LiveT1Checker
-            Dispatcher     Dispatcher              T1Checker      (查 iQuant)
+            Dispatcher     Dispatcher              T1Checker      (查 QMT)
             (回测模拟成交)  (实盘NATS下单)
 
 ```
@@ -881,7 +881,7 @@ class SimulatedDispatcher(OrderDispatcher):
         )
 
 class NatsDispatcher(OrderDispatcher):
-    """实盘使用：通过 NATS 发往 iQuant 网关"""
+    """实盘使用：通过 NATS 发往 QMT 网关"""
     def place_order(self, order, portfolio_id) -> TradeEvent:
         # 异步下单，等待成交回报
         nats_client.request("iquant.iguant.order.place", {
@@ -900,7 +900,7 @@ class NatsDispatcher(OrderDispatcher):
 class T1Checker(ABC):
     @abstractmethod
     def get_available_shares(self, stock_code: str, portfolio_id: int) -> int:
-        """获取当日可卖出股数（实盘查 iQuant，回测直接返回持仓量）"""
+        """获取当日可卖出股数（实盘查 QMT，回测直接返回持仓量）"""
 
 class SimulatedT1Checker(T1Checker):
     def get_available_shares(self, stock_code, portfolio_id) -> int:
@@ -909,7 +909,7 @@ class SimulatedT1Checker(T1Checker):
 
 class LiveT1Checker(T1Checker):
     def get_available_shares(self, stock_code, portfolio_id) -> int:
-        # 通过 NATS 查 iQuant 实际可用股数
+        # 通过 NATS 查 QMT 实际可用股数
         resp = nats_client.request("iquant.iguant.position.query", ...)
         return resp.get("available_shares", 0)
 ```
@@ -1159,7 +1159,7 @@ code=0 成功，非 0 为错误码。错误码与 HTTP 状态码对齐：
 > **实现状态（2026-08-11 复核，审计 #16）**：下表端点与 `main/core/api/live.py` 对照——
 > - 单组合启停 `POST /api/live/sessions/{id}/portfolios/{pid}/start|stop`（#10/#11）**未实现**；现为整 session 启停（`POST /sessions/{id}/start`、`POST /sessions/{id}/stop`），按需单独立项（涉及 LiveEngine 多组合调度改造）。
 > - `PUT /api/live/sessions/{id}`（#12 编辑会话）**未实现**；现为创建后不可编辑（仅可删后重建）。
-> - **额外端点**（设计无但已实现）：`GET /api/live/sessions/{id}/positions`（实时持仓快照）、`GET /api/live/sessions/{id}/bridge-status`（iQuant 桥连接/心跳状态）。
+> - **额外端点**（设计无但已实现）：`GET /api/live/sessions/{id}/positions`（实时持仓快照）、`GET /api/live/sessions/{id}/bridge-status`（QMT 桥连接/心跳状态）。
 
 | 方法 | URL | 说明 |
 |------|-----|------|
@@ -1332,7 +1332,7 @@ PUT    /api/system/configs
 ```
 
 ## 6.natsio
-### 6.1 定位：连接核心后端（main 环境，Python 3.13）与国信 iQuant 网关（live 环境，Python 3.7）的唯一通信桥梁。Core 与 TQ 模块同进程直接调用，不走 NATS
+### 6.1 定位：连接核心后端（main 环境，Python 3.13）与 QMT 通道网关（live 环境，Python 3.7）的唯一通信桥梁。Core 与 TQ 模块同进程直接调用，不走 NATS
 
 ### 6.2 通信模式
 | 模式 | 场景 |
@@ -1343,11 +1343,11 @@ PUT    /api/system/configs
 
 | 方向 | Subject | 模式 | 说明 |
 |------|---------|------|------|
-| Core→iQuant | `iquant.iguant.order.place` | 请求-响应 | 下单 |
-| Core→iQuant | `iquant.iguant.order.query` | 请求-响应 | 查询订单状态 |
-| Core→iQuant | `iquant.iguant.order.cancel` | 请求-响应 | 撤单 |
-| Core→iQuant | `iquant.iguant.position.query` | 请求-响应 | 查询持仓 |
-| Core→iQuant | `iquant.iguant.status` | 请求-响应 | 查询运行状态 |
+| Core→QMT | `iquant.iguant.order.place` | 请求-响应 | 下单 |
+| Core→QMT | `iquant.iguant.order.query` | 请求-响应 | 查询订单状态 |
+| Core→QMT | `iquant.iguant.order.cancel` | 请求-响应 | 撤单 |
+| Core→QMT | `iquant.iguant.position.query` | 请求-响应 | 查询持仓 |
+| Core→QMT | `iquant.iguant.status` | 请求-响应 | 查询运行状态 |
 
 ### 6.4 消息格式
 统一使用 JSON。
@@ -1373,8 +1373,8 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 1. Core 直接调用 TQ 模块订阅 bar，注册回调（进程内，无 NATS）
 2. TQ 实时接收 bar → 追加数据文件 → 触发对应周期公式（同 bar 可能同时触发 5m+30m+60m）→ 合并信号 → 回调传递给 Core
 3. Core 接收信号 → SignalEngine → RiskManager → ExecutionEngine
-4. Core → iQuant（NATS）: iquant.iguant.order.place（下单）
-5. iQuant → Core（NATS）: 返回成交结果
+4. Core → QMT（NATS）: iquant.iguant.order.place（下单）
+5. QMT → Core（NATS）: 返回成交结果
 ```
 
 ## 7.认证
@@ -1401,7 +1401,7 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 | # | 任务 | 内容 |
 |---|------|------|
 | 1 | main 环境 | 搭建 uv 环境（Python 3.13），初始化 FastAPI 项目骨架 |
-| 2 | live 环境 | 搭建 uv 环境（Python 3.7），初始化 iQuant 网关骨架 |
+| 2 | live 环境 | 搭建 uv 环境（Python 3.7），初始化 QMT 网关骨架 |
 | 3 | 前端项目 | Vite + Vue + Pinia 初始化，安装依赖 |
 | 4 | PostgreSQL | 安装配置 PostgreSQL |
 | 5 | natsio | 安装并配置 natsio server，验证连通 |
@@ -1442,7 +1442,7 @@ Core 按最小周期逐时间点迭代 → SignalEngine → RiskManager → Exec
 | # | 任务 | 内容 |
 |---|------|------|
 | 22 | 实盘引擎 | live_engine.py（TQ 回调接收 bar）+ 单元测试 |
-| 23 | iQuant 网关 | 下单、订单查询、撤单、持仓查询、状态（NATS 通信）+ Mock 测试 |
+| 23 | QMT 网关 | 下单、订单查询、撤单、持仓查询、状态（NATS 通信）+ Mock 测试 |
 | 24 | 实盘管理 | 先写测试 → 创建/启动/停止/订单/成交查询 API + SSE 推送 + 前端页面 |
 
 ### 第七阶段：系统收尾

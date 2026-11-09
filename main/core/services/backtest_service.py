@@ -28,13 +28,15 @@ from core.models import (
     StockPool, StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
-    BacktestRobustnessAnalysis, WalkForwardRun,
+    BacktestRobustnessAnalysis, BacktestPersistenceAnalysis, WalkForwardRun,
+    ParamPerturbRun,
 )
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
 )
+from core.engine.persistence_alpha import compute_persistence
 from core.engine.backtest_robustness import analyze_robustness
 from core.engine.regime import segment_regime, CausalRegimeTracker
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
@@ -53,18 +55,15 @@ from core.engine.portfolio_builder import (
 )
 from core.tq.data import TQData
 from core.tq.formula import TQFormula
+from core.engine.tdx_formula import (
+    FormulaEvalError,
+    cross_periods_of,
+    evaluate_outputs,
+    xref_names_of,
+)
 
 
 logger = logging.getLogger(__name__)
-
-
-# 回测复权口径：必须用后复权 back。
-# 真机 bug：TDX 前复权为「加性」且锚定查询 end 日期，长区间下高分红股（601225.SH）
-# 2020 年前 Close 被整体减到 ≤0/近零（2020-08-26 前 1296 根 ≤0，最低 -5.44；
-# 2020-07-13 Close=0.01）。0.01 是正数通过 close<=0 闸 → 下单量 0.2×资金/0.01
-# = 2000 万股异常单 → -41% 假回撤 → 熔断永久停机。后复权恒为正且锚定个股首日、
-# 与查询区间无关（前后复权在同区间内仅差常数比例，收益率等价）。
-BACKTEST_DIVIDEND_TYPE = "back"
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +314,19 @@ def build_klines(ps, start: date, end: date, db: Session = None,
     if not stocks:
         return {}
     periods = _strategy_periods(ps, db)
+    # 批次 9a：engine=builtin 公式含 FIELD#PERIOD 跨周期引用（如 C#WEEK）→
+    # 附加拉取缺失的上级周期 K 线（公式未引用时零改动）；上级周期与 base 同
+    # 窗口取数，对齐器按区间归属折算，预热语义与 TQ 一致（前端少量 null 无信号）
+    extra_periods: set = set()
+    for strat in _portfolio_strategies(ps, db):
+        if strat.formula_id is None:
+            continue
+        formula = db.get(Formula, strat.formula_id)
+        if formula is None or formula.engine != "builtin":
+            continue
+        extra_periods |= cross_periods_of(formula.content)
+    for p in sorted(extra_periods - set(periods)):
+        periods.append(p)
     warmup_counts = warmup_counts_by_period(ps, db)
     # W-A：start 前推覆盖预热窗口（按周期估算自然日，保守上限）
     fetch_start = start
@@ -503,7 +515,9 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           slippage_impact_coef=None,
                           volume_limit_enabled: bool | None = None,
                           volume_limit_ratio=None,
-                          equity_cap=None) -> str:
+                          equity_cap=None,
+                          daily_close_peak_enabled: bool = False,
+                          daily_loss_basis: str = "equity") -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
@@ -514,6 +528,8 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     payload["fee_reserve_enabled"] = bool(fee_reserve_enabled)
     payload["bond_t0_enabled"] = bool(bond_t0_enabled)
     payload["bond_lot_enabled"] = bool(bond_lot_enabled)
+    payload["daily_close_peak_enabled"] = bool(daily_close_peak_enabled)
+    payload["daily_loss_basis"] = daily_loss_basis
     for name, val in (
         ("adaptive_slippage_enabled", adaptive_slippage_enabled),
         ("slippage_impact_coef", slippage_impact_coef),
@@ -1003,6 +1019,8 @@ def _upsert_robustness(
     row.status = status
     row.error = error
     row.payload_json = json.dumps(payload, ensure_ascii=False, allow_nan=False) if payload else None
+    # 重算要刷新「计算于」：server_default 只在 INSERT 生效，复用旧行会显示过时时间
+    row.computed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     db.refresh(row)
     return row
@@ -1029,12 +1047,17 @@ def compute_and_store_robustness(
     payload = analyze_robustness(
         snaps=[
             {"snap_date": s.snap_date, "total_value": s.total_value,
-             "benchmark_value": s.benchmark_value}
-            for s in snaps
+             "benchmark_value": s.benchmark_value,
+             # 仅末期快照带持仓明细：未实现盈亏需要它（其余快照无需解析）
+             "positions": (json.loads(s.positions_json)
+                           if i == len(snaps) - 1 and s.positions_json
+                           else None)}
+            for i, s in enumerate(snaps)
         ],
         trades=[
             {"stock_code": t.stock_code, "trade_type": t.trade_type, "amount": t.amount,
-             "commission": t.commission, "stamp_duty": t.stamp_duty}
+             "commission": t.commission, "stamp_duty": t.stamp_duty,
+             "price": t.price, "quantity": t.quantity, "bar_time": t.bar_time}
             for t in trades
         ],
         oos_ratio=oos_ratio,
@@ -1080,6 +1103,225 @@ def recompute_robustness(db: Session, record_id: int, oos_ratio: float = 0.25) -
     }
 
 
+def recompute_validation_crisis(db: Session, record_id: int) -> Optional[dict]:
+    """离线刷新验证结论的 crisis 块（不重跑回测）。
+
+    危机防御判定仅依赖组合日快照（snap_date/total_value/cash/benchmark_value），
+    从落库快照按当前 CRISIS_WINDOWS/判定规则重算后，原位更新 validation_json
+    的 crisis 键；capacity/oos 等其余块保持冻结结果不动。
+    记录不存在返回 None（路由 404）。
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算"}
+    crisis = build_crisis_verification([
+        {"snap_date": s.snap_date, "total_value": s.total_value,
+         "cash": s.cash, "benchmark_value": s.benchmark_value}
+        for s in snaps
+    ])
+    try:
+        payload = json.loads(rec.validation_json) if rec.validation_json else None
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("capacity", [])
+    payload.setdefault("oos", None)
+    payload["crisis"] = crisis
+    rec.validation_json = json.dumps(payload, ensure_ascii=False, default=str)
+    db.commit()
+    return {"status": "ok", "crisis": crisis}
+
+
+def recompute_validation(db: Session, record_id: int) -> Optional[dict]:
+    """离线重算验证结论全量（capacity + crisis + oos，不重跑回测）。
+
+    与 build_validation_verdict 的差异：数据源全部来自落库（快照/评估/策略配置），
+    无 klines → ADV 容量预警无法复算（需逐股日线成交额），静默跳过；
+    concentration 从落库 evaluation 取 max_single_weight，敞口上限维度
+    （Σ持仓数上限×单仓上限 vs 期末净值）用快照+策略配置重算。
+    记录不存在返回 None（路由 404）。
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法重算"}
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date)
+        .all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法重算"}
+    ev_row = (
+        db.query(BacktestEvaluation)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .one_or_none()
+    )
+    evaluations = {}
+    if ev_row is not None and ev_row.max_single_weight is not None:
+        evaluations = {"max_single_weight": float(ev_row.max_single_weight)}
+    capacity = build_capacity_warnings(
+        [], None, evaluations,
+        getattr(ps, "position_sizing", "dynamic"),
+        getattr(ps, "equity_cap", None),
+        snapshots=snaps,
+        exposure_ceiling=_exposure_ceiling_for_ps(db, ps.id),
+    )
+    crisis = build_crisis_verification([
+        {"snap_date": s.snap_date, "total_value": s.total_value,
+         "cash": s.cash, "benchmark_value": s.benchmark_value}
+        for s in snaps
+    ])
+    oos: Optional[dict] = None
+    wf = (
+        db.query(WalkForwardRun)
+        .filter(WalkForwardRun.portfolio_strategy_id == ps.id)
+        .order_by(WalkForwardRun.id.desc())
+        .first()
+    )
+    if wf is not None:
+        oos = {
+            "run_id": wf.id, "name": wf.name,
+            "completed_at": wf.completed_at,
+            "windows_passed": (json.loads(wf.summary_json or "{}")
+                               .get("windows_passed")),
+            "overall_pass": (json.loads(wf.summary_json or "{}")
+                             .get("overall_pass")),
+        }
+    payload = {"capacity": capacity, "crisis": crisis, "oos": oos}
+    rec.validation_json = json.dumps(payload, ensure_ascii=False, default=str)
+    db.commit()
+    return {"status": "ok", "capacity": capacity, "crisis": crisis, "oos": oos}
+
+
+# ---------------------------------------------------------------------------
+# 持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化
+# ---------------------------------------------------------------------------
+def _upsert_persistence(
+    db, record_id, status, error=None, skipped=None, payload=None,
+):
+    row = (
+        db.query(BacktestPersistenceAnalysis)
+        .filter_by(backtest_record_id=record_id).one_or_none()
+    )
+    if row is None:
+        row = BacktestPersistenceAnalysis(backtest_record_id=record_id, status=status)
+        db.add(row)
+    row.status = status
+    row.error = error
+    row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False) if skipped else None
+    if payload is not None:
+        row.payload_json = json.dumps(payload, ensure_ascii=False)
+    elif status == "completed":
+        # 成功但 payload 为空：显式清空（异常路径）
+        row.payload_json = None
+    # status=failed 且未传 payload（TQ 取数失败/主基准缺失）：保留上次成功结果，
+    # 不得把已有分析清空（前端据此回退展示，用户可稍后重算）。
+    row.computed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _serialize_persistence(row) -> dict:
+    return {
+        "status": row.status,
+        "error": row.error,
+        "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        "skipped_benchmarks": (
+            json.loads(row.skipped_benchmarks_json) if row.skipped_benchmarks_json else []
+        ),
+        "data": json.loads(row.payload_json) if row.payload_json else None,
+    }
+
+
+def recompute_persistence(
+    db: Session, record_id: int, benchmark_code: Optional[str] = None,
+) -> Optional[dict]:
+    """离线重算持续性检验（详情页手动触发）。记录不存在返回 None（路由 404）。
+
+    benchmark_code：可选「判定基准」覆盖。默认用组合基准；成长类策略可切到创业板指等，
+    避免用沪深300 衡量成长策略时把风格贝塔算进超额。仅作用于本模块，不改组合配置。
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return None
+    snaps = (
+        db.query(BacktestDailySnapshot)
+        .filter_by(backtest_record_id=record_id, target_type="portfolio")
+        .order_by(BacktestDailySnapshot.snap_date).all()
+    )
+    if not snaps:
+        return {"status": "failed", "error": "该回测无组合日快照，无法计算",
+                "computed_at": None, "skipped_benchmarks": []}
+    ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+    if ps is None:
+        return {"status": "failed", "error": "组合策略已删除，无法确定基准指数",
+                "computed_at": None, "skipped_benchmarks": []}
+    resolution = resolve_crisis_benchmark(rec, None, ps)
+    if benchmark_code:
+        allowed = {ps.benchmark_index} | {spec["code"] for spec in CRISIS_BENCHMARKS}
+        if benchmark_code not in allowed:
+            raise ValueError(f"判定基准 {benchmark_code} 不受支持，可选：{'、'.join(sorted(allowed))}")
+        if benchmark_code != resolution["benchmark_code"]:
+            benchmark_name = next(
+                (spec["name"] for spec in CRISIS_BENCHMARKS if spec["code"] == benchmark_code),
+                benchmark_code,
+            )
+        else:
+            benchmark_name = resolution["benchmark_name"]
+    else:
+        benchmark_code = resolution["benchmark_code"]
+        benchmark_name = resolution["benchmark_name"]
+    codes = [benchmark_code] + [spec["code"] for spec in CRISIS_BENCHMARKS]
+    closes = build_index_close_series(codes, rec.start_date, rec.end_date)
+    skipped = [spec["name"] for spec in CRISIS_BENCHMARKS if spec["code"] not in closes]
+    main_closes = closes.get(benchmark_code)
+    if not main_closes:
+        row = _upsert_persistence(
+            db, record_id, "failed",
+            error="主基准指数无数据（TQ 取数失败或代码不被支持）", skipped=skipped,
+        )
+        return _serialize_persistence(row)
+    nav_series = {s.snap_date: s.total_value for s in snaps}
+    utilization_series = {
+        s.snap_date: Decimal(str(s.market_value)) / Decimal(str(s.total_value))
+        for s in snaps
+        if s.total_value is not None and Decimal(str(s.total_value)) > 0
+        and s.market_value is not None
+    }
+    trades = [{
+        "bar_time": t.bar_time.date(),
+        "trade_type": t.trade_type,
+        "amount": t.amount, "commission": t.commission, "stamp_duty": t.stamp_duty,
+        "price": t.price, "quantity": t.quantity,
+        "strategy_id": t.strategy_id, "stock_code": t.stock_code,
+    } for t in db.query(BacktestTrade).filter_by(backtest_record_id=record_id).all()]
+    payload = compute_persistence(
+        nav_series, trades,
+        {c: closes[c] for c in codes if c in closes},
+        benchmark_code, benchmark_name,
+        utilization_series=utilization_series,
+    )
+    if payload.get("status") == "failed":
+        row = _upsert_persistence(db, record_id, "failed", error=payload.get("error"), skipped=skipped)
+    else:
+        row = _upsert_persistence(db, record_id, "completed", skipped=skipped, payload=payload)
+    return _serialize_persistence(row)
+
+
 # ---------------------------------------------------------------------------
 # 换池稳健性对比（Tier2）：克隆组合（同参数仅换池）逐个重跑回测并对比
 # ---------------------------------------------------------------------------
@@ -1103,6 +1345,17 @@ def ensure_pool_clone(
         sell_commission_rate=src.sell_commission_rate, stamp_duty_rate=src.stamp_duty_rate,
         slippage=src.slippage, trading_session=src.trading_session,
     )
+    # 可选项/容量/滑点/口径等其余字段逐项照抄 —— 换池对比必须"只有股票池不同"，
+    # 否则克隆组合落库默认值会让对比结果失真。
+    for _f in (
+        "price_limit_check_enabled", "volume_limit_enabled", "volume_limit_ratio",
+        "adaptive_slippage_enabled", "slippage_impact_coef", "position_sizing",
+        "daily_loss_basis", "equity_cap", "cash_enhance_enabled",
+        "cash_enhance_equity_threshold", "cash_enhance_position_ratio_threshold",
+    ):
+        _v = getattr(src, _f, None)
+        if _v is not None:
+            setattr(clone, _f, _v)
     db.add(clone)
     db.flush()
     for s in _portfolio_strategies(src, db):
@@ -1278,7 +1531,14 @@ def recompute_evaluation(db: Session, record_id: int) -> Union[None, str, dict]:
         )
         for t in trades
     ]
-    ev = Evaluator().evaluate(snap_dicts, trades=trade_objs)
+    # 基准序列：口径与回测运行期一致（backtest_engine 用快照 benchmark_value
+    # 组成 [{"value": ...}]）；不传则 _compute_benchmark_return 恒返回 0，
+    # 重算后会把原记录的基准收益覆盖成 0。
+    bench_series = (
+        [{"value": s.benchmark_value} for s in snaps if s.benchmark_value is not None]
+        or None
+    )
+    ev = Evaluator().evaluate(snap_dicts, benchmark_data=bench_series, trades=trade_objs)
     if not ev:
         return {"status": "failed", "error": "快照序列无法产出评估结果"}
 
@@ -1323,7 +1583,8 @@ def recompute_evaluation(db: Session, record_id: int) -> Union[None, str, dict]:
             for s in srows
         ]
         s_trades = [t for t in trade_objs if t.strategy_id == sid]
-        sev = Evaluator().evaluate(s_dicts, trades=s_trades)
+        # 策略层同样注入组合基准序列（与运行期一致），否则基准收益被重算为 0
+        sev = Evaluator().evaluate(s_dicts, benchmark_data=bench_series, trades=s_trades)
         if not sev:
             continue
         ser = (
@@ -1360,7 +1621,7 @@ def _convert_formula_output(
     raw: {stock_code: {var_name: [{"Date":"YYYYMMDD","Value":float}, ...]}}，
          顶层可能有 ErrorId。
     返回: {(strategy_id, stock_code, bar_time): [{"name": str, "value": int}]}。
-    ErrorId 非 0/19 → 视为出错，返回空。
+    ErrorId 非 0 → 视为出错，返回空（19 表示只加载了部分股票，不能使用）。
 
     时间轴对齐（两种模式）：
     - 日线（bar_times_by_code=None）：公式输出 Date=YYYYMMDD 转午夜 datetime 作 key。
@@ -1376,7 +1637,7 @@ def _convert_formula_output(
     if not isinstance(raw, dict) or not raw:
         return {}
     err = raw.get("ErrorId")
-    if err is not None and str(err) not in ("0", "19"):
+    if err is not None and str(err) != "0":
         return {}
     entries: dict = {}
     for code in stocks:
@@ -1394,6 +1655,12 @@ def _convert_formula_output(
             for var_name, val_list in stock_data.items():
                 if var_name in _FORMULA_META_KEYS or not isinstance(val_list, list):
                     continue
+                if len(val_list) != len(bar_times):
+                    logger.warning(
+                        "公式 %s 输出长度 %d != bar 数 %d（code=%s），"
+                        "按日期+日内索引对齐，多余输出丢弃",
+                        var_name, len(val_list), len(bar_times), code,
+                    )
                 day_counter: Dict[date, int] = {}
                 for entry in val_list:
                     if not isinstance(entry, dict):
@@ -1458,6 +1725,32 @@ def _parse_date_str(d: str):
 _MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "1h"}
 
 
+# 通达信系统公式兜底：内置引擎只解析库内 engine=builtin 的公式，但用户公式常直接
+# 引用系统公式（如 "MACD.DIF#WEEK"）。库内未建同名公式时回退到这里，避免必须手工
+# 复制一份系统公式才能回测。库内同名 builtin 公式优先级更高（见 _make_xref_resolver）。
+# 内容用字面量参数（内置引擎不接受未定义变量 SHORT/LONG/MID）。
+_SYSTEM_FORMULA_SOURCES = {
+    "MACD": "DIF:EMA(CLOSE,12)-EMA(CLOSE,26);DEA:EMA(DIF,9);MACD:(DIF-DEA)*2;",
+}
+
+
+class _SystemFormula:
+    """系统公式的轻量 Formula 替身（resolver 只读 id/name/content/engine/no_leak_cross）。"""
+
+    engine = "builtin"
+    no_leak_cross = False
+
+    def __init__(self, name: str, content: str):
+        self.id = -1  # 负 id：与库内公式主键区分，同时用于 xref memo
+        self.name = name
+        self.content = content
+
+
+def _system_formula(name: str):
+    src = _SYSTEM_FORMULA_SOURCES.get(name.upper())
+    return _SystemFormula(name.upper(), src) if src else None
+
+
 def _bar_times_by_code(klines: dict) -> Dict[str, List[datetime]]:
     """从 klines 提取每只股票的时间轴（升序去重），供分钟级公式输出按索引对齐。
 
@@ -1496,16 +1789,170 @@ def _bar_times_by_period(klines: dict, period: str) -> Dict[str, List[datetime]]
     return result
 
 
+def _make_xref_resolver(code: str, base_period: str, klines: dict,
+                        xref_formulas: dict, xref_memo: dict):
+    """批次 9b：构造单 code 的跨公式引用 resolver 闭包。
+
+    resolver(form_name, period_key|None) -> {线名: Series}：
+    - period_key=None → 在 base 周期上求值被引公式（序列与 base df 1:1 对齐）；
+    - period_key 非 None → 在该上级周期上求值（折回对齐由 _xref_series 负责）；
+    - memo {(formula_id, period, code)}：同组多策略/多输出线共享一次求值；
+    - 被引公式自身的跨周期/跨公式引用递归解析（静态检查已保证无环）；
+    - 被引公式不存在或非 builtin → FormulaEvalError（进 diagnostics.errors）。
+    """
+
+    def resolver(form_name: str, period_key):
+        # 库内 builtin 公式优先；未建同名公式时回退到通达信系统公式（如 MACD）。
+        f = xref_formulas.get(form_name) or _system_formula(form_name)
+        if f is None:
+            raise FormulaEvalError(
+                f"跨公式引用 {form_name}：被引公式不存在或未启用内置引擎")
+        tgt = period_key if period_key is not None else base_period
+        memo_key = (f.id, tgt, code)
+        if memo_key in xref_memo:
+            return xref_memo[memo_key]
+        tdf = klines.get(code, {}).get(tgt)
+        if tdf is None or tdf.height == 0:
+            raise FormulaEvalError(
+                f"跨公式引用 {form_name}：代码 {code} 缺少 {tgt} 周期 K 线")
+        # 被引公式自身的 FIELD#PERIOD / 公式名.线名#周期 引用同样注入上级周期 df
+        tpf: dict = {}
+        for p in cross_periods_of(f.content):
+            pdf = klines.get(code, {}).get(p)
+            if pdf is not None and pdf.height > 0:
+                tpf[p] = pdf
+        outs = evaluate_outputs(
+            f.content, tdf, period=tgt, period_frames=tpf or None,
+            no_leak=bool(getattr(f, "no_leak_cross", False)),
+            xref_resolver=resolver)
+        xref_memo[memo_key] = outs
+        return outs
+
+    return resolver
+
+
+def _xref_static_check(formula, fmap: dict):
+    """批次 9b：跨公式引用静态校验（DFS 三色标记环检测）。
+
+    返回错误消息（被引公式缺失/非 builtin/引用环），None=通过。
+    公式内容解析失败容错（求值层才报错）；no_leak 等运行时问题不在此检查。
+    """
+    state: dict = {}  # formula.id -> 0 访问中 / 1 完成
+
+    def dfs(f) -> Optional[str]:
+        mark = state.get(f.id)
+        if mark == 1:
+            return None
+        if mark == 0:
+            return f"跨公式引用存在环：{f.name}"
+        state[f.id] = 0
+        try:
+            names = xref_names_of(f.content)
+        except Exception:
+            state[f.id] = 1
+            return None
+        for n in sorted(names):
+            ref = fmap.get(n) or _system_formula(n)
+            if ref is None:
+                state[f.id] = 1
+                return f"跨公式引用 {n}：被引公式不存在或未启用内置引擎"
+            err = dfs(ref)
+            if err:
+                return err
+        state[f.id] = 1
+        return None
+
+    return dfs(formula)
+
+
+def _builtin_formula_entries(
+    content: str, period: str, members: list, klines: dict,
+    cache: dict, diagnostics: Optional[dict],
+    cross_periods: Optional[list] = None, no_leak: bool = False,
+    xref_formulas: Optional[dict] = None, xref_memo: Optional[dict] = None,
+) -> None:
+    """engine=builtin 分支：内置公式子集解释器对喂入 klines 逐 bar 求值 → cache。
+
+    members: 同 (formula_id, period) 组的 [(strat, strat_stocks)]，组内共享求值。
+    与 TQ 路径差异：
+    - df 行序即 bar 序列，key 直接用 df datetime（与引擎 _build_timeline 同源同型），
+      无需 Date 字符串对齐；
+    - 复权口径与喂入 klines 一致（由 build_klines 的 dividend_mode 决定；dual 模式
+      下喂入为后复权，与 TQ 版"前复权信号"存在口径差异）。
+    求值报错 → diagnostics.errors 每策略记录根因（该组策略零信号）。
+
+    批次 9a 跨周期：cross_periods（公式 FIELD#PERIOD 引用的周期键，含 base 自身
+    周期）非空时，从 klines 取上级周期 df 组装 period_frames 注入求值；no_leak
+    透传公式级无泄露开关（默认 false=TDX 语义，行为与历史一致）。
+
+    批次 9b 跨公式引用：xref_formulas（{大写公式名: Formula}，全部 builtin）非空时
+    逐 code 构造 resolver 闭包注入求值；xref_memo 由调用方持有（build_signal_cache
+    级共享）。公式无 公式名.线名 引用时零改动。
+    """
+    codes: List[str] = []
+    seen: set = set()
+    for _, ss in members:
+        for c in ss:
+            if c not in seen:
+                seen.add(c)
+                codes.append(c)
+    try:
+        outs_by_code: dict = {}
+        for code in codes:
+            df = klines.get(code, {}).get(period)
+            if df is None or df.height == 0:
+                continue
+            pf: dict = {}
+            for p in (cross_periods or []):
+                pdf = klines.get(code, {}).get(p)
+                if pdf is not None and pdf.height > 0:
+                    pf[p] = pdf
+            resolver = None
+            if xref_formulas:
+                resolver = _make_xref_resolver(
+                    code, period, klines, xref_formulas, xref_memo or {})
+            outs_by_code[code] = evaluate_outputs(
+                content, df, period=period, period_frames=pf or None,
+                no_leak=no_leak, xref_resolver=resolver)
+    except FormulaEvalError as e:
+        if diagnostics is not None:
+            for strat, _ in members:
+                diagnostics["errors"].setdefault(strat.id, str(e))
+        return
+    for strat, strat_stocks in members:
+        lines: set = set()
+        for code in strat_stocks:
+            outs = outs_by_code.get(code)
+            if outs is None:
+                continue
+            lines.update(outs)
+            bar_times = klines[code][period]["datetime"].to_list()
+            for name, series in outs.items():
+                for j, v in enumerate(series.to_list()):
+                    if v is None or v != v:  # null/NaN → 无信号常态，与 TQ 口径一致
+                        continue
+                    cache.setdefault((strat.id, code, bar_times[j]), []).append(
+                        {"name": name, "value": _to_int(v)})
+        if diagnostics is not None:
+            diagnostics["output_lines"][strat.id] = lines
+
+
 def _formula_diagnostics(raw, stocks: list):
     """从 TQ 原始返回提取诊断：(error_msg|None, output_lines:set)。
 
-    ErrorId 非 0/19 → 公式执行错误（语法错误/引用公式缺失等）；
+    ErrorId 非 0 → 公式执行错误（语法错误/引用公式缺失等）；19 表示数据过多
+    只返回了部分股票，同样视为错误，不能静默使用部分结果。
     正常时收集所有股票的输出线名并集（过滤 ErrorId 等元信息键）。
     """
     if not isinstance(raw, dict) or not raw:
         return "公式执行无返回（通达信未返回数据，请确认公式名与通达信内一致）", set()
     err = raw.get("ErrorId")
-    if err is not None and str(err) not in ("0", "19"):
+    if err is not None and str(err) != "0":
+        if str(err) == "19":
+            return (
+                "ErrorId=19 公式执行返回数据过多，未能完整加载全部股票；"
+                "已拒绝部分结果（请减小股票池或分批回测）"
+            ), set()
         return f"ErrorId={err} Error={raw.get('Error')}", set()
     lines: set = set()
     for code in stocks:
@@ -1572,9 +2019,38 @@ def build_signal_cache(
         groups.setdefault((strat.formula_id, period), []).append(
             (strat, strat_stocks)
         )
+    # 批次 9a：公式 → 跨周期引用周期键 memo（同公式多周期组共享一次解析）
+    _cross_memo: Dict[int, list] = {}
+    # 批次 9b：跨公式引用——builtin 公式名表（大小写不敏感，TDX 公式名同义）+
+    # 求值 memo（build_signal_cache 级共享）。仅 builtin 公式参与解析；
+    # db 桩无 query（测试旁路）时跳过名表（engine=tq 路径不使用）。
+    _xref_formulas: Dict[str, Formula] = {
+        f.name.upper(): f for f in db.query(Formula).all()
+        if f.engine == "builtin"} if hasattr(db, "query") else {}
+    _xref_memo: Dict[tuple, dict] = {}
     for (formula_id, period), members in groups.items():
         formula = db.get(Formula, formula_id)
         if formula is None:
+            continue
+        # engine=builtin：内置公式子集解释器对喂入 klines 求值（仅回测接线，
+        # 默认 tq 不走此分支，行为不变）
+        if formula.engine == "builtin":
+            # 批次 9b：跨公式引用静态校验（被引公式存在性 + 环检测），失败零信号
+            xref_err = _xref_static_check(formula, _xref_formulas)
+            if xref_err is not None:
+                if diagnostics is not None:
+                    for strat, _ in members:
+                        diagnostics["errors"].setdefault(strat.id, xref_err)
+                continue
+            # 批次 9a：公式含 FIELD#PERIOD 跨周期引用时注入上级周期数据 +
+            # 无泄露开关（默认关=TDX 语义，不含 # 引用的公式行为不变）
+            if formula.id not in _cross_memo:
+                _cross_memo[formula.id] = sorted(cross_periods_of(formula.content))
+            _builtin_formula_entries(
+                formula.content, period, members, klines, cache, diagnostics,
+                cross_periods=_cross_memo[formula.id],
+                no_leak=bool(getattr(formula, "no_leak_cross", False)),
+                xref_formulas=_xref_formulas, xref_memo=_xref_memo)
             continue
         # 并集股票（保序去重）
         union: List[str] = []
@@ -1680,19 +2156,20 @@ def build_signal_warnings(
 
 
 # --- 辅助：从 DB 读组装所需数据 ---
-_POOL_STOCK_CACHE: dict = {}  # pool_id → set(stock_code)，进程级缓存避免回测中重复查询
 
 
 def _pool_stock_set(db: Session, pool_id: int) -> set:
-    """股票池成分集合（带进程级缓存，避免 build_signal_cache 中逐策略重复查询）。"""
-    if pool_id in _POOL_STOCK_CACHE:
-        return _POOL_STOCK_CACHE[pool_id]
-    codes = {
+    """股票池成分集合（每次实时查库）。
+
+    原实现用进程级 dict 缓存且无失效入口：服务运行期内经接口增删池成分后，
+    此处仍返回旧集合，而股票清单侧（_pool_stocks）实时查库 → 新增成分有行情
+    无信号、删除成分仍出「幽灵信号」，回测静默失真且不可复现。改为实时查询
+    （每策略一次，量级极小）。
+    """
+    return {
         row.stock_code
         for row in db.query(StockPoolStock).filter_by(pool_id=pool_id).all()
     }
-    _POOL_STOCK_CACHE[pool_id] = codes
-    return codes
 
 
 def _pool_stocks(ps, db: Session) -> list:
@@ -1769,10 +2246,31 @@ def _dedup_daily_by_date(snaps: list) -> list:
     return list(by_date.values())
 
 
+def _with_returns(snaps: list) -> list:
+    """按 total_value 差分回填 daily_return / cumulative_return（首日 0/0）。
+
+    引擎快照字典不含这两个键，落库前补齐；口径与 Evaluator._daily_returns
+    一致（基于日收盘 total_value）。prev/base 为 0 时防御为 0，不产生除零。
+    """
+    out = []
+    base = None
+    prev = None
+    for snap in snaps:
+        v = snap["total_value"]
+        if base is None:
+            dr, cum = 0.0, 0.0
+            base = v
+        else:
+            dr = float((v - prev) / prev) if prev else 0.0
+            cum = float(v / base - 1) if base else 0.0
+        out.append({**snap, "daily_return": dr, "cumulative_return": cum})
+        prev = v
+    return out
+
+
 def _persist_result(
     db: Session, record_id: int, ps_id: int, result: dict, strategies: list
 ) -> None:
-    strat_by_id = {s.id: s for s in strategies}
     for trade in result["trades"]:
         db.add(BacktestTrade(
             backtest_record_id=record_id,
@@ -1789,7 +2287,7 @@ def _persist_result(
             stamp_duty=trade.stamp_duty,
             bar_time=trade.trade_time,
         ))
-    for snap in _dedup_daily_by_date(result["snapshots"]):
+    for snap in _with_returns(_dedup_daily_by_date(result["snapshots"])):
         db.add(BacktestDailySnapshot(
             backtest_record_id=record_id,
             target_type="portfolio",
@@ -1819,7 +2317,7 @@ def _persist_result(
     strategy_snaps = result.get("strategy_snapshots") or {}
     strategy_evals = result.get("strategy_evaluations") or {}
     for sid, snaps in strategy_snaps.items():
-        for snap in _dedup_daily_by_date(snaps):
+        for snap in _with_returns(_dedup_daily_by_date(snaps)):
             db.add(BacktestDailySnapshot(
                 backtest_record_id=record_id,
                 target_type="strategy",
@@ -1828,6 +2326,8 @@ def _persist_result(
                 total_value=snap["total_value"],
                 cash=snap.get("cash", Decimal("0")),
                 market_value=snap.get("market_value", Decimal("0")),
+                daily_return=snap.get("daily_return"),
+                cumulative_return=snap.get("cumulative_return"),
                 # 引擎已注入与组合同日的基准值（FR-1 策略层相对指标数据源）
                 benchmark_value=snap.get("benchmark_value"),
                 positions_json=(
@@ -2141,6 +2641,41 @@ def list_records(db: Session) -> list:
     return [_serialize_record(r) for r in recs]
 
 
+def _refresh_oos_from_latest_wf(db: Session, record: dict) -> None:
+    """详情读取时用最新一次「已完成」的 walk-forward 覆盖冻结的样本外引用。
+
+    validation_json 在回测完成瞬间冻结，此时尚无 WF 的记录永远停在"未执行"，
+    即使之后补跑了 WF。详情页需要反映当前事实：按组合取最新 completed run；
+    该组合从未跑过 WF 时保留原值（None → 前端展示"未执行"）。
+    """
+    ps_id = record.get("portfolio_strategy_id")
+    if ps_id is None:
+        return
+    wf = (
+        db.query(WalkForwardRun)
+        .filter(
+            WalkForwardRun.portfolio_strategy_id == ps_id,
+            WalkForwardRun.status == "completed",
+        )
+        .order_by(WalkForwardRun.id.desc())
+        .first()
+    )
+    if wf is None:
+        return
+    summary = json.loads(wf.summary_json or "{}")
+    validation = record.get("validation")
+    if validation is None:
+        validation = {"capacity": [], "crisis": [], "oos": None}
+        record["validation"] = validation
+    validation["oos"] = {
+        "run_id": wf.id,
+        "name": wf.name,
+        "completed_at": wf.completed_at.isoformat() if wf.completed_at else None,
+        "windows_passed": summary.get("windows_passed"),
+        "overall_pass": summary.get("overall_pass"),
+    }
+
+
 def get_record_detail(
     db: Session, record_id: int, profile_override: Optional[str] = None,
 ) -> Optional[dict]:
@@ -2276,6 +2811,15 @@ def get_record_detail(
             "data": json.loads(rb.payload_json) if rb.payload_json else None,
         }
 
+    pp = (
+        db.query(BacktestPersistenceAnalysis)
+        .filter_by(backtest_record_id=record_id)
+        .one_or_none()
+    )
+    persistence = None
+    if pp is not None:
+        persistence = _serialize_persistence(pp)
+
     # ---- B6 考核口径验收（默认 absolute；?profile= 可临时切换查看另一口径）----
     evals_dict = _serialize_evaluation(evals) if evals else None
     profile = profile_override or rec.evaluation_profile or "absolute"
@@ -2283,8 +2827,12 @@ def get_record_detail(
         profile = "absolute"
     acceptance = compute_acceptance(evals_dict, profile)
 
+    record_payload = _serialize_record(rec)
+    # 样本外引用刷新：冻结快照可能早于后来补跑的 walk-forward
+    _refresh_oos_from_latest_wf(db, record_payload)
+
     return {
-        "record": _serialize_record(rec),
+        "record": record_payload,
         "snapshots": [_serialize_snapshot(s) for s in snaps],
         "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
         "evaluations": evals_dict,
@@ -2297,6 +2845,7 @@ def get_record_detail(
         "crisis_alpha": crisis_alpha,
         "market_regime": market_regime,
         "robustness": robustness,
+        "persistence": persistence,
         "acceptance": acceptance,
     }
 
@@ -2348,6 +2897,26 @@ def recover_stale_running_backtests(db: Session) -> int:
     return len(stale)
 
 
+def recover_stale_running_batch_runs(db: Session) -> int:
+    """#5 扩展：启动时清理僵尸 running 的批量任务 run（walk-forward / 参数微扰）。
+
+    与 recover_stale_running_backtests 同因：进程崩溃/重启后 run 表残留
+    status=running——面板永久显示"运行中"，且删除被 running 守卫拦截（409），
+    用户永远无法删除也无法辨识。统一标 failed 并附说明。返回受影响记录数。
+    """
+    stale: list = []
+    stale += db.query(WalkForwardRun).filter_by(status="running").all()
+    stale += db.query(ParamPerturbRun).filter_by(status="running").all()
+    if not stale:
+        return 0
+    msg = "应用启动时检测到中断状态（进程崩溃/重启），已自动标记为失败"
+    for run in stale:
+        run.status = "failed"
+        run.error_message = msg
+    db.commit()
+    return len(stale)
+
+
 # ---------------------------------------------------------------------------
 # 主链路
 # ---------------------------------------------------------------------------
@@ -2377,6 +2946,10 @@ def _log_kline_summary(record_id: int, klines: dict) -> None:
 # 流动性假设下，实盘按回测价成交不现实）；最大单票权重 > 25% → 集中度/权重膨胀。
 _CAP_PARTICIPATION_WARN = 0.30
 _CAP_MAX_WEIGHT_WARN = 0.25
+# 敞口上限预警：Σ(持仓数上限×单仓上限) < 期末净值 50% → 上限已结构性约束仓位部署
+_CAP_CEILING_RATIO_WARN = 0.50
+# 近端利用率窗口（交易日，取利用率序列末段均值 vs 全期均值对照）
+_CAP_RECENT_UTIL_DAYS = 60
 
 
 def _fmt_yuan(v: float) -> str:
@@ -2390,18 +2963,29 @@ def _fmt_yuan(v: float) -> str:
 
 # 危机期窗口（历史锁定、未来定义标准）：固定常量，非按策略表现回填，
 # 保证"危机防御判定"的标准先于结果确定（无前视）。key 用于稳定标识。
+# 窗口按"急跌段"定界，不含随后的修复/反弹期（否则基准收益被稀释成顺风窗）。
 CRISIS_WINDOWS: tuple = (
+    {"key": "2008_gfc", "name": "2008 金融危机", "start": "2008-01-01", "end": "2008-12-31"},
+    {"key": "2010_eurozone", "name": "2010 欧债/地产调控", "start": "2010-04-01", "end": "2010-07-31"},
+    {"key": "2013_cash_squeeze", "name": "2013 钱荒", "start": "2013-06-01", "end": "2013-07-31"},
     {"key": "2015_crash", "name": "2015 股灾", "start": "2015-06-01", "end": "2015-09-30"},
     {"key": "2016_circuit_breaker", "name": "2016 熔断", "start": "2016-01-01", "end": "2016-02-29"},
     {"key": "2018_tradewar", "name": "2018 贸易战/去杠杆", "start": "2018-01-01", "end": "2018-12-31"},
-    {"key": "2020_covid", "name": "2020 疫情", "start": "2020-01-01", "end": "2020-04-30"},
-    {"key": "2024_liquidity", "name": "2023底-24初流动性危机", "start": "2023-11-01", "end": "2024-02-29"},
-    {"key": "2025_tradewar", "name": "2025 贸易战", "start": "2025-04-01", "end": "2025-07-31"},
+    {"key": "2020_covid", "name": "2020 疫情", "start": "2020-01-01", "end": "2020-03-31"},
+    {"key": "2021_crowded_unwind", "name": "2021 抱团瓦解", "start": "2021-02-18", "end": "2021-03-31"},
+    {"key": "2022_multi_shock", "name": "2022 俄乌/加息/封控", "start": "2022-01-01", "end": "2022-04-30"},
+    {"key": "2024_liquidity", "name": "2023底-24初流动性危机", "start": "2024-01-01", "end": "2024-02-29"},
+    {"key": "2025_tradewar", "name": "2025 贸易战", "start": "2025-04-01", "end": "2025-04-30"},
     {"key": "2026_techcrash", "name": "2026-07 科技崩盘", "start": "2026-07-01", "end": "2026-07-31"},
 )
 
-# 危机防御判定：危机期正收益/持平 → 防御；负收益但最低现金占比 ≥70%（高现金避险）→ 防御。
+# 危机防御判定（三条规则，按序优先）：
+# ① 危机期正收益/持平 → 防御；
+# ② 负收益但最低现金占比 ≥70%（高现金避险）→ 防御；
+# ③ 负收益但跑赢基准 ≥5pp（显著抗跌；benchmark_return 为窗口内首末日比值）→ 防御。
+# 三条皆不满足 → exposed。
 _CRISIS_DEFENSIVE_CASH = 0.70
+_CRISIS_OUTPERFORM_PP = 0.05
 
 
 def build_crisis_verification(snapshots: list) -> list:
@@ -2437,8 +3021,13 @@ def build_crisis_verification(snapshots: list) -> list:
         base_total = float(by_date[base_day]["total_value"])
         end_total = float(by_date[in_window[-1]]["total_value"])
         strategy_return = (end_total / base_total - 1.0) if base_total else None
-        # 基准收益
+        # 基准收益：与策略侧**同一起点**——窗口前一日有基准值优先，否则窗口
+        # 首日（原实现只在窗口内取，两侧相差一个交易日收益，窗口首日大涨/大跌
+        # 时会系统性偏移超额，足以翻转 5pp 阈值的 defensive/exposed 判定）。
+        base_bv = by_date[base_day].get("benchmark_value")
         bench_vals = []
+        if base_bv is not None:
+            bench_vals.append(float(base_bv))
         for d in in_window:
             bv = by_date[d].get("benchmark_value")
             if bv is not None:
@@ -2473,6 +3062,13 @@ def build_crisis_verification(snapshots: list) -> list:
             verdict, reason = "defensive", "危机期仍取得正收益/持平"
         elif min_cash_ratio is not None and min_cash_ratio >= _CRISIS_DEFENSIVE_CASH:
             verdict, reason = "defensive", f"高现金避险（最低现金占比 {min_cash_ratio:.0%}）"
+        elif benchmark_return is not None and (
+                strategy_return - benchmark_return) >= _CRISIS_OUTPERFORM_PP:
+            out = strategy_return - benchmark_return
+            verdict, reason = "defensive", (
+                f"危机期受损但跑赢基准 {out:.0%}"
+                f"（策略 {strategy_return:.1%} vs 基准 {benchmark_return:.1%}）"
+            )
         else:
             verdict, reason = "exposed", f"危机期受损且现金占比低（最低 {min_cash_ratio:.0%}）"
         result.append({
@@ -2490,17 +3086,21 @@ def build_crisis_verification(snapshots: list) -> list:
 def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dict:
     """回测"验证结论"聚合：容量健康 + 危机防御 + 样本外引用，随结果冻结落库。
 
-    - capacity：build_capacity_warnings 的告警列表（空=健康）；
+    - capacity：build_capacity_warnings 的告警列表（空=健康），含集中度/ADV/
+      敞口上限（Σ持仓数上限×单仓上限 vs 期末净值）维度；
     - crisis：固定窗口危机防御验证（build_crisis_verification）；
     - oos：该组合最近的 walk-forward 运行摘要（None=未做过样本外验证）。
     """
     snapshots = result.get("snapshots") or []
     trades = result.get("trades") or []
+    ceiling = _exposure_ceiling_for_ps(db, ps.id) if db is not None else None
     warnings = build_capacity_warnings(
         trades, klines,
         result.get("evaluations") or {},
         getattr(ps, "position_sizing", "dynamic"),
         getattr(ps, "equity_cap", None),
+        snapshots=snapshots,
+        exposure_ceiling=ceiling,
     )
     crisis = build_crisis_verification(snapshots)
     oos: Optional[dict] = None
@@ -2527,72 +3127,98 @@ def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dic
     }
 
 
+def _snap_field(s, key):
+    """快照字段读取：dict（引擎 result）与 ORM 行（DB 查询）双兼容。"""
+    if isinstance(s, dict):
+        return s.get(key)
+    return getattr(s, key, None)
+
+
+def _exposure_ceiling_for_ps(db: Session, ps_id: int) -> Optional[Decimal]:
+    """组合级策略敞口上限 = Σ(策略 max_positions × max_order_amount)。
+
+    仅统计两者都有效配置（>0）的策略；全部未配置单仓上限 → None（无法归因，
+    不预警，宁缺勿假）。"""
+    total = Decimal("0")
+    found = False
+    for s in db.query(Strategy).filter_by(portfolio_id=ps_id).all():
+        mp = getattr(s, "max_positions", None)
+        moa = getattr(s, "max_order_amount", None)
+        if mp and moa:
+            total += Decimal(str(mp)) * Decimal(str(moa))
+            found = True
+    return total if found else None
+
+
 def build_capacity_warnings(
     trades: list,
     klines: dict,
     evaluations: Optional[dict] = None,
     position_sizing: str = "dynamic",
     equity_cap=None,
+    snapshots: Optional[list] = None,
+    exposure_ceiling=None,
 ) -> list:
     """容量健康度告警（自动）：即使未设 equity_cap，也在结果里明确提示
     "该结果是否含不可实现仓位"。
 
-    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_手×100×Close)，从 klines 估算）：
+    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_股×Close)，从 klines 估算）：
       最大占比 ≥ 30% → 该笔实盘按回测价成交不现实；
     - 最大单票权重 max_single_weight > 25% → 集中度/权重随涨幅过度膨胀；
+    - 敞口上限（snapshots + exposure_ceiling 均传入时）：Σ(持仓数上限×单仓上限)
+      < 期末净值 50% → 仓位上限已结构性约束策略弹性，附近端/全期利用率对照；
     - dynamic 且未设 equity_cap 时命中任一 → 附设置容量上限/成交量约束的建议。
 
     仅在有成交且可估算 ADV 时生效；无数据静默跳过（不误报）。
     """
-    if not trades:
-        return []
     warns: list = []
     # 1. 每股日均成交额（元）。TQ 单位已实测确认：Volume=股、Amount=万元。
     #    故优先用 量(股)×价(元) 直接得元口径；Amount(万元)×10000 兜底。
     adv_by_code: Dict[str, float] = {}
-    for code, periods in (klines or {}).items():
-        df = periods.get("1d") if isinstance(periods, dict) else None
-        if df is None:
-            continue
-        try:
-            cols = df.columns
-            amounts = df["Amount"].to_list() if "Amount" in cols else None
-            vols = df["Volume"].to_list() if "Volume" in cols else None
-            closes = df["Close"].to_list() if "Close" in cols else None
-        except Exception:
-            continue
-        day_amts = []
-        if vols is not None and closes is not None:
-            day_amts = [
-                float(v) * float(c)
-                for v, c in zip(vols, closes)
-                if v is not None and c is not None and float(v) > 0 and float(c) > 0
-            ]
-        if not day_amts and amounts is not None:
-            day_amts = [float(a) * 10000.0 for a in amounts
-                        if a is not None and float(a) > 0]
-        if day_amts:
-            adv_by_code[code] = sum(day_amts) / len(day_amts)
-    # 2. 最大单笔成交 vs ADV 占比
-    worst = None  # (amount, code, adv, ratio)
-    for t in trades:
-        code = getattr(t, "stock_code", None)
-        adv = adv_by_code.get(code)
-        if not adv or adv <= 0:
-            continue
-        amt = float(getattr(t, "amount", 0) or 0)
-        if amt <= 0:
-            continue
-        ratio = amt / adv
-        if worst is None or ratio > worst[3]:
-            worst = (amt, code, adv, ratio)
-    if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
-        amt, code, adv, ratio = worst
-        warns.append(
-            f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
-            f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
-            f"实盘按此价成交不现实，该结果可能含不可实现仓位"
-        )
+    if trades:
+        for code, periods in (klines or {}).items():
+            df = periods.get("1d") if isinstance(periods, dict) else None
+            if df is None:
+                continue
+            try:
+                cols = df.columns
+                amounts = df["Amount"].to_list() if "Amount" in cols else None
+                vols = df["Volume"].to_list() if "Volume" in cols else None
+                closes = df["Close"].to_list() if "Close" in cols else None
+            except Exception:
+                continue
+            day_amts = []
+            if vols is not None and closes is not None:
+                day_amts = [
+                    float(v) * float(c)
+                    for v, c in zip(vols, closes)
+                    if v is not None and c is not None and float(v) > 0 and float(c) > 0
+                ]
+            if not day_amts and amounts is not None:
+                day_amts = [float(a) * 10000.0 for a in amounts
+                            if a is not None and float(a) > 0]
+            if day_amts:
+                adv_by_code[code] = sum(day_amts) / len(day_amts)
+        # 2. 最大单笔成交 vs ADV 占比
+        worst = None  # (amount, code, adv, ratio)
+        for t in trades:
+            code = getattr(t, "stock_code", None)
+            adv = adv_by_code.get(code)
+            if not adv or adv <= 0:
+                continue
+            amt = float(getattr(t, "amount", 0) or 0)
+            if amt <= 0:
+                continue
+            ratio = amt / adv
+            if worst is None or ratio > worst[3]:
+                worst = (amt, code, adv, ratio)
+        if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
+            amt, code, adv, ratio = worst
+            warns.append(
+                f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
+                f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
+                f"实盘按此价成交不现实，该结果可能含不可实现仓位"
+            )
     # 3. 最大单票权重
     msw = (evaluations or {}).get("max_single_weight")
     if msw is not None and float(msw) > _CAP_MAX_WEIGHT_WARN:
@@ -2600,7 +3226,36 @@ def build_capacity_warnings(
             f"集中度预警：最大单票权重 {float(msw):.1%} 超过 {_CAP_MAX_WEIGHT_WARN:.0%}，"
             f"组合过度集中于单只股票（仓位随涨幅膨胀）"
         )
-    # 4. 修复建议
+    # 4. 敞口上限 vs 净值规模：上限 < 期末净值 50% → 已结构性限制仓位部署
+    if exposure_ceiling and snapshots:
+        utils: list = []
+        final_tv = Decimal("0")
+        for s in snapshots:
+            tv = _snap_field(s, "total_value")
+            mv = _snap_field(s, "market_value")
+            if tv is None or Decimal(str(tv)) <= 0:
+                continue
+            tv_d = Decimal(str(tv))
+            final_tv = tv_d
+            utils.append(Decimal(str(mv)) / tv_d if mv else Decimal("0"))
+        if final_tv > 0:
+            cap_ratio = float(exposure_ceiling) / float(final_tv)
+            if cap_ratio < _CAP_CEILING_RATIO_WARN:
+                whole = float(sum(utils) / len(utils)) if utils else 0.0
+                recent_n = min(len(utils), _CAP_RECENT_UTIL_DAYS)
+                recent = (
+                    float(sum(utils[-recent_n:]) / recent_n) if recent_n else 0.0
+                )
+                warns.append(
+                    f"敞口上限预警：策略敞口上限（Σ 持仓数上限×单仓上限）"
+                    f"{_fmt_yuan(float(exposure_ceiling))}，仅为期末净值 "
+                    f"{_fmt_yuan(float(final_tv))} 的 {cap_ratio:.0%}"
+                    f"（<{_CAP_CEILING_RATIO_WARN:.0%}），"
+                    f"近 {_CAP_RECENT_UTIL_DAYS} 日平均仓位利用率 "
+                    f"{recent:.1%}（全期 {whole:.1%}）——仓位上限已开始约束策略弹性；"
+                    f"资金规模扩大前建议上调 max_order_amount/持仓数并重测容量"
+                )
+    # 5. 修复建议
     if warns and position_sizing == "dynamic" and not equity_cap:
         warns.append(
             "容量建议：为组合设置 equity_cap（容量上限，仓位封顶）或开启 "
@@ -2610,7 +3265,9 @@ def build_capacity_warnings(
 
 
 def run_backtest(db: Session, ps: PortfolioStrategy, req,
-                 param_overrides: Optional[dict] = None) -> dict:
+                 param_overrides: Optional[dict] = None,
+                 walk_forward_run_id: Optional[int] = None,
+                 param_perturb_run_id: Optional[int] = None) -> dict:
     """回测主链路（从路由 _run_backtest_locked 迁入）。
 
     前置：路由层已保证 ps 非 None、日期合法、已持并发锁。
@@ -2686,6 +3343,15 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     volume_limit_ratio = getattr(req, "volume_limit_ratio", None)
     # 容量上限 run 级覆盖（None=用组合默认）
     equity_cap = getattr(req, "equity_cap", None)
+    # 日末 peak 保护（默认关；纯 1d 行为不变）
+    daily_close_peak_enabled = bool(
+        getattr(req, "daily_close_peak_enabled", False)
+    )
+    # 日内亏损熔断分母口径（run 级覆盖，None=跟随组合；组合默认 equity）
+    _basis_req = getattr(req, "daily_loss_basis", None)
+    daily_loss_basis = _basis_req if _basis_req in ("equity", "initial") else (
+        getattr(ps, "daily_loss_basis", None) or "equity"
+    )
     # 快照用的生效值：组合默认 or run 级覆盖（fee_reserve 仅 run 级）
     eff_adaptive = (
         bool(adaptive_slippage_enabled)
@@ -2715,10 +3381,17 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             volume_limit_enabled=volume_limit_enabled,
             volume_limit_ratio=volume_limit_ratio,
             equity_cap=equity_cap,
+            daily_close_peak_enabled=daily_close_peak_enabled,
+            daily_loss_basis=daily_loss_basis,
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,
         oos_gate_min_ratio=oos_gate_min_ratio,
+        # 批量任务子回测归属在创建时写入（而非事后关联）：run_backtest 内部多次
+        # commit，事后关联存在崩溃窗口——一旦中断，record 关联字段恒 NULL，
+        # 主列表过滤失效（孤儿子回测泄漏到主列表）。
+        walk_forward_run_id=walk_forward_run_id,
+        param_perturb_run_id=param_perturb_run_id,
     )
     db.add(rec)
     db.commit()
@@ -2732,6 +3405,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         portfolio.fee_reserve_enabled = fee_reserve_enabled
         portfolio.bond_t0_enabled = bond_t0_enabled
         portfolio.bond_lot_enabled = bond_lot_enabled
+        # 日内亏损熔断分母口径（equity=昨收净值；initial=初始资金）
+        portfolio.risk_manager.daily_loss_on_equity_enabled = (daily_loss_basis != "initial")
         if adaptive_slippage_enabled is not None:
             portfolio.adaptive_slippage_enabled = bool(adaptive_slippage_enabled)
         if slippage_impact_coef is not None:
@@ -2833,12 +3508,20 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 {d: c for d, c in regime_closes.items() if d < req.start_date}
             )
         engine = BacktestEngine()
+
+        def _on_progress(pct):
+            # 引擎已节流（至多约 100 次），此处逐次提交，运行中 progress 真实递增（#10）。
+            rec.progress = pct
+            db.commit()
+
         result = engine.run(
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
             benchmark_data=benchmark_data,
+            on_progress=_on_progress,
             regime_tracker=regime_tracker,
+            daily_close_peak_enabled=daily_close_peak_enabled,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")

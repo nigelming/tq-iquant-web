@@ -1,6 +1,6 @@
-"""桥正式版单测（0009 切片1）— Mock iQuant 内置函数，纯逻辑测试。
+"""桥正式版单测（0009 切片1）— Mock QMT 内置函数，纯逻辑测试。
 
-桥 live/bridge/iquant_bridge.py 是 iQuant 策略，iQuant API（passorder / get_trade_detail_data /
+桥 live/bridge/iquant_bridge.py 是 QMT 策略，QMT API（passorder / get_trade_detail_data /
 get_market_data_ex / download_history_data）在运行时注入策略命名空间（globals()）。测试通过
 `br.<api> = fake` 注入 Mock，直接调 _handle/place_order/get_quote 等纯逻辑函数。
 """

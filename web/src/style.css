@@ -95,7 +95,8 @@ input,select,button{font-family:inherit;font-size:inherit}
 .sidebar-subtitle{font-size:10px;color:var(--ink-faint);margin-top:6px;letter-spacing:.18em;text-transform:uppercase;font-weight:500}
 /* 侧栏底部：Core 状态 + 主题切换（原顶栏内容） */
 .sidebar-footbar{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-top:1px solid var(--line);font-size:11px;color:var(--ink-soft);font-variant-numeric:tabular-nums}
-.sidebar-footbar .status-chip,.sidebar-footbar .btn{width:100%;justify-content:center}
+.sidebar-footbar .status-chip,.sidebar-footbar .theme-toggle{width:100%;justify-content:center}
+.sidebar-footbar .btn{justify-content:center}
 .sidebar-nav{flex:1;padding:8px 8px;display:flex;flex-direction:column;overflow-y:auto}
 .nav-group-label{font-size:11px;font-weight:600;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.6px;padding:14px 14px 5px}
 .nav-item{display:flex;align-items:center;gap:9px;padding:9px 14px;margin-bottom:1px;border-radius:var(--radius);color:var(--ink-soft);font-size:13.5px;font-weight:500;transition:background .15s,color .15s}
@@ -124,7 +125,7 @@ tbody tr:last-child td{border-bottom:none}
 .badge-orange{background:var(--warn-wash);color:var(--warn);border-color:var(--warn)}
 .badge-teal{background:var(--hover-bg);color:var(--ink-soft)}
 .badge-purple{background:var(--accent-light);color:var(--accent)}
-.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--line-strong);border-radius:var(--radius);background:transparent;color:var(--ink);cursor:pointer;font-size:12px;letter-spacing:.08em;transition:all .2s}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px solid var(--line-strong);border-radius:var(--radius);background:transparent;color:var(--ink);cursor:pointer;font-size:12px;line-height:1.2;font-family:inherit;letter-spacing:.08em;transition:all .2s}
 .btn:hover{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 .btn-primary{background:var(--accent);color:var(--card-bg);border-color:var(--accent)}
 .btn-primary:hover{background:var(--accent);color:var(--card-bg)}

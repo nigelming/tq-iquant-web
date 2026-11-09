@@ -47,6 +47,7 @@ class Account:
         position_value: Decimal,
         strategy_capital_limit_override: Optional[Decimal] = None,
         lot_size: int = 100,
+        cash_override: Optional[Decimal] = None,
     ) -> tuple:
         """双层卡控：策略持仓上限 + 组合现金。返回 (approved, qty)。
 
@@ -61,6 +62,11 @@ class Account:
         上限由调用方按单传入（旧调用不传 → 行为不变）。
 
         lot_size（可选，默认 100=原行为）：可转债 10 张取整时由调用方传入 10。
+
+        cash_override（实盘账户全貌对齐，可选）：非 None 时现金上限取
+        min(self.cash, cash_override)——实盘审批额度对齐真实账户可用资金
+        （快照表最新值 × 0.98 缓冲），防虚拟账本虚高导致柜台拒单。
+        只影响本单审批额度，不修改账本现金（虚拟记账口径不变）。
         """
         if price <= 0:
             # 非正价格（前复权伪影/脏数据）：needed=price*qty<=cap 对负价恒成立，
@@ -70,6 +76,8 @@ class Account:
         needed = self._buy_needed(quantity, price)
         # 确认可用资金上限：取策略上限与组合现金的较小值
         cap = self.cash
+        if cash_override is not None and cash_override < cap:
+            cap = cash_override
         limit = (strategy_capital_limit_override
                  if strategy_capital_limit_override is not None
                  else self.strategy_capital_limit)

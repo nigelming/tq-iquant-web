@@ -14,6 +14,7 @@ import polars as pl
 
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.portfolio import Portfolio
+from core.engine.position import Position
 from core.engine.strategy_context import StrategyContext
 from core.engine.risk_manager import StrategyRiskManager, PortfolioRiskManager
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -112,3 +113,75 @@ def test_single_period_daily_golden_unchanged():
     assert trades[1].signal_type == SignalType.STOP_LOSS
     # W4.4：每交易日至一行（3 个交易日 → 3 行）
     assert len(result["snapshots"]) == 3
+
+
+def _mixed_period_portfolio_with_coarse_close():
+    """1d 策略 + 持仓；同一周一额外有一根 close=100 的 1w bar（日线 close=10）。
+
+    1w bar 的 close 是该周期末价格，对周一 00:00 而言是未来价。组合估值会被它
+    瞬间抬高；若每步都 update_peak，随后 1d 收盘会制造假 max_drawdown。
+    """
+    stock = "000001.SZ"
+    dates = [
+        datetime(2026, 7, 27), datetime(2026, 7, 28),
+        datetime(2026, 7, 29), datetime(2026, 7, 30),
+        datetime(2026, 7, 31),
+    ]
+    df_1d = pl.DataFrame({
+        "datetime": dates,
+        "Open": [Decimal("10")] * len(dates),
+        "High": [Decimal("10")] * len(dates),
+        "Low": [Decimal("10")] * len(dates),
+        "Close": [Decimal("10")] * len(dates),
+        "Volume": [1000] * len(dates),
+    })
+    df_1w = pl.DataFrame({
+        "datetime": [dates[0]],
+        "Open": [Decimal("100")], "High": [Decimal("100")],
+        "Low": [Decimal("100")], "Close": [Decimal("100")], "Volume": [1000],
+    })
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.5")
+    )
+    port = Portfolio(
+        portfolio_id=1, initial_capital=Decimal("10000"),
+        risk_manager=pm,
+    )
+    port.account.cash = Decimal("0")
+    ctx = StrategyContext(
+        strategy_id=1, period="1d",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+    )
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.9"), take_profit_ratio=Decimal("9"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    pos = Position(stock)
+    pos.quantity = 1000
+    pos.avg_cost = Decimal("10")
+    pos.highest_price = Decimal("10")
+    ctx.positions[stock] = pos
+    port.strategies.append(ctx)
+    return port, {stock: {"1d": df_1d, "1w": df_1w}}
+
+
+def test_daily_close_peak_guard_ignores_coarse_period_future_close():
+    """开启日末 peak 保护后，1w 粗 bar 的未来 close 不得污染当日 peak/max_drawdown。"""
+    port, klines = _mixed_period_portfolio_with_coarse_close()
+
+    result = BacktestEngine().run(
+        port, klines=klines, daily_close_peak_enabled=True,
+    )
+
+    assert port.risk_manager.peak_value == Decimal("10000")
+    assert port.risk_manager.circuit_breaker_active is False
+    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"] == []
+
+
+def test_daily_close_peak_guard_default_off_preserves_existing_behavior():
+    """默认关闭：粗周期每步仍更新 peak，复现原假回撤行为（保证开关默认零变化）。"""
+    port, klines = _mixed_period_portfolio_with_coarse_close()
+
+    result = BacktestEngine().run(port, klines=klines)
+
+    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"]

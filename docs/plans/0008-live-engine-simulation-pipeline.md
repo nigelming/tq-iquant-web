@@ -6,26 +6,26 @@
 > 验证：[0008-verify-results.md](0008-verify-results.md)（SDK 接口链路已实测确认，2026-08-04 盘中）
 > 依据：[system-plan-draft.md](../system-plan-draft.md) §2.4 实盘信号流程 / §5.3.3 并发模型 / §5.3.2 第9条虚拟持仓 / 实盘恢复机制；用户 4 项决策（见下）
 
-> ⚠️ **次期方案已变更（见 0009）**：本计划原定「次期 `NatsDispatcher` + iQuant NATS 网关」**已废弃**，改为「iQuant 客户端内 HTTP 桥（`HttpBridgeDispatcher`）」。NATS 通信拓扑整体移除。下文凡涉及 `NatsDispatcher`/NATS 网关的内容仅作历史记录，以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) 为准。
+> ⚠️ **次期方案已变更（见 0009）**：本计划原定「次期 `NatsDispatcher` + QMT NATS 网关」**已废弃**，改为「QMT 客户端内 HTTP 桥（`HttpBridgeDispatcher`）」。NATS 通信拓扑整体移除。下文凡涉及 `NatsDispatcher`/NATS 网关的内容仅作历史记录，以 [0009-iquant-http-bridge.md](0009-iquant-http-bridge.md) 为准。
 
 > ⚠️ **通达信分版已废弃（2026-08-06）**：本计划及验证记录中提到的「实盘版通达信 `D:\new_tdx64_live`」**已不再使用**。全系统统一用回测版 `D:\new_tdx64`，`tdx_live_path` 配置项已删除。下文凡涉及 `new_tdx64_live`/live 版/`tdx_live_path` 的内容仅作历史记录。
 
 ## 1. 目标
 
-打通「TQ 实时通知 → 主动拉数 → 内存注入公式 → 信号 → 风控 → 模拟撮合 → 落库 → SSE 推送 → 前端监控」实盘全链路。**首期成交用 `SimulatedDispatcher` 本地撮合**（与回测同），不接 iQuant 真实下单。一个会话跑多个组合（1:N），各组合虚拟持仓/虚拟现金隔离。落地后实盘具备「能跑能看能恢复」的产品级状态，与回测对称。
+打通「TQ 实时通知 → 主动拉数 → 内存注入公式 → 信号 → 风控 → 模拟撮合 → 落库 → SSE 推送 → 前端监控」实盘全链路。**首期成交用 `SimulatedDispatcher` 本地撮合**（与回测同），不接 QMT 真实下单。一个会话跑多个组合（1:N），各组合虚拟持仓/虚拟现金隔离。落地后实盘具备「能跑能看能恢复」的产品级状态，与回测对称。
 
 **不在本计划范围（次期）**：
-- `NatsDispatcher` + iQuant 网关真实化 + 真实下单/撤单/持仓查询
+- `NatsDispatcher` + QMT 网关真实化 + 真实下单/撤单/持仓查询
 - 多周期合成（1m→5m→30m/60m 整除点合成，§2.4 c/d/e）—— 首期单周期
 - 1d/1w 周期实盘（15:00 收盘合成 + 跨日 pending）—— 首期仅分钟级
-- 实际账户现金 NATS 查询、虚拟持仓 vs 实际持仓交叉验证（依赖 iQuant）
+- 实际账户现金 NATS 查询、虚拟持仓 vs 实际持仓交叉验证（依赖 QMT）
 
 ## 2. 已确认决策（用户）
 
 | 决策点 | 选择 | 落地方式 |
 |---|---|---|
 | 行情/信号驱动 | **TQ 实时回调 → 按周期触发 TQ 公式**（原表述「bar 追加本地文件」经验证改为 `formula_set_data` 内存注入，见[验证结论](0008-verify-results.md)风险点2/3） | `TQData.subscribe_bars` 注册 `subscribe_hq` 回调；回调线程只做 `run_coroutine_threadsafe(on_hq(code))` 投递；主循环 `on_hq` 收通知后 `run_in_executor` 调 `get_market_data`+`formula_set_data`+`formula_process_mul_zb`（持 `_tdx_lock`） |
-| 成交方式 | **先模拟撮合，后接 iQuant** | 首期复用 `SimulatedDispatcher`；`OrderDispatcher` 接口预留，次期实现 `NatsDispatcher` |
+| 成交方式 | **先模拟撮合，后接 QMT** | 首期复用 `SimulatedDispatcher`；`OrderDispatcher` 接口预留，次期实现 `NatsDispatcher` |
 | 会话×组合 | **1:N 一个会话跑多个组合** | 一个 `LiveEngine` 实例持有 `List[Portfolio]`；`LiveSessionPortfolio` 表关联；虚拟持仓按 `portfolio_strategy_id` 隔离 |
 | 首期范围 | **打通模拟实盘全链路** | 4 切片：引擎主链路 → 多组合落库 → SSE → 前端监控；收尾加恢复机制 |
 
@@ -72,7 +72,7 @@ TQ 回调线程（通达信驱动，微秒级返回，不做业务）:
 - **主从策略**：从策略 OPEN 只能买主策略当前持有的同一只股票；主清仓后从不可新开仓但存量可卖 —— 已在 `Portfolio._signal_to_order`（§89 修复）
 - **资金模型**：策略资金占比=持仓上限（非预分），多策略上限之和可超 100%；资金不足按剩余金额等比例缩减，不足 1 手放弃 —— 已在 `Account.approve_order`
 - **熔断**：max_drawdown 次日恢复（累计 3 次转手动）、daily_loss_limit 当日暂停次日恢复、熔断期间不清仓仅暂停新开仓 —— 已在 `PortfolioRiskManager` + `Portfolio.on_bar` 剥 BUY
-- **T+1**：模拟撮合阶段复用 `SimulatedT1Checker`（按 `Position.buy_time` 判断）；次期接 iQuant 用真实可用股数查询
+- **T+1**：模拟撮合阶段复用 `SimulatedT1Checker`（按 `Position.buy_time` 判断）；次期接 QMT 用真实可用股数查询
 - **信号来源透传**：`signal_name`（公式变量名/风控名）已端到端透传 SignalEvent→OrderEvent→TradeEvent（commit f6381e9），实盘沿用，落 `live_orders.signal_name`/`live_trades`（表已带列）
 
 ### 4.2 实盘新增规则
@@ -271,7 +271,7 @@ class LiveEngine:
 ## 10. 次期预告（不在本计划）
 
 - `NatsDispatcher`：实现 `OrderDispatcher.place_order` → `NatsClient.request("iquant.iguant.order.place")` → 网关真实下单；订单状态轮询/推送
-- iQuant 网关 5 个 mock handler 真实化（需 iQuant 实盘/模拟环境）
+- QMT 网关 5 个 mock handler 真实化（需 QMT 实盘/模拟环境）
 - 多周期合成（1m/5m → 30m/60m 整除点，§2.4 c/d/e）
 - 1d/1w 周期实盘（15:00 合成 + 跨日 pending）
 - 虚拟持仓 vs 实际账户交叉验证（§恢复机制第4步）

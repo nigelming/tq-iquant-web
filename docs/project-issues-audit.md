@@ -1,7 +1,7 @@
 # 项目问题清单 — 全面审计
 
 > 审计日期：2026-08-10
-> 审计范围：main/（Core 引擎 + API + ORM + TQ）、live/bridge/（iQuant 桥）、shared/、web/（前端）、docs/、配置文件
+> 审计范围：main/（Core 引擎 + API + ORM + TQ）、live/bridge/（QMT 桥）、shared/、web/（前端）、docs/、配置文件
 > 审计方法：3 个 explore agent 并行代码审查 + 直接代码/测试/迁移检查
 > 测试状态：后端 364/365 passed（1 flaky），前端 77/77 passed，vue-tsc 零错误
 
@@ -330,7 +330,7 @@
 | `live_engine.py:91` | `deals_poll_interval = 5.0` | 成交轮询间隔 |
 | `live_engine.py:95` | `formula_count = 200` | 默认注入根数 |
 | `live_engine.py:192` | `Queue(maxsize=200)` | SSE 队列上限 |
-| `http_bridge_dispatcher.py:77` | `"pr_type": 14` | iQuant 价格类型 |
+| `http_bridge_dispatcher.py:77` | `"pr_type": 14` | QMT 价格类型 |
 | `api/live.py:185` | `["000001.SZ"]` | 空池回退股票 |
 | `execution_engine.py:29-33` | `min_commission=5` 等 | 成本参数默认值 |
 

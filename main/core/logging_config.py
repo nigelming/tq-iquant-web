@@ -24,13 +24,14 @@ def setup_logging():
     if not any(getattr(h, "_core_logging", False) for h in root.handlers):
         if not _under_pytest():
             # Nuitka 打包后 __file__ 位于 <exe目录>/core/，.parent×3 会跑到分发目录的上一级；
-            # 打包环境（argv[0] 为 exe）下日志固定写到 exe 同级的 logs/。
-            argv0 = Path(sys.argv[0])
-            if argv0.suffix.lower() == ".exe":
-                log_dir = argv0.resolve().parent / "logs"
+            # 打包版（及 TQ_APP_ROOT 便携模式）日志固定写到可写根目录的 logs/。
+            from core.config import app_root, use_app_root
+
+            if use_app_root():
+                log_dir = app_root() / "logs"
             else:
                 log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-            log_dir.mkdir(exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / "core.log"
             file_handler = logging.handlers.RotatingFileHandler(
                 log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"

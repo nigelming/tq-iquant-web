@@ -2,22 +2,31 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
   mockStopLiveSession: vi.fn(),
+  mockGetLiveChannel: vi.fn(),
+  mockTestLiveChannel: vi.fn(),
+  mockGetLiveSession: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
   createLiveSession: mockCreateLiveSession,
   startLiveSession: mockStartLiveSession,
   stopLiveSession: mockStopLiveSession,
+  getLiveChannel: mockGetLiveChannel,
+  testLiveChannel: mockTestLiveChannel,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
   getLiveDecisions: vi.fn(),
+  getLiveSignals: vi.fn(),
+  getLiveSession: mockGetLiveSession,
   getPortfolios: vi.fn(),
+  getFormulas: vi.fn(),
+  sendUserBlock: vi.fn(),
 }))
 
 // happy-dom 无 EventSource,用可手动 emit 的 fake
@@ -45,7 +54,8 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getPortfolios } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession } from '../api'
+import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
 const stoppedSession = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -63,7 +73,24 @@ beforeEach(() => {
   ;(getLiveOrders as any).mockResolvedValue([])
   ;(getLiveTrades as any).mockResolvedValue([])
   ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
+  ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
+  ;(getLiveSession as any).mockResolvedValue({ account_snapshot: null, trading_calendar: null })
   ;(getPortfolios as any).mockResolvedValue([])
+  ;(getFormulas as any).mockResolvedValue([])
+  ;(getLiveChannel as any).mockResolvedValue({
+    engine: 'iquant',
+    active: 'iquant_bridge',
+    label: 'QMT 通道',
+    online: null,
+    engines: [
+      { key: 'iquant', channel: 'iquant_bridge', label: 'QMT 通道', configured: true, detail: '' },
+      { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+      { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
+    ],
+    ths_ui: { enabled: false, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
+    bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+  })
+  ;(testLiveChannel as any).mockResolvedValue({ ok: true, channel: 'iquant_bridge', base_url: 'http://127.0.0.1:8790' })
 })
 
 afterEach(() => {
@@ -247,6 +274,94 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('持仓 tab 来源列：策略持仓（蓝）/ 原有持仓（灰），外部行组合/子策略显示 —', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000, portfolio_id: 1, strategy_id: 1, source: 'strategy' },
+      { stock_code: '000001.SZ', quantity: 1000, avg_cost: 12, market_value: 13000, portfolio_id: null, strategy_id: null, source: 'external' },
+    ])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 1, name: '日线趋势', portfolio_id: 1 }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 表头含「来源」列
+    expect(w.text()).toContain('来源')
+    const posTable = w.findAll('table').find((t) => t.text().includes('来源'))!
+    const rows = posTable.findAll('tbody tr')
+    expect(rows.length).toBe(2)
+    // 策略行：蓝色「策略持仓」徽章 + 组合/子策略名
+    const badge0 = rows[0].find('.badge')
+    expect(badge0.text()).toBe('策略持仓')
+    expect(badge0.classes()).toContain('badge-blue')
+    expect(rows[0].text()).toContain('稳健组合')
+    expect(rows[0].text()).toContain('日线趋势')
+    // 外部行：灰色「原有持仓」徽章 + 组合/子策略列显示 —
+    const badge1 = rows[1].find('.badge')
+    expect(badge1.text()).toBe('原有持仓')
+    expect(badge1.classes()).toContain('badge-gray')
+    expect(rows[1].text()).toContain('000001.SZ')
+    expect(rows[1].text()).toContain('—')
+    w.unmount()
+  })
+
+  it('持仓 tab 归属徽标：池外兜底行显示「非池内·兜底归属」，池内/缺字段不显示', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'pool' },
+      { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
+      // 旧接口无 attribution → 降级不显示、不报错
+      { stock_code: '600888.SH', quantity: 900, avg_cost: 10.99, market_value: 7893,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const posTable = w.findAll('table').find((t) => t.text().includes('来源'))!
+    const rows = posTable.findAll('tbody tr')
+    expect(rows.length).toBe(3)
+    expect(rows[0].text()).not.toContain('非池内')
+    expect(rows[2].text()).not.toContain('非池内')
+
+    expect(rows[1].text()).toContain('非池内·兜底归属')
+    const fb = rows[1].findAll('.badge').find((b) => b.text().includes('非池内'))!
+    expect(fb.classes()).toContain('badge-orange')
+    expect(fb.attributes('title')).toContain('止损')
+    w.unmount()
+  })
+
+  it('SSE position 事件未带 attribution → 保留已有兜底徽标', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('position', { portfolio_id: 1, strategy_id: 1, stock_code: '002745.SZ',
+      quantity: 5300, avg_cost: 10.221, market_value: 54171 })
+    await flushPromises()
+
+    expect(w.text()).toContain('非池内·兜底归属')
+    w.unmount()
+  })
+
+  it('持仓 tab 空态：提示原有持仓监视口径', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('暂无持仓')
+    expect(w.text()).toContain('账户原有持仓（非策略买入）以灰色标注为原有持仓，已自动导入虚拟账本纳入风控（真实成本计算止损/止盈）')
+    w.unmount()
+  })
+
   it('SSE order/trade 事件 → 委托/成交表顶部插入', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)
@@ -264,6 +379,25 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
     await tradesTab.trigger('click')
     expect(w.text()).toContain('1050')
+    w.unmount()
+  })
+
+  it('SSE rejected order 事件 → 委托表错误列显示 error_message', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+
+    es.emit('order', {
+      trade_type: 'BUY', stock_code: '600000.SH', status: 'rejected',
+      quantity: 100, error_message: 'ths ui captcha_ocr disabled',
+    })
+    await flushPromises()
+
+    const ordersTab = w.findAll('button').find((b) => b.text().includes('委托'))!
+    await ordersTab.trigger('click')
+    expect(w.text()).toContain('错误')
+    expect(w.text()).toContain('ths ui captcha_ocr disabled')
     w.unmount()
   })
 
@@ -305,6 +439,119 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     await flushPromises()
     expect(w.text()).toContain('持股数达上限')
     expect(w.text()).toContain('600000.SH')
+    w.unmount()
+  })
+
+  it('决策表默认今日过滤；切到全部可见更早事件；聚合随筛选重算', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const ev = (id: number, iso: string, code: string) => ({
+      id, gate: 'stop_loss', layer: 'risk', action: 'sell', stock_code: code,
+      strategy_id: 1, created_at: iso, bar_time: iso,
+      param_name: 'stop_loss', param_value: 5, actual_value: 4.9,
+      requested_qty: 100, final_qty: 100, message: '',
+    })
+    ;(getLiveDecisions as any).mockResolvedValue({
+      summary: [],
+      events: [
+        ev(1, '2026-11-05T09:10:00+08:00', '600000.SH'),
+        ev(2, '2026-11-05T09:20:00+08:00', '600888.SH'),
+        ev(3, '2026-10-30T09:10:00+08:00', '000009.SZ'),
+      ],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+
+    // 默认今日：旧事件不可见，聚合次数=2（非全时段 3）
+    expect(w.text()).not.toContain('000009.SZ')
+    const sumTable = () => w.findAll('table').find((t) => t.text().includes('次数'))!
+    expect(sumTable().findAll('tbody tr')[0].findAll('td')[5].text()).toBe('2')
+
+    // 切到全部：更早事件出现，聚合次数=3
+    await w.find('select[aria-label="决策时间范围"]').setValue('all')
+    expect(w.text()).toContain('000009.SZ')
+    expect(sumTable().findAll('tbody tr')[0].findAll('td')[5].text()).toBe('3')
+    spy.mockRestore()
+    w.unmount()
+  })
+
+  it('决策聚合显示成交笔数/转化率：重复触发按 order_id 只计 1 笔', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const ev = (id: number) => ({
+      id, gate: 'stop_loss', layer: 'risk', action: 'sell', stock_code: '600000.SH',
+      strategy_id: 1, created_at: '2026-11-05T09:10:00+08:00',
+      bar_time: '2026-11-05T09:10:00+08:00', param_name: 'stop_loss',
+      param_value: 5, actual_value: 4.9, requested_qty: 100, final_qty: 100, message: '',
+    })
+    ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [ev(1), ev(2)] })
+    // 同一订单的 filled + partial 两条状态行 → 只算 1 笔成交
+    ;(getLiveOrders as any).mockResolvedValue([
+      { id: 9, stock_code: '600000.SH', trade_type: 'SELL', status: 'filled',
+        quantity: 100, price: 10, filled_quantity: 100, filled_price: 10,
+        error_message: null, bar_time: '2026-11-05T09:30:00+08:00' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+
+    expect(w.text()).toContain('成交笔数')
+    expect(w.text()).toContain('转化率')
+    const cells = w.findAll('table').find((t) => t.text().includes('次数'))!
+      .findAll('tbody tr')[0].findAll('td')
+    expect(cells[5].text()).toBe('2')      // 触发 2 次
+    expect(cells[6].text()).toBe('1')      // 成交 1 笔（同订单去重）
+    expect(cells[7].text()).toBe('50.0%')  // 1/2
+    spy.mockRestore()
+    w.unmount()
+  })
+
+  it('今日无决策事件 → 显示「今日暂无决策事件」而不是空白', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    ;(getLiveDecisions as any).mockResolvedValue({
+      summary: [],
+      events: [{
+        id: 9, gate: 'stop_loss', layer: 'risk', action: 'sell', stock_code: '000009.SZ',
+        strategy_id: 1, created_at: '2026-10-30T09:10:00+08:00',
+        bar_time: '2026-10-30T09:10:00+08:00', param_name: 'stop_loss',
+        param_value: 5, actual_value: 4.9, requested_qty: 100, final_qty: 100,
+        message: '',
+      }],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+    expect(w.text()).toContain('今日暂无决策事件')
+    spy.mockRestore()
+    w.unmount()
+  })
+
+  it('委托表默认今日过滤；切到全部可见更早委托', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    ;(getLiveOrders as any).mockResolvedValue([
+      { id: 11, stock_code: '600000.SH', trade_type: 'BUY', status: 'filled',
+        quantity: 100, price: 10.5, filled_quantity: 100, filled_price: 10.5,
+        error_message: null, bar_time: '2026-11-05T09:20:00+08:00' },
+      { id: 12, stock_code: '000009.SZ', trade_type: 'SELL', status: 'filled',
+        quantity: 200, price: 8.0, filled_quantity: 200, filled_price: 8.0,
+        error_message: null, bar_time: '2026-10-30T09:20:00+08:00' },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('委托'))!.trigger('click')
+
+    expect(w.text()).toContain('600000.SH')
+    expect(w.text()).not.toContain('000009.SZ')
+    await w.find('select[aria-label="委托时间范围"]').setValue('all')
+    expect(w.text()).toContain('000009.SZ')
+    spy.mockRestore()
     w.unmount()
   })
 })
@@ -393,7 +640,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
 
   it('启动失败(桥未启动) → alert 告警且不连接流', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
-    ;(startLiveSession as any).mockRejectedValue(new Error('桥未启动：仿真（http://127.0.0.1:8790）— 请先在 iQuant 客户端加载并运行对应桥策略'))
+    ;(startLiveSession as any).mockRejectedValue(new Error('桥未启动：仿真（http://127.0.0.1:8790）— 请先在 QMT 客户端加载并运行对应桥策略'))
     vi.stubGlobal('alert', vi.fn())
     const w = mount(LiveSessions)
     await flushPromises()
@@ -406,6 +653,918 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     // 失败不连流
     expect(FakeEventSource.instances.length).toBe(0)
     vi.unstubAllGlobals()
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
+  it('新建弹窗渲染「实盘资金基准（元）」number 输入 + 占位符 + 说明', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+
+    const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')
+    expect(capInput).toBeTruthy()
+    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 用组合初始资金')
+    expect(w.text()).toContain('实盘资金基准（元）')
+    expect(w.text()).toContain('比率配置等比缩放')
+    expect(w.text()).toContain('多组合各自独立记账')
+    w.unmount()
+  })
+
+  it('填写 live_capital 提交 → 透传数值', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')!
+    await capInput.setValue('1000000')
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: '', mode: 'simulation', portfolio_ids: [1], live_capital: 1000000,
+    }))
+    w.unmount()
+  })
+
+  it('留空 live_capital 提交 → null（用组合初始资金）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      portfolio_ids: [1], live_capital: null,
+    }))
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 执行通道条', () => {
+  it('显示当前引擎并支持只读测试连接', async () => {
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'ths',
+      active: 'ths_ui',
+      label: '同花顺独立交易（UI 自动化）',
+      online: null,
+      engines: [
+        { key: 'iquant', channel: 'iquant_bridge', label: 'QMT 通道', configured: true, detail: '' },
+        { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+        { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
+      ],
+      ths_ui: { enabled: true, available: true, window_title: '网上股票交易系统5.0', client_exe_path: 'D:/xiadan.exe', driver: 'clipboard' },
+      bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+    })
+    ;(testLiveChannel as any).mockResolvedValue({ ok: true, channel: 'ths_ui', positions: 2 })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(getLiveChannel).toHaveBeenCalled()
+    expect(w.text()).toContain('同花顺独立交易（UI 自动化）')
+
+    await w.findAll('button').find((b) => b.text().includes('测试连接'))!.trigger('click')
+    await flushPromises()
+
+    expect(testLiveChannel).toHaveBeenCalledWith('ths_ui')
+    expect(w.text()).toContain('已连接，读到 2 条持仓')
+    w.unmount()
+  })
+
+  it('四引擎清单全部渲染：通道条与新建下拉都不省略 QMT/掘金', async () => {
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'goldminer',
+      active: 'goldminer_bridge',
+      label: '掘金量化（HTTP 桥）',
+      online: null,
+      engine_running: false,
+      engines: [
+        { key: 'goldminer', channel: 'goldminer_bridge', label: '掘金量化（HTTP 桥）', configured: true, detail: '' },
+        { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+        { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
+        { key: 'iquant', channel: 'iquant_bridge', label: 'QMT 通道', configured: true, detail: '' },
+      ],
+      ths_ui: { enabled: false, available: true, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
+      bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const labels = [
+      '掘金量化（HTTP 桥）', '通达信 TQ 交易', '同花顺独立交易（UI 自动化）', 'QMT 通道',
+    ]
+    const badges = w.find('.channel-bar').findAll('.badge').map((b) => b.text())
+    labels.forEach((label) => expect(badges).toContain(label))
+
+    // 新建实盘下拉同样包含四个引擎（顺序与后端清单一致）
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const engineSelect = w.findAll('select').find((s) => s.html().includes('QMT 通道'))
+    expect(engineSelect).toBeTruthy()
+    expect(engineSelect!.findAll('option').map((o) => o.text())).toEqual(labels)
+    w.unmount()
+  })
+
+  it('运行中会话按 session.engine 拉取通道状态', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, engine: 'tdx' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(getLiveChannel).toHaveBeenCalledWith('tdx')
+    w.unmount()
+  })
+
+  it('依赖未安装时以（未配置）红标提示', async () => {
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'iquant',
+      active: 'iquant_bridge',
+      label: 'QMT 通道',
+      online: null,
+      engines: [
+        { key: 'iquant', channel: 'iquant_bridge', label: 'QMT 通道', configured: true, detail: '' },
+        { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: false, detail: '依赖未安装（pywinauto/pyperclip）' },
+      ],
+      ths_ui: { enabled: true, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
+      bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('QMT 通道')
+    expect(w.text()).toContain('同花顺独立交易（UI 自动化）（未配置）')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 执行模式 + 预警信号', () => {
+  it('会话列表按 execution_mode 显示「预警/自动」，引擎列显示通道名', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 11, name: '预警盘', mode: 'live', status: 'stopped', engine: 'iquant', execution_mode: 'alert', started_at: null, stopped_at: null, portfolio_ids: [] },
+      { id: 12, name: '自动盘', mode: 'live', status: 'stopped', engine: 'tdx', execution_mode: 'auto', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const rows = w.findAll('tbody tr')
+    expect(rows.length).toBe(2)
+    expect(rows[0].text()).toContain('预警')
+    expect(rows[0].text()).toContain('QMT 通道')
+    expect(rows[1].text()).toContain('自动')
+    expect(rows[1].text()).toContain('通达信')
+    w.unmount()
+  })
+
+  it('新建表单默认 alert，引擎 select 始终可见（决定信号计算数据源）；提交带 execution_mode', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+
+    // 默认 alert：执行模式 select
+    const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
+    expect(execSelect).toBeTruthy()
+    expect((execSelect!.element as HTMLSelectElement).value).toBe('alert')
+    // alert 模式下引擎 select 也渲染（决定信号计算数据源）
+    expect(w.findAll('select').some((s) => s.html().includes('QMT 通道'))).toBe(true)
+
+    // 切到 auto：引擎 select 仍在
+    await execSelect!.setValue('auto')
+    await flushPromises()
+    expect(w.findAll('select').some((s) => s.html().includes('QMT 通道'))).toBe(true)
+
+    // 提交：带 execution_mode=auto
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      execution_mode: 'auto', portfolio_ids: [1],
+    }))
+    w.unmount()
+  })
+
+  it('新建实盘切 auto：引擎默认跟随后端 default_engine（通道条 engine）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
+    await execSelect!.setValue('auto')
+    await flushPromises()
+
+    // beforeEach mock 的 channel.engine='iquant' → 引擎 select 默认选中 QMT（而非硬编码）
+    const engineSelect = w.findAll('select').find((s) => s.html().includes('QMT 通道'))
+    expect((engineSelect!.element as HTMLSelectElement).value).toBe('iquant')
+    w.unmount()
+  })
+
+  it('通道条消重：默认引擎徽章只出现一次，前缀为「默认引擎」', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // beforeEach mock engine='iquant' 且 engines 清单含同名项 → 消重后首徽章唯一
+    const badges = w.find('.channel-bar').findAll('.badge').map((b) => b.text())
+    expect(badges.filter((t) => t === 'QMT 通道').length).toBe(1)
+    expect(w.text()).toContain('默认引擎')
+    w.unmount()
+  })
+
+  it('运行中会话时通道条前缀切为「运行中通道」且同样消重', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, engine: 'tdx' }])
+    ;(getLiveChannel as any).mockResolvedValue({
+      engine: 'tdx',
+      active: 'tdx_tq',
+      label: '通达信 TQ 交易',
+      online: true,
+      engines: [
+        { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
+        { key: 'iquant', channel: 'iquant_bridge', label: 'QMT 通道', configured: true, detail: '' },
+      ],
+      ths_ui: { enabled: false, available: false, window_title: '', client_exe_path: '', driver: 'clipboard' },
+      bridge: { simulation: '', live: '' },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('运行中通道')
+    const badges = w.find('.channel-bar').findAll('.badge').map((b) => b.text())
+    expect(badges.filter((t) => t === '通达信 TQ 交易').length).toBe(1)
+    w.unmount()
+  })
+
+  it('预警信号 tab → 加载信号列表，显示 alert_status/alert_error', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { ...runningSession, execution_mode: 'alert' },
+    ])
+    ;(getLiveSignals as any).mockResolvedValue({
+      total: 2,
+      items: [
+        {
+          id: 1, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d',
+          bar_time: '2026-10-26T15:00:00', formula_name: 'MACD金叉', signal_name: 'BUY',
+          signal_type: 'OPEN', trigger_value: 1, price: '10.50',
+          execution_mode: 'alert', status: 'new',
+          alert_status: 'sent', alert_error: null, tdx_run_id: 'R123',
+          created_at: '2026-10-26T15:00:01', alerted_at: '2026-10-26T15:00:02',
+        },
+        {
+          id: 2, portfolio_id: 1, strategy_id: 10, stock_code: '000001.SZ', period: '1d',
+          bar_time: '2026-10-26T15:00:00', formula_name: 'MACD金叉', signal_name: 'SELL',
+          signal_type: 'CLOSE', trigger_value: -1, price: '9.80',
+          execution_mode: 'alert', status: 'new',
+          alert_status: 'failed', alert_error: 'send_warn 返回 ErrorId=1001', tdx_run_id: null,
+          created_at: '2026-10-26T15:00:01', alerted_at: null,
+        },
+      ],
+    })
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 10, name: '日线趋势' }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 切到「预警信号」tab
+    const tab = w.findAll('button').find((b) => b.text() === '预警信号')
+    expect(tab).toBeTruthy()
+    await tab!.trigger('click')
+    await flushPromises()
+
+    expect(getLiveSignals).toHaveBeenCalledWith(7, expect.objectContaining({ limit: 200 }))
+    expect(w.text()).toContain('600000.SH')
+    expect(w.text()).toContain('MACD金叉')
+    expect(w.text()).toContain('已发送')
+    expect(w.text()).toContain('发送失败')
+    expect(w.text()).toContain('send_warn 返回 ErrorId=1001')
+    // 组合/子策略名解析
+    expect(w.text()).toContain('稳健组合')
+    expect(w.text()).toContain('日线趋势')
+    w.unmount()
+  })
+
+  it('预警信号 tab 空态：无信号时给出口径说明（audit I3 准确文案）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { ...runningSession, execution_mode: 'alert' },
+    ])
+    ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('暂无预警信号')
+    expect(w.text()).toContain('send_warn')
+    // 准确口径：alert 落库 + send_warn 推送；auto 默认同样推送（审计旁路），均落库
+    expect(w.text()).toContain('审计旁路')
+    expect(w.text()).toContain('落库')
+    // 旧失实文案（auto 仅记录不上送）不再出现
+    expect(w.text()).not.toContain('仅记录信号不上送')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue SSE signal → 预警信号 tab 节流重拉', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('SSE signal 事件 → 2s 节流后重拉 getLiveSignals 更新 tab（payload 不直接映射成行）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '稳健组合', strategies: [{ id: 10, name: '日线趋势' }] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    // 初始 loadHistory 拉一次
+    expect(getLiveSignals).toHaveBeenCalledTimes(1)
+
+    // 只 fake setTimeout/clearTimeout（节流 timer）；flushPromises 走 setImmediate 不受影响
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    ;(getLiveSignals as any).mockResolvedValue({
+      total: 1,
+      items: [{
+        id: 5, portfolio_id: 1, strategy_id: 10, stock_code: '600519.SH', period: '1d',
+        bar_time: '2026-10-27T10:30:00', formula_name: 'MACD金叉', signal_name: 'BUY',
+        signal_type: 'OPEN', trigger_value: 1, price: '1700.00',
+        execution_mode: 'alert', status: 'new',
+        alert_status: 'sent', alert_error: null, tdx_run_id: null,
+        created_at: '2026-10-27T10:30:01', alerted_at: '2026-10-27T10:30:02',
+      }],
+    })
+
+    // SSE payload 是精简形状（signal_id 而非 id）→ 只触发重拉，不直接进表
+    const es = FakeEventSource.instances[0]
+    es.emit('signal', { signal_id: 5, signal_type: 'OPEN', stock_code: '600519.SH' })
+    await flushPromises()
+    // 节流窗口内不重拉
+    expect(getLiveSignals).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(2000)
+    await flushPromises()
+    expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    expect(getLiveSignals).toHaveBeenLastCalledWith(7, { limit: 200 })
+
+    // tab 数据来自重拉结果（完整列形状），非 SSE 精简 payload
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('600519.SH')
+    expect(w.text()).toContain('MACD金叉')
+    w.unmount()
+  })
+
+  it('节流窗口内多条 signal 事件 → 合并为一次重拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const es = FakeEventSource.instances[0]
+    es.emit('signal', { signal_id: 1 })
+    es.emit('signal', { signal_id: 2 })
+    es.emit('signal', { signal_id: 3 })
+    vi.advanceTimersByTime(2000)
+    await flushPromises()
+    // 初始 loadHistory 1 次 + 节流合并后 1 次
+    expect(getLiveSignals).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue loadHistory 与 SSE 竞态补拉（audit C1）', () => {
+  /** 让 getLivePositions 首次调用挂起，返回放行函数（模拟历史请求在途窗口）。
+   *  先 mockReset 清掉前一测试可能残留的 once 实现（避免 once 队列串测试），再重建默认。 */
+  function deferPositions(): () => void {
+    let resolve!: (v: unknown) => void
+    const m = getLivePositions as any
+    m.mockReset()
+    m.mockResolvedValue([])
+    m.mockImplementationOnce(() => new Promise((res) => { resolve = res }))
+    return () => resolve([])
+  }
+
+  it('五请求在途期间 SSE 推过 position/order/trade → resolve 后补拉一次三表历史', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    // 补拉（第二次调用）返回最新持仓，验证补拉结果落到工作台
+    ;(getLivePositions as any).mockResolvedValueOnce([
+      { stock_code: '600519.SH', quantity: 900, avg_cost: 10, market_value: 9000, portfolio_id: 1, strategy_id: 1 },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    es.emit('order', { trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100, price: 10.5 })
+    es.emit('trade', { trade_type: 'BUY', stock_code: '600000.SH', price: 10.5, quantity: 100, amount: 1050 })
+    es.emit('position', { stock_code: '600000.SH', quantity: 100, avg_cost: 10, market_value: 1000 })
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(2)
+    expect(getLiveOrders).toHaveBeenCalledTimes(2)
+    expect(getLiveTrades).toHaveBeenCalledTimes(2)
+    expect(w.text()).toContain('600519.SH')
+    w.unmount()
+  })
+
+  it('在途期间仅 decision/signal 事件 → 不补拉（计数只算 position/order/trade）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    es.emit('decision', { gate: 'max_positions_full', layer: 'signal_gate', action: 'block', stock_code: '600000.SH', message: 'x' })
+    es.emit('signal', { signal_id: 1, signal_type: 'OPEN', stock_code: '600000.SH' })
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(1)
+    expect(getLiveOrders).toHaveBeenCalledTimes(1)
+    expect(getLiveTrades).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
+  it('在途期间无 SSE 事件 → 不补拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const resolvePositions = deferPositions()
+    const w = mount(LiveSessions)
+    await flushPromises()
+    resolvePositions()
+    await flushPromises()
+
+    expect(getLivePositions).toHaveBeenCalledTimes(1)
+    expect(getLiveOrders).toHaveBeenCalledTimes(1)
+    expect(getLiveTrades).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue SSE 心跳流升级重接（D-5）', () => {
+  it('收到 reconnect 事件 → 关闭当前心跳流并重接同一 session 真流，历史重拉', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    expect(getLivePositions).toHaveBeenCalledTimes(1) // 初始 loadHistory
+
+    es.emit('reconnect', { session_id: 7 })
+    await flushPromises()
+
+    expect(es.close).toHaveBeenCalled()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/7/stream')
+    // startEventStream 末尾 loadHistory 重拉
+    expect(getLivePositions).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+
+  it('切换会话后旧流迟到的 reconnect → 不重接旧 session（防循环/串台）', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+
+    // 停止 7 → load() 切到外部已启动的 8
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([
+      { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+    expect(FakeEventSource.instances.length).toBe(2)
+
+    // 旧流（7）迟到的 reconnect：当前绑定已是 8 → 忽略
+    es7.emit('reconnect', { session_id: 7 })
+    await flushPromises()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 会话切换清理 + 停止时序 + 重连状态（audit M3）', () => {
+  it('停止会话：先调 stop API 成功后再关事件流（接收清扫 canceled 终态）', async () => {
+    const order: string[] = []
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    ;(stopLiveSession as any).mockImplementation(async () => {
+      order.push('api')
+      return { id: 7, status: 'stopped' }
+    })
+    ;(getLiveSessions as any).mockResolvedValueOnce([stoppedSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es = FakeEventSource.instances[0]
+    ;(es as any).close = vi.fn(() => { order.push('close') })
+
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(order).toEqual(['api', 'close'])
+    w.unmount()
+  })
+
+  it('切换聚焦会话：工作台清空（不与上一会话混排），事件日志保留（合并流带前缀）', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+    es7.emit('position', { stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350 })
+    es7.emit('order', { trade_type: 'BUY', stock_code: '600000.SH', status: 'submitted', quantity: 100, price: 10.5 })
+    es7.emit('trade', { trade_type: 'BUY', stock_code: '600000.SH', price: 10.5, quantity: 100, amount: 1050 })
+    es7.emit('decision', { gate: 'max_positions_full', layer: 'signal_gate', action: 'block', stock_code: '600000.SH', message: 'x' })
+    await flushPromises()
+    expect(w.text()).toContain('600000.SH')
+
+    // 停止 7 → load() 发现 8 已在外部启动为 running → 聚焦切到 8
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([
+      { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] },
+    ])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    // 工作台已切到空的新会话
+    expect(w.text()).toContain('暂无持仓')
+    // 事件日志保留（多会话合并流）：旧事件带 [#7] 前缀可见
+    expect(w.text()).toContain('[#7 模拟盘A]')
+    w.unmount()
+  })
+
+  it('SSE onerror → 状态显示「连接中」（EventSource 自动重连中，非 closed）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(w.text()).toContain('已连接')
+    const es = FakeEventSource.instances[0] as any
+    es.onerror()
+    await flushPromises()
+    expect(w.text()).toContain('连接中')
+    expect(w.text()).not.toContain('未连接')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 多会话并行监控（M1）', () => {
+  const runningSession2 = { id: 8, name: '模拟盘B', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
+
+  it('存在运行中会话时启动按钮仍可点（B6 全局限 1 已移除，多会话并行）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, { ...runningSession2, status: 'stopped' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
+    expect(startBtn.attributes('disabled')).toBeUndefined()
+    expect(startBtn.attributes('title')).toBeUndefined()
+    w.unmount()
+  })
+
+  it('多 running 会话：并行订阅所有运行中会话的流（事件日志合并带前缀）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(FakeEventSource.instances[0].url).toBe('/api/live/sessions/7/stream')
+    expect(FakeEventSource.instances[1].url).toBe('/api/live/sessions/8/stream')
+    // 首个会话标「工作台聚焦」（仅表示工作台聚焦展示哪个会话，不代表其他会话未被监控）；
+    // 仅第二个 running 行显示「监控」按钮
+    expect(w.text()).toContain('工作台聚焦')
+    // 后端未返回 engine_running 时不显示「监控正常」，避免误报
+    expect(w.text()).not.toContain('监控正常')
+    const watchBtns = w.findAll('button').filter((b) => b.text() === '监控')
+    expect(watchBtns.length).toBe(1)
+    w.unmount()
+  })
+
+  it('「监控正常」绿标仅对 running 且 engine_running=true 的会话显示', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { ...runningSession, engine_running: true },
+      { ...runningSession2, engine_running: false },
+      { ...runningSession2, id: 9, name: '模拟盘C', status: 'stopped', engine_running: true },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 只有 running + engine_running=true 显示绿标
+    const okBadges = w.findAll('.badge').filter((b) => b.text() === '监控正常')
+    expect(okBadges.length).toBe(1)
+    expect(okBadges[0].classes()).toContain('badge-green')
+    // 与「工作台聚焦」互不排斥，可同时出现
+    expect(w.findAll('.badge').filter((b) => b.text() === '工作台聚焦').length).toBe(1)
+    // engine_running=false 维持原红标语义
+    expect(w.text()).toContain('引擎未启动')
+    w.unmount()
+  })
+
+  it('点监控 → 工作台聚焦切换（事件流保持并行，不关旧流）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const es7 = FakeEventSource.instances[0]
+
+    const watchBtn = w.findAll('button').find((b) => b.text() === '监控')!
+    await watchBtn.trigger('click')
+    await flushPromises()
+
+    // 事件流保持并行：不关旧流、不新建流
+    expect(es7.close).not.toHaveBeenCalled()
+    expect(FakeEventSource.instances.length).toBe(2)
+    expect(getLivePositions).toHaveBeenLastCalledWith(8)
+    // 监控中标记随切换移动：已监控行（8）不再显示监控按钮，另一 running 行（7）显示
+    const watchBtns = w.findAll('button').filter((b) => b.text() === '监控')
+    expect(watchBtns.length).toBe(1)
+    w.unmount()
+  })
+
+  it('监控切换后旧会话在途历史不覆盖新会话工作台（防串台）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, runningSession2])
+    let resolve7!: (v: unknown) => void
+    const m = getLivePositions as any
+    m.mockReset()
+    m.mockImplementationOnce(() => new Promise((res) => { resolve7 = res }))
+    m.mockResolvedValueOnce([
+      { stock_code: '000001.SZ', quantity: 500, avg_cost: 12, market_value: 6000, portfolio_id: 1, strategy_id: 1 },
+    ])
+    m.mockResolvedValue([])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const watchBtn = w.findAll('button').find((b) => b.text() === '监控')!
+    await watchBtn.trigger('click')
+    await flushPromises()
+    // 会话 8 历史已展示
+    expect(w.text()).toContain('000001.SZ')
+
+    // 会话 7 的在途历史此刻才 resolve → 不得覆盖会话 8 的工作台
+    resolve7([{ stock_code: '600000.SH', quantity: 700, avg_cost: 10.5, market_value: 7350, portfolio_id: 1, strategy_id: 1 }])
+    await flushPromises()
+    expect(w.text()).not.toContain('600000.SH')
+    expect(w.text()).toContain('000001.SZ')
+    w.unmount()
+  })
+
+  it('监控中的会话停止后，自动回退聚焦其它 running 会话（事件流按会话重整）', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession, runningSession2])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    // 停止 7 → load()：监控中(7) 已不在 running 列表 → 回退聚焦 8
+    ;(stopLiveSession as any).mockResolvedValue({ id: 7, status: 'stopped' })
+    ;(getLiveSessions as any).mockResolvedValueOnce([{ ...runningSession2 }])
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    // 重整后仅剩会话 8 的流（旧的 7/8 两流已关）
+    const last = FakeEventSource.instances[FakeEventSource.instances.length - 1]
+    expect(last.url).toBe('/api/live/sessions/8/stream')
+    expect(FakeEventSource.instances.length).toBe(3)
+    w.unmount()
+  })
+
+  it('通道条提示多会话并行规则（THS 独占 / 复制交易语义）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('支持跨引擎多会话并行')
+    expect(w.text()).toContain('同一引擎同时仅一个会话')
+    expect(w.text()).toContain('复制交易')
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 预警信号同步自选（1.3.1）', () => {
+  const signalTabItems = {
+    total: 3,
+    items: [
+      { id: 1, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'BUY', signal_type: 'OPEN', trigger_value: 1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+      { id: 2, portfolio_id: 1, strategy_id: 10, stock_code: '000001.SZ', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'SELL', signal_type: 'CLOSE', trigger_value: -1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+      { id: 3, portfolio_id: 1, strategy_id: 10, stock_code: '600000.SH', period: '1d', bar_time: null, formula_name: 'F', signal_name: 'BUY', signal_type: 'OPEN', trigger_value: 1, price: null, execution_mode: 'alert', status: 'new', alert_status: 'sent', alert_error: null, tdx_run_id: null, created_at: null, alerted_at: null },
+    ],
+  }
+
+  it('信号 tab 无信号 → 点同步按钮 alert「暂无信号股票」且不调 sendUserBlock', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    await flushPromises()
+
+    expect(alert).toHaveBeenCalledWith(expect.stringContaining('暂无信号股票'))
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('有信号 → prompt 确认后调 sendUserBlock（codes 去重），成功 alert 写入数', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    ;(sendUserBlock as any).mockResolvedValue({ block_code: '创懿预警', count: 2 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿预警'))
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿预警')
+    expect(sendUserBlock).toHaveBeenCalledWith({
+      block_code: deriveBlockCode('创懿预警'), block_name: '创懿预警',
+      stock_codes: ['600000.SH', '000001.SZ'], mode: 'replace',
+    })
+    expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 2 只'))
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('sendUserBlock 失败 → alert 提取后端 message（M5），不裸露网络层英文文案', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    ;(sendUserBlock as any).mockRejectedValue({ response: { data: { message: '通达信未启动' } } })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿预警'))
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(alertMock).toHaveBeenCalledWith('通达信未启动')
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('prompt 取消 → 不调用 sendUserBlock', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, execution_mode: 'alert' }])
+    ;(getLiveSignals as any).mockResolvedValue(signalTabItems)
+    vi.stubGlobal('prompt', () => null)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '预警信号')!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('同步信号股到自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 实盘配置指南弹窗（M2）', () => {
+  it('页头「📖 配置指南」按钮 → 打开弹窗，含三引擎标题与关键词条', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    // 初始无指南弹窗
+    expect(w.find('.modal-lg').exists()).toBe(false)
+
+    await w.find('[data-field="live-guide-toggle"]').trigger('click')
+    await flushPromises()
+
+    const modal = w.find('.modal-lg')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toContain('实盘配置指南')
+    // 一、交易通道选择（三引擎对比）
+    expect(modal.text()).toContain('交易通道选择')
+    expect(modal.text()).toContain('通达信 TQ')
+    expect(modal.text()).toContain('同花顺')
+    expect(modal.text()).toContain('掘金量化')
+    expect(modal.text()).toContain('无人值守首选')
+    expect(modal.text()).toContain('risk_timing')
+    // 二、会话与组合
+    expect(modal.text()).toContain('会话与组合')
+    expect(modal.text()).toContain('复制交易')
+    // 三、实盘执行配置
+    expect(modal.text()).toContain('requote')
+    expect(modal.text()).toContain('split_order_threshold')
+    expect(modal.text()).toContain('risk_timing')
+    // 四、原有持仓
+    expect(modal.text()).toContain('原有持仓')
+    // 五、执行模式
+    expect(modal.text()).toContain('执行模式')
+    // 六、风险提示
+    expect(modal.text()).toContain('风险提示')
+    expect(modal.text()).toContain('同一资金账号禁止挂两个会话')
+    w.unmount()
+  })
+
+  it('弹窗点「关闭」→ 收起', async () => {
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-field="live-guide-toggle"]').trigger('click')
+    await flushPromises()
+    expect(w.find('.modal-lg').exists()).toBe(true)
+
+    await w.findAll('button').find((b) => b.text() === '关闭')!.trigger('click')
+    await flushPromises()
+    expect(w.find('.modal-lg').exists()).toBe(false)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 交易日历可见性', () => {
+  it('degraded=true → 显示红色「交易日历退化」徽标，title 含来源', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveSession as any).mockResolvedValue({
+      account_snapshot: null,
+      trading_calendar: {
+        degraded: true,
+        years: { '2026': { source: 'fail_open', degraded: true } },
+        builtin_years: [],
+        retry_after_seconds: 900,
+      },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const badge = w.find('[data-test="calendar-degraded"]')
+    expect(badge.exists()).toBe(true)
+    expect(badge.text()).toContain('交易日历退化')
+    expect(badge.classes()).toContain('badge-red')
+    expect(badge.attributes('title')).toContain('fail_open')
+    expect(w.find('[data-test="calendar-info"]').exists()).toBe(false)
+    w.unmount()
+  })
+
+  it('degraded=false → 显示灰色摘要行（来源/交易日数/覆盖区间）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveSession as any).mockResolvedValue({
+      account_snapshot: null,
+      trading_calendar: {
+        degraded: false,
+        years: {
+          '2026': { source: 'primary', degraded: false, trading_days: 203, coverage: ['2026-01-05', '2026-11-06'] },
+        },
+        builtin_years: [],
+        retry_after_seconds: 900,
+      },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const info = w.find('[data-test="calendar-info"]')
+    expect(info.exists()).toBe(true)
+    expect(info.text()).toContain('primary')
+    expect(info.text()).toContain('203 个交易日')
+    expect(info.text()).toContain('2026-01-05 ~ 2026-11-06')
+    expect(w.find('[data-test="calendar-degraded"]').exists()).toBe(false)
+    w.unmount()
+  })
+
+  it('trading_calendar=null → 不渲染任何日历信息', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveSession as any).mockResolvedValue({ account_snapshot: null, trading_calendar: null })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.find('[data-test="calendar-degraded"]').exists()).toBe(false)
+    expect(w.find('[data-test="calendar-info"]').exists()).toBe(false)
     w.unmount()
   })
 })

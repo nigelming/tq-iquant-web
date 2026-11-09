@@ -136,9 +136,15 @@ class Evaluator:
             if dd > max_dd:
                 max_dd = dd
 
-        mean_dr = sum(daily_returns) / len(daily_returns)
-        variance = sum((r - mean_dr) ** 2 for r in daily_returns) / len(daily_returns)
-        volatility = math.sqrt(variance * 252)
+        # 单日回测（区间内只有 1 个交易日，快照≥2 但按日聚合只有 1 行）时
+        # daily_returns 为空，直接 sum/len 会除零；此时波动率按 0 处理，
+        # sharpe 上层已对 volatility==0 退化，var/cvar 因样本<20 保持 None。
+        if daily_returns:
+            mean_dr = sum(daily_returns) / len(daily_returns)
+            variance = sum((r - mean_dr) ** 2 for r in daily_returns) / len(daily_returns)
+            volatility = math.sqrt(variance * 252)
+        else:
+            volatility = 0.0
 
         rf = RISK_FREE_RATE
         sharpe = (annual_return - rf) / volatility if volatility > 0 else 0
@@ -270,6 +276,10 @@ class Evaluator:
         for i in range(1, len(rows)):
             prev = rows[i - 1]["total_value"]
             cur = rows[i]["total_value"]
+            # 总资产为 0/负只可能来自退化数据（异常快照）；直接除会抛
+            # ZeroDivisionError（Decimal）或给出无意义收益率，跳过该日。
+            if prev <= 0:
+                continue
             returns.append(float((cur - prev) / prev))
         return returns
 
@@ -440,7 +450,9 @@ class Evaluator:
     #
     # 口径约定（固化，勿随手感改）：
     # - 年化换手率 = 双边成交额（BUY+SELL amount 全计）/ 日均总净值 / 自然年数
-    # - 成本占比 =（佣金 + 印花税）/ 首日总净值（≈初始资金）
+    #   （双边口径，约为单边换手率 2 倍；前端标签须标「双边」）
+    # - 成本占比 =（佣金 + 印花税）/ 期间日均总净值
+    #   （与换手率同分母；不用首日净值，避免长周期/高增长记录被放大）
     # - 仓位利用率 = mean(market_value / total_value)，按日收盘
     # - 空仓日 = 当日 market_value <= 0
     # - 单票权重 = 个股市值 / 组合总净值（含现金口径）；HHI = 日 Σw² 再按日均值
@@ -459,13 +471,12 @@ class Evaluator:
             sum((r["total_value"] for r in daily_rows), Decimal("0")) / n_rows
             if n_rows else Decimal("0")
         )
-        start_value = daily_rows[0]["total_value"] if daily_rows else Decimal("0")
 
         turnover = (
             float(total_amount / avg_total) / years if avg_total > 0 else None
         )
         cost_ratio = (
-            total_cost / start_value if start_value > 0 else None
+            total_cost / avg_total if avg_total > 0 else None
         )
         return {
             "annual_turnover": (

@@ -295,9 +295,18 @@ def backfill_record(db: Session, record_id: int, force: bool = False,
     replayed = replay_positions(trades, dates)
     held_codes = sorted({slot["stock_code"] for day in replayed.values()
                          for slot in day})
-    close = (provider(held_codes, snaps[0].snap_date, snaps[-1].snap_date)
-             if held_codes else {})
-    missing = [c for c in held_codes if c not in (close or {})]
+    close: Dict[str, Dict[date, Decimal]] = {}
+    if held_codes:
+        # 取价是外部 I/O（TQ SDK / 行情源），任一异常不得外抛——本函数契约是
+        # 「绝不抛异常」。CLI 批量回填逐条循环，一条抛异常会中断整个列表。
+        try:
+            close = provider(held_codes, snaps[0].snap_date,
+                             snaps[-1].snap_date) or {}
+        except Exception as e:
+            return {"status": "failed", "record_id": record_id,
+                    "error": "取价失败: %s" % e,
+                    "cash_check": cash_check, "written": False}
+    missing = [c for c in held_codes if c not in close]
 
     # 3) 逐日估值 + 缩放
     k_by_date: Dict[date, Decimal] = {}

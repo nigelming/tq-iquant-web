@@ -27,25 +27,43 @@ def signal_type_from_str(s: str) -> SignalType:
     raise ValueError("unknown signal_type: %s" % s)
 
 
-def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
-                       enable_manual_recovery: bool = True) -> Portfolio:
+def assemble_portfolio(
+    ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
+    initial_capital_override=None, enable_manual_recovery: bool = True,
+) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
     cost_params 来自组合表，供 SimulatedDispatcher（回测）透传成本参数；
     实盘 HttpBridgeDispatcher 不用 cost_params（真实成本从 /deals 回报取），
     但 Portfolio 仍持有以备恢复/评估时记账。
 
-    enable_manual_recovery：实盘 True（累计 3 次熔断转手动）；回测传 False
-    （无人工恢复入口，避免永久停机，见 run_backtest 调用点）。
+    initial_capital_override（实盘资金基准，可选，**账户总资产口径**）：非 None 时
+    覆盖组合表的 initial_capital 起账——实盘资金与组合配置不一致时，让全部比率型
+    配置（资金占比/单仓/敞口/熔断分母）等比缩放。实盘启动后继承持仓的市值由
+    LiveEngine 从起账现金中扣除（见 _import_external_positions），避免与基准双计；
+    回测调用点不传（无继承持仓），行为不变。
+
+    enable_manual_recovery：实盘 True（累计 3 次熔断转手动）；回测 False
+    （无人工恢复入口，避免永久停机，由 run_backtest 调用点显式传入）。
     """
+    initial_capital = (
+        Decimal(str(initial_capital_override))
+        if initial_capital_override is not None
+        else Decimal(str(ps.initial_capital))
+    )
     pm = PortfolioRiskManager(
         max_drawdown=Decimal(str(ps.max_drawdown)),
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
         enable_manual_recovery=enable_manual_recovery,
     )
+    # 日内亏损熔断分母：equity（默认）=上一交易日收盘净值；initial=初始资金（旧口径）。
+    # 回测/实盘共用，故口径在此统一注入。
+    pm.daily_loss_on_equity_enabled = (
+        (getattr(ps, "daily_loss_basis", None) or "equity") != "initial"
+    )
     port = Portfolio(
         portfolio_id=ps.id,
-        initial_capital=Decimal(str(ps.initial_capital)),
+        initial_capital=initial_capital,
         risk_manager=pm,
         position_sizing=getattr(ps, "position_sizing", None) or "dynamic",
         cost_params={
@@ -58,6 +76,9 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
     )
     # #1 涨跌停约束（默认开；仅回测成交步生效）
     port.price_limit_check_enabled = bool(getattr(ps, "price_limit_check_enabled", True))
+    # 组合级 max_holdings / trading_session（历史死配置首次接线，回测/实盘共用生效）
+    port.max_holdings = int(getattr(ps, "max_holdings", 0) or 0)
+    port.trading_session = getattr(ps, "trading_session", None) or "full"
     # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
     port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
     _vol_ratio = getattr(ps, "volume_limit_ratio", None)
@@ -118,8 +139,25 @@ def assemble_portfolio(ps: PortfolioStrategy, strategies: List[Strategy], db: Se
                 else None
             ),
             trend_max_positions=getattr(strat, "trend_max_positions", None),
-            # #3 策略级敞口上限（可选，默认关；仅回测成交步生效）
+            # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
+            # 单笔最大买入金额（元，可选 None=不限；回测/实盘双端 cap_quantity 生效）
+            max_order_amount=(
+                Decimal(str(getattr(strat, "max_order_amount", None)))
+                if getattr(strat, "max_order_amount", None) is not None
+                else None
+            ),
+            # 实盘执行配置（批次1，默认关/保守默认；关闭时行为与原逻辑一致）
+            requote_enabled=bool(getattr(strat, "requote_enabled", False)),
+            requote_max_attempts=getattr(strat, "requote_max_attempts", None) or 2,
+            split_order_enabled=bool(getattr(strat, "split_order_enabled", False)),
+            split_order_threshold=Decimal(str(
+                getattr(strat, "split_order_threshold", None) or "500000")),
+            risk_timing=getattr(strat, "risk_timing", None) or "next_day",
+            signal_frequency=strat.signal_frequency,
+            signal_at=strat.signal_at,
+            signal_weekday=strat.signal_weekday,
+            signal_data_end=strat.signal_data_end,
         )
         # 从 formula_signals 表读信号配置
         sigs = db.query(FormulaSignal).filter_by(formula_id=strat.formula_id).all()

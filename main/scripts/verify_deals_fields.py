@@ -1,15 +1,15 @@
 # -*- coding: gbk -*-
 # verify_deals_fields.py - verify /deals fields (G4) + order matching key (G3)
 # =====================================================
-# Runs INSIDE the iQuant client as a strategy (Python 3.6, GBK editor).
+# Runs INSIDE the QMT client as a strategy (Python 3.6, GBK editor).
 # Pure ASCII comments, stdlib only. It calls get_trade_detail_data DIRECTLY
-# (injected into globals by iQuant), NOT the bridge's HTTP /deals - because
+# (injected into globals by QMT), NOT the bridge's HTTP /deals - because
 # the bridge's query_deals only returns 4 fields today, which is exactly what
 # G4 asks whether it is enough.
 #
 # IMPORTANT: this script does NOT depend on the bridge. It places the order
 # directly via passorder and queries deals directly via get_trade_detail_data.
-# Reason: iQuant runs strategies serially in one client instance - the bridge's
+# Reason: QMT runs strategies serially in one client instance - the bridge's
 # init blocks the main loop forever, so a verify script in the same instance
 # never runs until the bridge stops. Running the order through the bridge would
 # require the bridge to be alive, which blocks this script. So bypass it.
@@ -28,17 +28,17 @@
 #     (stock + direction + qty + time).
 #
 # Usage:
-#   1. copy the WHOLE file into the iQuant strategy editor as-is (GBK-safe).
+#   1. copy the WHOLE file into the QMT strategy editor as-is (GBK-safe).
 #   2. set ACCOUNT below to your account (same as bridge).
 #   3. STOP the bridge strategy first (serial execution - bridge blocks).
-#   4. run THIS script as the only strategy; output goes to iQuant log panel.
+#   4. run THIS script as the only strategy; output goes to QMT log panel.
 #   5. PHASE 1 runs automatically. To also run PHASE 2 (one real order),
 #      set PLACE_ORDER = True and run once more.
 import time
 
 
 # ================= config =================
-ACCOUNT = "110002348760"      # TODO: change to your account (same as bridge)
+ACCOUNT = "410038214257"      # QMT paper account 410038214257 (bridge 8790, "STOCK")
 ORDER_CODE = "600000.SH"      # stock for the real order (active, liquid)
 ORDER_OP = "buy"              # "buy" = safe (needs cash); "sell" = needs holding
 ORDER_VOLUME = 100            # 1 lot = 100 shares (minimum)
@@ -53,7 +53,7 @@ _CTX = None
 
 
 def _iq(name):
-    """iQuant injects get_trade_detail_data/passorder into globals()."""
+    """QMT injects get_trade_detail_data/passorder into globals()."""
     return globals().get(name)
 
 
@@ -108,7 +108,7 @@ def phase1():
 def _place_passorder(code, op, volume, price):
     """Place one order directly via passorder (no bridge).
 
-    iQuant real C++ signature (same as bridge, verified returns 0 = accepted):
+    QMT real C++ signature (same as bridge, verified returns 0 = accepted):
       passorder(opType, orderType, accountID, orderCode, prType, price,
                 volume, strategyName, quickTrade, ContextInfo)
     opType: 23 buy, 24 sell; orderType=1101; prType=14 opposite best price.
@@ -238,7 +238,7 @@ def init(ContextInfo):
     print("=" * 70)
     print("[VERIFY] start %s  account=%s  PLACE_ORDER=%s"
           % (time.strftime("%Y-%m-%d %H:%M:%S"), ACCOUNT, PLACE_ORDER))
-    print("[VERIFY] run during trading hours; logs go to the iQuant panel")
+    print("[VERIFY] run during trading hours; logs go to the QMT panel")
     print("=" * 70)
     phase1()
     phase2()

@@ -351,7 +351,7 @@ def main():
     if overall:
         print("\n[总判定 PASS] 内存注入可行：实盘可用 get_market_data(桥/xtdata) → format → set_data")
         print("  → process_mul_zb 链路算公式，不依赖 .lc1 盘后落盘。")
-        print("  下一步：实盘 LiveEngine 接入此链路，盘中注入 iQuant 桥拉的实时 bar。")
+        print("  下一步：实盘 LiveEngine 接入此链路，盘中注入 QMT 桥拉的实时 bar。")
     else:
         print("\n[总判定 未通过] 请看上方明细：")
         print("  - 若是「无信号(无 1)」→ 对比无意义，扩大范围重试：")

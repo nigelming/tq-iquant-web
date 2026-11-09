@@ -59,6 +59,17 @@ def test_total_return_intraday_first_day_uses_daily_close():
     assert abs(float(result["total_return"]) - 0.1011) > 1e-6
 
 
+def test_single_trading_day_does_not_divide_by_zero():
+    """区间只有 1 个交易日（同日多 bar）：日收益序列为空，评估不应除零。"""
+    result = Evaluator().evaluate([
+        _snap(100000, date(2024, 1, 2)),
+        _snap(101000, date(2024, 1, 2)),
+    ])
+    assert result
+    assert result["volatility"] == Decimal("0")
+    assert result["sharpe_ratio"] == Decimal("0")
+
+
 def test_max_drawdown():
     ev = Evaluator()
     result = ev.evaluate([
@@ -455,10 +466,12 @@ def _pos_snap(total, holdings, d):
 
 
 def test_cost_and_turnover_metrics():
-    """双边成交额 20000、费用 5+5+10=20：年化换手与成本占初始资金比。"""
+    """双边成交额 20000、费用 5+5+10=20：换手与成本同用「日均总净值」为分母。"""
     from datetime import timedelta
+    # 净值 100000→340000，日均 220000（与首日 100000 区分，锁定分母口径）
     snaps = [
-        _snap(100000, date(2024, 1, 1) + timedelta(days=i)) for i in range(25)
+        _snap(100000 + i * 10000, date(2024, 1, 1) + timedelta(days=i))
+        for i in range(25)
     ]
     trades = [
         _trade("A", TradeType.BUY, 10, 1000, datetime(2024, 1, 2, 10, 0)),
@@ -468,9 +481,9 @@ def test_cost_and_turnover_metrics():
     result = Evaluator().evaluate(snaps, trades=trades)
 
     years = 24 / 365.25
-    expected_turnover = (Decimal("20000") / Decimal("100000")) / Decimal(str(years))
+    expected_turnover = (Decimal("20000") / Decimal("220000")) / Decimal(str(years))
     assert result["annual_turnover"] == expected_turnover.quantize(Decimal("0.0001"))
-    assert result["total_cost_ratio"] == Decimal("0.000200")  # 20/100000
+    assert result["total_cost_ratio"] == Decimal("0.000091")  # 20/220000
 
 
 def test_cost_metrics_no_trades_are_zero():
@@ -564,3 +577,13 @@ def test_position_structure_none_without_payload():
     result = Evaluator().evaluate(snaps)
     assert result["max_single_weight"] is None
     assert result["hhi"] is None
+
+
+def test_returns_from_rows_skips_nonpositive_prev():
+    """前一日总资产为 0/负（退化快照）时跳过该日：Decimal 除法会抛 ZeroDivisionError。"""
+    rows = [
+        {"total_value": Decimal("0")},
+        {"total_value": Decimal("100000")},
+        {"total_value": Decimal("110000")},
+    ]
+    assert Evaluator._returns_from_rows(rows) == [0.1]

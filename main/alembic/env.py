@@ -14,7 +14,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-from core.config import load_config
+from core.config import app_root, load_config, use_app_root
 from core.models import Base
 
 target_metadata = Base.metadata
@@ -25,12 +25,12 @@ _MAIN_DIR = Path(__file__).resolve().parent.parent
 
 
 def _db_url() -> str:
-    """从 config.yaml 读取数据库连接串，与 core.db 同源。"""
+    """从 config.yaml 读取数据库连接串，与 core.db 同源（打包版锚到可写根目录）。"""
     cfg = load_config()
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     db_file = Path(sqlite_path)
     if not db_file.is_absolute():
-        db_file = _MAIN_DIR / sqlite_path
+        db_file = (app_root() if use_app_root() else _MAIN_DIR) / sqlite_path
     return f"sqlite:///{db_file.as_posix()}"
 
 

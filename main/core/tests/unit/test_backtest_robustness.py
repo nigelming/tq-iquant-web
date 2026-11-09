@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from core.engine.backtest_robustness import analyze_robustness
@@ -30,6 +30,18 @@ def test_annual_returns_and_mdd():
     assert round(annual["2025"]["return"], 4) == 0.1    # 121 -> 133.1
     assert r["total_return"] == round(133.1 / 100 - 1, 4)
     assert r["years_positive"] == "2/2"
+
+
+def test_zero_net_value_returns_none_instead_of_crashing():
+    """首末净值为 0 时 _return_ratio 返回 None，不能 round(None) 抛 TypeError。"""
+    snaps = _curve([
+        (date(2024, 1, 2), 0.0),
+        (date(2024, 1, 3), 0.0),
+        (date(2025, 1, 2), 0.0),
+    ])
+    r = analyze_robustness(snaps, [], oos_ratio=0.25)
+    assert r["total_return"] is None
+    assert r["benchmark_return"] is None
 
 
 def test_rolling_3y_cagr():
@@ -104,6 +116,80 @@ def test_concentration_from_trades():
     assert top[0]["pnl"] == 890
     total = 490 + (-210) + 890
     assert abs(conc["top20_share"] - total / total) < 1e-6  # 3 只全在前20 → 100%
+
+
+def test_concentration_separates_unrealized_from_realized():
+    """期末未平仓不得按现金流口径计入已实现净利（旧实现会把这笔买入成本算成负贡献）。"""
+    trades = [
+        {"stock_code": "A.SZ", "trade_type": "BUY", "amount": 1000,
+         "commission": 0, "stamp_duty": 0, "price": 10, "quantity": 100},
+        {"stock_code": "A.SZ", "trade_type": "SELL", "amount": 720,
+         "commission": 0, "stamp_duty": 0, "price": 12, "quantity": 60},
+    ]
+    last_positions = [{"stock_code": "A.SZ", "quantity": "40",
+                       "cost_value": "400", "market_value": "480"}]
+    snaps = ([{"snap_date": date(2024, 1, 2), "total_value": 100, "benchmark_value": None,
+               "positions": None},
+              {"snap_date": date(2024, 12, 31), "total_value": 200, "benchmark_value": None,
+               "positions": last_positions}])
+    conc = analyze_robustness(snaps, trades, oos_ratio=0.5)["concentration"]
+    # 已实现只认已平仓的 60 股：(12-10)*60 = 120；剩余 400 元成本不进已实现
+    assert conc["total_realized_pnl"] == 120
+    assert conc["gross_profit"] == 120
+    assert conc["gross_loss"] == 0
+    assert conc["unrealized"]["total_pnl"] == 80      # 480 - 400
+    assert conc["unrealized"]["cost"] == 400
+    assert [r["code"] for r in conc["unrealized"]["rows"]] == ["A.SZ"]
+    assert conc["lots"]["count"] == 1
+    assert conc["lots"]["top"][0]["pnl"] == 120
+
+
+def test_concentration_shares_report_both_denominators():
+    """占比同时给毛利与净利两个分母：净利受亏损抵扣，占比可 >100%。"""
+    trades = [
+        {"stock_code": "W.SZ", "trade_type": "BUY", "amount": 1000, "commission": 0,
+         "stamp_duty": 0, "price": 10, "quantity": 100},
+        {"stock_code": "W.SZ", "trade_type": "SELL", "amount": 1100, "commission": 0,
+         "stamp_duty": 0, "price": 11, "quantity": 100},
+        {"stock_code": "L.SZ", "trade_type": "BUY", "amount": 1000, "commission": 0,
+         "stamp_duty": 0, "price": 10, "quantity": 100},
+        {"stock_code": "L.SZ", "trade_type": "SELL", "amount": 950, "commission": 0,
+         "stamp_duty": 0, "price": 9.5, "quantity": 100},
+    ]
+    snaps = _curve([(date(2024, 1, 2), 100), (date(2024, 12, 31), 200)])
+    conc = analyze_robustness(snaps, trades, oos_ratio=0.5)["concentration"]
+    assert conc["gross_profit"] == 100 and conc["gross_loss"] == 50
+    assert conc["total_realized_pnl"] == 50
+    top = {t["code"]: t for t in conc["top"]}
+    assert top["W.SZ"]["share_gross"] == 1.0        # 100/100
+    assert top["W.SZ"]["share_net"] == 2.0          # 100/50
+    assert conc["top20_share"] == 1.0               # 50/50
+    assert conc["top20_share_gross"] == 1.0         # 50/100
+
+
+def test_concentration_lots_hhi_and_cumulative():
+    """单笔贡献分布：4 笔等额盈利 → HHI=0.25、等效来源 4 笔；累计占比单调递增。"""
+    trades = []
+    for i, code in enumerate(["A.SZ", "B.SZ", "C.SZ", "D.SZ"]):
+        trades += [
+            {"stock_code": code, "trade_type": "BUY", "amount": 1000, "commission": 0,
+             "stamp_duty": 0, "price": 10, "quantity": 100,
+             "bar_time": datetime(2024, 1, 2)},
+            {"stock_code": code, "trade_type": "SELL", "amount": 1025, "commission": 0,
+             "stamp_duty": 0, "price": 10.25, "quantity": 100,
+             "bar_time": datetime(2024, 6, 3)},
+        ]
+    snaps = _curve([(date(2024, 1, 2), 100), (date(2024, 12, 31), 200)])
+    lots = analyze_robustness(snaps, trades, oos_ratio=0.5)["concentration"]["lots"]
+    assert lots["count"] == 4 and lots["winners"] == 4
+    assert lots["hhi"] == 0.25
+    assert lots["effective_sources"] == 4.0
+    cum = lots["cumulative"]
+    assert cum[0]["n"] == 1 and abs(cum[0]["share_gross"] - 0.25) < 1e-9
+    assert cum[-1]["share_gross"] == 1.0
+    assert lots["top"][0]["share_gross"] == 0.25
+    assert lots["top"][0]["buy_date"] == "2024-01-02"
+    assert lots["top"][0]["sell_date"] == "2024-06-03"
 
 
 def test_benchmark_return_tracked():

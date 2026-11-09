@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+import re
 
 from core.api.response import err, ok
 from core.db import get_db
@@ -32,11 +33,12 @@ from core.services.strategy_service import (
     delete_strategy as _svc_delete_strategy,
     count_slave_strategies as _svc_count_slave_strategies,
 )
+from core.services.signal_schedule import validate_signal_config
 
 router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
 # 枚举校验集合（出处：docs/system-plan-draft.md §5.3.2）
-# 周期取 TQ 公式支持 ∩ iQuant 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
+# 周期取 TQ 公式支持 ∩ QMT 桥 xtdata 本地读取白名单的交集（open-questions Q4）。
 # 实盘三段式（C6）：1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；
 # 1w/1mon 桥端 xtdata 拉不到，走通达信 TQFormula.compute 启动/日终注入（见 live_engine._STARTUP_ONLY_PERIODS）。
 # 注意 60h 两端都不认（TQ periodstr error + xtdata 白名单是 1h 不是 60m）。
@@ -47,6 +49,8 @@ VALID_SLAVE_EXIT_MODES = {"independent", "follow_master"}
 VALID_TRADING_SESSIONS = {"full", "am", "pm"}  # draft:499，非 morning/afternoon
 VALID_STATUSES = {"active", "archived"}  # draft:500
 VALID_POSITION_SIZING = {"dynamic", "fixed"}  # W2 仓位模型：动态净资产/固定名义
+VALID_DAILY_LOSS_BASIS = {"equity", "initial"}  # 日内亏损分母：昨收净值（默认）/ 初始资金
+VALID_RISK_TIMINGS = {"next_day", "immediate"}  # 实盘风控/信号执行时点（批次1）
 
 
 class StrategyItem(BaseModel):
@@ -77,6 +81,19 @@ class StrategyItem(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
+    # （回测/实盘双端生效）
+    max_order_amount: float | None = None
+    # 实盘执行配置（批次1，默认关/保守默认）
+    requote_enabled: bool = False
+    requote_max_attempts: int = 2
+    split_order_enabled: bool = False
+    split_order_threshold: float = 500000.0
+    risk_timing: str = "next_day"
+    signal_frequency: str | None = None
+    signal_at: str | None = None
+    signal_weekday: int | None = None
+    signal_data_end: str | None = None
 
 
 class PortfolioCreate(BaseModel):
@@ -103,6 +120,9 @@ class PortfolioCreate(BaseModel):
     slippage_impact_coef: float | None = None
     # W2 仓位模型：dynamic=动态净资产（默认）/ fixed=固定名义
     position_sizing: str = "dynamic"
+    # 日内亏损熔断分母：equity=上一交易日收盘净值（默认）/ initial=初始资金（旧口径）
+    # None=请求未携带：新建兜底 equity，编辑不动已有值（避免 API 直调被静默重置）
+    daily_loss_basis: str | None = None
     # W2 现金管理增强（预留，默认关）：命中任一阈值记决策事件（不自动下单）
     cash_enhance_enabled: bool = False
     cash_enhance_equity_threshold: float | None = None
@@ -171,6 +191,62 @@ def _check_portfolio_slaves_subset(
     return None
 
 
+def _validate_strategy_numerics(req, label: str = "") -> str | None:
+    """子策略数值字段范围校验（组合批量校验与独立子策略端点共用）。
+    注意：止损/止盈/移动止损允许 0 = 禁用该风控（合法值）。"""
+    checks = [
+        ("max_positions", req.max_positions, lambda v: v >= 1, "须 ≥ 1"),
+        ("single_open_ratio", req.single_open_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]"),
+        ("stop_loss_ratio", req.stop_loss_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]（0=禁用止损）"),
+        ("take_profit_ratio", req.take_profit_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]（0=禁用止盈）"),
+        ("trailing_stop_ratio", req.trailing_stop_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]（0=禁用移动止损）"),
+        ("add_position_ratio", req.add_position_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]"),
+        ("reduce_position_ratio", req.reduce_position_ratio, lambda v: 0 <= v <= 1, "须在 [0,1]"),
+    ]
+    for field, val, ok, hint in checks:
+        if not ok(val):
+            return f"{label}{field} {hint}，收到 {val}"
+    # 单笔最大买入金额（可选，None=不限）：非 None 须 > 0
+    _moa = getattr(req, "max_order_amount", None)
+    if _moa is not None and _moa <= 0:
+        return f"{label}单笔最大金额须大于 0，收到 {_moa}"
+    return None
+
+
+def _validate_execution_config(req, label: str = "") -> str | None:
+    """实盘执行配置校验（批次1，组合批量与独立子策略端点共用）。
+
+    requote/split 互不依赖可独立开关，不做联动校验。
+    """
+    if not (0 <= req.requote_max_attempts <= 10):
+        return f"{label}requote_max_attempts 须在 [0,10]，收到 {req.requote_max_attempts}"
+    if req.split_order_threshold < 0:
+        return f"{label}split_order_threshold 不能为负，收到 {req.split_order_threshold}"
+    if req.risk_timing not in VALID_RISK_TIMINGS:
+        return (
+            f"{label}risk_timing 必须为 {sorted(VALID_RISK_TIMINGS)}，"
+            f"收到 {req.risk_timing}"
+        )
+    return None
+
+
+def _validate_portfolio_numerics(req) -> str | None:
+    """组合数值字段范围校验：负佣金/负滑点会静默污染回测结果，须入口拦截。"""
+    if req.initial_capital <= 0:
+        return f"initial_capital 必须 > 0，收到 {req.initial_capital}"
+    if req.max_holdings < 1:
+        return f"max_holdings 须 ≥ 1，收到 {req.max_holdings}"
+    if req.min_commission < 0:
+        return f"min_commission 不能为负，收到 {req.min_commission}"
+    for field in ("buy_commission_rate", "sell_commission_rate", "stamp_duty_rate", "slippage"):
+        val = getattr(req, field)
+        if not (0 <= val <= 0.5):
+            return f"{field} 须在 [0, 0.5]，收到 {val}"
+    if req.benchmark_index and not re.fullmatch(r"\d{6}\.[A-Za-z]{2,4}", req.benchmark_index):
+        return f"benchmark_index 格式须为 6 位代码.市场（如 000300.SH），收到 {req.benchmark_index!r}"
+    return None
+
+
 def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
     if not req.name.strip():
@@ -183,12 +259,20 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         return f"max_drawdown 必须在 (0,1)，收到 {req.max_drawdown}"
     if not (0 < req.daily_loss_limit < 1):
         return f"daily_loss_limit 必须在 (0,1)，收到 {req.daily_loss_limit}"
+    num_msg = _validate_portfolio_numerics(req)
+    if num_msg:
+        return num_msg
     if req.volume_limit_ratio is not None and not (0 < req.volume_limit_ratio <= 1):
         return f"volume_limit_ratio 必须在 (0,1]，收到 {req.volume_limit_ratio}"
     if req.slippage_impact_coef is not None and not (0 < req.slippage_impact_coef <= 1):
         return f"slippage_impact_coef 必须在 (0,1]，收到 {req.slippage_impact_coef}"
     if req.position_sizing not in VALID_POSITION_SIZING:
         return f"position_sizing 必须为 {sorted(VALID_POSITION_SIZING)}，收到 {req.position_sizing}"
+    if req.daily_loss_basis is not None and req.daily_loss_basis not in VALID_DAILY_LOSS_BASIS:
+        return (
+            f"daily_loss_basis 必须为 {sorted(VALID_DAILY_LOSS_BASIS)}，"
+            f"收到 {req.daily_loss_basis}"
+        )
     if req.cash_enhance_position_ratio_threshold is not None and not (
         0 < req.cash_enhance_position_ratio_threshold <= 1
     ):
@@ -208,13 +292,45 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             return f"子策略[{idx}] role 必须为 {sorted(VALID_ROLES)}，收到 {s.role}"
         if s.period not in VALID_PERIODS:
             return f"子策略[{idx}] period 必须为 {sorted(VALID_PERIODS)}，收到 {s.period}"
+        # 预警调度 + 轮动/趋势参数校验（与单策略端点 _validate_strategy 同口径）。
+        # 批量路径才是「新建/编辑组合」的真实入口：缺这段会让非法配置静默落库，
+        # 下游 parse_signal_at 静默回退 14:30、portfolio_builder 静默改 20。
+        sig_msg = validate_signal_config(
+            s.period, getattr(s, "signal_frequency", None),
+            getattr(s, "signal_at", None),
+            getattr(s, "signal_weekday", None),
+            getattr(s, "signal_data_end", None),
+        )
+        if sig_msg:
+            return f"子策略[{idx}] {sig_msg}"
+        if not (1 <= s.rotation_momentum_bars <= 250):
+            return (f"子策略[{idx}] rotation_momentum_bars 须在 [1,250]，"
+                    f"收到 {s.rotation_momentum_bars}")
+        if not (0 <= s.rotation_hysteresis <= 1):
+            return (f"子策略[{idx}] rotation_hysteresis 须在 [0,1]，"
+                    f"收到 {s.rotation_hysteresis}")
+        if (s.trend_trailing_stop_ratio is not None
+                and not (0 < s.trend_trailing_stop_ratio <= 1)):
+            return (f"子策略[{idx}] trend_trailing_stop_ratio 须在 (0,1]，"
+                    f"收到 {s.trend_trailing_stop_ratio}")
+        if s.trend_max_positions is not None and s.trend_max_positions < 1:
+            return (f"子策略[{idx}] trend_max_positions 须 ≥ 1，"
+                    f"收到 {s.trend_max_positions}")
         if not (0 < s.capital_ratio <= 1):
             return f"子策略[{idx}] capital_ratio 必须在 (0,1]，收到 {s.capital_ratio}"
+        # 数值字段范围校验（max_positions/开平仓比例/风控比例）
+        num_msg = _validate_strategy_numerics(s, f"子策略[{idx}] ")
+        if num_msg:
+            return num_msg
         # 加仓阈值：-1=特殊值（任何价格都加），0=不涨即加，正常 (0,1]
         if s.add_position_threshold != -1 and not (0 <= s.add_position_threshold <= 1):
             return f"子策略[{idx}] 加仓阈值须为 -1（任何价都加）或 [0,1]，收到 {s.add_position_threshold}"
         if not (0 <= s.max_add_count <= 10):
             return f"子策略[{idx}] 加仓次数须在 [0,10]（0=禁加仓），收到 {s.max_add_count}"
+        # 实盘执行配置（批次1）
+        exec_msg = _validate_execution_config(s, f"子策略[{idx}] ")
+        if exec_msg:
+            return exec_msg
         if not db.query(Formula).filter(Formula.id == s.formula_id).first():
             return f"子策略[{idx}] 公式 id={s.formula_id} 不存在"
         # 主从配置期校验
@@ -338,6 +454,19 @@ class StrategyCreate(BaseModel):
     trend_max_positions: int | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
+    # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
+    # （回测/实盘双端生效）
+    max_order_amount: float | None = None
+    # 实盘执行配置（批次1，默认关/保守默认）
+    requote_enabled: bool = False
+    requote_max_attempts: int = 2
+    split_order_enabled: bool = False
+    split_order_threshold: float = 500000.0
+    risk_timing: str = "next_day"
+    signal_frequency: str | None = None
+    signal_at: str | None = None
+    signal_weekday: int | None = None
+    signal_data_end: str | None = None
 
 
 def _validate_strategy(
@@ -353,8 +482,18 @@ def _validate_strategy(
         return f"role 必须为 {sorted(VALID_ROLES)}，收到 {req.role}"
     if req.period not in VALID_PERIODS:
         return f"period 必须为 {sorted(VALID_PERIODS)}，收到 {req.period}"
+    sig_msg = validate_signal_config(
+        req.period, req.signal_frequency, req.signal_at,
+        req.signal_weekday, req.signal_data_end,
+    )
+    if sig_msg:
+        return sig_msg
     if not (0 < req.capital_ratio <= 1):
         return f"capital_ratio 必须在 (0,1]，收到 {req.capital_ratio}"
+    # 数值字段范围校验（max_positions/开平仓比例/风控比例）
+    num_msg = _validate_strategy_numerics(req)
+    if num_msg:
+        return num_msg
     # 加仓阈值：-1=特殊值（任何价格都加），0=不涨即加，正常 (0,1]
     if req.add_position_threshold != -1 and not (0 <= req.add_position_threshold <= 1):
         return f"加仓阈值须为 -1（任何价都加）或 [0,1]，收到 {req.add_position_threshold}"
@@ -369,6 +508,10 @@ def _validate_strategy(
         return f"trend_trailing_stop_ratio 须在 (0,1]，收到 {req.trend_trailing_stop_ratio}"
     if req.trend_max_positions is not None and req.trend_max_positions < 1:
         return f"trend_max_positions 须 ≥ 1，收到 {req.trend_max_positions}"
+    # 实盘执行配置（批次1）
+    exec_msg = _validate_execution_config(req)
+    if exec_msg:
+        return exec_msg
     if not db.query(Formula).filter(Formula.id == req.formula_id).first():
         return f"公式 id={req.formula_id} 不存在"
     if req.role == "slave":

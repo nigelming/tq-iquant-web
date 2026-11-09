@@ -3,13 +3,14 @@ import { ref, onMounted } from 'vue'
 import {
   getPortfolios, getWalkForwardRuns, getParamPerturbRuns,
   type PortfolioItem, type WalkForwardRunItem, type ParamPerturbRunItem,
+  type WalkForwardRequest,
 } from '../api'
 import WalkForwardPanel from './WalkForwardPanel.vue'
 import ParamPerturbPanel from './ParamPerturbPanel.vue'
 import PageHeader from '../components/PageHeader.vue'
 
 const activeTab = ref<'wf' | 'pp'>('wf')
-const wfPanel = ref<{ openForm: () => void } | null>(null)
+const wfPanel = ref<{ openForm: (prefill?: Partial<WalkForwardRequest>) => void } | null>(null)
 const ppPanel = ref<{ openForm: () => void } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])
 const wfRuns = ref<WalkForwardRunItem[]>([])
@@ -22,9 +23,22 @@ async function reloadPp() {
   ppRuns.value = await getParamPerturbRuns().catch(() => [])
 }
 
+// 回测详情页「样本外验证 → 立即发起验证」接力：消费 sessionStorage 预填并自动开表单
+function consumeWfPrefill() {
+  const raw = sessionStorage.getItem('wf_prefill')
+  if (!raw) return
+  sessionStorage.removeItem('wf_prefill')
+  try {
+    const prefill = JSON.parse(raw) as Partial<WalkForwardRequest>
+    activeTab.value = 'wf'
+    wfPanel.value?.openForm(prefill)
+  } catch { /* 非法内容忽略 */ }
+}
+
 onMounted(async () => {
   portfolios.value = await getPortfolios().catch(() => [])
   await Promise.all([reloadWf(), reloadPp()])
+  consumeWfPrefill()
 })
 </script>
 

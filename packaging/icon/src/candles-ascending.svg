@@ -1,0 +1,26 @@
+<!-- 创懿基金量化投资平台 自绘图标（版权归项目所有，可商用）
+     母版 1024x1024 矢量：深海军蓝渐变底 + 三根上升蜡烛图 + 金色基线 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#16405F"/>
+      <stop offset="0.55" stop-color="#0B2440"/>
+      <stop offset="1" stop-color="#07182A"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F6D98C"/>
+      <stop offset="1" stop-color="#D9A33A"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="214" fill="url(#bg)"/>
+  <rect x="9" y="9" width="1006" height="1006" rx="206" fill="none" stroke="#2E628F" stroke-width="10" opacity="0.5"/>
+  <g stroke-linecap="round">
+    <line x1="300" y1="404" x2="300" y2="726" stroke="#EBD9A8" stroke-width="34"/>
+    <line x1="512" y1="300" x2="512" y2="664" stroke="#EBD9A8" stroke-width="34"/>
+    <line x1="724" y1="222" x2="724" y2="596" stroke="#EBD9A8" stroke-width="34"/>
+    <rect x="228" y="500" width="144" height="172" rx="28" fill="#F5EFE0"/>
+    <rect x="440" y="392" width="144" height="212" rx="28" fill="url(#gold)"/>
+    <rect x="652" y="298" width="144" height="236" rx="28" fill="#F5EFE0"/>
+  </g>
+  <line x1="188" y1="832" x2="836" y2="832" stroke="#D9A33A" stroke-width="28" stroke-linecap="round" opacity="0.92"/>
+</svg>

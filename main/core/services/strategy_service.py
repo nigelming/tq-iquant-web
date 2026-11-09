@@ -49,6 +49,18 @@ def serialize_strategy(s: Strategy) -> dict:
         "trend_max_positions": s.trend_max_positions,
         # #3 策略级敞口上限（默认关）
         "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
+        # 策略级单笔最大买入金额（元，None=不限）
+        "max_order_amount": s.max_order_amount,
+        # 实盘执行配置（批次1，默认关/保守默认；NULL 兜底默认值）
+        "requote_enabled": bool(s.requote_enabled) if s.requote_enabled is not None else False,
+        "requote_max_attempts": s.requote_max_attempts if s.requote_max_attempts is not None else 2,
+        "split_order_enabled": bool(s.split_order_enabled) if s.split_order_enabled is not None else False,
+        "split_order_threshold": float(s.split_order_threshold) if s.split_order_threshold is not None else 500000.0,
+        "risk_timing": s.risk_timing or "next_day",
+        "signal_frequency": s.signal_frequency,
+        "signal_at": s.signal_at,
+        "signal_weekday": s.signal_weekday,
+        "signal_data_end": s.signal_data_end,
     }
 
 
@@ -81,6 +93,7 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "adaptive_slippage_enabled": bool(p.adaptive_slippage_enabled) if p.adaptive_slippage_enabled is not None else False,
         "slippage_impact_coef": float(p.slippage_impact_coef) if p.slippage_impact_coef is not None else 0.10,
         "position_sizing": p.position_sizing or "dynamic",
+        "daily_loss_basis": getattr(p, "daily_loss_basis", None) or "equity",
         "cash_enhance_enabled": bool(p.cash_enhance_enabled) if p.cash_enhance_enabled is not None else False,
         "cash_enhance_equity_threshold": (
             float(p.cash_enhance_equity_threshold) if p.cash_enhance_equity_threshold is not None else None
@@ -129,11 +142,19 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     # W2 仓位模型 + 现金管理（请求携带默认值，按值落库）
     if getattr(req, "position_sizing", None) is not None:
         p.position_sizing = req.position_sizing
+    # 日内亏损分母口径（equity=昨收净值，默认；initial=初始资金）
+    if getattr(req, "daily_loss_basis", None) is not None:
+        p.daily_loss_basis = req.daily_loss_basis
     if getattr(req, "cash_enhance_enabled", None) is not None:
         p.cash_enhance_enabled = req.cash_enhance_enabled
-    p.cash_enhance_equity_threshold = getattr(req, "cash_enhance_equity_threshold", None)
-    p.cash_enhance_position_ratio_threshold = getattr(
-        req, "cash_enhance_position_ratio_threshold", None)
+    # 阈值：None=请求未携带（编辑不动已有值）——与相邻开关/价格约束收视口径一致。
+    # 原实现无条件赋值：前端开关关闭时字段被 showIf 隐藏不进 payload → 阈值被清 NULL，
+    # 而 cash_enhance_enabled 仍为 True，净值闸/仓位闸永久失效（界面看不出来）。
+    if getattr(req, "cash_enhance_equity_threshold", None) is not None:
+        p.cash_enhance_equity_threshold = req.cash_enhance_equity_threshold
+    if getattr(req, "cash_enhance_position_ratio_threshold", None) is not None:
+        p.cash_enhance_position_ratio_threshold = (
+            req.cash_enhance_position_ratio_threshold)
     # W3 容量上限（可选，None=不设上限）
     p.equity_cap = getattr(req, "equity_cap", None)
 
@@ -161,6 +182,16 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
             trend_max_positions=getattr(s, "trend_max_positions", None),
             exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
+            max_order_amount=getattr(s, "max_order_amount", None),
+            requote_enabled=getattr(s, "requote_enabled", False),
+            requote_max_attempts=getattr(s, "requote_max_attempts", 2),
+            split_order_enabled=getattr(s, "split_order_enabled", False),
+            split_order_threshold=getattr(s, "split_order_threshold", 500000.0),
+            risk_timing=getattr(s, "risk_timing", None) or "next_day",
+            signal_frequency=getattr(s, "signal_frequency", None),
+            signal_at=getattr(s, "signal_at", None),
+            signal_weekday=getattr(s, "signal_weekday", None),
+            signal_data_end=getattr(s, "signal_data_end", None),
         )
         db.add(strat)
         inserted.append(strat)
@@ -194,9 +225,12 @@ def create_portfolio(db: Session, req) -> dict:
     """建组合 + 子策略（两步 commit）。req 已校验合法。"""
     p = PortfolioStrategy()
     _apply_portfolio_fields(p, req)
-    # #1 新组合默认开启涨跌停约束（旧组合迁移后 server_default '0' 保持关闭）
+    # 新组合默认开启涨跌停约束（旧组合迁移后 server_default '0' 保持关闭）
     if getattr(req, "price_limit_check_enabled", None) is None:
         p.price_limit_check_enabled = True
+    # 新组合日内亏损口径兜底 equity（请求未携带时不依赖 DB server_default）
+    if getattr(req, "daily_loss_basis", None) is None:
+        p.daily_loss_basis = "equity"
     db.add(p)
     db.flush()
     _create_strategies_two_step(db, p.id, req.strategies)
@@ -245,7 +279,7 @@ def delete_portfolio(db: Session, pid: int) -> bool:
 # ===========================================================================
 # 独立子策略 CRUD
 # ===========================================================================
-def _apply_strategy_fields(s: Strategy, req) -> None:
+def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     s.name = req.name
     s.formula_id = req.formula_id
     s.period = req.period
@@ -264,14 +298,36 @@ def _apply_strategy_fields(s: Strategy, req) -> None:
     s.stock_pool_id = req.stock_pool_id
     s.slave_exit_mode = req.slave_exit_mode
     # B4/B5 可选增强（默认关；缺省字段回落默认，保持旧请求行为不变）
-    s.rotation_enabled = getattr(req, "rotation_enabled", False)
-    s.rotation_momentum_bars = getattr(req, "rotation_momentum_bars", 20)
-    s.rotation_hysteresis = getattr(req, "rotation_hysteresis", 0.05)
-    s.regime_filter_enabled = getattr(req, "regime_filter_enabled", False)
-    s.trend_trailing_stop_ratio = getattr(req, "trend_trailing_stop_ratio", None)
-    s.trend_max_positions = getattr(req, "trend_max_positions", None)
+    # 编辑路径：前端在开关关闭时用 showIf 隐藏子参数、不进 payload——这里若用
+    # 模型默认值（20/0.05）回填，用户自定义的轮动/趋势参数会被静默重置。
+    # 故 update 时仅应用请求显式携带（model_fields_set）的键。
+    provided = set(getattr(req, "model_fields_set", ()) or ()) if is_update else None
+
+    def _apply_opt(attr: str, default) -> None:
+        if provided is not None and attr not in provided:
+            return
+        setattr(s, attr, getattr(req, attr, default))
+
+    _apply_opt("rotation_enabled", False)
+    _apply_opt("rotation_momentum_bars", 20)
+    _apply_opt("rotation_hysteresis", 0.05)
+    _apply_opt("regime_filter_enabled", False)
+    _apply_opt("trend_trailing_stop_ratio", None)
+    _apply_opt("trend_max_positions", None)
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
+    # 单笔最大买入金额（None=不限；缺省字段回落 None，保持旧请求行为不变）
+    s.max_order_amount = getattr(req, "max_order_amount", None)
+    # 实盘执行配置（批次1；缺省字段回落默认，保持旧请求行为不变）
+    s.requote_enabled = getattr(req, "requote_enabled", False)
+    s.requote_max_attempts = getattr(req, "requote_max_attempts", 2)
+    s.split_order_enabled = getattr(req, "split_order_enabled", False)
+    s.split_order_threshold = getattr(req, "split_order_threshold", 500000.0)
+    s.risk_timing = getattr(req, "risk_timing", None) or "next_day"
+    s.signal_frequency = getattr(req, "signal_frequency", None)
+    s.signal_at = getattr(req, "signal_at", None)
+    s.signal_weekday = getattr(req, "signal_weekday", None)
+    s.signal_data_end = getattr(req, "signal_data_end", None)
 
 
 def portfolio_exists(db: Session, pid: int) -> bool:
@@ -305,7 +361,7 @@ def update_strategy(db: Session, pid: int, sid: int, req) -> dict | None:
     s = db.query(Strategy).filter(Strategy.id == sid, Strategy.portfolio_id == pid).first()
     if s is None:
         return None
-    _apply_strategy_fields(s, req)
+    _apply_strategy_fields(s, req, is_update=True)
     db.commit()
     db.refresh(s)
     return serialize_strategy(s)

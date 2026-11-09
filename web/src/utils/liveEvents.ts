@@ -71,6 +71,10 @@ export const GATE_LABEL: Record<string, string> = {
   bridge_unavailable: '桥离线拒单',
   bridge_rejected: '桥业务拒单',
   approval_failed: '发单兜底失败',
+  // 主从策略 / 现金增强（portfolio.py）
+  slave_master_selling: '主策略清仓禁开仓',
+  cash_enhance_trigger: '现金增强触发',
+  follow_master_sell: '跟随主策略平仓',
 }
 
 // 闸门层 → 中文
@@ -81,6 +85,7 @@ export const LAYER_LABEL: Record<string, string> = {
   capital_gate: '资金拦截',
   t1: 'T+1',
   live_gate: '实盘闸门',
+  formula: '公式计算',
 }
 
 // 闸门动作 → 中文
@@ -93,6 +98,7 @@ export const ACTION_LABEL: Record<string, string> = {
   reject: '拒单',
   shrink: '缩量',
   clamp: '钳量',
+  error: '运行错误',
 }
 
 /** 闸门代码 → 中文标签（未知 gate 回退原代码）。 */
@@ -122,9 +128,26 @@ export const ORDER_STATUS_LABEL: Record<string, string> = {
 const RISK_RULE_LABEL: Record<string, string> = {
   max_drawdown: '最大回撤熔断',
   daily_loss: '日内亏损熔断',
+  reconcile_mismatch: '持仓对账差异',
+  quote_polling_paused: '行情轮询暂停',
+  quote_polling_resumed: '行情轮询恢复',
 }
 
 const fmt = (v: unknown): string => (v === null || v === undefined ? '' : String(v))
+
+/** 成本价展示：统一 3 位小数（后端计算/存储仍全精度）。 */
+function fmtCost(v: unknown): string {
+  const n = Number(v)
+  if (v === null || v === undefined || !Number.isFinite(n)) return ''
+  return n.toFixed(3)
+}
+
+/** 金额（市值）展示：统一 2 位小数（分为精度；后端计算/存储仍全精度）。 */
+function fmtMoney(v: unknown): string {
+  const n = Number(v)
+  if (v === null || v === undefined || !Number.isFinite(n)) return ''
+  return n.toFixed(2)
+}
 
 /** 委托:已提交/成交/部分成交/拒绝/撤单,读 trade_type + quantity/price 或 filled_*。 */
 function formatOrder(data: Record<string, unknown>): string {
@@ -203,7 +226,7 @@ export function formatEvent(type: string, data: Record<string, unknown>): string
       return `${t} ${fmt(data.stock_code)} ${fmt(data.quantity)}股 @ ${fmt(data.price)}${amount}`
     }
     case 'position':
-      return `${fmt(data.stock_code)} ${fmt(data.quantity)}股 成本${fmt(data.avg_cost)} 市值${fmt(data.market_value)}`
+      return `${fmt(data.stock_code)} ${fmt(data.quantity)}股 成本${fmtCost(data.avg_cost)} 市值${fmtMoney(data.market_value)}`
     case 'risk': {
       const label = RISK_RULE_LABEL[String(data.rule)] || fmt(data.rule)
       return `${label}: ${fmt(data.message)}`

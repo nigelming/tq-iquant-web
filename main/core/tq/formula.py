@@ -5,6 +5,16 @@ from .utils import get_tdx_lock, get_tq
 
 logger = logging.getLogger(__name__)
 
+# TQ formula_process_mul 在单次请求股票过多时返回 ErrorId=19（数据过多无法
+# 完全加载），且每次返回的股票子集可能不同，导致回测不可复现。按 50 只分批
+# 执行；若单批仍返回 19 则继续二分，直到成功或单只股票仍失败。
+_FORMULA_STOCK_CHUNK = 50
+_FORMULA_META_KEYS = ("ErrorId", "Error", "Date", "Time")
+
+
+def _chunks(items: List[str], size: int):
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
 
 class TQFormula:
     def compute(
@@ -15,11 +25,113 @@ class TQFormula:
         return_count: int = -1, return_date: bool = True,
     ) -> Optional[dict]:
         with get_tdx_lock():
-            return self._run_formula(
-                formula_name, formula_arg, stocks, period,
+            return self._run_chunked(
+                formula_name, formula_arg, list(stocks), period,
                 count, dividend_type, start_time, end_time,
                 return_count, return_date,
             )
+
+    def _run_chunked(
+        self, formula_name, formula_arg, stocks, period,
+        count, dividend_type, start_time, end_time,
+        return_count, return_date,
+    ) -> dict:
+        if not stocks:
+            return {"ErrorId": "0"}
+        merged: dict = {}
+        errors: List[str] = []
+        for chunk in _chunks(stocks, _FORMULA_STOCK_CHUNK):
+            data, err = self._run_split(
+                formula_name, formula_arg, chunk, period,
+                count, dividend_type, start_time, end_time,
+                return_count, return_date,
+            )
+            merged.update(data)
+            if err:
+                errors.append(err)
+        if errors:
+            return {
+                "ErrorId": "19",
+                "Error": "；".join(errors),
+                **merged,
+            }
+        return {"ErrorId": "0", **merged}
+
+    def _run_split(
+        self, formula_name, formula_arg, chunk, period,
+        count, dividend_type, start_time, end_time,
+        return_count, return_date,
+    ):
+        raw = self._run_formula(
+            formula_name, formula_arg, chunk, period,
+            count, dividend_type, start_time, end_time,
+            return_count, return_date,
+        )
+        if not isinstance(raw, dict) or not raw:
+            return {}, f"股票 {chunk[0]} 公式执行无返回"
+        err = raw.get("ErrorId")
+        if str(err) == "19":
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                left, left_err = self._run_split(
+                    formula_name, formula_arg, chunk[:mid], period,
+                    count, dividend_type, start_time, end_time,
+                    return_count, return_date,
+                )
+                right, right_err = self._run_split(
+                    formula_name, formula_arg, chunk[mid:], period,
+                    count, dividend_type, start_time, end_time,
+                    return_count, return_date,
+                )
+                errs = [e for e in (left_err, right_err) if e]
+                return {**left, **right}, "；".join(errs) or None
+            return {}, f"公式数据过多无法完全加载：{chunk[0]}"
+        if err is not None and str(err) != "0":
+            return {}, f"ErrorId={err} Error={raw.get('Error')}"
+        return {
+            code: value for code, value in raw.items()
+            if code not in _FORMULA_META_KEYS
+        }, None
+
+    def compute_by_src(
+        self, formula_src: str, stocks: List[str], period: str = "1d",
+        count: int = -1, dividend_type: int = 1,
+        formula_type: int = 0, return_count: int = -1, return_date: bool = True,
+    ) -> dict:
+        """临时公式源码试算（tqcenter 1.3.1 formula_by_src，不保存公式）。
+
+        formula_type：0=指标 / 1=选股；dividend_type：0=不复权 / 1=前复权 / 2=后复权。
+        SDK 内部自动分批合并，无需平台再分批。输出与 compute 同构：
+        成功 {"ErrorId": "0", code: value}（经 _FORMULA_META_KEYS 清洗），
+        失败 {"ErrorId": 非0, "Error": ...}；空股票池短路不触 SDK。
+        """
+        if not stocks:
+            return {"ErrorId": "0"}
+        with get_tdx_lock():
+            tq = get_tq()
+            raw = tq.formula_by_src(
+                formula_src=formula_src,
+                stock_list=list(stocks),
+                stock_period=period,
+                start_time="",
+                end_time="",
+                count=count,
+                return_count=return_count,
+                return_date=return_date,
+                xsflag=-1,
+                dividend_type=dividend_type,
+                formula_type=formula_type,
+            )
+        if not isinstance(raw, dict) or not raw:
+            return {"ErrorId": "1", "Error": "公式试算无返回"}
+        err = raw.get("ErrorId")
+        if err is not None and str(err) != "0":
+            return {"ErrorId": str(err), "Error": raw.get("Error")}
+        return {
+            "ErrorId": "0",
+            **{code: value for code, value in raw.items()
+               if code not in _FORMULA_META_KEYS},
+        }
 
     def compute_xg(
         self, formula_name: str, formula_arg: str,
@@ -42,7 +154,10 @@ class TQFormula:
             行=DatetimeIndex），由 _bars_to_formula_df 从桥 bar 构造。
         链路：formula_format_data → 逐股票 formula_set_data(dividend_type=0 内存注入)
             → formula_process_mul_zb(count=-1，不传时间范围，让公式用注入的全部数据)。
-        任一股票 set_data 失败（ErrorId != 0）→ 返回 None。
+        逐只注入后一次 formula_process_mul_zb(count=-1，不传时间范围，让公式用
+        注入的全部数据)。个别股票 format/set_data 失败 → 跳过该只并告警继续，
+        全部失败才返回 None（与 compute_injected_batch 同口径；原实现任一只失败
+        即返回 None，会让一只坏股票吞掉整池当周期信号且无日志）。
         get_tdx_lock() 串行化，与回测互不并发（同进程共用 get_tq() 单例）。
         返回 formula_process_mul_zb 的 raw（同 compute）。
         """
@@ -57,10 +172,16 @@ class TQFormula:
             # 全量重算注入数据——两者是午后节拍变慢的嫌疑点，DEBUG 日志供下钻定位。
             t_set = 0.0
             n_bars = 0
+            ok_codes = []
             for code in stocks:
                 stock_data = formatted.get(code)
                 if stock_data is None or len(stock_data) == 0:
-                    return None
+                    # 单只失败不吞掉整池：跳过该只并告警（与 compute_injected_batch
+                    # 的 continue 口径一致），否则一只坏股票会让全池当周期无信号。
+                    logger.warning(
+                        "compute_injected 跳过 %s：format 数据缺失(formula=%s period=%s)",
+                        code, formula_name, period)
+                    continue
                 ts = time.perf_counter()
                 sd = tq.formula_set_data(
                     stock_code=code, stock_period=period,
@@ -70,7 +191,16 @@ class TQFormula:
                 t_set += time.perf_counter() - ts
                 n_bars = len(stock_data)
                 if not sd or str(sd.get("ErrorId", "1")) != "0":
-                    return None
+                    logger.warning(
+                        "compute_injected 跳过 %s：set_data 失败 %s(formula=%s period=%s)",
+                        code, sd, formula_name, period)
+                    continue
+                ok_codes.append(code)
+            if not ok_codes:
+                logger.warning(
+                    "compute_injected 全部股票注入失败(formula=%s period=%s n=%d)",
+                    formula_name, period, len(stocks))
+                return None
             tp = time.perf_counter()
             raw = tq.formula_process_mul_zb(
                 formula_name=formula_name,
@@ -78,7 +208,7 @@ class TQFormula:
                 return_count=-1,
                 return_date=True,
                 xsflag=-1,
-                stock_list=stocks,
+                stock_list=ok_codes,
                 stock_period=period,
                 start_time="",
                 end_time="",
@@ -89,7 +219,7 @@ class TQFormula:
             logger.debug(
                 "compute_injected formula=%s period=%s n=%d bars=%d "
                 "fmt=%.3fs set=%.3fs proc=%.3fs total=%.3fs",
-                formula_name, period, len(stocks), n_bars,
+                formula_name, period, len(ok_codes), n_bars,
                 t_fmt, t_set, t_proc, time.perf_counter() - t0,
             )
             return raw
@@ -170,12 +300,15 @@ class TQFormula:
 
     def get_formula_list(self, formula_type: int = 0) -> List[dict]:
         tq = get_tq()
-        return tq.formula_get_all(formula_type=formula_type) or []
+        with get_tdx_lock():
+            return tq.formula_get_all(formula_type=formula_type) or []
 
     def get_formula_info(self, formula_type: int = 0, formula_code: str = "") -> dict:
         """单公式元数据（参数表 Para + 输出线名 Line，信号预填用）。"""
         tq = get_tq()
-        return tq.formula_get_info(formula_type=formula_type, formula_code=formula_code) or {}
+        with get_tdx_lock():
+            return tq.formula_get_info(
+                formula_type=formula_type, formula_code=formula_code) or {}
 
     def _run_formula(self, formula_name, formula_arg, stocks, period, count, dividend_type,
                      start_time="", end_time="", return_count=-1, return_date=True):

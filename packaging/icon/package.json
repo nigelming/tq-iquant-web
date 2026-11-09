@@ -1,0 +1,8 @@
+{
+  "name": "tq-iquant-icon",
+  "private": true,
+  "description": "应用图标矢量母版转 PNG/ICO 的构建脚本（仅构建期使用）",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2"
+  }
+}

@@ -1,0 +1,8 @@
+{创懿量化 内置引擎对比验证公式 9B：批次9b 跨公式引用——公式名.线名[#周期] 语法（引用已存在的 TESTA 公式，其内容为一行：A1:CLOSE;）。整段复制到通达信技术指标公式，公式名 TQVERIFY9B。注意：若通达信公式编辑器报「未知字符串」或语法错误，请截图或记录报错文案}
+R01:TESTA.A1,NODRAW;
+R02:REF(TESTA.A1,5),NODRAW;
+R03:MA(TESTA.A1,5),NODRAW;
+R04:TESTA.A1#WEEK,NODRAW;
+R05:HHV(TESTA.A1#WEEK,8),NODRAW;
+R06:CROSS(TESTA.A1,MA(TESTA.A1,5))*1,NODRAW;
+R07:TESTA.A1-C,NODRAW;

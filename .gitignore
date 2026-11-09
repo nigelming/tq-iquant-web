@@ -4,8 +4,14 @@ __pycache__/
 *.egg-info/
 .venv/
 *.egg
+# Pyinstaller / Nuitka 打包产物与缓存
 dist/
 build/
+.nuitka-cache/
+.build/
+# 图标构建中间产物（矢量源与 app.ico 入库，渲染结果不入库）
+packaging/icon/master_1024.png
+packaging/icon/preview_*.png
 
 # Node
 node_modules/
@@ -62,9 +68,21 @@ docs/risk/
 
 # One-off diagnostics (local only, not for commit)
 live/bridge/diag_*.py
-# SQLite WAL/SHM sidecars
-main/data/*.db-shm
-main/data/*.db-wal
+# THS file handoff runtime files (local only)
+data/ths/
 
-# Superpowers session workspace (local scratch)
+# Local runtime data / one-off diagnostics (2026-11-07)
+main/data/
+main/_ab_result.json
+main/_pool2021.json
+main/nuitka-crash-report.xml
+main/scripts_rerun_fix.py
+main/core/tests/tdx_compare/last_report.json
+main/core/tests/unit/test_dbg_pywinauto.py
+
+# Editor / agent session state
+.trae/
 .superpowers/
+
+# Local ops scripts at repo root (not part of the platform)
+scripts/

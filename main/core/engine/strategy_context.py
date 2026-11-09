@@ -34,11 +34,32 @@ class StrategyContext:
         trend_trailing_stop_ratio: Optional[Decimal] = None,
         trend_max_positions: Optional[int] = None,
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
-        # ≤ capital_ratio × 组合初始资金（仅回测成交步传入生效）
+        # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
+        # 策略级单笔最大买入金额（元，可选，None=不限）：BUY 审批金额封顶，
+        # 超限缩量到该金额能买的整手股数（回测/实盘双端 cap_quantity 生效）
+        max_order_amount: Optional[Decimal] = None,
+        # 实盘执行配置（批次1，全部默认关/保守默认，关闭时行为与原逻辑一致）
+        requote_enabled: bool = False,
+        requote_max_attempts: int = 2,
+        split_order_enabled: bool = False,
+        split_order_threshold: Decimal = Decimal("500000"),
+        risk_timing: str = "next_day",
+        signal_frequency: Optional[str] = None,
+        signal_at: Optional[str] = None,
+        signal_weekday: Optional[int] = None,
+        signal_data_end: Optional[str] = None,
+        formula_name: str = "",
+        formula_id: Optional[int] = None,
     ):
         self.strategy_id = strategy_id
         self.period = period
+        self.signal_frequency = signal_frequency
+        self.signal_at = signal_at
+        self.signal_weekday = signal_weekday
+        self.signal_data_end = signal_data_end
+        self.formula_name = formula_name
+        self.formula_id = formula_id
         self.capital_ratio = capital_ratio
         self.max_positions = max_positions
         # 下单量参数（对应策略表字段，默认值同表默认）
@@ -63,6 +84,14 @@ class StrategyContext:
         self.trend_max_positions = trend_max_positions
         # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
         self.exposure_cap_enabled = exposure_cap_enabled
+        # 单笔最大买入金额（None=不限，关闭时审批行为与原逻辑一致）
+        self.max_order_amount = max_order_amount
+        # 实盘执行配置（批次1）：撤单追价重下 / TDX 大额拆单（批次2接线）/ 风控时点
+        self.requote_enabled = requote_enabled
+        self.requote_max_attempts = requote_max_attempts
+        self.split_order_enabled = split_order_enabled
+        self.split_order_threshold = split_order_threshold
+        self.risk_timing = risk_timing
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
         self.strategy_risk: Optional[StrategyRiskManager] = None

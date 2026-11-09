@@ -11,6 +11,7 @@ import polars as pl
 import pytest
 
 import core.api.backtest as bt_api
+import core.services.backtest_service as svc
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +234,28 @@ def test_convert_formula_output_empty_raw():
 
 
 def test_convert_formula_output_error_id_nonzero():
-    """ErrorId 非 0/19 → 视为公式出错，返回空（不抛异常）。"""
+    """ErrorId 非 0 → 视为公式出错，返回空（不抛异常）。"""
     raw = {"ErrorId": "99", "Error": "formula not found", "000001.SZ": {}}
     assert bt_api._convert_formula_output(raw, 1, ["000001.SZ"]) == {}
+
+
+def test_convert_formula_output_error_id_19_rejected():
+    """ErrorId=19 表示数据过多只返回了部分股票，不能静默使用部分结果。"""
+    raw = {
+        "ErrorId": "19", "Error": "数据过多无法完全加载",
+        "000001.SZ": {"open_sig": [{"Date": "20260729", "Value": 1}]},
+    }
+    assert bt_api._convert_formula_output(raw, 1, ["000001.SZ"]) == {}
+
+
+def test_formula_diagnostics_error_id_19_is_error():
+    """ErrorId=19 必须在信号预检里报错，而不是当作正常输出。"""
+    err, lines = svc._formula_diagnostics(
+        {"ErrorId": "19", "Error": "数据过多无法完全加载"}, ["000001.SZ"],
+    )
+    assert err is not None
+    assert "19" in err
+    assert lines == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1065,3 +1085,436 @@ def test_build_signal_cache_multi_period_daily_strategy_uses_date_match(db_sessi
     # 5m 时间点不应出现在 1d 策略的 cache 中
     assert (strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35)) not in cache
 
+
+def test_convert_formula_output_warns_on_length_mismatch(caplog):
+    """#3：公式输出条数与 bar 数不一致时记 warning（不崩溃，多余输出丢弃）。"""
+    import logging
+    bar_times = [datetime(2026, 7, 28, 9, 35)]
+    raw = {"000001.SZ": {"open_sig": [
+        {"Date": "20260728", "Value": 1},
+        {"Date": "20260728", "Value": -1},
+    ]}}
+    with caplog.at_level(logging.WARNING):
+        entries = bt_api._convert_formula_output(
+            raw, 1, ["000001.SZ"], bar_times_by_code={"000001.SZ": bar_times},
+        )
+    assert (1, "000001.SZ", bar_times[0]) in entries
+    assert any("长度" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# engine=builtin：内置公式子集解释器分支（仅回测接线；engine 默认 tq 行为不变）
+# ---------------------------------------------------------------------------
+def _builtin_klines():
+    """3 根日线合成行情：bar1 C>O、bar2 C<O、bar3 C>O。"""
+    return {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [
+            datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31),
+        ],
+        "Open": [Decimal("10"), Decimal("10.2"), Decimal("10.0")],
+        "High": [Decimal("10.3"), Decimal("10.5"), Decimal("10.4")],
+        "Low": [Decimal("9.9"), Decimal("10.1"), Decimal("9.9")],
+        "Close": [Decimal("10.2"), Decimal("9.0"), Decimal("10.2")],
+        "Volume": [1000, 1000, 1000],
+        "Amount": [Decimal("10200"), Decimal("9000"), Decimal("10200")],
+    })}}
+
+
+def test_build_signal_cache_builtin_engine_skips_tq(db_session, monkeypatch):
+    """engine=builtin：不调 TQFormula.compute，对喂入 klines 求值出信号。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(C>O,1,0);",
+    })
+    db.commit()
+
+    def fail_compute(*a, **kw):
+        raise AssertionError("engine=builtin 不应调用 TQFormula.compute")
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fail_compute)
+
+    cache = bt_api.build_signal_cache(ps, _builtin_klines(), db)
+
+    # 与 TQ 口径一致：0（无信号常态值）也入 cache
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "SIG", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 30))] == [{"name": "SIG", "value": 0}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 31))] == [{"name": "SIG", "value": 1}]
+
+
+def test_build_signal_cache_builtin_default_tq_unchanged(db_session, monkeypatch):
+    """engine 默认 tq：仍走 TQ 按名调用（原有行为不变）。"""
+    db = db_session
+    ps, strat, formula = _seed_db(db)  # engine 默认 "tq"
+    called = {}
+
+    def fake_compute(self, formula_name, **kw):
+        called["name"] = formula_name
+        return {"000001.SZ": {"open_sig": [
+            {"Date": "20260729", "Value": 1},
+            {"Date": "20260730", "Value": 0},
+            {"Date": "20260731", "Value": 1},
+        ]}}
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+
+    cache = bt_api.build_signal_cache(ps, _builtin_klines(), db)
+
+    assert called["name"] == "OPEN_FORMULA"
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "open_sig", "value": 1}]
+
+
+def test_build_signal_cache_builtin_diagnostics_error(db_session):
+    """builtin 求值报错 → diagnostics.errors 记录根因，cache 为空。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:C>FOO;",
+    })
+    db.commit()
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(ps, _builtin_klines(), db, diagnostics=diagnostics)
+
+    assert cache == {}
+    assert strat.id in diagnostics["errors"]
+    assert "FOO" in diagnostics["errors"][strat.id]
+
+
+def test_build_signal_cache_builtin_diagnostics_output_lines(db_session):
+    """正常求值 → diagnostics.output_lines 收集真实输出线名（信号预检用）。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(C>O,1,0);",
+    })
+    db.commit()
+
+    diagnostics = {}
+    bt_api.build_signal_cache(ps, _builtin_klines(), db, diagnostics=diagnostics)
+
+    assert diagnostics["output_lines"][strat.id] == {"SIG"}
+
+
+def test_build_signal_cache_builtin_minute_uses_df_datetime(db_session):
+    """分钟级 builtin：df 行序即 bar 序列，key 直接用 df datetime（含时分）。"""
+    from core.models import Formula, Strategy
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Strategy).filter_by(id=strat.id).update({"period": "5m"})
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(C>O,1,0);",
+    })
+    db.commit()
+
+    klines = {"000001.SZ": {"5m": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29, 9, 35), datetime(2026, 7, 29, 9, 40)],
+        "Open": [Decimal("10"), Decimal("10.2")],
+        "High": [Decimal("10.3"), Decimal("10.5")],
+        "Low": [Decimal("9.9"), Decimal("10.1")],
+        "Close": [Decimal("10.2"), Decimal("9.0")],
+        "Volume": [1000, 1000],
+        "Amount": [Decimal("10200"), Decimal("9000")],
+    })}}
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 35))] == [{"name": "SIG", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29, 9, 40))] == [{"name": "SIG", "value": 0}]
+
+
+def test_build_signal_cache_builtin_start_filters_warmup(db_session):
+    """builtin 信号同样受 start 过滤：预热段条目不进 cache。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(C>O,1,0);",
+    })
+    db.commit()
+
+    cache = bt_api.build_signal_cache(
+        ps, _builtin_klines(), db, start=date(2026, 7, 30))
+
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 29)) not in cache
+    assert (strat.id, "000001.SZ", datetime(2026, 7, 30)) in cache
+
+
+# ---------------------------------------------------------------------------
+# 批次 9b 跨公式引用：resolver 闭包 + memo + 静态环检测（build_signal_cache 级）
+# ---------------------------------------------------------------------------
+def test_build_signal_cache_xref_base_period(db_session, monkeypatch):
+    """9b 跨公式引用：SIG:IF(TESTA.A1=100,1,0)——resolver 在 base 周期求值 TESTA。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.add(Formula(name="TESTA", content="A1:IF(C>O,100,50);", engine="builtin"))
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(TESTA.A1=100,1,0);",
+    })
+    db.commit()
+
+    def fail_compute(*a, **kw):
+        raise AssertionError("跨公式引用不应调用 TQFormula.compute")
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fail_compute)
+
+    cache = bt_api.build_signal_cache(ps, _builtin_klines(), db)
+
+    # TESTA.A1=[100,50,100]（C>O 判定）：bar1/bar3 → 1，bar2 → 0
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "SIG", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 30))] == [{"name": "SIG", "value": 0}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 31))] == [{"name": "SIG", "value": 1}]
+
+
+def test_build_signal_cache_xref_system_macd_week(db_session, monkeypatch):
+    """系统公式兜底：库内未建 MACD 时 "MACD.DIF#WEEK" 仍可解析（自动取周线对齐）。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin",
+        "content": 'SIG:IF("MACD.DIF#WEEK">0,1,0);',
+    })
+    db.commit()
+
+    klines = _builtin_klines()
+    klines["000001.SZ"]["1w"] = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 20), datetime(2026, 7, 27), datetime(2026, 8, 3)],
+        "Open": [Decimal("5"), Decimal("10"), Decimal("20")],
+        "High": [Decimal("6"), Decimal("11"), Decimal("21")],
+        "Low": [Decimal("4"), Decimal("9"), Decimal("19")],
+        "Close": [Decimal("5"), Decimal("10"), Decimal("20")],
+        "Volume": [5000, 5000, 5000],
+        "Amount": [Decimal("25000"), Decimal("50000"), Decimal("100000")],
+    })
+
+    def fail_compute(*a, **kw):
+        raise AssertionError("跨公式引用不应调用 TQFormula.compute")
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fail_compute)
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(ps, klines, db, diagnostics=diagnostics)
+
+    assert not diagnostics.get("errors"), diagnostics
+    assert cache, "系统 MACD 兜底后应产出信号"
+    # 日线落在 7/27 那根周线上（周线收盘 5→10→20 上行，该根 DIF>0）→ 信号恒为 1
+    assert all(v[0]["value"] == 1 for v in cache.values())
+
+
+MOMENTUM_MODEL_SRC = """SHORT:=12;
+LONG:=26;
+MID:=9;
+
+周DIF:="MACD.DIF#WEEK";
+周DEA:="MACD.DEA#WEEK";
+周MACD:="MACD.MACD#WEEK";
+
+DIF:=周DIF;
+DEA:=周DEA;
+MACD:=周MACD;
+
+金叉:=CROSS(周DIF,周DEA);
+金叉后周期数:=BARSLAST(金叉);
+金叉后最低DIF:=LLV(周DIF,金叉后周期数+1);
+转强:=金叉后周期数>0 AND 金叉后最低DIF<-0.12 AND CROSS(周DIF,-0.12) AND 周MACD>0;
+强势金叉:=金叉 AND 周DIF>=-0.12;
+普通金叉:=金叉 AND 周DIF<-0.12;
+
+普通金叉信号:IF(普通金叉,1,0);
+强势金叉信号:IF(强势金叉,1,0);
+转强信号:IF(转强,1,0);
+"""
+
+
+def test_build_signal_cache_momentum_model_builtin_e2e(db_session, monkeypatch):
+    """用户实际粘贴的「创懿动量模型」原文：语法预检 + builtin 求值全链路，零 TQ 公式调用。
+
+    覆盖此前只有合成公式验证过的部分：BARSLAST/LLV 动态周期、系统公式 MACD 兜底、
+    `:=` 与中文标识符、三条 `:` 输出线。
+    """
+    from core.engine.tdx_formula import syntax_check
+    from core.models import Formula
+
+    checked = syntax_check(MOMENTUM_MODEL_SRC)
+    assert checked["ok"], checked
+    assert checked["outputs"] == ["普通金叉信号", "强势金叉信号", "转强信号"]
+
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": MOMENTUM_MODEL_SRC,
+    })
+    db.commit()
+
+    klines = _builtin_klines()
+    # 60 根周线：先长期阴跌（DIF 下探 -0.12 以下）再强势反弹（制造金叉）
+    closes = [20 - i * 0.2 for i in range(45)] + [11 + i * 0.8 for i in range(15)]
+    from datetime import timedelta
+    weekly_dates = [datetime(2025, 6, 2) + timedelta(days=7 * i) for i in range(60)]
+    klines["000001.SZ"]["1w"] = pl.DataFrame({
+        "datetime": weekly_dates,
+        "Open": [Decimal(str(c)) for c in closes],
+        "High": [Decimal(str(c * 1.01)) for c in closes],
+        "Low": [Decimal(str(c * 0.99)) for c in closes],
+        "Close": [Decimal(str(c)) for c in closes],
+        "Volume": [5000] * 60,
+        "Amount": [Decimal("50000")] * 60,
+    })
+
+    def fail_compute(*a, **kw):
+        raise AssertionError("engine=builtin 不应调用 TQFormula.compute")
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fail_compute)
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(ps, klines, db, diagnostics=diagnostics)
+
+    assert not diagnostics.get("errors"), diagnostics
+    assert cache, "内置求值应产出信号条目"
+    assert diagnostics["output_lines"][strat.id] == {
+        "普通金叉信号", "强势金叉信号", "转强信号"}
+    names = {item["name"] for items in cache.values() for item in items}
+    assert names <= {"普通金叉信号", "强势金叉信号", "转强信号"}
+    assert all(item["value"] in (0, 1) for items in cache.values() for item in items)
+
+
+def test_build_signal_cache_xref_missing_formula(db_session):
+    """9b 被引公式不存在或非 builtin → diagnostics.errors，cache 空。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.add(Formula(name="TQ_ONLY", content="A1:CLOSE;", engine="tq"))
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(NOSUCH.A1>C,1,0);",
+    })
+    db.commit()
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(
+        ps, _builtin_klines(), db, diagnostics=diagnostics)
+
+    assert cache == {}
+    assert strat.id in diagnostics["errors"]
+    assert "NOSUCH" in diagnostics["errors"][strat.id]
+
+
+def test_build_signal_cache_xref_cycle(db_session):
+    """9b 自引用 → 静态环检测报错（不进入求值，避免无限递归）。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:OPEN_FORMULA.A1;",
+    })
+    db.commit()
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(
+        ps, _builtin_klines(), db, diagnostics=diagnostics)
+
+    assert cache == {}
+    assert "环" in diagnostics["errors"][strat.id]
+
+
+def test_build_signal_cache_xref_cross_period(db_session):
+    """9b 组合语法 TESTA.A1#WEEK：在 1w 上求值 TESTA → 对齐折回日线。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.add(Formula(name="TESTA", content="A1:CLOSE;", engine="builtin"))
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": "SIG:IF(TESTA.A1#WEEK>C,1,0);",
+    })
+    db.commit()
+
+    klines = _builtin_klines()
+    klines["000001.SZ"]["1w"] = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 27)],
+        "Open": [Decimal("9")], "High": [Decimal("11")], "Low": [Decimal("9")],
+        "Close": [Decimal("10.1")],
+        "Volume": [1000], "Amount": [Decimal("10000")],
+    })
+
+    cache = bt_api.build_signal_cache(ps, klines, db)
+
+    # 周 A1=10.1 对齐三根日线：C=10.2→0；C=9.0→1；C=10.2→0
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 29))] == [{"name": "SIG", "value": 0}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 30))] == [{"name": "SIG", "value": 1}]
+    assert cache[(strat.id, "000001.SZ", datetime(2026, 7, 31))] == [{"name": "SIG", "value": 0}]
+
+
+# ---------------------------------------------------------------------------
+# 批次 9a+9b 组合：跨周期(#WEEK) + 跨公式("MACD.DIF#WEEK") + CROSS/BARSLAST/LLV
+# （用户实际案例：创懿动量模型，内置引擎，数据走 TQ K线）
+# ---------------------------------------------------------------------------
+_MOMENTUM_FORMULA = """SHORT:=12;
+LONG:=26;
+MID:=9;
+周DIF:=\"MACD.DIF#WEEK\";
+周DEA:=\"MACD.DEA#WEEK\";
+周MACD:=\"MACD.MACD#WEEK\";
+DIF:=周DIF;
+DEA:=周DEA;
+MACD:=周MACD;
+金叉:=CROSS(周DIF,周DEA);
+金叉后周期数:=BARSLAST(金叉);
+金叉后最低DIF:=LLV(周DIF,金叉后周期数+1);
+转强:=金叉后周期数>0 AND 金叉后最低DIF<-0.12 AND CROSS(周DIF,-0.12) AND 周MACD>0;
+强势金叉:=金叉 AND 周DIF>=-0.12;
+普通金叉:=金叉 AND 周DIF<-0.12;
+普通金叉信号:IF(普通金叉,1,0);
+强势金叉信号:IF(强势金叉,1,0);
+转强信号:IF(转强,1,0);"""
+
+
+def _macd_momentum_klines():
+    """周线先跌后涨制造 DIF 金叉；日线由周线展开（每日同价）。"""
+    from datetime import timedelta
+    week_closes = [Decimal(str(round(10 - 1.0 * i / 19, 4))) for i in range(20)]
+    week_closes += [Decimal(str(round(9 + 1.5 * i / 19, 4))) for i in range(20)]
+    week_dt = [datetime(2022, 1, 3) + timedelta(days=7 * i) for i in range(40)]
+    w_df = pl.DataFrame({
+        "datetime": week_dt, "Open": week_closes,
+        "High": [c + Decimal("0.2") for c in week_closes],
+        "Low": [c - Decimal("0.2") for c in week_closes], "Close": week_closes,
+        "Volume": [1000] * 40, "Amount": [Decimal("10000")] * 40,
+    })
+    d_dt, d_close = [], []
+    for i, c in enumerate(week_closes):
+        base = week_dt[i]
+        for d in range(5):
+            d_dt.append(base + timedelta(days=d))
+            d_close.append(c)
+    d_df = pl.DataFrame({
+        "datetime": d_dt, "Open": d_close,
+        "High": [c + Decimal("0.2") for c in d_close],
+        "Low": [c - Decimal("0.2") for c in d_close], "Close": d_close,
+        "Volume": [1000] * len(d_dt), "Amount": [Decimal("10000")] * len(d_dt),
+    })
+    return {"000001.SZ": {"1d": d_df, "1w": w_df}}
+
+
+def test_build_signal_cache_builtin_macd_momentum_crossweek(db_session, monkeypatch):
+    """创懿动量模型（内置引擎）跨周期跨公式：'MACD.DIF#WEEK' + CROSS/BARSLAST/LLV 可求值出信号。"""
+    from core.models import Formula
+    db = db_session
+    ps, strat, formula = _seed_db(db)
+    db.add(Formula(name="MACD", engine="builtin",
+                   content="DIF:EMA(CLOSE,12)-EMA(CLOSE,26);DEA:EMA(DIF,9);MACD:(DIF-DEA)*2;"))
+    db.query(Formula).filter_by(id=formula.id).update({
+        "engine": "builtin", "content": _MOMENTUM_FORMULA,
+    })
+    db.commit()
+
+    def fail_compute(*a, **kw):
+        raise AssertionError("内置引擎不应调用 TQFormula.compute")
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fail_compute)
+
+    diagnostics = {}
+    cache = bt_api.build_signal_cache(ps, _macd_momentum_klines(), db, diagnostics=diagnostics)
+
+    assert not diagnostics.get("errors", {}).get(strat.id), diagnostics.get("errors")
+    assert diagnostics["output_lines"][strat.id] == {"普通金叉信号", "强势金叉信号", "转强信号"}
+    assert cache
+    values = [v["value"] for lst in cache.values() for v in lst]
+    assert any(v != 0 for v in values), "周 DIF 回升段应至少出现一次金叉信号"

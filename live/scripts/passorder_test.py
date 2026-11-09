@@ -1,4 +1,4 @@
-# -*- coding: gbk -*-
+# -*- coding: utf-8 -*-
 # passorder_test.py - minimal passorder smoke test for the sim account
 # =====================================================
 # Tests whether a passorder call from a strategy reaches the broker queue
@@ -15,14 +15,15 @@
 #
 # How to run:
 #   1. 模型交易 UI -> 新建交易 -> select this model, a stock (e.g. 600000),
-#      a period, and account 110002348760.
+#      a period, and account 410038214257.
 #   2. IMPORTANT: check the 运行模式 column/dropdown - try to pick 实盘
 #      (realtime) if available. 模拟 only logs a signal, no real order.
 #   3. run; then check 委托/成交 pages for the order.
 import time
 
 # ================= config =================
-ACCOUNT = "110002348760"
+# QMT paper account 410038214257 (bridge 8790, ACCOUNT_TYPE=STOCK)
+ACCOUNT = "410038214257"
 CODE = "600000.SH"
 VOLUME = 100
 PRICE = 9.35          # limit price; change to today's price if needed

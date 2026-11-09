@@ -151,6 +151,24 @@ def test_can_sell_t_plus_one():
     assert pos.can_sell_on(datetime(2026, 7, 30).date()) is True
 
 
+def test_full_close_then_rebuy_same_day_not_sellable():
+    """全平后同日再建仓：buy_time 重置为新买入时点 → 当日不可卖（T+1 语义）。
+
+    回归：sell() 全平原先不清 buy_time，同日再建仓后 can_sell_on(当日) 误返回 True。
+    """
+    pos = Position("000001.SZ")
+    t1 = datetime(2026, 7, 29, 9, 30)
+    t2 = datetime(2026, 7, 30, 9, 30)
+    pos.apply_trade(_trade(TradeType.BUY, "10", 1000, t1))
+    pos.apply_trade(_trade(TradeType.SELL, "11", 1000, t2))
+    assert pos.quantity == 0
+    assert pos.buy_time is None  # 全平清空
+    pos.apply_trade(_trade(TradeType.BUY, "10", 1000, t2))
+    assert pos.buy_time == t2  # 重新建仓取新时点
+    assert pos.can_sell_on(t2.date()) is False
+    assert pos.available_shares_on(t2.date()) == 0
+
+
 # ---------------- apply_reverse（切片5 G6 拒单/撤单反向修正）----------------
 def test_apply_reverse_buy_reduces_quantity():
     """买入被撤：减持仓（原 apply_trade 加了 quantity）。"""

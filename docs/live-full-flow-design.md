@@ -12,7 +12,7 @@
 Web 前端 ──HTTP/SSE──→ Core (FastAPI, main/, Py3.13)
                          │
                          ├── 实盘引擎 LiveEngine (进程内,长期持有内存态)
-                         │     ├── BarPoller ──HTTP /quote──→ iQuant 桥 (127.0.0.1:8790)
+                         │     ├── BarPoller ──HTTP /quote──→ QMT 桥 (127.0.0.1:8790)
                          │     ├── Portfolio[] (每组合一个,复用回测逻辑)
                          │     │     └── StrategyContext[] (每子策略一个,持有 positions)
                          │     ├── ExecutionEngine (复用回测,注入 HttpBridgeDispatcher + LiveT1Checker)
@@ -21,12 +21,12 @@ Web 前端 ──HTTP/SSE──→ Core (FastAPI, main/, Py3.13)
                          ├── DB (SQLite/PG): LiveSession / LiveOrder / LiveTrade ...
                          └── 嵌入式 TQ 模块 (通达信,get_tq() 单例 + get_tdx_lock 串行)
                                     ↑
-                         iQuant 桥 ──HTTP /order──→ iQuant 客户端 (Py3.6, passorder 真实下单)
+                         QMT 桥 ──HTTP /order──→ QMT 客户端 (Py3.6, passorder 真实下单)
 ```
 
 **两个 Python 环境**:
 - Core(`main/`, Py3.13):引擎、API、公式计算、回测(同进程)
-- iQuant 桥(`live/bridge/`, Py3.6.8):HTTP 服务 + `passorder` 真实下单,`init` 阻塞主循环=单线程事件循环
+- QMT 桥(`live/bridge/`, Py3.6.8):HTTP 服务 + `passorder` 真实下单,`init` 阻塞主循环=单线程事件循环
 
 **复用原则**:实盘引擎核心(Portfolio/StrategyContext/ExecutionEngine/risk_manager)97% 复用回测,仅通过策略模式注入隔离:
 - `OrderDispatcher`:回测 `SimulatedDispatcher`(open 价模拟成交) / 实盘 `HttpBridgeDispatcher`(桥真实下单)
@@ -458,7 +458,7 @@ submitted(受理未成交) → partial(部分成交) → filled(全部成交)
 
 - **LiveEngine 主循环**:asyncio Task,跑在 FastAPI 事件循环,单线程
 - **TQ 公式计算**:`get_tdx_lock()` 串行化,回测同步在请求线程(同进程),与实盘共用 `get_tq()` 单例,不并发
-- **桥**:iQuant 客户端内单线程事件循环(`init` 阻塞),HTTP 请求排队处理
+- **桥**:QMT 客户端内单线程事件循环(`init` 阻塞),HTTP 请求排队处理
 - **DB**:每根 bar 一个独立 Session(`_db_session_factory`),用完即关,不跨 bar 持有
 
 **约束**:主循环不可被 TQ 回调阻塞(回测同步已避免);单用户系统,实盘 session 同一时刻最多一个引擎实例在跑(但代码层未强制,`_ENGINES` 是 dict,理论支持多 session,需确认是否要限制)。

@@ -19,7 +19,7 @@
 周频口径与 ``crisis_alpha`` 对齐：``resample("W-FRI")`` 等价——按 ISO 周聚合
 日频收盘价（每周取最后一个交易日），周末标签日为该周**周五**。
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -63,8 +63,9 @@ def _normalize_prices(prices) -> List[Tuple[date, float]]:
     norm = []
     for item in items:
         d, v = item[0], item[1]
-        if hasattr(d, "date") and not isinstance(d, date):
-            # pandas.Timestamp / datetime.datetime
+        # datetime（含 pandas.Timestamp）是 date 的子类，须先判 datetime 再取 .date()；
+        # 否则归一后仍混入 datetime，与纯 date 比较时（date < datetime）会 TypeError。
+        if isinstance(d, datetime):
             d = d.date()
         norm.append((d, float(v)))
     norm.sort(key=lambda x: x[0])

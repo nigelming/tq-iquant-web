@@ -24,13 +24,15 @@ class StrategyRiskManager:
         self.trailing_stop_ratio = trailing_stop_ratio
 
     def check_stop_loss(self, position: Position, current_price: Decimal) -> bool:
-        if position.quantity == 0:
+        if position.quantity == 0 or position.avg_cost <= 0:
+            # avg_cost<=0 = 成本未知（外部导入持仓桥侧未给 cost）→ 跳过而非 0 除
             return False
         loss = (position.avg_cost - current_price) / position.avg_cost
         return loss >= self.stop_loss_ratio
 
     def check_take_profit(self, position: Position, current_price: Decimal) -> bool:
-        if position.quantity == 0:
+        if position.quantity == 0 or position.avg_cost <= 0:
+            # 同上：无成本基准时止盈同样无从判断（导入时已打 WARN）
             return False
         profit = (current_price - position.avg_cost) / position.avg_cost
         return profit >= self.take_profit_ratio
@@ -64,6 +66,9 @@ class PortfolioRiskManager:
         self.breaker_trigger_date: Optional[date] = None
         self.daily_pause_active = False
         self.daily_loss_trigger_date: Optional[date] = None
+        # 可选（默认关）：daily_loss 分母用「上一交易日收盘净值」而非初始资金。
+        # 关闭 = 原口径（阈值固定为 initial_capital × limit，历史结果不变）。
+        self.daily_loss_on_equity_enabled = False
         # 分钟级实盘（E5/E6）：跨日检测记录上一根 bar 的日期与 total_value
         self._last_bar_date: Optional[date] = None
         self._last_bar_total_value: Optional[Decimal] = None
@@ -101,6 +106,19 @@ class PortfolioRiskManager:
             return False
         loss = abs(daily_pnl) / initial_value if daily_pnl < 0 else 0
         return loss >= self.daily_loss_limit
+
+    def daily_loss_base(self, initial_capital: Decimal) -> Decimal:
+        """daily_loss 的分母。
+
+        默认 = 初始资金（原口径，阈值恒定，历史结果可比）；
+        daily_loss_on_equity_enabled 开启 = 上一交易日收盘净值（首日无前值回落初始资金），
+        使 5% 阈值随净值滚动，等价"日内亏损 ≥ 昨日净值 5%"。
+        """
+        if (self.daily_loss_on_equity_enabled
+                and self.prev_close_value is not None
+                and self.prev_close_value > 0):
+            return self.prev_close_value
+        return initial_capital
 
     def daily_reset(self) -> None:
         """旧接口保留：清日级暂停。"""
@@ -144,12 +162,22 @@ class PortfolioRiskManager:
         if self._last_bar_date is not None:
             self.update_daily(self._last_bar_total_value, self._last_bar_date, initial_capital)
 
-    def update_peak(self, total_value: Decimal, current_date: date) -> None:
+    def update_peak(
+        self,
+        total_value: Decimal,
+        current_date: date,
+        *,
+        allow_peak_update: bool = True,
+    ) -> None:
         """每根 bar 调用（实盘分钟级）：跨日刷新 prev_close、更新峰值、检测 max_drawdown 熔断 + 次日恢复。
 
         跨日检测：current_date 与上一根 bar 日期不同 → prev_close_value 刷新为
         上一根 bar 的 total_value（= 昨日最后一根 bar 总市值 = 昨日收盘基准）。
         分钟级每 bar 调：prev_close 只在跨日时刷新，不被分钟抖动覆盖（E6）。
+
+        allow_peak_update=False：只维护跨日 prev_close / 当日末值 / 熔断次日恢复，
+        不更新 peak、不检测 max_drawdown。供回测「日末 peak」可选保护使用，避免
+        混合周期粗 bar 的周期末 close（未来价）污染组合峰值；默认 True 保持原行为。
         """
         # 1. 跨日刷新 prev_close（分钟级：prev_close = 昨日最后一根 bar 的 total_value）
         if self._last_bar_date is not None and self._last_bar_date != current_date:
@@ -165,6 +193,9 @@ class PortfolioRiskManager:
                     "max_drawdown 熔断次日自动恢复（触发日 %s）" % self.breaker_trigger_date,
                     current_date,
                 )
+
+        if not allow_peak_update:
+            return
 
         # 3. 更新峰值
         if total_value > self.peak_value:
@@ -226,18 +257,22 @@ class PortfolioRiskManager:
             daily_pnl = total_value - self.prev_close_value
 
         # 4. 检测 daily_loss（当日未暂停时）
+        #    分母：默认初始资金（原口径）；开关开启时上一交易日收盘净值（见 daily_loss_base）
         if not self.daily_pause_active:
-            if self.check_daily_loss(daily_pnl, initial_capital):
+            base = self.daily_loss_base(initial_capital)
+            if self.check_daily_loss(daily_pnl, base):
                 loss = (
-                    abs(daily_pnl) / initial_capital
-                    if initial_capital and daily_pnl < 0 else Decimal("0")
+                    abs(daily_pnl) / base
+                    if base and daily_pnl < 0 else Decimal("0")
                 )
                 self.daily_pause_active = True
                 self.daily_loss_trigger_date = current_date
                 self._record_halt(
                     "daily_loss", "daily_loss_limit", self.daily_loss_limit, loss,
                     current_date,
-                    "日内盈亏 %s（基准 %s）亏损 %s 触发当日暂停" % (
-                        fmt_money(daily_pnl), fmt_money(self.prev_close_value), fmt_pct(loss),
+                    "日内盈亏 %s（基准 %s%s）亏损 %s 触发当日暂停" % (
+                        fmt_money(daily_pnl), fmt_money(base),
+                        "，昨日收盘净值" if self.daily_loss_on_equity_enabled else "，初始资金",
+                        fmt_pct(loss),
                     ),
                 )

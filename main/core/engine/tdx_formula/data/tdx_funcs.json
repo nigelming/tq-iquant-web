@@ -1,0 +1,3457 @@
+{
+ "funcs": {
+  "AUTOFILTER": {
+   "cat": "其他收录",
+   "sig": "AUTOFILTER",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "BETAEX": {
+   "cat": "其他收录",
+   "cn": "相关放大系数",
+   "sig": "BETAEX(X,Y,N)",
+   "d": "BETAEX(X,Y,N) 返回X与Y的N周期的相关放大系数,N支持变量",
+   "src": "dll"
+  },
+  "CANSELLGP": {
+   "cat": "其他收录",
+   "cn": "可卖数量",
+   "sig": "CANSELLGP",
+   "d": "返回可卖数量.此函数只适用于服务器端特定版本的策略交易模式下. 用法: CANSELL",
+   "src": "dll"
+  },
+  "CANUSEMONEY": {
+   "cat": "其他收录",
+   "cn": "可卖数量",
+   "sig": "CANUSEMONEY",
+   "d": "返回可卖数量.此函数只适用于服务器端特定版本的策略交易模式下. 用法: CANSELL",
+   "src": "dll"
+  },
+  "CODELIKE": {
+   "cat": "财务与板块",
+   "cn": "代码匹配",
+   "sig": "CODELIKE('前缀')",
+   "d": "股票代码以前缀开头时为真，如 CODELIKE('688')、CODELIKE('30')。",
+   "e": "二十厘米:=CODELIKE('30') OR CODELIKE('688');",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "FEERATE": {
+   "cat": "其他收录",
+   "cn": "合约手续费",
+   "sig": "FEERATE",
+   "d": "合约手续费比例(百分比),(具体交易策略中设置) (两种情况下支持:1.本地策略交易时,2.程序交易评测时配合交易函数使用)",
+   "src": "dll"
+  },
+  "HHVLLV": {
+   "cat": "其他收录",
+   "sig": "HHVLLV(X,T,N1,N2)",
+   "d": "阶段最高最低值. 用法: HHVLLV(X,T,N1,N2),表示前N1日到前N2日时段内的X最高值(T=0时)或最低值(T=1时)。 若N1为0,表示从第一天开始,N2为0,表示到最后日止,当N1,N2非0时,N1应>=N2。",
+   "src": "dll"
+  },
+  "IFF": {
+   "cat": "逻辑与判断",
+   "cn": "条件取值(双条件)",
+   "sig": "IFF(COND,A,B)",
+   "d": "与 IF 同类写法，部分版本行为一致。",
+   "e": "IFF(C>O,1,0)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": [
+    "ver"
+   ]
+  },
+  "INCLUDEDV": {
+   "cat": "其他收录",
+   "cn": "被后面包含",
+   "sig": "INCLUDEDV",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "LONGCROSS": {
+   "cat": "逻辑与判断",
+   "cn": "持续后上穿",
+   "sig": "LONGCROSS(A,B,N)",
+   "d": "A 在 N 周期内保持小于 B，然后上穿 B。",
+   "e": "LONGCROSS(DIF,DEA,3)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "MARGINRATE": {
+   "cat": "其他收录",
+   "cn": "合约保证金",
+   "sig": "MARGINRATE",
+   "d": "合约保证金比例(百分比),(具体交易策略中设置) (两种情况下支持:1.本地策略交易时,2.程序交易评测时配合交易函数使用)",
+   "src": "dll"
+  },
+  "MULTIPLIER": {
+   "cat": "其他收录",
+   "cn": "期货每手乘数",
+   "sig": "MULTIPLIER",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "NAMEINCLUDE": {
+   "cat": "其他收录",
+   "cn": "品种名称中包含",
+   "sig": "NAMEINCLUDE",
+   "d": "品种名称中是否包含参数. 用法: if(NAMEINCLUDE('文化'),x,y);",
+   "src": "dll"
+  },
+  "TOTALHQINFO": {
+   "cat": "其他收录",
+   "cn": "沪深京市场表现",
+   "sig": "TOTALHQINFO(N)",
+   "d": "TOTALHQINFO(N) 沪深京市场表现 N:1:上涨家数 2:下跌家数 3:涨停家数 4:跌停家数 5:昨日上涨家数 6:总成交金额(亿元)",
+   "src": "dll"
+  },
+  "TQFLAG": {
+   "cat": "常数",
+   "cn": "当前的复权状态",
+   "sig": "TQFLAG",
+   "d": "TQFLAG 当前的复权状态,0:无复权 1:前复权 2:后复权",
+   "src": "dll"
+  },
+  "BUYVOL": {
+   "cat": "行情数据",
+   "cn": "外盘/主动买量",
+   "sig": "BUYVOL",
+   "d": "主动性买入成交量，需逐笔/分笔数据支撑。",
+   "e": "外盘:=BUYVOL;",
+   "fl": [
+    "data"
+   ]
+  },
+  "CALCSTOCKINDEX": {
+   "cat": "引用函数",
+   "sig": "CALCSTOCKINDEX(品种代码,指标名称,指标输出)",
+   "d": "指标引用. 用法:CALCSTOCKINDEX(品种代码,指标名称,指标输出),返回该指标相应输出的计算值. 例如: CALCSTOCKINDEX('SH600000','KDJ',3)表示上证600000的KDJ指标第3个输出即J之值(注意:公式不能自己嵌套自己),第一个参数可在前面加SZ(深市),SH(沪市),BJ(京市),或市场_,, CALCSTOCKINDEX('47_IFL0','MACD',2)表示IFL0品种的MACD指标第2个输出值. 注意:引用品种的对应周期的数据必须要先下载到本地",
+   "src": "dll"
+  },
+  "DATETOCUR": {
+   "cat": "引用函数",
+   "cn": "日期离当天的数据数",
+   "sig": "DATETOCUR(DT)",
+   "d": "指定日期离当天的数据数. 用法: DATETOCUR(DT) DATETOCUR(DT).返回DT到当天的数据数.有效日期为(901219-1341231,+19000000后才是真正的日期值)",
+   "src": "dll"
+  },
+  "DTPRICE": {
+   "cat": "行情数据",
+   "cn": "跌停价",
+   "sig": "DTPRICE(昨收,幅度)",
+   "d": "跌停价，用法同 ZTPRICE。",
+   "e": "跌停价:=DTPRICE(REF(C,1),0.1);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": [
+    "ver"
+   ]
+  },
+  "DYNA_LB": {
+   "cat": "引用函数",
+   "sig": "DYNA_LB",
+   "d": "DYNA_LB 量比(同DYNAINFO(17) 即时行情数据",
+   "src": "dll"
+  },
+  "DYNA_NOW": {
+   "cat": "引用函数",
+   "sig": "DYNA_NOW",
+   "d": "DYNA_NOW 现价(同DYNAINFO(7) 即时行情数据 没有现价时(比如在开盘前),返回昨收盘价",
+   "src": "dll"
+  },
+  "DYNA_ZAF": {
+   "cat": "引用函数",
+   "sig": "DYNA_ZAF",
+   "d": "DYNA_ZAF 涨幅(同DYNAINFO(14) 即时行情数据(沪深京早盘竞价期间使用匹配价的涨幅) 转换成幅度需要乘100",
+   "src": "dll"
+  },
+  "DYNA_ZAS": {
+   "cat": "引用函数",
+   "sig": "DYNA_ZAS",
+   "d": "DYNA_ZAS 涨速(同DYNAINFO(24) 报价界面行情数据,可用于选股公式 转换成幅度需要乘100",
+   "src": "dll"
+  },
+  "EXTERNVALUE": {
+   "cat": "引用函数",
+   "cn": "引用自定义外部数值数据",
+   "sig": "EXTERNVALUE(TYPE,ID)",
+   "d": "EXTERNVALUE(TYPE,ID),用法同EXTERNSTR类似（依赖：EXTERNSTR）",
+   "src": "dll"
+  },
+  "FGBLOCKNUM": {
+   "cat": "引用函数",
+   "cn": "所属风格板块(个数)",
+   "sig": "FGBLOCKNUM",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "GNBLOCKNUM": {
+   "cat": "引用函数",
+   "cn": "所属概念板块(个数)",
+   "sig": "GNBLOCKNUM",
+   "d": "返回所属概念板块的个数,比如:IF(GNBLOCKNUM>5,1,0);.（依赖：IF）",
+   "src": "dll"
+  },
+  "HOD": {
+   "cat": "引用函数",
+   "cn": "高值名次",
+   "sig": "HOD(X,N)",
+   "d": "求高值名次. 用法: HOD(X,N):求当前X数据是N周期内的第几个高值,N=0则从第一个有效值开始. 例如: HOD(HIGH,20)返回是20日的第几个高价（依赖：HIGH）",
+   "src": "dll"
+  },
+  "IOPV": {
+   "cat": "引用函数",
+   "sig": "IOPV",
+   "d": "DYNAINFO(54) 某些基金的单位净值 即时行情数据",
+   "src": "dll"
+  },
+  "LOCALDAYNUM": {
+   "cat": "引用函数",
+   "cn": "本地日线数据个数",
+   "sig": "LOCALDAYNUM",
+   "d": "LOCALDAYNUM 客户端本地已下载的该品种的日线数据个数(含当日)",
+   "src": "dll"
+  },
+  "LOD": {
+   "cat": "引用函数",
+   "cn": "低值名次",
+   "sig": "LOD(X,N)",
+   "d": "求低值名次. 用法: LOD(X,N):求当前X数据是N周期内的第几个低值,N=0则从第一个有效值开始. 例如: LOD(LOW,20)返回是20日的第几个低价（依赖：LOW）",
+   "src": "dll"
+  },
+  "REFDATE": {
+   "cat": "引用函数",
+   "cn": "指定日期引用",
+   "sig": "REFDATE(X,日期)",
+   "d": "取指定日期（DATE 数值格式）的 X 值。",
+   "e": "基准:=REFDATE(C,1040101);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "REFX": {
+   "cat": "引用函数",
+   "cn": "日后的",
+   "sig": "REFX(X,A)",
+   "d": "属于未来函数,引用若干周期后的数据. 用法: REFX(X,A),引用A周期后的X值.A可以是变量. 例如: TT:=IF(C>O,1,2); REFX(CLOSE,TT);表示阳线引用下一周期的收盘价,阴线引用日后第二周期的收盘价.（依赖：CLOSE、IF）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "SEASON": {
+   "cat": "引用函数",
+   "cn": "引用季线",
+   "sig": "SEASON",
+   "d": "用于跨周期季线引用,注:DAY,MONTH,YEAR等也支持引用（依赖：DAY、MONTH、YEAR）",
+   "src": "dll"
+  },
+  "SELLVOL": {
+   "cat": "行情数据",
+   "cn": "内盘/主动卖量",
+   "sig": "SELLVOL",
+   "d": "主动性卖出成交量。",
+   "e": "内盘:=SELLVOL;",
+   "fl": [
+    "data"
+   ]
+  },
+  "TFILT": {
+   "cat": "引用函数",
+   "sig": "TFILT(X,D1,M1,D2,M2)",
+   "d": "对指定时间段的数据进行过滤,该时间段以外的数据无效. 用法: TFILT(X,D1,M1,D2,M2) 例如: TFILT(CLOSE,1040101,1025,1040101,1345)表示在2004年1月1日的10:25到2004年1月1日的13:45的收盘价是有效的. 周期以日为基本单位的,分时为0有效.（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "TOTALMMPAMO": {
+   "cat": "引用函数",
+   "cn": "沪深买卖盘金额",
+   "sig": "TOTALMMPAMO(N)",
+   "d": "TOTALMMPAMO(N) 沪深买卖盘金额 N:1:买一总金额 2:卖一总金额 3:前5档或前10档(Level2时)的买盘总金额 4:前5档或前10档(Level2时)的卖盘总金额 5:总委买金额(Level2时) 6:总委卖金额(Level2时) 单位为亿元,即时行情数据",
+   "src": "dll"
+  },
+  "UNDERCODE": {
+   "cat": "引用函数",
+   "cn": "对应标的的代码",
+   "sig": "UNDERCODE",
+   "d": "返回对应标的的代码,对于股票期权品种和可转债品种等有效. 比如: CALCSTOCKINDEX(UNDERCODE,'KDJ',3);（依赖：CALCSTOCKINDEX）",
+   "src": "dll"
+  },
+  "UPDOWN": {
+   "cat": "引用函数",
+   "cn": "大小变化",
+   "sig": "UPDOWN(X)",
+   "d": "返回数据相对上一周期的大小. 用法: UPDOWN(X) 表示X相对上一周期的大小,-1为变小,0表示不变,1为变大",
+   "src": "dll"
+  },
+  "VOLINSTK": {
+   "cat": "引用函数",
+   "cn": "分时图均价",
+   "sig": "VOLINSTK",
+   "d": "返回该周期的分时图均价线,对于分时图周期指标有效. 用法: ZSTJJ（依赖：ZSTJJ）",
+   "src": "dll"
+  },
+  "WEEK": {
+   "cat": "时间与周期",
+   "cn": "星期",
+   "sig": "WEEK",
+   "d": "星期序号，用于跨周期引用时要与周期后缀 #WEEK 区分。",
+   "e": "WEEK",
+   "fl": []
+  },
+  "ZDBLOCKNUM": {
+   "cat": "引用函数",
+   "cn": "所属自定义板块(个数)",
+   "sig": "ZDBLOCKNUM",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "ZHBLOCKNUM": {
+   "cat": "引用函数",
+   "cn": "所属组合板块(个数)",
+   "sig": "ZHBLOCKNUM",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "ZSTJJ": {
+   "cat": "引用函数",
+   "cn": "分时图均价",
+   "sig": "ZSTJJ",
+   "d": "返回该周期的分时图均价线,对于分时图周期指标有效. 用法: ZSTJJ",
+   "src": "dll"
+  },
+  "ZTPRICE": {
+   "cat": "行情数据",
+   "cn": "涨停价",
+   "sig": "ZTPRICE(昨收,幅度)",
+   "d": "按昨收与涨跌幅比例算涨停价，幅度传 0.1/0.2/0.05。",
+   "n": "需配合品种限制：主板10%、创业板/科创板20%、ST 5%。",
+   "e": "涨停价:=ZTPRICE(REF(C,1),0.1);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": [
+    "ver"
+   ]
+  },
+  "CROSS": {
+   "cat": "逻辑与判断",
+   "cn": "上穿",
+   "sig": "CROSS(A,B)",
+   "d": "A 上穿 B：上一周期 A<=B 且当周期 A>B。",
+   "n": "两值长期相等时可能不触发，可加 LONGCROSS 或先用条件锁一下。",
+   "e": "金叉:=CROSS(DIF,DEA);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "LFS": {
+   "cat": "形态与成本分布",
+   "cn": "新抛物转向",
+   "sig": "LFS",
+   "d": "新抛物转向函数 用法: NewSAR(N,S),N为起始统计天数,S为加速因子 例如: NewSAR(10,2)表示从10日后开始统计,加速因子为2的抛物转向",
+   "src": "dll"
+  },
+  "NEWSAR": {
+   "cat": "形态与成本分布",
+   "cn": "新抛物转向",
+   "sig": "NEWSAR",
+   "d": "新抛物转向函数 用法: NewSAR(N,S),N为起始统计天数,S为加速因子 例如: NewSAR(10,2)表示从10日后开始统计,加速因子为2的抛物转向",
+   "src": "dll"
+  },
+  "PEAK": {
+   "cat": "形态与成本分布",
+   "cn": "波峰值",
+   "sig": "PEAK(K,N,M)",
+   "d": "ZIG 系列波峰取值，依赖 ZIG。",
+   "e": "",
+   "args": [
+    3,
+    3
+   ],
+   "fl": [
+    "future"
+   ]
+  },
+  "PEAKBARS": {
+   "cat": "形态与成本分布",
+   "cn": "波峰距今年数",
+   "sig": "PEAKBARS(K,N,M)",
+   "d": "第 M 个 ZIG 波峰距今年数。",
+   "e": "",
+   "args": [
+    3,
+    3
+   ],
+   "fl": [
+    "future"
+   ]
+  },
+  "PPART": {
+   "cat": "形态与成本分布",
+   "cn": "之字转向",
+   "sig": "PPART",
+   "d": "区间成本. 用法: 例如COSTEX(CLOSE,REF(CLOSE,1)),表示近两日收盘价格间筹码的成本 该函数仅对日线分析周期有效（依赖：CLOSE、COSTEX、REF）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "SAR": {
+   "cat": "形态与成本分布",
+   "cn": "抛物转向",
+   "sig": "SAR(N,S,M)",
+   "d": "抛物线转向，N 步长、S 极限、M 起始值。",
+   "e": "停损:PARSAR(4,2,10);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "SARTURN": {
+   "cat": "形态与成本分布",
+   "cn": "抛物转向点",
+   "sig": "SARTURN(N,S,M)",
+   "d": "SAR 发生转向的K线上返回 1，否则返回 0。",
+   "n": "它只说“转了”，不区分向上还是向下转向；要分方向请用 CROSS(C,SAR(...)) 与 CROSS(SAR(...),C)。",
+   "e": "转向:=SARTURN(10,2,60);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "SHAPE_LONG": {
+   "cat": "形态与成本分布",
+   "cn": "长期形态值",
+   "sig": "SHAPE_LONG",
+   "d": "返回当前品种的长期形态值(1,2,..14) 1.倒V型反转 2.V型反转 3.W底 4.M顶 5.盘整 6.盘整后上行 7.盘整后下跌 8.上升通道 9.下降通道 10.拐头下跌 11.拐头上升 12.上行盘整 13.下跌盘整 14.其它形态",
+   "src": "dll"
+  },
+  "SHAPE_MID": {
+   "cat": "形态与成本分布",
+   "cn": "中期形态值",
+   "sig": "SHAPE_MID",
+   "d": "返回当前品种的中期形态值(1,2,..14) 1.倒V型反转 2.V型反转 3.W底 4.M顶 5.盘整 6.盘整后上行 7.盘整后下跌 8.上升通道 9.下降通道 10.拐头下跌 11.拐头上升 12.上行盘整 13.下跌盘整 14.其它形态",
+   "src": "dll"
+  },
+  "SHAPE_SHORT": {
+   "cat": "形态与成本分布",
+   "cn": "短期形态值",
+   "sig": "SHAPE_SHORT",
+   "d": "返回当前品种的短期形态值(1,2,..14) 1.倒V型反转 2.V型反转 3.W底 4.M顶 5.盘整 6.盘整后上行 7.盘整后下跌 8.上升通道 9.下降通道 10.拐头下跌 11.拐头上升 12.上行盘整 13.下跌盘整 14.其它形态",
+   "src": "dll"
+  },
+  "TROUGH": {
+   "cat": "形态与成本分布",
+   "cn": "波谷值",
+   "sig": "TROUGH(K,N,M)",
+   "d": "ZIG 系列波谷取值。",
+   "e": "",
+   "args": [
+    3,
+    3
+   ],
+   "fl": [
+    "future"
+   ]
+  },
+  "TROUGHBARS": {
+   "cat": "形态与成本分布",
+   "cn": "波谷距今年数",
+   "sig": "TROUGHBARS(K,N,M)",
+   "d": "第 M 个 ZIG 波谷距今年数。",
+   "e": "",
+   "args": [
+    3,
+    3
+   ],
+   "fl": [
+    "future"
+   ]
+  },
+  "ZIG": {
+   "cat": "形态与成本分布",
+   "cn": "之字转向",
+   "sig": "ZIG(K,N)",
+   "d": "按 N% 转折幅度画之字线，K=0收 1开 2高 3低。",
+   "n": "典型未来函数：转折未确认前末端会重画，绝不能进评分与选股。",
+   "e": "转向:ZIG(3,10);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": [
+    "future"
+   ]
+  },
+  "ZIGA": {
+   "cat": "形态与成本分布",
+   "sig": "ZIGA(K,X)",
+   "d": "属于未来函数,之字转向. 用法: ZIGA(K,X),当价格变化超过X时转向,K表示0:开盘价,1:最高价,2:最低价,3:收盘价,其余:序列数组 例如: ZIGA(3,1.5)表示收盘价变化1.5元的ZIGA转向",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "USERFUNC0": {
+   "cat": "外部扩展",
+   "cn": "DLL函数(无参数)",
+   "sig": "USERFUNC0",
+   "d": "调用DLL中的函数,DLL中内部对应定义. 用法: USERFUNC0",
+   "src": "dll"
+  },
+  "USERFUNC1": {
+   "cat": "外部扩展",
+   "cn": "DLL函数(1参数)",
+   "sig": "USERFUNC1(param1)",
+   "d": "调用DLL中的函数,DLL中内部对应定义. 用法: USERFUNC1(param1)",
+   "src": "dll"
+  },
+  "USERFUNC2": {
+   "cat": "外部扩展",
+   "cn": "DLL函数(2参数)",
+   "sig": "USERFUNC2(param1,param2)",
+   "d": "调用DLL中的函数,DLL中内部对应定义. 用法: USERFUNC2(param1,param2)",
+   "src": "dll"
+  },
+  "USERFUNC3": {
+   "cat": "外部扩展",
+   "cn": "DLL函数(3参数)",
+   "sig": "USERFUNC3(param1,param2,param3)",
+   "d": "调用DLL中的函数,DLL中内部对应定义. 用法: USERFUNC3(param1,param2,param3)",
+   "src": "dll"
+  },
+  "USERFUNC4": {
+   "cat": "外部扩展",
+   "cn": "DLL函数(4参数)",
+   "sig": "USERFUNC4(param1,param2,param3,param4)",
+   "d": "调用DLL中的函数,DLL中内部对应定义. 用法: USERFUNC4(param1,param2,param3,param4)",
+   "src": "dll"
+  },
+  "ABS": {
+   "cat": "数学函数",
+   "cn": "绝对值",
+   "sig": "ABS(X)",
+   "d": "取绝对值。",
+   "e": "波动:=ABS(C-REF(C,1));",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "ACOS": {
+   "cat": "数学函数",
+   "cn": "反余弦",
+   "sig": "ACOS(X)",
+   "d": "反余弦值. 用法: ACOS(X)返回X的反余弦值",
+   "src": "dll"
+  },
+  "ADVANCE": {
+   "cat": "行情数据",
+   "cn": "上涨家数",
+   "sig": "ADVANCE",
+   "d": "大盘上涨家数。仅在指数/综合类公式中有效，个股K线周期上通常取不到值。",
+   "e": "宽度:ADVANCE/(ADVANCE+DECLINE)*100;",
+   "fl": [
+    "indexonly"
+   ]
+  },
+  "ASIN": {
+   "cat": "数学函数",
+   "cn": "反正弦",
+   "sig": "ASIN(X)",
+   "d": "反正弦值. 用法: ASIN(X)返回X的反正弦值",
+   "src": "dll"
+  },
+  "ATAN": {
+   "cat": "数学函数",
+   "cn": "反正切",
+   "sig": "ATAN(X)",
+   "d": "反正切值. 用法: ATAN(X)返回X的反正切值",
+   "src": "dll"
+  },
+  "BETA": {
+   "cat": "统计函数",
+   "cn": "贝塔系数",
+   "sig": "BETA(N)",
+   "d": "个股相对大盘的 N 周期 Beta。",
+   "e": "BETA(60)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "data"
+   ]
+  },
+  "BLOCKSETNUM": {
+   "cat": "财务与板块",
+   "cn": "板块成分数",
+   "sig": "BLOCKSETNUM('板块名')",
+   "d": "指定板块内的股票个数。",
+   "e": "成分:=BLOCKSETNUM('沪深300');",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "data"
+   ]
+  },
+  "CEILING": {
+   "cat": "数学函数",
+   "cn": "向上取整",
+   "sig": "CEILING(X)",
+   "d": "不小于 X 的最小整数。",
+   "e": "CEILING(X)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "COS": {
+   "cat": "数学函数",
+   "cn": "余弦",
+   "sig": "COS(X)",
+   "d": "余弦值. 用法: COS(X)返回X的余弦值",
+   "src": "dll"
+  },
+  "COST": {
+   "cat": "形态与成本分布",
+   "cn": "N%获利盘价格",
+   "sig": "COST(N)",
+   "d": "成本分布中获利比例为 N% 对应的价位（0~100）。",
+   "n": "依赖筹码分布数据且在除权/历史区间上会重算，属未来数据类，回测与选股慎用。",
+   "e": "成本:=COST(50);",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "future",
+    "data"
+   ]
+  },
+  "COSTEX": {
+   "cat": "数学函数",
+   "cn": "区间成本",
+   "sig": "COSTEX",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "DECLINE": {
+   "cat": "行情数据",
+   "cn": "下跌家数",
+   "sig": "DECLINE",
+   "d": "大盘下跌家数，使用范围同 ADVANCE。",
+   "e": "DECLINE",
+   "fl": [
+    "indexonly"
+   ]
+  },
+  "DPZSCODE": {
+   "cat": "数学函数",
+   "cn": "所属的大盘指数的代码",
+   "sig": "DPZSCODE",
+   "d": "所属的大盘指数的代码.比如: CALCSTOCKINDEX(DPZSCODE,'KDJ',3);（依赖：CALCSTOCKINDEX）",
+   "src": "dll"
+  },
+  "EMA": {
+   "cat": "均线与累计",
+   "cn": "指数移动平均",
+   "sig": "EMA(X,N)",
+   "d": "加权递推平均，反应比 MA 快。",
+   "e": "快线:=EMA(C,10);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "EXP": {
+   "cat": "数学函数",
+   "cn": "指数",
+   "sig": "EXP(X)",
+   "d": "指数. 用法: EXP(X)为e的X次幂 例如: EXP(CLOSE)返回e的CLOSE次幂（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "EXPMA": {
+   "cat": "数学函数",
+   "sig": "EXPMA",
+   "d": "与EMA的用法一致（依赖：EMA）",
+   "src": "dll"
+  },
+  "EXTDATA_USER": {
+   "cat": "数学函数",
+   "cn": "引用扩展数据",
+   "sig": "EXTDATA_USER",
+   "d": "引用扩展数据. 请用扩展数据管理器来设置和刷新数据. EXTDATA_USER(N,TYPE),N取(1-200),表示读当前品种的N号扩展序列数据,TYPE:1表示做平滑处理,没有数据的周期返回上一周期的值;0表示不做平滑处理;2表示没有数据则为0;3表示做反向平滑处理,没有数据的周期返回下一周期的值",
+   "src": "dll"
+  },
+  "FGBKZSCODE": {
+   "cat": "数学函数",
+   "cn": "所属风格板块的指数代码",
+   "sig": "FGBKZSCODE",
+   "d": "返回品种所属风格板块的指数代码,参数表示是第几个,支持1-60. 用于支持Level2行情的版本 比如: CALCSTOCKINDEX(FGBKZSCODE(1),'KDJ',3);（依赖：CALCSTOCKINDEX）",
+   "src": "dll"
+  },
+  "FINDHIGH": {
+   "cat": "数学函数",
+   "sig": "FINDHIGH(VAR,N,M,T)",
+   "d": "N周期前的M周期内的第T个最大值. 用法: FINDHIGH(VAR,N,M,T):VAR在N日前的M天内第T个最高价",
+   "src": "dll"
+  },
+  "FINDHIGHBARS": {
+   "cat": "数学函数",
+   "cn": "寻找指定周期内的特定最大值到当前的周期数",
+   "sig": "FINDHIGHBARS(VAR,N,M,T)",
+   "d": "N周期前的M周期内的第T个最大值到当前周期的周期数. 用法: FINDHIGHBARS(VAR,N,M,T):VAR在N日前的M天内第T个最高价到当前周期的周期数",
+   "src": "dll"
+  },
+  "FINDLOW": {
+   "cat": "数学函数",
+   "cn": "寻找指定周期内的特定最小值",
+   "sig": "FINDLOW(VAR,N,M,T)",
+   "d": "N周期前的M周期内的第T个最小值. 用法: FINDLOW(VAR,N,M,T):VAR在N日前的M天内第T个最低价",
+   "src": "dll"
+  },
+  "FINDLOWBARS": {
+   "cat": "数学函数",
+   "sig": "FINDLOWBARS(VAR,N,M,T)",
+   "d": "N周期前的M周期内的第T个最小值到当前周期的周期数. 用法: FINDLOWBARS(VAR,N,M,T):VAR在N日前的M天内第T个最低价到当前周期的周期数.",
+   "src": "dll"
+  },
+  "FRACPART": {
+   "cat": "数学函数",
+   "cn": "小数部分",
+   "sig": "FRACPART(X)",
+   "d": "小数部分. 用法: FRACPART(X),返回X的小数部分",
+   "src": "dll"
+  },
+  "GNBKZSCODE": {
+   "cat": "数学函数",
+   "cn": "所属概念板块的指数代码",
+   "sig": "GNBKZSCODE",
+   "d": "返回品种所属概念板块的指数代码,参数表示是第几个,支持1-60. 用于支持Level2行情的版本 比如: CALCSTOCKINDEX(GNBKZSCODE(1),'KDJ',3);（依赖：CALCSTOCKINDEX）",
+   "src": "dll"
+  },
+  "HYSJL": {
+   "cat": "数学函数",
+   "cn": "指数市净率或个股所属行业的市净率",
+   "sig": "HYSJL",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "HYSYL": {
+   "cat": "数学函数",
+   "cn": "指数市盈率或个股所属行业的市盈率",
+   "sig": "HYSYL",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "HYZSCODE": {
+   "cat": "数学函数",
+   "cn": "所属行业的板块指数代码",
+   "sig": "HYZSCODE",
+   "d": "返回品种所属行业(按系统设置为普通行业或研究行业)的板块指数代码.比如: CALCSTOCKINDEX(HYZSCODE,'KDJ',3);（依赖：CALCSTOCKINDEX）",
+   "src": "dll"
+  },
+  "INBLOCK": {
+   "cat": "财务与板块",
+   "cn": "是否属于某板块",
+   "sig": "INBLOCK('板块名')",
+   "d": "判断个股是否属于指定板块/概念，字符串用英文单引号。",
+   "e": "创业板:=INBLOCK('创业板');",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "data"
+   ]
+  },
+  "INDEXA": {
+   "cat": "行情数据",
+   "cn": "大盘成交额",
+   "sig": "INDEXA",
+   "d": "对应大盘指数的成交金额，用于指数/大盘类公式。",
+   "e": "INDEXA",
+   "fl": [
+    "indexonly"
+   ]
+  },
+  "INDEXADV": {
+   "cat": "数学函数",
+   "cn": "大盘的上涨家数",
+   "sig": "INDEXADV",
+   "d": "INDEXADV 返回对应的上涨家数,分别是上证指数,深证成指,科创50,创业板指,北证50 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "INDEXC": {
+   "cat": "行情数据",
+   "cn": "大盘收盘价",
+   "sig": "INDEXC",
+   "d": "对应大盘指数的收盘价，用于算个股相对大盘的强弱。",
+   "e": "强度:INDEXC;",
+   "fl": []
+  },
+  "INDEXDEC": {
+   "cat": "数学函数",
+   "cn": "大盘的下跌家数",
+   "sig": "INDEXDEC",
+   "d": "INDEXDEC 返回对应的下跌家数,分别是上证指数,深证成指,科创50,创业板指,北证50 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "INDEXH": {
+   "cat": "行情数据",
+   "cn": "大盘最高价",
+   "sig": "INDEXH",
+   "d": "对应大盘指数的最高价。",
+   "e": "INDEXH",
+   "fl": []
+  },
+  "INDEXL": {
+   "cat": "行情数据",
+   "cn": "大盘最低价",
+   "sig": "INDEXL",
+   "d": "对应大盘指数的最低价。",
+   "e": "INDEXL",
+   "fl": []
+  },
+  "INDEXO": {
+   "cat": "行情数据",
+   "cn": "大盘开盘价",
+   "sig": "INDEXO",
+   "d": "对应大盘指数的开盘价。",
+   "e": "INDEXO",
+   "fl": []
+  },
+  "INDEXV": {
+   "cat": "数学函数",
+   "cn": "大盘的成交量",
+   "sig": "INDEXV",
+   "d": "INDEXV 返回对应的大盘成交量,分别是上证指数,深证成指,科创50,创业板指,北证50,港股为恒生指数,国内期货为对应的L9指数品种 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "INTPART": {
+   "cat": "数学函数",
+   "cn": "整数部分",
+   "sig": "INTPART(A)",
+   "d": "取整. 用法: INTPART(A)返回沿A绝对值减小方向最接近的整数 例如: INTPART(12.3)求得12,INTPART(-3.5)求得-3",
+   "src": "dll"
+  },
+  "L2_VOLNUM": {
+   "cat": "数学函数",
+   "cn": "单数分档",
+   "sig": "L2_VOLNUM(N,M)",
+   "d": "L2_VOLNUM(N,M) 单数分档,按: N(0--1):(超大+大)/(中+小),M(0--1):买/卖二类,沪深品种的资金流向,仅日线以上周期,用于特定版本",
+   "src": "dll"
+  },
+  "LOG": {
+   "cat": "数学函数",
+   "cn": "常用对数",
+   "sig": "LOG(X)",
+   "d": "以 10 为底对数。",
+   "e": "LOG(AMOUNT)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "LOWRANGE": {
+   "cat": "数学函数",
+   "cn": "当前值是近多少周期内的最小值",
+   "sig": "LOWRANGE(X)",
+   "d": "当前值是近多少周期内的最小值. 用法: LOWRANGE(X):X是近多少周期内X的最小值 例如: LOWRANGE(LOW)表示当前最低价是近多少周期内最低价的最小值（依赖：LOW）",
+   "src": "dll"
+  },
+  "MAINZSHQ": {
+   "cat": "数学函数",
+   "cn": "主要指数行情",
+   "sig": "MAINZSHQ(M,N)",
+   "d": "MAINZSHQ(M,N) 主要指数行情 M:0:当前品种所属指数 1:上证指数 2:深圳成指 3:创业板指 4:科创50指数 5:北证50指数 N:0现价 1:昨收 2:今开 3:最高 4:最低 5:成交额 6:上涨家数 7:下跌家数 8:涨幅 9:3日涨幅",
+   "src": "dll"
+  },
+  "MAX": {
+   "cat": "数学函数",
+   "cn": "较大值",
+   "sig": "MAX(A,B)",
+   "d": "两参数取大。",
+   "e": "MAX(C,O)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "MAX6": {
+   "cat": "数学函数",
+   "sig": "MAX6(A,B,C,D,E,F)",
+   "d": "求6个参数中的最大值. 用法: MAX6(A,B,C,D,E,F)返回最大值",
+   "src": "dll"
+  },
+  "MIN": {
+   "cat": "数学函数",
+   "cn": "较小值",
+   "sig": "MIN(A,B)",
+   "d": "两参数取小。",
+   "e": "MIN(C,O)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "MIN15": {
+   "cat": "数学函数",
+   "cn": "引用15分钟线",
+   "sig": "MIN15",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "MIN30": {
+   "cat": "数学函数",
+   "cn": "引用30分钟线",
+   "sig": "MIN30",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "MIN5": {
+   "cat": "数学函数",
+   "cn": "引用5分钟线",
+   "sig": "MIN5",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "MIN6": {
+   "cat": "数学函数",
+   "sig": "MIN6(A,B,C,D,E,F)",
+   "d": "求6个参数中的最小值. 用法: MIN6(A,B,C,D,E,F)返回最小值",
+   "src": "dll"
+  },
+  "MIN60": {
+   "cat": "数学函数",
+   "cn": "引用60分钟线",
+   "sig": "MIN60",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "MINDIFF": {
+   "cat": "数学函数",
+   "cn": "最小变动价位",
+   "sig": "MINDIFF",
+   "d": "MINDIFF 返回某品种的最小变动价位(也是交易价格的最小间隔单位)",
+   "src": "dll"
+  },
+  "NAMELIKE": {
+   "cat": "财务与板块",
+   "cn": "名称匹配",
+   "sig": "NAMELIKE('子串')",
+   "d": "股票名称含指定子串时为真，常用来排除 ST。",
+   "e": "NOT(NAMELIKE('ST'))",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "REVERSE": {
+   "cat": "数学函数",
+   "cn": "求相反数",
+   "sig": "REVERSE(X)",
+   "d": "求相反数. 用法: REVERSE(X)返回-X. 例如: REVERSE(CLOSE)返回-CLOSE（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "ROUND": {
+   "cat": "数学函数",
+   "cn": "四舍五入",
+   "sig": "ROUND(X)",
+   "d": "四舍五入到整数。小数位用 PRECISION 类属性或先乘后除。",
+   "e": "ROUND(换手*100)/100",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "ROUND2": {
+   "cat": "数学函数",
+   "cn": "262",
+   "sig": "ROUND2(X,N)",
+   "d": "四舍五入. 用法: ROUND2(X,N),返回X四舍五入到N位小数的数值 由于精度问题,数据越大误差可能越大 注:所有数值类型输出在一个公式内都是由此公式编辑器右上方[显示小数]的设置来决定的",
+   "src": "dll"
+  },
+  "SETCODE": {
+   "cat": "数学函数",
+   "cn": "市场类型",
+   "sig": "SETCODE",
+   "d": "SETCODE 市场类型 0:深圳 1:上海 2:北京 47:中金所期货 28:郑州商品 29:大连商品 30:上海商品,27:香港指数 31:香港主板,48:香港创业板...",
+   "src": "dll"
+  },
+  "SGN": {
+   "cat": "数学函数",
+   "sig": "SGN",
+   "d": "用法同SIGN（依赖：SIGN）",
+   "src": "dll"
+  },
+  "SIGN": {
+   "cat": "数学函数",
+   "sig": "SIGN(X)",
+   "d": "取符号. 用法: SIGN(X),返回X的符号.当X>0,X=0,X<0分别返回1,0,-1",
+   "src": "dll"
+  },
+  "SIGNALS_QS": {
+   "cat": "数学函数",
+   "cn": "引用自定义序列数据(券商)",
+   "sig": "SIGNALS_QS",
+   "d": "引用自定义序列数据(券商). SIGNALS_QS(ID,TYPE),TYPE:1表示做平滑处理,没有自定义数据的周期返回上一周期的值;0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "SIGNALS_USER": {
+   "cat": "数学函数",
+   "cn": "引用自定义序列数据",
+   "sig": "SIGNALS_USER",
+   "d": "引用自定义序列数据. 读取个人目录下的signals目录下面的[signals_user_?]目录,请用自定义数据管理器来维护. SIGNALS_USER(ID,TYPE):表示读当前品种的ID数据号的序列数据(自定义数据需按日期从小到大排序), TYPE:1表示做平滑处理,没有自定义数据的周期返回上一周期的值;0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "SIN": {
+   "cat": "数学函数",
+   "cn": "正弦",
+   "sig": "SIN(X)",
+   "d": "正弦值. 用法: SIN(X)返回X的正弦值",
+   "src": "dll"
+  },
+  "SQRT": {
+   "cat": "数学函数",
+   "cn": "平方根",
+   "sig": "SQRT(X)",
+   "d": "开平方，X 为负返回无效值。",
+   "e": "SQRT(VOL)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "TAN": {
+   "cat": "数学函数",
+   "cn": "正切",
+   "sig": "TAN(X)",
+   "d": "正切值. 用法: TAN(X)返回X的正切值",
+   "src": "dll"
+  },
+  "TOPRANGE": {
+   "cat": "数学函数",
+   "cn": "当前值是近多少周期内的最大值",
+   "sig": "TOPRANGE(X)",
+   "d": "当前值是近多少周期内的最大值. 用法: TOPRANGE(X):X是近多少周期内X的最大值 例如: TOPRANGE(HIGH)表示当前最高价是近多少周期内最高价的最大值（依赖：HIGH）",
+   "src": "dll"
+  },
+  "UNDERLYC": {
+   "cat": "数学函数",
+   "cn": "对应标的的收盘价",
+   "sig": "UNDERLYC",
+   "d": "UNDERLYC 返回对应标的的收盘价,对于股票期权品种和可转债品种等有效 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "USEDDATANUM": {
+   "cat": "数学函数",
+   "cn": "当前使用的数据个数",
+   "sig": "USEDDATANUM",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "ZSBLOCKNUM": {
+   "cat": "数学函数",
+   "cn": "所属指数板块(个数)",
+   "sig": "ZSBLOCKNUM",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "BKJYONE": {
+   "cat": "字符串",
+   "cn": "板块交易类数据(指定日期)",
+   "sig": "BKJYONE",
+   "d": "引用某天某种类型的板块交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. BKJYONE(ID,N,Y,MMDD),ID为数据编号,N表示第几个数据(取1或2),Y和MMDD表示年和月日. 如果Y为0,MMDD为0,表示最新数据,MMDD为1,2,3...,表示倒数第2,3,4...个数据",
+   "src": "dll"
+  },
+  "BKJYVALUE": {
+   "cat": "字符串",
+   "cn": "板块交易类数据(序列)",
+   "sig": "BKJYVALUE",
+   "d": "引用板块交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. BKJYVALUE(ID,N,TYPE),ID为数据编号,N表示第几个数据(取1或2),TYPE:为1表示做平滑处理,没有数据的周期返回上一周期的值;为0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "CON2STR": {
+   "cat": "字符串",
+   "cn": "数值转字符串",
+   "sig": "CON2STR(X,N)",
+   "d": "数值转字符串，保留 N 位小数。",
+   "e": "CON2STR(C,2)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "CONST": {
+   "cat": "字符串",
+   "sig": "CONST(A)",
+   "d": "CONST(A):取A最后的值为常数. 用法: CONST(INDEXC)表示取指数现价（依赖：INDEXC）",
+   "src": "dll"
+  },
+  "CONSTA": {
+   "cat": "字符串",
+   "sig": "CONSTA(A,N)",
+   "d": "CONSTA(A,N):取A中倒数第N位置的值为常数.N=0时表示是最后的值,N若为USEDDATANUM-1则为第一个值 用法: CONSTA(INDEXC,1)表示取昨日的指数现价为常数（依赖：INDEXC、USEDDATANUM）",
+   "src": "dll"
+  },
+  "DLL1": {
+   "cat": "字符串",
+   "sig": "DLL1(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL1(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL10": {
+   "cat": "字符串",
+   "sig": "DLL10(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL10(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL2": {
+   "cat": "字符串",
+   "sig": "DLL2(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL2(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL3": {
+   "cat": "字符串",
+   "sig": "DLL3(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL3(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL4": {
+   "cat": "字符串",
+   "sig": "DLL4(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL4(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL5": {
+   "cat": "字符串",
+   "sig": "DLL5(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL5(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL6": {
+   "cat": "字符串",
+   "sig": "DLL6(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL6(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL7": {
+   "cat": "字符串",
+   "sig": "DLL7(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL7(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL8": {
+   "cat": "字符串",
+   "sig": "DLL8(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL8(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "DLL9": {
+   "cat": "字符串",
+   "sig": "DLL9(funcid,param1,param2,param3)",
+   "d": "调用DLL中的函数. 用法: DLL9(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.",
+   "src": "dll"
+  },
+  "EXTERNSTR": {
+   "cat": "字符串",
+   "cn": "引用自定义外部字符串数据",
+   "sig": "EXTERNSTR(TYPE,ID)",
+   "d": "EXTERNSTR(TYPE,ID) TYPE为1表示是系统定义数据(需要通达信官方提供,需要[专业财务数据]下载,支持的ID为10001以上,详见自定义数据管理器), TYPE为0表示是自定义外部数据,读取signals目录下面的的extern_user.txt,请用自定义数据管理器来维护 extern_user.txt为文本结构,如下 1|600717|1|好股|0.33 市场(0:深圳,1:上海,2:北京)|品种代码|数据号|文字串|数值 如果是导出格式,则不需要数据号",
+   "src": "dll"
+  },
+  "FINDSTR": {
+   "cat": "字符串",
+   "cn": "字符串查找",
+   "sig": "FINDSTR(A,B)",
+   "d": "FINDSTR(A,B):在字符串A中查找字符串B,如果找到返回1,否则返回0. 用法: FINDSTR('多头开仓','开仓')在字符串'多头开仓'中查找字符串'开仓',返回1",
+   "src": "dll"
+  },
+  "FINONE": {
+   "cat": "字符串",
+   "cn": "专业财务数据(指定日期)",
+   "sig": "FINONE",
+   "d": "引用指定年和月日的某类型的财务数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. FINONE(ID,Y,MMDD),ID为数据编号,Y和MMDD表示年和月日. 如果Y和MMDD都为0,表示最新的财报; 如果Y为0,MMDD为小于300的数字,表示最近一期向前推MMDD期的数据,如果是331,630,930,1231这些,表示最近一期的对应季报的数据; 如果MMDD为0,Y为一数字,表示最近一期向前推Y年的同期数据; 季报分界点为:0331,0630,0930,1231",
+   "src": "dll"
+  },
+  "FINVALUE": {
+   "cat": "字符串",
+   "cn": "专业财务数据(序列)",
+   "sig": "FINVALUE",
+   "d": "引用专业财务数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. FINVALUE(ID),ID为数据编号",
+   "src": "dll"
+  },
+  "GPJYONE": {
+   "cat": "字符串",
+   "cn": "股票交易类数据(指定日期)",
+   "sig": "GPJYONE",
+   "d": "引用某天某种类型的股票交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场,不支持获取太早时间的数据. GPJYONE(ID,N,Y,MMDD),ID为数据编号,N表示第几个数据(取1或2),Y和MMDD表示年和月日. 如果Y为0,MMDD为0,表示最新数据,MMDD为1,2,3...,表示倒数第2,3,4...个数据",
+   "src": "dll"
+  },
+  "GPJYVALUE": {
+   "cat": "字符串",
+   "cn": "股票交易类数据(序列)",
+   "sig": "GPJYVALUE",
+   "d": "引用股票交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场,不支持获取太早时间的数据. GPJYVALUE(ID,N,TYPE),ID为数据编号,N表示第几个数据(取1或2),TYPE:为1表示做平滑处理,没有数据的周期返回上一周期的值;为0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "GPONEDAT": {
+   "cat": "字符串",
+   "cn": "股票的单个数据(非序列)",
+   "sig": "GPONEDAT",
+   "d": "引用股票的某种数据,该函数只适用于沪深京市场. GPONEDAT(ID),ID为数据编号",
+   "src": "dll"
+  },
+  "ORDERBUY": {
+   "cat": "字符串",
+   "cn": "委托买入",
+   "sig": "ORDERBUY(condition, volumetype, volume, pricetype, price)",
+   "d": "委托买入.此函数只适用于服务器端特定版本的策略交易模式下. 用法: ORDERBUY(condition, volumetype, volume, pricetype, price).",
+   "src": "dll"
+  },
+  "ORDERSELL": {
+   "cat": "字符串",
+   "cn": "委托卖出",
+   "sig": "ORDERSELL(condition, volumetype, volume, pricetype, price)",
+   "d": "委托卖出.此函数只适用于服务器端特定版本的策略交易模式下. 用法: ORDERSELL(condition, volumetype, volume, pricetype, price).",
+   "src": "dll"
+  },
+  "SCJYONE": {
+   "cat": "字符串",
+   "cn": "市场交易类数据(指定日期)",
+   "sig": "SCJYONE",
+   "d": "引用某天某种类型的市场总的交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. SCJYONE(ID,N,Y,MMDD),ID为数据编号,N表示第几个数据(取1或2),Y和MMDD表示年和月日. 如果Y为0,MMDD为0,表示最新数据,MMDD为1,2,3...,表示倒数第2,3,4...个数据",
+   "src": "dll"
+  },
+  "SCJYVALUE": {
+   "cat": "字符串",
+   "cn": "市场交易类数据(序列)",
+   "sig": "SCJYVALUE",
+   "d": "引用市场总的交易类数据.如果指标支持云数据函数(用于选股除外),则不需要[专业财务数据]下载,该函数只适用于沪深京市场. SCJYVALUE(ID,N,TYPE),ID为数据编号,N表示第几个数据(取1或2),TYPE:为1表示做平滑处理,没有数据的周期返回上一周期的值;为0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "SIGNALS_TQ": {
+   "cat": "字符串",
+   "cn": "引用自定义序列数据(TQ策略)",
+   "sig": "SIGNALS_TQ",
+   "d": "引用自定义序列数据(TQ策略). SIGNALS_TQ(ID,TYPE),ID为TQ数据中的序号(1-16),TYPE:1表示做平滑处理,没有自定义数据的周期返回上一周期的值;0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "STR2CON": {
+   "cat": "字符串",
+   "cn": "字符串转数值",
+   "sig": "STR2CON(S)",
+   "d": "字符串转数值。",
+   "e": "",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "STRCAT": {
+   "cat": "字符串",
+   "cn": "字符串连接",
+   "sig": "STRCAT(A,B)",
+   "d": "拼接两个字符串。",
+   "e": "标题:=STRCAT('涨幅:',CON2STR(涨幅,2));",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "STRCAT6": {
+   "cat": "字符串",
+   "cn": "6222222",
+   "sig": "STRCAT6(A,B,C,D,E,F)",
+   "d": "STRCAT6(A,B,C,D,E,F):将六个字符串A,B,C,D,E,F(非序列化)相加成一个字符串. 用法: STRCAT6('多头','开仓','或者','空头','平仓','')将六个字符串相加成一个字符串",
+   "src": "dll"
+  },
+  "STRCMP": {
+   "cat": "字符串",
+   "cn": "字符串比较",
+   "sig": "STRCMP(A,B)",
+   "d": "比较两字符串是否相同。",
+   "e": "",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "STRLEN": {
+   "cat": "字符串",
+   "sig": "STRLEN(S)",
+   "d": "STRLEN(S):得到字符串S(非序列值)的长度. 用法: STRLEN('通达信')表示字符串'通达信'为6",
+   "src": "dll"
+  },
+  "STRSPACE": {
+   "cat": "字符串",
+   "cn": "字符串加一空格",
+   "sig": "STRSPACE",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "SUBSTR": {
+   "cat": "字符串",
+   "cn": "字符串中取一部分",
+   "sig": "SUBSTR(S,A,N)",
+   "d": "SUBSTR(S,A,N):取字符串S中从位置A取N长的子字符串,A从1开始",
+   "src": "dll"
+  },
+  "TDXDLL1": {
+   "cat": "字符串",
+   "cn": "第1号DLL",
+   "sig": "TDXDLL1",
+   "d": "调用DLL中的函数. 用法: DLL1(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL1）",
+   "src": "dll"
+  },
+  "TDXDLL10": {
+   "cat": "字符串",
+   "cn": "第10号DLL",
+   "sig": "TDXDLL10",
+   "d": "调用DLL中的函数. 用法: DLL10(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL10）",
+   "src": "dll"
+  },
+  "TDXDLL2": {
+   "cat": "字符串",
+   "cn": "第2号DLL",
+   "sig": "TDXDLL2",
+   "d": "调用DLL中的函数. 用法: DLL2(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL2）",
+   "src": "dll"
+  },
+  "TDXDLL3": {
+   "cat": "字符串",
+   "cn": "第3号DLL",
+   "sig": "TDXDLL3",
+   "d": "调用DLL中的函数. 用法: DLL3(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL3）",
+   "src": "dll"
+  },
+  "TDXDLL4": {
+   "cat": "字符串",
+   "cn": "第4号DLL",
+   "sig": "TDXDLL4",
+   "d": "调用DLL中的函数. 用法: DLL4(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL4）",
+   "src": "dll"
+  },
+  "TDXDLL5": {
+   "cat": "字符串",
+   "cn": "第5号DLL",
+   "sig": "TDXDLL5",
+   "d": "调用DLL中的函数. 用法: DLL5(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL5）",
+   "src": "dll"
+  },
+  "TDXDLL6": {
+   "cat": "字符串",
+   "cn": "第6号DLL",
+   "sig": "TDXDLL6",
+   "d": "调用DLL中的函数. 用法: DLL6(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL6）",
+   "src": "dll"
+  },
+  "TDXDLL7": {
+   "cat": "字符串",
+   "cn": "第7号DLL",
+   "sig": "TDXDLL7",
+   "d": "调用DLL中的函数. 用法: DLL7(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL7）",
+   "src": "dll"
+  },
+  "TDXDLL8": {
+   "cat": "字符串",
+   "cn": "第8号DLL",
+   "sig": "TDXDLL8",
+   "d": "调用DLL中的函数. 用法: DLL8(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL8）",
+   "src": "dll"
+  },
+  "TDXDLL9": {
+   "cat": "字符串",
+   "cn": "第9号DLL",
+   "sig": "TDXDLL9",
+   "d": "调用DLL中的函数. 用法: DLL9(funcid,param1,param2,param3),funcid为数字,表示调用dll函数编号.（依赖：DLL9）",
+   "src": "dll"
+  },
+  "TOTALBARSCOUNT": {
+   "cat": "字符串",
+   "cn": "到最后交易的周期",
+   "sig": "TOTALBARSCOUNT",
+   "d": "求到最后K线的周期数.从最新一根K线倒数编号,从1开始计数. 用法: CURRBARSCOUNT（依赖：CURRBARSCOUNT）",
+   "src": "dll"
+  },
+  "VAR2STR": {
+   "cat": "字符串",
+   "cn": "取值转为字符串(序列)",
+   "sig": "VAR2STR(A,N)",
+   "d": "VAR2STR(A,N):取A的每一个值转为字符串,小数位数N. 每个数据都进行序列运算,若用于多股选股,建议换用非系列计算CON2STR 用法: VAR2STR(C,3)表示取收盘价,以3位小数转为字符串（依赖：CON2STR）",
+   "src": "dll"
+  },
+  "VARCAT6": {
+   "cat": "字符串",
+   "sig": "VARCAT6(A,B,C,D,E,F)",
+   "d": "VARCAT6(A,B,C,D,E,F):将六个字符串A,B,C,D,E,F相加成一个字符串. 每个数据都进行序列运算,若用于多股选股,建议换用STRCAT6 用法: VARCAT6('多头',VAR2STR(C,2),' ',VAR2STR(O,2),' ',VAR2STR(MA(C,5),2))将六个字符串相加成一个字符串（依赖：MA、STRCAT6、VAR2STR）",
+   "src": "dll"
+  },
+  "DATE": {
+   "cat": "时间与周期",
+   "cn": "日期",
+   "sig": "DATE",
+   "d": "返回日期数值（YYMMDD 形式），不是字符串。",
+   "e": "DATE>=1240101",
+   "fl": []
+  },
+  "DATETODAY": {
+   "cat": "时间与周期",
+   "cn": "转换天数",
+   "sig": "DATETODAY(DT)",
+   "d": "指定日期到1990.12.19的天数. 用法: DATETODAY(DT) DATETODAY(DT).返回DT到1990.12.19的天数.有效日期为(901219-1341231,+19000000后才是真正的日期值) 例如: DATETODAY(901219)返回0.",
+   "src": "dll"
+  },
+  "DAYTODATE": {
+   "cat": "时间与周期",
+   "cn": "转换日期",
+   "sig": "DAYTODATE(N)",
+   "d": "求1990.12.19后第若干天的日期. 用法: DAYTODATE(N) DAYTODATE(N).返回1990.12.19后第N天的日期.有效天数为(0-20000) 例如: DAYTODATE(0)返回901219.",
+   "src": "dll"
+  },
+  "FROMOPEN": {
+   "cat": "时间与周期",
+   "cn": "当前离开盘分钟数",
+   "sig": "FROMOPEN",
+   "d": "求该品种当前时刻已开盘有多少分钟,若在开市时间之前,则为0分钟. 用法: FROMOPEN FROMOPEN.返回当前时刻距开盘有多少分钟(开市期间的相对时间).",
+   "src": "dll"
+  },
+  "MACHINEDATE": {
+   "cat": "时间与周期",
+   "cn": "当前系统的日期",
+   "sig": "MACHINEDATE",
+   "d": "取得当前客户端机器从1900以来的的年月日,比如2016年10月1日为:01161001,MACHINEDATE+19000000后才是真正的日期值,公式内容中请不要直接写8位长的日期数字",
+   "src": "dll"
+  },
+  "MACHINETIME": {
+   "cat": "时间与周期",
+   "cn": "当前系统的时间",
+   "sig": "MACHINETIME",
+   "d": "取得当前客户端机器的时间,比如11:01:15时为110115",
+   "src": "dll"
+  },
+  "MACHINEWEEK": {
+   "cat": "时间与周期",
+   "cn": "当前系统的星期",
+   "sig": "MACHINEWEEK",
+   "d": "取得当前客户端机器为星期几(1,2,3,4,5,6,0)",
+   "src": "dll"
+  },
+  "PERIOD": {
+   "cat": "时间与周期",
+   "cn": "周期类型",
+   "sig": "PERIOD",
+   "d": "返回当前K线周期编号。",
+   "e": "PERIOD",
+   "fl": []
+  },
+  "SECTOTIME": {
+   "cat": "时间与周期",
+   "cn": "转换时间",
+   "sig": "SECTOTIME(N)",
+   "d": "求0时后若干秒是什么时间. 用法: SECTOTIME(N) SECTOTIME(N).返回0时后N秒是什么时间.有效秒数为(0-86399) 例如: SECTOTIME(34200)返回93000.",
+   "src": "dll"
+  },
+  "TIME": {
+   "cat": "时间与周期",
+   "cn": "时间",
+   "sig": "TIME",
+   "d": "返回时间数值（HHMMSS），仅分钟级周期有意义。",
+   "e": "TIME>=143000",
+   "fl": []
+  },
+  "TIMETOSEC": {
+   "cat": "时间与周期",
+   "cn": "当日秒数",
+   "sig": "TIMETOSEC(TM)",
+   "d": "求指定时刻距0时有多长时间. 用法: TIMETOSEC(TM) TIMETOSEC(TM).返回TM时刻距0时有多长时间,单位为秒.有效时间为(0-235959) 例如: TIMETOSEC(93000)返回34200.",
+   "src": "dll"
+  },
+  "TOTALFZNUM": {
+   "cat": "时间与周期",
+   "cn": "当前离开盘分钟数",
+   "sig": "TOTALFZNUM",
+   "d": "求该品种当前时刻已开盘有多少分钟,若在开市时间之前,则为0分钟. 用法: FROMOPEN FROMOPEN.返回当前时刻距开盘有多少分钟(开市期间的相对时间).（依赖：FROMOPEN）",
+   "src": "dll"
+  },
+  "ALIGNRIGHT": {
+   "cat": "绘图函数",
+   "cn": "有效数据右对齐",
+   "sig": "ALIGNRIGHT(X)",
+   "d": "有效数据右对齐. 用法: ALIGNRIGHT(X)有效数据向右移动,左边空出来的周期填充无效值 例如:TC:=IF(CURRBARSCOUNT=2 || CURRBARSCOUNT=5,DRAWNULL,C);XC:ALIGNRIGHT(TC);删除了两天的收盘价,并将剩余数据右移（依赖：CURRBARSCOUNT、DRAWNULL、IF）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "BARSCOUNT": {
+   "cat": "时间与周期",
+   "cn": "有效K线总数",
+   "sig": "BARSCOUNT(X)",
+   "d": "第一个有效数据到当前K线的周期数，常用于「有效数据超过 N 根才算」的过滤。",
+   "e": "Vard:=BARSCOUNT(CLOSE);",
+   "fl": []
+  },
+  "BUY": {
+   "cat": "绘图函数",
+   "cn": "买入开仓",
+   "sig": "BUY",
+   "d": "多头建仓(买入开仓). 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: BUY(CROSS(A,B),LOW),当A上穿B时,在LOW处画标记,同时突出提示或直接下单,如果LOW改为DRAWNULL,就不画标记.(分时图上不支持)（依赖：CROSS、DRAWNULL、LOW）",
+   "src": "dll"
+  },
+  "BUYSHORT": {
+   "cat": "绘图函数",
+   "cn": "卖出开仓",
+   "sig": "BUYSHORT",
+   "d": "空头建仓(卖出开仓),暂不适用于股票. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: SELLSHORT(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持)（依赖：CROSS、DRAWNULL、HIGH、SELLSHORT）",
+   "src": "dll"
+  },
+  "BUYSHORT_BUY": {
+   "cat": "绘图函数",
+   "cn": "先平空仓再开多仓",
+   "sig": "BUYSHORT_BUY",
+   "d": "先平空仓再开多仓,对于股票只是开多仓. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: BUYSHORT_BUY(CROSS(A,B),LOW),当A上穿B时,在LOW处画标记,同时突出提示或直接下单,如果LOW改为DRAWNULL,就不画标记.(分时图上不支持) 独立池时,反手时平掉所有的原来仓位（依赖：CROSS、DRAWNULL、LOW）",
+   "src": "dll"
+  },
+  "CLOSEALLD": {
+   "cat": "绘图函数",
+   "cn": "先平多仓再开空仓",
+   "sig": "CLOSEALLD",
+   "d": "先平多仓再开空仓,对于股票只是平多仓. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: SELL_SELLSHORT(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持) 独立池时,反手时平掉所有的原来仓位（依赖：CROSS、DRAWNULL、HIGH、SELL_SELLSHORT）",
+   "src": "dll"
+  },
+  "CLOSEALLK": {
+   "cat": "绘图函数",
+   "cn": "平掉所有空头仓位,暂不适用于股票.",
+   "sig": "CLOSEALLK",
+   "d": "平掉所有多头仓位. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: CLOSEALLD(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持)（依赖：CLOSEALLD、CROSS、DRAWNULL、HIGH、LOW）",
+   "src": "dll"
+  },
+  "CODE": {
+   "cat": "绘图函数",
+   "cn": "品种代码",
+   "sig": "CODE",
+   "d": "返回品种代码. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,CODE);在屏幕左上角显示品种代码（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "COLORBLACK": {
+   "cat": "绘图函数",
+   "cn": "格式为RGBX+“RRGGBB”：RR、GG、BB表示红色、绿色和的蓝色分量，每",
+   "sig": "COLORBLACK",
+   "d": "格式为COLOR+“BBGGRR”：BB、GG、RR表示蓝色、绿色和红色的分量，每种颜色的取值范围是00-FF，采用了16进制。 例如：MA5:MA(CLOSE,5)，COLOR00FFFF表示纯红色与纯绿色的混合色：COLOR808000表示淡蓝色和淡绿色的混合色。（依赖：CLOSE、MA、RGBX）",
+   "src": "dll"
+  },
+  "COLORLIMAGENTA": {
+   "cat": "绘图函数",
+   "cn": "淡洋红色",
+   "sig": "COLORLIMAGENTA",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "COLORLIRED": {
+   "cat": "绘图函数",
+   "cn": "淡红色",
+   "sig": "COLORLIRED",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "COLORSTICK": {
+   "cat": "绘图函数",
+   "cn": "彩色柱状线",
+   "sig": "COLORSTICK",
+   "d": "彩色柱状线。数据为正数时，向上画红色柱状线，反之向下画绿线",
+   "src": "dll"
+  },
+  "DPZSNAME": {
+   "cat": "绘图函数",
+   "cn": "所属的大盘指数的名称",
+   "sig": "DPZSNAME",
+   "d": "所属的大盘指数的名称.比如: DRAWTEXT_FIX(ISLASTBAR,0,0,0,DPZSNAME);（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "DRAWBAND": {
+   "cat": "绘图函数",
+   "cn": "填充带",
+   "sig": "DRAWBAND(V1,COL1,V2,COL2)",
+   "d": "两条线之间填充颜色。",
+   "e": "DRAWBAND(多,RGB(255,0,0),空,RGB(0,255,0));",
+   "args": [
+    4,
+    4
+   ],
+   "fl": [
+    "ver"
+   ]
+  },
+  "DRAWBMP": {
+   "cat": "绘图函数",
+   "cn": "画图片",
+   "sig": "DRAWBMP(COND,PRICE,'Bmp文件名')",
+   "d": "画出图片. 用法: DRAWBMP(COND,PRICE,'Bmp文件名'),当条件COND满足时,在PRICE位置画T0002目录下面的signals目录下面的\"Bmp文件名\"; 例如: DRAWBMP(O>C,CLOSE,'高开');（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "DRAWGBK": {
+   "cat": "绘图函数",
+   "sig": "DRAWGBK(COND,COLOR1,COLOR2,是否横向渐进,'BMP或PNG文件名',是否拉升BMP或PNG文件名)",
+   "d": "填充背景. 用法: DRAWGBK(COND,COLOR1,COLOR2,是否横向渐进,'BMP或PNG文件名',是否拉升BMP或PNG文件名),当条件COND满足时填充背景,如果COLOR1和COLOR2有一个不为0,则以COLOR1到COLOR2的渐变色为背景, 否则画T0002目录下面的signals目录下面的'Bmp或Png文件名'(优先使用BMP文件). 例如: DRAWGBK(ISLASTBAR AND O>C,RGB(0,255,0),RGB(255,0,0),0,'背景图',0);（依赖：ISLASTBAR、RGB）",
+   "src": "dll"
+  },
+  "DRAWGBK_DIV": {
+   "cat": "绘图函数",
+   "cn": "填充部分背景",
+   "sig": "DRAWGBK_DIV(COND,COLOR1,COLOR2,填色方式,填充范围)",
+   "d": "填充部分背景. 用法: DRAWGBK_DIV(COND,COLOR1,COLOR2,填色方式,填充范围),填充满足COND条件的背景区域 填色方式:0是上下渐进 1是左右渐进 2是用COLOR1画框线 3是用COLOR1画框线,用COLOR2填充 10-20时表示透明度选择,用COLOR1填充 填充范围:0为整个区域 1为最高最低区(主图) 2为开盘收盘区(主图) 例如: DRAWGBK_DIV(C>O,RGB(0,255,0),RGB(255,0,0),0,0);（依赖：RGB）",
+   "src": "dll"
+  },
+  "DRAWICON": {
+   "cat": "绘图函数",
+   "cn": "画图标",
+   "sig": "DRAWICON(COND,PRICE,TYPE)",
+   "d": "条件成立时在价格处画图标，TYPE 为图标编号。",
+   "e": "DRAWICON(金叉,L,1);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "DRAWKLINE": {
+   "cat": "绘图函数",
+   "cn": "画K线",
+   "sig": "DRAWKLINE(H,O,L,C)",
+   "d": "在当前图上重画一组K线。",
+   "e": "DRAWKLINE(H,O,L,C);",
+   "args": [
+    4,
+    4
+   ],
+   "fl": []
+  },
+  "DRAWLINE": {
+   "cat": "绘图函数",
+   "cn": "画直线",
+   "sig": "DRAWLINE(COND1,P1,COND2,P2,EXPAND)",
+   "d": "以两个定位点画直线，EXPAND=1 向右延伸。",
+   "e": "DRAWLINE(前低,L,突破,C,1);",
+   "args": [
+    5,
+    5
+   ],
+   "fl": []
+  },
+  "DRAWNUMBER": {
+   "cat": "绘图函数",
+   "cn": "画数值",
+   "sig": "DRAWNUMBER(COND,PRICE,NUM)",
+   "d": "条件成立处显示数值。",
+   "e": "DRAWNUMBER(1,L,涨跌幅);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "DRAWNUMBER_DIF": {
+   "cat": "绘图函数",
+   "sig": "DRAWNUMBER_DIF(COND,STYLE,START,NUM)",
+   "d": "画等差数字和字母. 用法: DRAWNUMBER_DIF(COND,STYLE,START,NUM),当COND条件满足时,用STYLE方式书写数字或字母START(0-9或11-36(显示为A-Z)),后面依次显示增加1的内容,显示NUM个. STYLE,0:普通 1:加引线 2:加引线加框 后面可以加入颜色或DRAWABOVE等,建议用于主图指标",
+   "src": "dll"
+  },
+  "DRAWNUMBER_FIX": {
+   "cat": "绘图函数",
+   "cn": "画定点数字",
+   "sig": "DRAWNUMBER_FIX(COND,X,Y,TYPE,DATA)",
+   "d": "固定位置显示数字. 用法: DRAWNUMBER_FIX(COND,X,Y,TYPE,DATA),COND中一般需要加ISLASTBAR,当COND条件满足时,在当前指标窗口内(X,Y)位置书写DATA,X,Y为书写点在窗口中相对于左上角的百分比, TYPE:0为左对齐,1为右对齐. 例如: DRAWNUMBER_FIX(ISLASTBAR AND CLOSE/OPEN>1.08,0.5,0.5,0,C)表示最后一个交易日实体阳线大于8%时在窗口中间位置显示收盘价.（依赖：CLOSE、ISLASTBAR、OPEN）",
+   "src": "dll"
+  },
+  "DRAWRECTREL": {
+   "cat": "绘图函数",
+   "cn": "相对矩形",
+   "sig": "DRAWRECTREL(X1,Y1,X2,Y2,COLOR)",
+   "d": "按窗口相对坐标画矩形背景。",
+   "e": "DRAWRECTREL(0,0,100,100,RGB(255,255,0));",
+   "args": [
+    5,
+    5
+   ],
+   "fl": [
+    "ver"
+   ]
+  },
+  "DRAWSL": {
+   "cat": "绘图函数",
+   "cn": "斜线",
+   "sig": "DRAWSL(COND,PRICE,SLOPE,LEN,DIRECT)",
+   "d": "绘制斜线. 用法: DRAWSL(COND,PRICE,SLOPE,LEN,DIRECT),当COND条件满足时,在PRICE位置画斜线,SLOPE为斜率,LEN为长度,DIRECT为0向右延伸,1向左延伸,2双向延伸.若COND太容易满足,此函数可能会很耗时 注意: 1.K线间的纵向高度差为SLOPE; 2.SLOPE为0时,为水平线; 3.SLOPE为10000时,为垂直线,LEN为向上的像素高度,DIRECT表示向上或向下延伸; 4.SLOPE和LEN支持变量;（依赖：SLOPE）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "DRAWTEXT": {
+   "cat": "绘图函数",
+   "cn": "画文字",
+   "sig": "DRAWTEXT(COND,PRICE,'文字')",
+   "d": "条件成立处写文字，文字用英文单引号包裹。",
+   "n": "文字里不要放 emoji 等 GBK 之外字符，会显示成问号。",
+   "e": "DRAWTEXT(买点,L,'买'),COLORYELLOW;",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "DRAWTEXT_FIX": {
+   "cat": "绘图函数",
+   "cn": "固定位置文字",
+   "sig": "DRAWTEXT_FIX(COND,X,Y,TYPE,'文字')",
+   "d": "在窗口相对位置输出文字，X/Y 为 0~1 比例。",
+   "e": "DRAWTEXT_FIX(1,0.01,0.05,0,'通达信指标源码库'),COLORYELLOW;",
+   "args": [
+    5,
+    5
+   ],
+   "fl": []
+  },
+  "DYBLOCK": {
+   "cat": "财务与板块",
+   "cn": "地域板块名",
+   "sig": "DYBLOCK",
+   "d": "返回地域板块字符串。",
+   "e": "DYBLOCK",
+   "args": [
+    0,
+    0
+   ],
+   "fl": [
+    "data"
+   ]
+  },
+  "FGBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属风格板块(字串)",
+   "sig": "FGBLOCK",
+   "d": "返回所属风格板块. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,FGBLOCK);在屏幕左上角显示所属风格板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "GETNAMEOFCODE": {
+   "cat": "绘图函数",
+   "cn": "根据品种代码得到品种名称",
+   "sig": "GETNAMEOFCODE",
+   "d": "根据品种代码和市场(比如深交所为0,上交所和板块指数为1,未知时可传-1),得到品种名称. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,GETNAMEOFCODE(1,HYZSCODE));（依赖：DRAWTEXT_FIX、HYZSCODE、ISLASTBAR）",
+   "src": "dll"
+  },
+  "GNBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属概念板块(字串)",
+   "sig": "GNBLOCK",
+   "d": "返回所属概念板块. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,GNBLOCK);在屏幕左上角显示所属概念板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "HORCALC": {
+   "cat": "财务与板块",
+   "cn": "多股统计",
+   "sig": "HORCALC",
+   "d": "横向统计取值，版本相关。",
+   "e": "",
+   "fl": [
+    "ver",
+    "data"
+   ]
+  },
+  "HQCRBK": {
+   "cat": "绘图函数",
+   "cn": "行情区背景色",
+   "sig": "HQCRBK",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "HYBLOCK": {
+   "cat": "财务与板块",
+   "cn": "行业板块名",
+   "sig": "HYBLOCK",
+   "d": "返回个股所属行业板块字符串。",
+   "n": "需本地板块数据，部分版本要求登录或有板块权限。",
+   "e": "板块:=HYBLOCK;",
+   "args": [
+    0,
+    0
+   ],
+   "fl": [
+    "data"
+   ]
+  },
+  "INSORT": {
+   "cat": "财务与板块",
+   "cn": "板块指标排序",
+   "sig": "INSORT",
+   "d": "横向统计排序类函数，版本相关。",
+   "e": "",
+   "fl": [
+    "ver",
+    "data"
+   ]
+  },
+  "INSUM": {
+   "cat": "财务与板块",
+   "cn": "板块指标求和",
+   "sig": "INSUM",
+   "d": "横向统计类，需在支持横统计的版本中使用。",
+   "e": "",
+   "fl": [
+    "ver",
+    "data"
+   ]
+  },
+  "LEVEL1HYBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属一级研究行业(字串)",
+   "sig": "LEVEL1HYBLOCK",
+   "d": "返回品种所属一级研究行业.此函数仅用于PC客户端. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,LEVEL1HYBLOCK);在屏幕左上角显示所属一级研究行业板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "MAINBUSINESS": {
+   "cat": "绘图函数",
+   "cn": "主营构成(字串)",
+   "sig": "MAINBUSINESS",
+   "d": "返回主营构成. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,MAINBUSINESS);在屏幕左上角显示主营构成,PC端有增强功能集的版本支持（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "MOREHYBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属细分行业(字串)",
+   "sig": "MOREHYBLOCK",
+   "d": "返回品种所属细分行业.此函数仅用于PC客户端. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,MOREHYBLOCK);在屏幕左上角显示所属细分行业板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "NODRAW": {
+   "cat": "绘图函数",
+   "cn": "不显示",
+   "sig": "NODRAW",
+   "d": "在指标区不显示,如果有输出线名的话,只显示在输出线行",
+   "src": "dll"
+  },
+  "NOTEXT": {
+   "cat": "绘图函数",
+   "cn": "不显示输出线数据",
+   "sig": "NOTEXT",
+   "d": "输出线名称前带有NOTEXT字样时,不显示输出线数据",
+   "src": "dll"
+  },
+  "PARTLINE": {
+   "cat": "绘图函数",
+   "cn": "分段线",
+   "sig": "PARTLINE(COND,PRICE)",
+   "d": "分段画线，常用于变色趋势线。",
+   "e": "PARTLINE(C>MA(C,20),MA(C,20)),COLORRED;",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "PLAYSOUND1": {
+   "cat": "绘图函数",
+   "cn": "播放1号",
+   "sig": "PLAYSOUND1",
+   "d": "播放1号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND10": {
+   "cat": "绘图函数",
+   "cn": "播放10号",
+   "sig": "PLAYSOUND10",
+   "d": "播放10号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND11": {
+   "cat": "绘图函数",
+   "cn": "播放11号",
+   "sig": "PLAYSOUND11",
+   "d": "播放11号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND12": {
+   "cat": "绘图函数",
+   "cn": "播放12号",
+   "sig": "PLAYSOUND12",
+   "d": "播放12号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND13": {
+   "cat": "绘图函数",
+   "cn": "播放13号",
+   "sig": "PLAYSOUND13",
+   "d": "播放13号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND14": {
+   "cat": "绘图函数",
+   "cn": "播放14号",
+   "sig": "PLAYSOUND14",
+   "d": "播放14号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND15": {
+   "cat": "绘图函数",
+   "cn": "播放15号",
+   "sig": "PLAYSOUND15",
+   "d": "播放15号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND16": {
+   "cat": "绘图函数",
+   "cn": "播放16号",
+   "sig": "PLAYSOUND16",
+   "d": "播放16号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND17": {
+   "cat": "绘图函数",
+   "cn": "播放17号",
+   "sig": "PLAYSOUND17",
+   "d": "播放17号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND18": {
+   "cat": "绘图函数",
+   "cn": "播放18号",
+   "sig": "PLAYSOUND18",
+   "d": "播放18号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND19": {
+   "cat": "绘图函数",
+   "cn": "播放19号",
+   "sig": "PLAYSOUND19",
+   "d": "播放19号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND2": {
+   "cat": "绘图函数",
+   "cn": "播放2号",
+   "sig": "PLAYSOUND2",
+   "d": "播放2号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND20": {
+   "cat": "绘图函数",
+   "cn": "播放20号",
+   "sig": "PLAYSOUND20",
+   "d": "播放20号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND3": {
+   "cat": "绘图函数",
+   "cn": "播放3号",
+   "sig": "PLAYSOUND3",
+   "d": "播放3号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND4": {
+   "cat": "绘图函数",
+   "cn": "播放4号",
+   "sig": "PLAYSOUND4",
+   "d": "播放4号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND5": {
+   "cat": "绘图函数",
+   "cn": "播放5号",
+   "sig": "PLAYSOUND5",
+   "d": "播放5号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND6": {
+   "cat": "绘图函数",
+   "cn": "播放6号",
+   "sig": "PLAYSOUND6",
+   "d": "播放6号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND7": {
+   "cat": "绘图函数",
+   "cn": "播放7号",
+   "sig": "PLAYSOUND7",
+   "d": "播放7号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND8": {
+   "cat": "绘图函数",
+   "cn": "播放8号",
+   "sig": "PLAYSOUND8",
+   "d": "播放8号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLAYSOUND9": {
+   "cat": "绘图函数",
+   "cn": "播放9号",
+   "sig": "PLAYSOUND9",
+   "d": "播放9号 声音和动画在[插入资源]中设置 最后一个数据满足条件后播放(只播放一次)",
+   "src": "dll"
+  },
+  "PLOYLINE": {
+   "cat": "绘图函数",
+   "sig": "PLOYLINE(COND,PRICE)",
+   "d": "绘制折线段. 用法: PLOYLINE(COND,PRICE),当COND条件满足时,以PRICE位置为顶点画折线连接. 例如: PLOYLINE(HIGH>=HHV(HIGH,20),HIGH)表示在创20天新高点之间画折线（依赖：HHV、HIGH）",
+   "src": "dll"
+  },
+  "RGB": {
+   "cat": "绘图函数",
+   "cn": "自定义颜色",
+   "sig": "RGB(R,G,B)",
+   "d": "0~255 三通道自定义颜色。",
+   "e": "COLORRGB:=RGB(255,128,0);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "RGBX": {
+   "cat": "绘图函数",
+   "cn": "自定义色",
+   "sig": "RGBX",
+   "d": "格式为RGBX+“RRGGBB”：RR、GG、BB表示红色、绿色和的蓝色分量，每种颜色的取值范围是00-FF，采用了16进制。 例如：MA5:MA(CLOSE,5)，RGBXFFFF00表示纯红色与纯绿色的混合色：RGBX008080表示淡蓝色和淡绿色的混合色。（依赖：CLOSE、MA）",
+   "src": "dll"
+  },
+  "SELL": {
+   "cat": "绘图函数",
+   "cn": "卖出平仓",
+   "sig": "SELL",
+   "d": "多头平仓(卖出平仓). 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: SELL(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持)（依赖：CROSS、DRAWNULL、HIGH）",
+   "src": "dll"
+  },
+  "SELLSHORT": {
+   "cat": "绘图函数",
+   "cn": "卖出开仓",
+   "sig": "SELLSHORT",
+   "d": "空头建仓(卖出开仓),暂不适用于股票. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: SELLSHORT(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持)（依赖：CROSS、DRAWNULL、HIGH）",
+   "src": "dll"
+  },
+  "SELL_SELLSHORT": {
+   "cat": "绘图函数",
+   "cn": "先平多仓再开空仓",
+   "sig": "SELL_SELLSHORT",
+   "d": "先平多仓再开空仓,对于股票只是平多仓. 参数1为触发条件,参数2为标记放置位置.此函数只适用于特定版本交易模式下. 例如: SELL_SELLSHORT(CROSS(A,B),HIGH),当A上穿B时,在HIGH处画标记,同时突出提示或直接下单,如果HIGH改为DRAWNULL,就不画标记.(分时图上不支持) 独立池时,反手时平掉所有的原来仓位（依赖：CROSS、DRAWNULL、HIGH）",
+   "src": "dll"
+  },
+  "SIMIBLOCK": {
+   "cat": "绘图函数",
+   "cn": "最相似板块(字串)",
+   "sig": "SIMIBLOCK",
+   "d": "返回最相似板块(代码 名称),注:供参考信息. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,SIMIBLOCK);在屏幕左上角显示最相似板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "STICKLINE": {
+   "cat": "绘图函数",
+   "cn": "画柱线",
+   "sig": "STICKLINE(COND,P1,P2,WIDTH,EMPTY)",
+   "d": "条件成立时画柱，WIDTH 宽度、EMPTY 0实心/1空心。",
+   "e": "STICKLINE(C>O,O,C,0,0),COLORRED;",
+   "args": [
+    5,
+    5
+   ],
+   "fl": []
+  },
+  "STKNAME": {
+   "cat": "绘图函数",
+   "cn": "品种名称",
+   "sig": "STKNAME",
+   "d": "返回品种名称. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,STKNAME);在屏幕左上角显示品种名称（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "TOKENWORD": {
+   "cat": "绘图函数",
+   "cn": "标识简字",
+   "sig": "TOKENWORD",
+   "d": "返回用户在客户端设置的标识简字 用法: DRAWTEXT_FIX(ISLASTBAR,0.1,0.5,0,TOKENWORD);（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "VARCAT": {
+   "cat": "绘图函数",
+   "cn": "字符串相加(序列)",
+   "sig": "VARCAT(A,B)",
+   "d": "VARCAT(A,B):将两个字符串A,B相加成一个字符串. 每个数据都进行序列运算,若用于多股选股,建议换用STRCAT 用法: DRAWTEXT(CLOSE>OPEN,LOW,VARCAT('多头',VAR2STR(C,2))) 将两个字符串相加成一个字符串并按条件显示出来（依赖：CLOSE、DRAWTEXT、LOW、OPEN、STRCAT、VAR2STR）",
+   "src": "dll"
+  },
+  "VOLSTICK": {
+   "cat": "绘图函数",
+   "cn": "成交量柱状线",
+   "sig": "VOLSTICK",
+   "d": "成交量柱状线。当股价上涨时显示红色空心柱，反之则显示绿色实心柱",
+   "src": "dll"
+  },
+  "ZDBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属自定义板块(字串)",
+   "sig": "ZDBLOCK",
+   "d": "返回所属自定义板块. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,ZDBLOCK);在屏幕左上角显示所属自定义板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "ZHBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属组合板块(字串)",
+   "sig": "ZHBLOCK",
+   "d": "返回所属组合板块. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,ZHBLOCK);在屏幕左上角显示所属组合板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "ZSBLOCK": {
+   "cat": "绘图函数",
+   "cn": "所属指数板块(字串)",
+   "sig": "ZSBLOCK",
+   "d": "返回所属指数板块. 用法: DRAWTEXT_FIX(ISLASTBAR,0,0,0,ZSBLOCK);在屏幕左上角显示所属指数板块（依赖：DRAWTEXT_FIX、ISLASTBAR）",
+   "src": "dll"
+  },
+  "AMA": {
+   "cat": "统计函数",
+   "sig": "AMA(X,A)",
+   "d": "求自适应均线值. 用法: AMA(X,A),A为自适应系数,必须小于1. 算法: Y=Y'+A*(X-Y').初值为X",
+   "src": "dll"
+  },
+  "BACKSET": {
+   "cat": "统计函数",
+   "cn": "向前赋值",
+   "sig": "BACKSET(X,N)",
+   "d": "属于未来函数,将当前位置到若干周期前的数据设为1. 用法: BACKSET(X,N),若X非0,则将当前位置到N周期前的数值设为1. 例如: BACKSET(CLOSE>OPEN,2)若收阳则将该周期及前一周期数值设为1,否则为0（依赖：CLOSE、OPEN）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "BARSTATUS": {
+   "cat": "统计函数",
+   "cn": "数据位置状态",
+   "sig": "BARSTATUS",
+   "d": "BARSTATUS返回数据的位置信息,结果1表示第一根K线,2表示最后一根K线,0表示在中间位置. 例如: BARSTATUS=2表示当前是序列数据的最后一个.",
+   "src": "dll"
+  },
+  "COVAR": {
+   "cat": "统计函数",
+   "cn": "协方差",
+   "sig": "COVAR(X,Y,N)",
+   "d": "N 周期协方差。",
+   "e": "COVAR(C,V,20)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "CURRBARSCOUNT": {
+   "cat": "时间与周期",
+   "cn": "到最新K线距离",
+   "sig": "CURRBARSCOUNT",
+   "d": "当前K线到最新K线的周期数，1 表示最新一根。",
+   "n": "配合 DYNAINFO 类实时数据时要用 CURRBARSCOUNT=1 门控，否则历史柱会画错。",
+   "e": "DRAWTEXT(CURRBARSCOUNT=1 AND 信号,H,'今');",
+   "fl": []
+  },
+  "DMA": {
+   "cat": "均线与累计",
+   "cn": "动态移动平均",
+   "sig": "DMA(X,A)",
+   "d": "A 为 0~1 的变动权数，A 越大越贴近现价。",
+   "n": "A 超出 0~1 会导致均线跑飞，常用 A=VOL/HHV(VOL,N) 需再做夹逼。",
+   "e": "跟踪线:=DMA(C,MIN(VOL/HHV(VOL,60),1));",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "DOWNNDAY": {
+   "cat": "统计函数",
+   "cn": "连跌",
+   "sig": "DOWNNDAY(CLOSE,M)",
+   "d": "返回周期数内是否连跌. 用法: DOWNNDAY(CLOSE,M) 表示连跌M个周期,M为常量（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "HHVBARS": {
+   "cat": "引用函数",
+   "cn": "最高值距今年数",
+   "sig": "HHVBARS(X,N)",
+   "d": "N 周期内最大值到当前周期的距离（0 表示当期创新高）。",
+   "e": "距前高:=HHVBARS(H,250);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "LLVBARS": {
+   "cat": "引用函数",
+   "cn": "最低值距今年数",
+   "sig": "LLVBARS(X,N)",
+   "d": "N 周期内最小值到当前周期的距离。",
+   "e": "距前低:=LLVBARS(L,250);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "MEMA": {
+   "cat": "统计函数",
+   "cn": "平滑移动平均",
+   "sig": "MEMA(X,N)",
+   "d": "返回平滑移动平均 用法: MEMA(X,N):X的N日平滑移动平均,如Y=(X+Y'*(N-1))/N MEMA(X,N)相当于SMA(X,N,1)（依赖：SMA）",
+   "src": "dll"
+  },
+  "MULAR": {
+   "cat": "均线与累计",
+   "cn": "累乘",
+   "sig": "MULAR(X,N)",
+   "d": "N 周期累乘（部分版本写作 MULAE）。",
+   "e": "",
+   "fl": [
+    "ver"
+   ]
+  },
+  "NDAY": {
+   "cat": "统计函数",
+   "cn": "连大",
+   "sig": "NDAY(CLOSE,OPEN,3)",
+   "d": "返回是否持续存在X>Y 用法: NDAY(CLOSE,OPEN,3) 表示连续3日收阳线（依赖：CLOSE、OPEN）",
+   "src": "dll"
+  },
+  "REF": {
+   "cat": "引用函数",
+   "cn": "N周期前引用",
+   "sig": "REF(X,N)",
+   "d": "取 X 在 N 周期前的值。N 为非常数时按变长引用处理。",
+   "n": "N 用负数是向前引用，属于未来数据，回测与选股会漂移；首根K线 REF 结果为无效值，参与除法或比较要保护。",
+   "e": "昨收:=REF(C,1);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "REFV": {
+   "cat": "统计函数",
+   "cn": "日前的(平滑处理)",
+   "sig": "REFV(X,A)",
+   "d": "引用若干周期前的数据(平滑处理). 用法: REFV(X,A),引用A周期前的X值.A可以是变量. 例如: REFV(CLOSE,BARSCOUNT(C)-1)表示第二根K线的收盘价.（依赖：BARSCOUNT、CLOSE）",
+   "src": "dll"
+  },
+  "REFXV": {
+   "cat": "统计函数",
+   "cn": "日后的(平滑处理)",
+   "sig": "REFXV(X,A)",
+   "d": "属于未来函数,引用若干周期后的数据(平滑处理). 用法: REFXV(X,A),引用A周期后的X值.A可以是变量. 例如: REFXV(CLOSE,1)表示下一周期的收盘价,在日线上就是明天收盘价（依赖：CLOSE）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "SLOPE": {
+   "cat": "统计函数",
+   "cn": "线性回归斜率",
+   "sig": "SLOPE(X,N)",
+   "d": "N 周期线性回归斜率，衡量趋势陡峭度。",
+   "n": "价格与量能量级差极大，做评分要先归一化。",
+   "e": "斜率:=SLOPE(C,20);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "SMA": {
+   "cat": "均线与累计",
+   "cn": "加权移动平均",
+   "sig": "SMA(X,N,M)",
+   "d": "Y = (M*X + (N-M)*Y')/N，MACD 类指标常用。",
+   "n": "通达信 SMA 是三参数，写成 SMA(C,5) 会报参数错误。",
+   "e": "DIF:=SMA(C,13,1);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "STDDEV": {
+   "cat": "统计函数",
+   "cn": "标准偏差",
+   "sig": "STDDEV",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "STDP": {
+   "cat": "统计函数",
+   "cn": "总体标准差",
+   "sig": "STDP(X,N)",
+   "d": "N 周期总体标准差（除以 N）。",
+   "e": "STDP(C,20)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "SUM": {
+   "cat": "均线与累计",
+   "cn": "N周期求和",
+   "sig": "SUM(X,N)",
+   "d": "N 周期累计值；N=0 表示从头累加。",
+   "e": "五日量:=SUM(V,5);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "SUMBARS": {
+   "cat": "均线与累计",
+   "cn": "累加到达年数",
+   "sig": "SUMBARS(X,A)",
+   "d": "将 X 由近及远累加，首次达到 A 所需周期数。",
+   "e": "SUMBARS(REF(C,1)*0.1,ABS(C-REF(C,1)))",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "SUMBARSX": {
+   "cat": "统计函数",
+   "sig": "SUMBARSX(X,A)",
+   "d": "向前累加到指定值到现在的周期数. 用法: SUMBARSX(X,A):将X向前累加直到大于等于A,返回这个区间的周期数,若所有的数据都累加后还不能达到A,则返回无效值",
+   "src": "dll"
+  },
+  "TMA": {
+   "cat": "统计函数",
+   "sig": "TMA(X,A,B)",
+   "d": "返回移动平均 用法: TMA(X,A,B),A和B必须小于1,算法:Y=(A*Y'+B*X),其中Y'表示上一周期Y值.初值为X",
+   "src": "dll"
+  },
+  "UPNDAY": {
+   "cat": "统计函数",
+   "cn": "连涨",
+   "sig": "UPNDAY(CLOSE,M)",
+   "d": "返回周期数内是否连涨. 用法: UPNDAY(CLOSE,M) 表示连涨M个周期,M为常量（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "VARP": {
+   "cat": "统计函数",
+   "cn": "总体方差",
+   "sig": "VARP(X,N)",
+   "d": "总体方差。",
+   "e": "VARP(C,20)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "WMA": {
+   "cat": "均线与累计",
+   "cn": "权重移动平均",
+   "sig": "WMA(X,N)",
+   "d": "按周期线性加权平均。",
+   "e": "WMA(C,10)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "XMA": {
+   "cat": "统计函数",
+   "cn": "偏移移动平均",
+   "sig": "XMA(X,N)",
+   "d": "属于未来函数,返回偏移移动平均 用法: XMA(X,N):X的N日偏移移动平均,用到了当日以后N/2日的数据,N支持变量,只供内部测试使用",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "AMO": {
+   "cat": "行情数据",
+   "cn": "成交额(元)",
+   "sig": "AMO",
+   "d": "返回该周期成交额.期货和期权无成交金额,返回持仓量 用法: AMO",
+   "src": "dll"
+  },
+  "AMOUNT": {
+   "cat": "行情数据",
+   "cn": "成交额",
+   "sig": "AMOUNT 或 AMO",
+   "d": "当期成交金额，单位元。",
+   "e": "AMOUNT",
+   "fl": []
+  },
+  "CAPITAL": {
+   "cat": "行情数据",
+   "cn": "流通股本",
+   "sig": "CAPITAL",
+   "d": "当前流通股本，单位与 VOL 一致。新股/未登记数据时可能为 0，作分母必须保护。",
+   "e": "VOL/CAPITAL*100",
+   "fl": []
+  },
+  "FFTRANS": {
+   "cat": "行情数据",
+   "cn": "傅里叶变换",
+   "sig": "FFTRANS(X,N)",
+   "d": "FFTRANS(X,N) 返回序列X(比如收盘价)的N周期的傅里叶变换,N支持变量 例如:FFTRANS(CLOSE,30)（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "HHV": {
+   "cat": "引用函数",
+   "cn": "N周期最高值",
+   "sig": "HHV(X,N)",
+   "d": "N 周期内 X 的最大值。",
+   "n": "含当期内取值，做除法分母（如 HHV-LLV）时必须防 0。",
+   "e": "压力:=HHV(H,60);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "HIGH": {
+   "cat": "行情数据",
+   "cn": "最高价",
+   "sig": "HIGH 或 H",
+   "d": "当期K线最高价。",
+   "e": "H",
+   "fl": []
+  },
+  "IVOLAT": {
+   "cat": "行情数据",
+   "cn": "期权波动率",
+   "sig": "IVOLAT(N,M)",
+   "d": "IVOLAT(N,M) 返回期权波动率 N表示计算周期 M表示类型,0:标的证券的历史波动率 1:隐含波动率",
+   "src": "dll"
+  },
+  "L2_AMO": {
+   "cat": "实时与Level2",
+   "cn": "Level2 分段成交额",
+   "sig": "L2_AMO(类型,序号)",
+   "d": "Level2 大中小单成交金额统计，需 L2 行情权限。",
+   "n": "无权限时恒为 0；历史盘中数据不可靠，只作当日观察。",
+   "e": "主力净流入:=L2_AMO(0,2)-L2_AMO(0,3);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": [
+    "l2"
+   ]
+  },
+  "L2_VOL": {
+   "cat": "实时与Level2",
+   "cn": "Level2 分段成交量",
+   "sig": "L2_VOL(类型,序号)",
+   "d": "Level2 分单成交量，需权限。",
+   "e": "",
+   "args": [
+    2,
+    2
+   ],
+   "fl": [
+    "l2"
+   ]
+  },
+  "LAST": {
+   "cat": "逻辑与判断",
+   "cn": "区间持续成立",
+   "sig": "LAST(X,A,B)",
+   "d": "从前 A 周期到前 B 周期 X 一直成立。",
+   "e": "LAST(C>MA(C,20),10,3)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "LLV": {
+   "cat": "引用函数",
+   "cn": "N周期最低值",
+   "sig": "LLV(X,N)",
+   "d": "N 周期内 X 的最小值。",
+   "e": "支撑:=LLV(L,60);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "LOW": {
+   "cat": "行情数据",
+   "cn": "最低价",
+   "sig": "LOW 或 L",
+   "d": "当期K线最低价。",
+   "e": "L",
+   "fl": []
+  },
+  "LWINNER": {
+   "cat": "形态与成本分布",
+   "cn": "近期获利盘",
+   "sig": "LWINNER(价格)",
+   "d": "近期成本分布获利盘，同属未来数据类。",
+   "e": "",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "future",
+    "data"
+   ]
+  },
+  "OPEN": {
+   "cat": "行情数据",
+   "cn": "开盘价",
+   "sig": "OPEN 或 O",
+   "d": "当期K线开盘价。",
+   "e": "O",
+   "fl": []
+  },
+  "POW": {
+   "cat": "数学函数",
+   "cn": "乘幂",
+   "sig": "POW(X,Y)",
+   "d": "X 的 Y 次方。",
+   "n": "不要写成 ** 或 ^，通达信不支持。",
+   "e": "POW(C/REF(C,1),2)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "PWINNER": {
+   "cat": "形态与成本分布",
+   "cn": "远期获利盘",
+   "sig": "PWINNER(价格)",
+   "d": "远期成本分布获利盘，同属未来数据类。",
+   "e": "",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "future",
+    "data"
+   ]
+  },
+  "QHJSJ": {
+   "cat": "行情数据",
+   "cn": "持仓量",
+   "sig": "QHJSJ",
+   "d": "返回该周期持仓量,对于期货和期权有意义. 用法: VOLINSTK（依赖：VOLINSTK）",
+   "src": "dll"
+  },
+  "TOTALCAPITAL": {
+   "cat": "行情数据",
+   "cn": "当前总股本(手)",
+   "sig": "TOTALCAPITAL",
+   "d": "TOTALCAPITAL 当前总股本,单位为手,债券1手为10张,其它为100",
+   "src": "dll"
+  },
+  "VOL": {
+   "cat": "行情数据",
+   "cn": "成交量",
+   "sig": "VOL 或 V",
+   "d": "当期成交量，单位随品种（A股为手）。与 CAPITAL 单位一致，可直接相除算换手率。",
+   "e": "换手:=VOL/CAPITAL*100;",
+   "fl": []
+  },
+  "WINNER": {
+   "cat": "形态与成本分布",
+   "cn": "获利盘比例",
+   "sig": "WINNER(价格)",
+   "d": "指定价位以下的获利盘比例（0~1）。",
+   "n": "属未来数据类，仅适合当下盘面观察，不可用于历史回测信号。",
+   "e": "获利:WINNER(C)*100;",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "future",
+    "data"
+   ]
+  },
+  "SIGNALS_SYS": {
+   "cat": "财务与板块",
+   "cn": "引用自定义序列数据(系统)",
+   "sig": "SIGNALS_SYS",
+   "d": "引用自定义序列数据(需要通达信官方提供,需要[专业财务数据]下载,支持的ID为20001以上,详见自定义数据管理器) SIGNALS_SYS(ID,TYPE),TYPE:1表示做平滑处理,没有自定义数据的周期返回上一周期的值;0表示不做平滑处理;2表示没有数据则为0.",
+   "src": "dll"
+  },
+  "SPLIT": {
+   "cat": "财务与板块",
+   "cn": "除权除息数据",
+   "sig": "SPLIT",
+   "d": "除权除息数据 SPLIT(N,TYPE),取得之前第N次除息除权(送转股,分红)的除权除息数据,参数为0表示送转股的比例(送转/(送转+10)),1表示每股分红(分红/10)),例如:SPLIT(0,0)=0.5表示最近一次除权可能是10送10",
+   "src": "dll"
+  },
+  "SPLITBARS": {
+   "cat": "财务与板块",
+   "cn": "除权除息数据",
+   "sig": "SPLITBARS",
+   "d": "除权除息数据 SPLIT(N,TYPE),取得之前第N次除息除权(送转股,分红)的除权除息数据,参数为0表示送转股的比例(送转/(送转+10)),1表示每股分红(分红/10)),例如:SPLIT(0,0)=0.5表示最近一次除权可能是10送10（依赖：SPLIT）",
+   "src": "dll"
+  },
+  "BARSLAST": {
+   "cat": "引用函数",
+   "cn": "上次条件成立至今",
+   "sig": "BARSLAST(X)",
+   "d": "上一次 X 非零到当前的周期数。",
+   "n": "从未成立时返回 0，与“当期成立”混淆，用作条件要先 COUNT 验证。",
+   "e": "距上次金叉:=BARSLAST(CROSS(DIF,DEA));",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "BARSLASTCOUNT": {
+   "cat": "逻辑与判断",
+   "cn": "条件连续成立次数",
+   "sig": "BARSLASTCOUNT(X)",
+   "d": "统计连续满足条件的周期数. 用法: BARSLASTCOUNT(X),统计连续满足X条件的周期数. 例如: BARSLASTCOUNT(CLOSE>OPEN)表示统计连续收阳的周期数（依赖：CLOSE、OPEN）",
+   "src": "dll"
+  },
+  "BARSLASTS": {
+   "cat": "逻辑与判断",
+   "cn": "倒数第N次成立时距今的周期数",
+   "sig": "BARSLASTS(X,N)",
+   "d": "倒数第N次成立时距今的周期数. 用法: BARSLASTS(X,N):X倒数第N满足到现在的周期数,N支持变量",
+   "src": "dll"
+  },
+  "BARSNEXT": {
+   "cat": "逻辑与判断",
+   "cn": "下一条件成立位置",
+   "sig": "BARSNEXT(X)",
+   "d": "属于未来函数,下一次条件成立到当前的周期数. 用法: BARSNEXT(X):下一次X不为0到现在的周期数 例如: BARSNEXT(CLOSE/REF(CLOSE,1)>=1.1)表示下一个涨停板到当前的周期数（依赖：CLOSE、REF）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "BARSSINCE": {
+   "cat": "逻辑与判断",
+   "cn": "首个条件成立位置",
+   "sig": "BARSSINCE(X)",
+   "d": "第一个条件成立到当前的周期数. 用法: BARSSINCE(X):第一次X不为0到现在的周期数 例如: BARSSINCE(HIGH>10)表示股价超过10元时到当前的周期数（依赖：HIGH）",
+   "src": "dll"
+  },
+  "BARSSINCEN": {
+   "cat": "逻辑与判断",
+   "cn": "N周期内首个条件成立位置",
+   "sig": "BARSSINCEN(X,N)",
+   "d": "N周期内第一个条件成立到当前的周期数. 用法: BARSSINCEN(X,N):N周期内第一次X不为0到现在的周期数,N为常量 例如: BARSSINCEN(HIGH>10,10)表示10个周期内股价超过10元时到当前的周期数（依赖：HIGH）",
+   "src": "dll"
+  },
+  "BETAVALUE": {
+   "cat": "逻辑与判断",
+   "cn": "主动性买单",
+   "sig": "BETAVALUE",
+   "d": "返回当前成交是否为主动性买单. 用法: ISBUYORDER 当本笔成交为主动性买盘时,返回1,否则为0（依赖：ISBUYORDER）",
+   "src": "dll"
+  },
+  "BETWEEN": {
+   "cat": "逻辑与判断",
+   "cn": "区间判断",
+   "sig": "BETWEEN(A,B,C)",
+   "d": "A 处于 B、C 之间（含边界）时为 1。",
+   "e": "BETWEEN(C,MA(C,20)*0.95,MA(C,20)*1.05)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "CLOSE": {
+   "cat": "行情数据",
+   "cn": "收盘价",
+   "sig": "CLOSE 或 C",
+   "d": "当期K线收盘价。",
+   "e": "C",
+   "fl": []
+  },
+  "COUNT": {
+   "cat": "逻辑与判断",
+   "cn": "条件计数",
+   "sig": "COUNT(X,N)",
+   "d": "N 周期内 X 非零的次数。",
+   "e": "涨停数:=COUNT(涨停,20);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "DAYSTOTODAY": {
+   "cat": "逻辑与判断",
+   "cn": "星期",
+   "sig": "DAYSTOTODAY",
+   "d": "取得该周期的星期数. 用法: WEEKDAY 函数返回有效值范围为(1,2,3,4,5,6,0)（依赖：WEEKDAY）",
+   "src": "dll"
+  },
+  "DIVFACTOR": {
+   "cat": "逻辑与判断",
+   "sig": "DIVFACTOR",
+   "d": "除权除息到现在的周期数 SPLITBARS(N,TYPE),取得之前第N次除权除息到当前的周期数,参数为0表示送转股,1表示分红,2表示送转股或分红,例如:SPLITBARS(0,0)=0表示当天发生除权（依赖：SPLITBARS）",
+   "src": "dll"
+  },
+  "EVERY": {
+   "cat": "逻辑与判断",
+   "cn": "每天都成立",
+   "sig": "EVERY(X,N)",
+   "d": "N 周期内 X 一直非零。",
+   "e": "EVERY(C>REF(C,1),3)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "EXIST": {
+   "cat": "逻辑与判断",
+   "cn": "存在成立",
+   "sig": "EXIST(X,N)",
+   "d": "N 周期内至少一次 X 非零。",
+   "e": "EXIST(涨停,5)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "EXISTR": {
+   "cat": "逻辑与判断",
+   "sig": "EXISTR(X,A,B)",
+   "d": "EXISTR(X,A,B):是否存在(前几日到前几日间). 例如: EXISTR(CLOSE>OPEN,10,5) 表示从前10日内到前5日内存在着阳线 若A为0,表示从第一天开始,B为0,表示到最后日止,第2,3个参数为常量（依赖：CLOSE、OPEN）",
+   "src": "dll"
+  },
+  "EXPMEMA": {
+   "cat": "逻辑与判断",
+   "cn": "指数平滑移动平均",
+   "sig": "EXPMEMA(X,N)",
+   "d": "返回指数平滑移动平均 用法: EXPMEMA(X,N):X的N日指数平滑移动平均,N不支持变量 EXPMEMA同EMA(EXPMA)的差别在于周期不满足N时,返回无效值（依赖：EMA、EXPMA）",
+   "src": "dll"
+  },
+  "FILTER": {
+   "cat": "逻辑与判断",
+   "cn": "信号过滤",
+   "sig": "FILTER(X,N)",
+   "d": "X 成立后 N 周期内屏蔽后续信号，用于去重复买卖点。",
+   "e": "买点:=FILTER(金叉,5);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "FILTERX": {
+   "cat": "逻辑与判断",
+   "sig": "FILTERX(X,N)",
+   "d": "反向过滤连续出现的信号. 用法:FILTERX(X,N):X满足条件后,将其前N周期内的数据置为0,N为常量. 例如: FILTERX(CLOSE>OPEN,5)查找阳线,前5天内出现过的阳线不被记录在内（依赖：CLOSE、OPEN）",
+   "fl": [
+    "future"
+   ],
+   "src": "dll"
+  },
+  "FLOOR": {
+   "cat": "数学函数",
+   "cn": "向下取整",
+   "sig": "FLOOR(X)",
+   "d": "不大于 X 的最大整数。",
+   "e": "FLOOR(X)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "FORCAST": {
+   "cat": "统计函数",
+   "cn": "线性回归预测",
+   "sig": "FORCAST(X,N)",
+   "d": "N 周期线性回归在当前周期的预测值。",
+   "e": "预测:=FORCAST(C,20);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "HKSHORTVOL": {
+   "cat": "逻辑与判断",
+   "cn": "抛空量",
+   "sig": "HKSHORTVOL",
+   "d": "返回该周期抛空量,对于港股有意义. 用法: HKSHORTVOL",
+   "src": "dll"
+  },
+  "HOUR": {
+   "cat": "逻辑与判断",
+   "cn": "取得该周期的日期离今天的天数.",
+   "sig": "HOUR",
+   "d": "取得该周期的日期. 用法: DAY 函数返回有效值范围为(1-31) 注:DAY关键字也可用于跨周期日线引用（依赖：DAY、DAYSTOTODAY）",
+   "src": "dll"
+  },
+  "HY_INDEXA": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的成交额",
+   "sig": "HY_INDEXA",
+   "d": "HY_INDEXA 返回对应的行业指数成交额,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXADV": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的上涨家数",
+   "sig": "HY_INDEXADV",
+   "d": "HY_INDEXADV 返回对应的行业指数上涨家数,如果没有通达信板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXC": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的收盘价",
+   "sig": "HY_INDEXC",
+   "d": "HY_INDEXC 返回对应的行业指数收盘价,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXDEC": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的下跌家数",
+   "sig": "HY_INDEXDEC",
+   "d": "HY_INDEXDEC 返回对应的行业指数下跌家数,如果没有通达信板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXH": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的最高价",
+   "sig": "HY_INDEXH",
+   "d": "HY_INDEXH 返回对应的行业指数最高价,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXL": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的最低价",
+   "sig": "HY_INDEXL",
+   "d": "HY_INDEXL 返回对应的行业指数最低价,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXO": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的开盘价",
+   "sig": "HY_INDEXO",
+   "d": "HY_INDEXO 返回对应的行业指数开盘价,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "HY_INDEXV": {
+   "cat": "逻辑与判断",
+   "cn": "行业指数的成交量",
+   "sig": "HY_INDEXV",
+   "d": "HY_INDEXV 返回对应的行业指数成交量,如果没有通达信板块指数,港美股没有扩展板块指数,则不支持 (对应指数的数据必须要先下载到本地)",
+   "src": "dll"
+  },
+  "IF": {
+   "cat": "逻辑与判断",
+   "cn": "条件取值",
+   "sig": "IF(COND,A,B)",
+   "d": "条件成立取 A，否则取 B。",
+   "e": "红柱:=IF(C>O,1,0);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "IFC": {
+   "cat": "逻辑与判断",
+   "cn": "条件判断,可中止",
+   "sig": "IFC(X,A,B)",
+   "d": "根据条件执行不同的语句(根据序列的最后一个数值来判断). 用法: IFC(X,A,B)若X不为0则执行A,否则执行B.IFC与IF函数的区别:IFC根据X的值来选择性执行A或B表达式,并且只根据X序列的最后一个数据来判断. 例如: IFC(CLOSE>OPEN,HIGH,TESTSKIP(1));L;表示当日收阳则返回最高值,并执行下一句\"L;\",否则退出公式计算（依赖：CLOSE、HIGH、OPEN、TESTSKIP）",
+   "src": "dll"
+  },
+  "IFN": {
+   "cat": "逻辑与判断",
+   "cn": "条件取反值",
+   "sig": "IFN(COND,A,B)",
+   "d": "条件不成立时取 A。",
+   "e": "IFN(C<O,1,0)",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "INCLUDED": {
+   "cat": "逻辑与判断",
+   "cn": "被前面包含",
+   "sig": "INCLUDED(T,N)",
+   "d": "INCLUDED(T,N) 返回K线是否被前面的K线包含,T为0,最高最低包含;T为1,实体包含; N为向前判断包含的个数,为非负数,为0表示一直向前判断",
+   "src": "dll"
+  },
+  "ISBUYORDER": {
+   "cat": "逻辑与判断",
+   "cn": "主动性买单",
+   "sig": "ISBUYORDER",
+   "d": "返回当前成交是否为主动性买单. 用法: ISBUYORDER 当本笔成交为主动性买盘时,返回1,否则为0",
+   "src": "dll"
+  },
+  "ISJYDATE": {
+   "cat": "逻辑与判断",
+   "cn": "A股行情已初始化",
+   "sig": "ISJYDATE",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "ISLASTBAR": {
+   "cat": "时间与周期",
+   "cn": "是否最后一根",
+   "sig": "ISLASTBAR",
+   "d": "最后一根K线为真。",
+   "e": "",
+   "fl": []
+  },
+  "ISQHQQCODE": {
+   "cat": "逻辑与判断",
+   "cn": "是否是期货或期权品种",
+   "sig": "ISQHQQCODE",
+   "d": "ISQHQQCODE 期货类或期权类的品种(支持做空交易)",
+   "src": "dll"
+  },
+  "ISQUITCODE": {
+   "cat": "逻辑与判断",
+   "cn": "是否是退市整理板",
+   "sig": "ISQUITCODE",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "ISSTCODE": {
+   "cat": "逻辑与判断",
+   "cn": "是否是ST",
+   "sig": "ISSTCODE",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "IST0CODE": {
+   "cat": "逻辑与判断",
+   "cn": "是否是T+0品种",
+   "sig": "IST0CODE",
+   "d": "IST0CODE 沪深京市场中支持T+0交易的品种(T+0基金,可转债等)",
+   "src": "dll"
+  },
+  "ISVALID": {
+   "cat": "逻辑与判断",
+   "cn": "判断有效值",
+   "sig": "ISVALID",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "MA": {
+   "cat": "均线与累计",
+   "cn": "简单移动平均",
+   "sig": "MA(X,N)",
+   "d": "N 周期 X 的算术平均。",
+   "n": "N 必须为正整数常量或变量；数据不足时结果无效。",
+   "e": "短线:=MA(C,5);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "MEDIAN": {
+   "cat": "逻辑与判断",
+   "cn": "中位数",
+   "sig": "MEDIAN(X,M,N)",
+   "d": "MEDIAN(X,M,N)返回序列X的倒数第M个开始N个周期的中位数,M>=0 N>0 (如果N太大,计算会耗时) 例如:MEDIAN(CLOSE,0,30)（依赖：CLOSE）",
+   "src": "dll"
+  },
+  "MIN1": {
+   "cat": "逻辑与判断",
+   "cn": "跨周期引用符号",
+   "sig": "MIN1",
+   "d": "#后可用MIN1,MIN5,MIN15,MIN30,MIN60,DAY,WEEK,MONTH,SEASON,YEAR 例如:TMP1:=CLOSE#WEEK; {非指标引用时只可用于OPEN,HIGH,LOW,CLOSE,VOL,AMOUNT,VOLINSTK等,当前周期不支持多秒线,多分钟线和多日线,并且引用周期必须要高于当前周期,5秒线只支持引用1分钟线和5分钟线,周期数据转换得到} TMP2:=KDJ.K#WEEK; {跨周期指标引用,引用品种的对应周期的数据必须要先下载到本地} 跨周期指标引用支持带参数,比如TMP2:=KDJ.K#WEEK(N,3,3); 提示:跨周期时,可能会引用到未来数据（依赖：AMOUNT、CLOSE、DAY、HIGH、LOW、MIN15、MIN30、MIN5、MIN60、MONTH、OPEN、SEASON、VOL、VOLINSTK、WEEK、YEAR）",
+   "src": "dll"
+  },
+  "MINUTE": {
+   "cat": "逻辑与判断",
+   "cn": "分钟",
+   "sig": "MINUTE",
+   "d": "取得该周期的分钟数. 用法: MINUTE 函数返回有效值范围为(0-59),对于日线及更长的分析周期值为0",
+   "src": "dll"
+  },
+  "MOD": {
+   "cat": "逻辑与判断",
+   "sig": "MOD(M,N)",
+   "d": "取模. 用法: MOD(M,N),返回M关于N的模(M除以N的余数) 例如: MOD(5,3)返回2 注意:公式系统对有效数字部分有要求,如果数字部分超过7-8位,会有精度丢失",
+   "src": "dll"
+  },
+  "MONTH": {
+   "cat": "时间与周期",
+   "cn": "月份",
+   "sig": "MONTH",
+   "d": "月份 1~12。",
+   "e": "MONTH",
+   "fl": []
+  },
+  "NOT": {
+   "cat": "逻辑与判断",
+   "cn": "逻辑非",
+   "sig": "NOT(X)",
+   "d": "取反。",
+   "e": "NOT(涨停)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "PERCENTILE": {
+   "cat": "逻辑与判断",
+   "cn": "中位数",
+   "sig": "PERCENTILE",
+   "d": "MEDIAN(X,M,N)返回序列X的倒数第M个开始N个周期的中位数,M>=0 N>0 (如果N太大,计算会耗时) 例如:MEDIAN(CLOSE,0,30)（依赖：CLOSE、MEDIAN）",
+   "src": "dll"
+  },
+  "RAND": {
+   "cat": "逻辑与判断",
+   "cn": "随机正整数",
+   "sig": "RAND(N)",
+   "d": "取随机数. 用法: RAND(N),返回一个范围在1-N的随机整数",
+   "src": "dll"
+  },
+  "RANGE": {
+   "cat": "逻辑与判断",
+   "sig": "RANGE(A,B,C)",
+   "d": "RANGE(A,B,C):A在B和C范围之间,B<A<C. 用法: RANGE(A,B,C)表示A大于B同时小于C时返回1,否则返回0",
+   "src": "dll"
+  },
+  "RELATE": {
+   "cat": "统计函数",
+   "cn": "相关系数",
+   "sig": "RELATE(X,Y,N)",
+   "d": "N 周期两序列相关系数，用于量价背离识别。",
+   "e": "量价相关:=RELATE(C,V,20);",
+   "args": [
+    3,
+    3
+   ],
+   "fl": []
+  },
+  "SAFESCORE": {
+   "cat": "逻辑与判断",
+   "cn": "安全分",
+   "sig": "SAFESCORE",
+   "d": "SAFESCORE 安全分(0-100),通达信扫雷宝数据,仅供参考,PC端有增强功能集的版本支持",
+   "src": "dll"
+  },
+  "SHINESCORE": {
+   "cat": "逻辑与判断",
+   "cn": "亮点数",
+   "sig": "SHINESCORE",
+   "d": "SHINESCORE 亮点数(0-100),通达信扫雷宝中的亮点数据,仅供参考,PC端有增强功能集的版本支持",
+   "src": "dll"
+  },
+  "TESTSKIP": {
+   "cat": "逻辑与判断",
+   "cn": "是否就此返回",
+   "sig": "TESTSKIP(A)",
+   "d": "TESTSKIP(A):满足A则直接返回. 用法: TESTSKIP(A) 表示如果满足条件A则该公式直接返回,不再计算接下来的表达式 注意:A为非序列数据,只取最后一个数据",
+   "src": "dll"
+  },
+  "TFILTER": {
+   "cat": "逻辑与判断",
+   "cn": "多空信号过滤",
+   "sig": "TFILTER(A,B,N)",
+   "d": "多空配对信号去抖。",
+   "e": "",
+   "fl": [
+    "ver"
+   ]
+  },
+  "TIME2": {
+   "cat": "逻辑与判断",
+   "cn": "时间(时分秒)",
+   "sig": "TIME2",
+   "d": "取得该周期的时分秒,适用于日线以下周期. 用法: TIME2 函数返回有效值范围为(000000-235959)",
+   "src": "dll"
+  },
+  "TTFILTER": {
+   "cat": "逻辑与判断",
+   "sig": "TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,N)",
+   "d": "按照开平配对等原则过滤不合理的信号. 用法:TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,N); 主要规则有: 1.连续的同方向指令只有第一个有效,其他的将被过滤; 2.交易信号必须配对出现(比如前面已经有了买开指令,则后面只允许出现卖平指令,其他的指令都被过滤掉); N=1表示仅对买入开仓信号过滤; N=2表示仅对卖出平仓信号过滤; N=3表示仅对卖出开仓信号过滤; N=4表示仅对买入平仓信号过滤; N=0表示都过滤,返回1,2,3,4分别表示对应的条件成立; 同一K线上只能有一个信号; 例如: ENTERLONG:TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,1); EXITLONG:TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,2); ENTERSHORT:TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,3); EXITSHORT:TTFILTER(买入开仓,卖出平仓,卖出开仓,买入平仓,4);",
+   "src": "dll"
+  },
+  "VALUEWHEN": {
+   "cat": "逻辑与判断",
+   "cn": "条件跟随",
+   "sig": "VALUEWHEN",
+   "d": "（自补全索引收录，DLL 中无独立帮助文本）",
+   "src": "dll"
+  },
+  "WEEKDAY": {
+   "cat": "逻辑与判断",
+   "cn": "星期",
+   "sig": "WEEKDAY",
+   "d": "取得该周期的星期数. 用法: WEEKDAY 函数返回有效值范围为(1,2,3,4,5,6,0)",
+   "src": "dll"
+  },
+  "WEEKOFYEAR": {
+   "cat": "逻辑与判断",
+   "cn": "月份",
+   "sig": "WEEKOFYEAR",
+   "d": "取得该周期的月份. 用法: MONTH 函数返回有效值范围为(1-12) 注:MONTH关键字也可用于跨周期月线引用（依赖：MONTH）",
+   "src": "dll"
+  },
+  "YEAR": {
+   "cat": "时间与周期",
+   "cn": "年份",
+   "sig": "YEAR",
+   "d": "年份整数。",
+   "e": "YEAR",
+   "fl": []
+  },
+  "FINANCE": {
+   "cat": "财务与板块",
+   "cn": "财务数据",
+   "sig": "FINANCE(N)",
+   "d": "按编号取财务/股本数据：FINANCE(1)总股本、FINANCE(3)每股收益、FINANCE(7)净资产、FINANCE(18)净利润、FINANCE(20)营业收入、FINANCE(31)ROE、FINANCE(34)每股净资产、FINANCE(40)流通市值、FINANCE(52)流动比率、FINANCE(54)资产负债率等。",
+   "e": "流通市值:=FINANCE(40);",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "data"
+   ],
+   "pn": "1=总股本(股)；2=用法同SETCODE；3=沪深京品种类型；4=沪深京行业代码；5=B股；6=H股；7=流通股本(股)；8=股东人数(户)；9=资产负债率%；10=总资产；11=流动资产；12=固定资产；13=无形资产；15=流动负债；16=少数股东权益；17=资本公积金；18=每股公积金；19=股东权益(净资产)；20=营业收入；21=营业成本；22=应收账款；23=营业利润；24=投资收益；25=经营现金流量；26=总现金流量；27=存货；28=利润总额；29=税后利润；30=净利润；31=未分配利润；32=每股未分配利润；33=每股收益(全年折算)；34=每股净资产；35=季报调整净资产；36=股东权益比；37=第几季报；38=每股收益(最近一期)；39=总市值；40=流通市值；41=AB股总市值；42=上市的天数；43=利润同比%；44=收入同比%；45=股息率%；46=自由流通股本(股)；47=是否属于次新股；48=是否为陆通股标的；49=今日权息标识；50=是否属于沪深300；51=是否含可转债；52=是否为融资融券标的；53=每股股息(港股,美股)；54=扣非净利润；55=研发费用；56=员工人数；57=货币资金；58=合同负债；59=其它权益工具；60=行权比例(权证,期权)；61=行权价(权证,期权)；62=杠杆比率(权证,期权)；63=内在价值(权证,期权)；64=溢价率(权证,期权)；65=时间价值(权证,期权)；66=剩余天数(期货,期权)；67=合约乘数(期权)；68=Delta对冲值(权证,期权)；69=认购认沽类型(股票期权)；75=溢价率(基金,可转债)；76=利润环比%；77=收入环比%；80=最近财报公告离现在的天数；81=最后涨停板离现在的天数；82=最后跌停板离现在的天数；83=最后上榜离现在的天数；84=最近停牌离现在的天数；85=最近业绩预告离现在的天数；86=最近股份解禁离现在的天数；87=最近定增股上市离现在的天数；88=最近北上大额增仓日离现在的天数；89=最近北上大额减仓日离现在的天数；90=最近回购预案日离现在的天数；91=最近股权激励预案日离现在的天数；99=是否为注册制股票；101=标识类型；102=IPO发行价；130=正股代码；131=转股价格；132=当期利率；133=剩余规模；134=回售触发价；135=强赎触发价；136=转股日期；137=到期价格；138=到期日期；139=转股比率%；140=纯债价值；141=到期收益率%；142=赎回登记日期；143=赎回价格；144=回售申报起始日期；145=回售价格；146=转股代码；147=正股当前价格；148=溢价率；149=转股价值"
+  },
+  "LN": {
+   "cat": "数学函数",
+   "cn": "自然对数",
+   "sig": "LN(X)",
+   "d": "以 e 为底对数，X 需大于 0。",
+   "e": "LN(C)",
+   "args": [
+    1,
+    1
+   ],
+   "fl": []
+  },
+  "STD": {
+   "cat": "统计函数",
+   "cn": "估算样本标准差",
+   "sig": "STD(X,N)",
+   "d": "N 周期样本标准差（除以 N-1）。",
+   "n": "N=1 时分母为 0，必须保护。",
+   "e": "σ:=STD(C,20);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "VAR": {
+   "cat": "统计函数",
+   "cn": "样本方差",
+   "sig": "VAR(X,N)",
+   "d": "估算样本方差。",
+   "e": "VAR(C,20)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "AVEDEV": {
+   "cat": "统计函数",
+   "cn": "平均绝对偏差",
+   "sig": "AVEDEV(X,N)",
+   "d": "N 周期内 X 与均值的平均绝对偏差，布林/压力类算法常用。",
+   "e": "AVEDEV(C,20)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "DEVSQ": {
+   "cat": "统计函数",
+   "cn": "偏差平方和",
+   "sig": "DEVSQ(X,N)",
+   "d": "N 周期偏差平方和。",
+   "e": "DEVSQ(C,20)",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "FINSTR": {
+   "cat": "字符串",
+   "cn": "查找子串",
+   "sig": "FINSTR(A,B)",
+   "d": "在 A 中查找 B 的位置。",
+   "e": "",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "POLYLINE": {
+   "cat": "绘图函数",
+   "cn": "折线",
+   "sig": "POLYLINE(COND,PRICE)",
+   "d": "把条件成立的点连成折线。",
+   "e": "POLYLINE(高点,H);",
+   "args": [
+    2,
+    2
+   ],
+   "fl": []
+  },
+  "DRAWNULL": {
+   "cat": "绘图函数",
+   "cn": "不画值",
+   "sig": "DRAWNULL",
+   "d": "占位返回无效值，配合 IF 控制某根K线不画。",
+   "e": "线:IF(条件,C,DRAWNULL);",
+   "fl": []
+  },
+  "PLAYSOUND": {
+   "cat": "绘图函数",
+   "cn": "声音提示",
+   "sig": "PLAYSound(...)",
+   "d": "报警类函数，副图评分公式中不要引用。",
+   "e": "",
+   "fl": [
+    "alarm"
+   ]
+  },
+  "DAY": {
+   "cat": "时间与周期",
+   "cn": "日",
+   "sig": "DAY",
+   "d": "日期中的日。",
+   "e": "DAY",
+   "fl": []
+  },
+  "DAYOFWEEK": {
+   "cat": "时间与周期",
+   "cn": "星期",
+   "sig": "DAYOFWEEK",
+   "d": "返回当前是周几。",
+   "e": "DAYOFWEEK",
+   "fl": [
+    "ver"
+   ]
+  },
+  "TOTALBARCOUNT": {
+   "cat": "时间与周期",
+   "cn": "K线总数",
+   "sig": "TOTALBARCOUNT",
+   "d": "当前可见K线总数。",
+   "e": "",
+   "fl": []
+  },
+  "DYNAINFO": {
+   "cat": "实时与Level2",
+   "cn": "实时行情数据",
+   "sig": "DYNAINFO(N)",
+   "d": "取即时行情数值（现价、均价、量比、内外盘等），编号随版本不同。",
+   "n": "只在最新一根K线有效，且盘后/历史数据不可回测，必须用 CURRBARSCOUNT=1 门控，不进历史评分。",
+   "e": "现价:DYNAINFO(6);",
+   "args": [
+    1,
+    1
+   ],
+   "fl": [
+    "realtime"
+   ],
+   "pn": "3=昨收盘价；4=开盘价 即时行情数据 在开盘前,值为0,在使用时需要判断(否则分时指标时；5=最高价 即时行情数据 在开盘前,值为0,在使用时需要判断(否则分时指标时；6=现价；7=现价 即时行情数据 没有现价时(比如在开盘前),返回昨收盘价 盘中可能一；8=总量；9=现量；10=总金额；11=均价；12=日涨跌；13=涨幅；14=涨幅 即时行情数据(沪深京早盘竞价期间使用匹配价的涨幅) 转换成幅度需要；15=开盘金额；16=前5日每分钟均量；17=DYNAINFO(17) 量比 即时行情数据；18=上涨家数(对沪深指数和通达信板块指数有效) 即时行情数据；19=下跌家数(对沪深指数和通达信板块指数有效) 即时行情数据；20=买价(即买一价)；21=卖价(即卖一价)；22=内盘/板块指数跌停数；23=外盘/板块指数涨停数；24=返回涨速 报价界面行情数据(若用于预警,为5分钟涨速,其他情况下为系统设；25=几分钟前的价格；26=涨停价；27=跌停价；28=笼子买入价上限；29=笼子卖出价下限；30=昨开盘成交量(手)；31=竞价涨停买；32=最新5日均价；33=前日涨幅；34=昨日涨幅；35=3日换手Z；36=换手率Z；37=换手率；38=市盈(静)；39=市盈(动)；40=市盈(TTM)；48=开盘量比；49=成交方向；50=采样点数(分笔数)；51=内外比；52=扩展行情资金流向；53=应计利息/昨净值；54=IOPV；55=基金估算涨幅%；57=笔涨跌；58=买量(即买一量)；59=卖量(即卖一量)；60=沪深京总上涨家数；61=沪深京总下跌家数；62=沪深京总成交金额；63=3日涨幅；64=5日涨幅；65=10日涨幅；66=20日涨幅；67=60日涨幅；68=年初至今涨幅；69=月初至今涨幅；70=一年涨幅；71=买二价；72=买二量；73=卖二价；74=卖二量；75=买三价；76=买三量；77=卖三价；78=卖三量；79=买四价；80=买四量；81=卖四价；82=卖四量；83=买五价；84=买五量；85=卖五价；86=卖五量；88=封单额；89=年涨停天数；90=连板天数；91=几天；92=几板；93=昨成交额；94=3日成交额；95=昨封单额；96=前封单额；101=量涨速；102=分钟换手率；103=2分钟金额；104=开盘抢筹；105=委比；106=当前总委买量(对沪深有效).Level2报价界面行情数据；107=当前总委卖量(对沪深有效).Level2报价界面行情数据；108=总撤买量；109=总撤卖量；110=L2逐笔成交数；111=L2逐笔委托数；117=量比(序列)；118=52周最高价；119=52周最低价；121=首次封板时间；122=最后封板时间；123=最后开板时间；124=开板次数；125=最高封单额；126=板上成交；132=期货沉淀资金；133=30日涨幅"
+  },
+  "ACTINVOL": {
+   "cat": "实时与Level2",
+   "cn": "主动买入量",
+   "sig": "ACTINVOL",
+   "d": "Level2 主动买入量，量纲随版本变化，建议只做比值不做绝对额。",
+   "e": "",
+   "fl": [
+    "l2"
+   ]
+  },
+  "TRADEINNUM": {
+   "cat": "实时与Level2",
+   "cn": "主动买入笔数",
+   "sig": "TRADEINNUM",
+   "d": "Level2 主动买入笔数。",
+   "e": "",
+   "fl": [
+    "l2"
+   ]
+  },
+  "CUR_BUYORDER": {
+   "cat": "实时与Level2",
+   "cn": "当前买盘挂单",
+   "sig": "CUR_BUYORDER",
+   "d": "Level2 挂单类字段，仅末根K线有标记意义。",
+   "e": "",
+   "fl": [
+    "l2"
+   ]
+  }
+ },
+ "attrs": [
+  "COLORRED",
+  "COLORGREEN",
+  "COLORBLUE",
+  "COLORYELLOW",
+  "COLORWHITE",
+  "COLORBLACK",
+  "COLORMAGENTA",
+  "COLORCYAN",
+  "COLORBROWN",
+  "COLORLIGRAY",
+  "COLORGRAY",
+  "COLORLIBLUE",
+  "COLORLIGREEN",
+  "COLORLICYAN",
+  "COLORYELLOW",
+  "COLOR00A0FF",
+  "LINETHICK1",
+  "LINETHICK2",
+  "LINETHICK3",
+  "LINETHICK4",
+  "LINETHICK5",
+  "LINETHICK6",
+  "LINETHICK7",
+  "LINETHICK8",
+  "LINETHICK9",
+  "DOTLINE",
+  "POINTDOT",
+  "CIRCLEDOT",
+  "CROSSDOT",
+  "STICK",
+  "VOLSTICK",
+  "LINESTICK",
+  "NODRAW",
+  "NOTEXT",
+  "PRECISION1",
+  "PRECISION2",
+  "PRECISION3",
+  "PRECISION4",
+  "CROSSNODOT",
+  "COLORSTICK",
+  "POINTLINE"
+ ],
+ "fields": [
+  "OPEN",
+  "HIGH",
+  "LOW",
+  "CLOSE",
+  "VOL",
+  "AMOUNT",
+  "AMO",
+  "O",
+  "H",
+  "L",
+  "C",
+  "V",
+  "CAPITAL",
+  "BUYVOL",
+  "SELLVOL",
+  "ADVANCE",
+  "DECLINE",
+  "INDEXA",
+  "INDEXC",
+  "INDEXO",
+  "INDEXH",
+  "INDEXL",
+  "DATE",
+  "TIME",
+  "YEAR",
+  "MONTH",
+  "DAY",
+  "WEEK",
+  "PERIOD",
+  "CURRBARSCOUNT",
+  "TOTALBARCOUNT",
+  "ISLASTBAR",
+  "HYBLOCK",
+  "DYBLOCK",
+  "AND",
+  "OR",
+  "NOT",
+  "DRAWNULL",
+  "TRUE",
+  "FALSE",
+  "PI"
+ ],
+ "future": [
+  "ZIG",
+  "PEAK",
+  "PEAKBARS",
+  "TROUGH",
+  "TROUGHBARS",
+  "WINNER",
+  "LWINNER",
+  "PWINNER",
+  "COST"
+ ],
+ "realtime": [
+  "DYNAINFO",
+  "FINANCE"
+ ],
+ "need_l2": [
+  "L2_AMO",
+  "L2_VOL",
+  "ACTINVOL",
+  "ACTOUTVOL",
+  "TRADEINNUM",
+  "TRADEOUTNUM",
+  "CUR_BUYORDER",
+  "CUR_SELLORDER"
+ ],
+ "index_only": [
+  "ADVANCE",
+  "DECLINE",
+  "INDEXA"
+ ]
+}

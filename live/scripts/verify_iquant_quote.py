@@ -1,6 +1,6 @@
-"""iQuant 行情可达性验证 — 验证 xtquant.xtdata 能否在独立进程拿 tick/1m bar。
+"""QMT 行情可达性验证 — 验证 xtquant.xtdata 能否在独立进程拿 tick/1m bar。
 
-前置条件：iQuant 客户端在运行（行情服务监听 127.0.0.1:58610）。
+前置条件：QMT 客户端在运行（行情服务监听 127.0.0.1:58610）。
 用 live 环境（Python 3.7）跑，xtquant 的 pyd 是 cp37。
 
 验证点：
@@ -23,16 +23,16 @@ import threading
 import time
 from pathlib import Path
 
-# 注入 iQuant 的 xtquant
-XTQUANT_PATH = r"D:/iQuant/bin.x64/Lib/site-packages"
+# 注入 QMT 的 xtquant
+XTQUANT_PATH = r"D:/QMT/bin.x64/Lib/site-packages"
 if XTQUANT_PATH not in sys.path:
     sys.path.insert(0, XTQUANT_PATH)
 
-# 交易端认证配置（iQuant 行情需交易端登录后才有权限）
-#   userdata_mini 路径：iQuant 行情共享内存所在目录
+# 交易端认证配置（QMT 行情需交易端登录后才有权限）
+#   userdata_mini 路径：QMT 行情共享内存所在目录
 #   account：资金账号（股票账号）
 # 优先级：CLI --account > 环境变量 IQUANT_ACCOUNT > 空（不认证）
-USERDATA_MINI_PATH = r"D:/iQuant/userdata_mini"
+USERDATA_MINI_PATH = r"D:/QMT/userdata_mini"
 AUTH_SESSION = 888888  # 任务 session id（任意 int，避开客户端占用的 123456）
 
 
@@ -77,7 +77,7 @@ def authenticate_trade(account):
         result = trader.connect()  # 0=成功
         print(f"[{'OK' if result == 0 else 'WARN'}] trader.connect() = {result}")
         if result != 0:
-            print("       → 连接失败，确认 iQuant 客户端在运行（XtItClient.exe 监听 58600）")
+            print("       → 连接失败，确认 QMT 客户端在运行（XtItClient.exe 监听 58600）")
             return trader, result
         acc = StockAccount(account)
         trader.subscribe(acc)
@@ -108,7 +108,7 @@ def probe_import_and_connect():
         connected = client.is_connected()
         print(f"[{'OK' if connected else 'WARN'}] get_client().is_connected() = {connected}")
         if not connected:
-            print("       → 58610 未连上，确认 iQuant 客户端在运行")
+            print("       → 58610 未连上，确认 QMT 客户端在运行")
             return None
     except Exception as e:
         print(f"[FAIL] get_client 异常：{e}")
@@ -244,10 +244,10 @@ def probe_history_1m(xtdata):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="iQuant 行情可达性验证")
+    parser = argparse.ArgumentParser(description="QMT 行情可达性验证")
     parser.add_argument("--only", choices=["A", "B", "C", "D", "E"], help="只跑某一项")
     parser.add_argument("--account", default=os.environ.get("IQUANT_ACCOUNT", ""),
-                        help="iQuant 资金账号（交易端认证用）；默认读环境变量 IQUANT_ACCOUNT")
+                        help="QMT 资金账号（交易端认证用）；默认读环境变量 IQUANT_ACCOUNT")
     parser.add_argument("--skip-auth", action="store_true", help="跳过交易端认证（仅测连接，预期 not authenticated）")
     args = parser.parse_args()
 
@@ -255,7 +255,7 @@ def main():
     if args.only in (None, "A"):
         xtdata = probe_import_and_connect()
         if xtdata is None:
-            print("\n[A 失败] 无法连接 iQuant 行情服务，后续跳过。确认 iQuant 客户端在运行。")
+            print("\n[A 失败] 无法连接 QMT 行情服务，后续跳过。确认 QMT 客户端在运行。")
             return
     else:
         xtdata, err = _import_xtdata()

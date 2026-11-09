@@ -35,7 +35,7 @@
 | # | 细节 | 状态 | 方式 | 说明(→ 参照) | 确认结论 |
 |---|---|---|---|---|---|
 | A1 | 桥地址/token | ✅ | 📖 | `config.iquant_bridge`,缺省 127.0.0.1:8790;token 从 `IQUANT_BRIDGE_TOKEN` 或 `.bridge_token` | ✅ 无问题 |
-| A2 | `ACCOUNT` 硬编码 | ✅ | 📖 | 桥跑在 iQuant 客户端内,账号随客户端登录确定,写死合理,不改 | ✅ 保留写死 |
+| A2 | `ACCOUNT` 硬编码 | ✅ | 📖 | 桥跑在 QMT 客户端内,账号随客户端登录确定,写死合理,不改 | ✅ 保留写死 |
 | A3 | `DRY_RUN` 切换方式 | ✅ | 🧠 | 实盘桥 / 模拟桥**分两个桥文件**部署,各自 `DRY_RUN` 不同。Core 端按 `mode` 连对应桥(→ 连带定 B3) | ✅ 两个桥文件 |
 | A4 | `ALLOWED_STOCKS` 白名单 | ✅ | 🧠 | **取消白名单**,桥尽可能简化,信任 Core 端控制 | ✅ 取消 |
 | A5 | 股票池成分股 | ✅ | 📖 | `StockPoolStock` 表,`_resolve_stock_codes` 读取(→ design §2.1)。有股票池数据即可 | ✅ 有条件即可 |
@@ -147,7 +147,7 @@
 | # | 细节 | 状态 | 方式 | 说明(→ 参照) | 确认结论 |
 |---|---|---|---|---|---|
 | H1 | `POST /sessions/{id}/stop` | ✅ | 📖 | 取消循环任务,status=stopped(→ design §1.3) | — |
-| H2 | 休市时桥是否在跑 | ✅ | 🧠 | **(2026-08-07 定:不通知)** 桥无 `/shutdown` 端点(只有 ping/order/positions/account/orders/deals/quote),是 iQuant 客户端内策略,Core 无法让它停。Core stop session 后桥继续监听但无请求 = 空转无害;下次 start session 桥还在,省重连。不改桥 | ✅ 不通知,桥空转无害 |
+| H2 | 休市时桥是否在跑 | ✅ | 🧠 | **(2026-08-07 定:不通知)** 桥无 `/shutdown` 端点(只有 ping/order/positions/account/orders/deals/quote),是 QMT 客户端内策略,Core 无法让它停。Core stop session 后桥继续监听但无请求 = 空转无害;下次 start session 桥还在,省重连。不改桥 | ✅ 不通知,桥空转无害 |
 | H3 | 持仓快照留存 | ✅ | 🧠 | **(2026-08-07 定:不存快照,只靠 live_trades 重放)** 实盘无快照表(只有回测 `BacktestDailySnapshot`);`recover`(live_engine.py:367)重放 `live_trades` 重建持仓+现金,逻辑完整,成本 O(交易笔数),单用户毫秒级可忽略。**为何不存**:(1)快照不增加对账能力——D3 拿重放结果即可对账,快照只是"某一刻的",无额外价值;(2)快照不解决非交易状态丢失——熔断计数/peak/prev_close 那是 D4/H4 的活,不是持仓;(3)快照+live_trades 两套源,写快照后又成交没更新 → 脏数据风险;(4)只省可忽略的重放成本,却引入双源维护负担。**单一事实源 = live_trades**,不引入快照表 | ✅ 不存快照,只靠 live_trades 重放;非交易状态走 D4/H4 |
 | H4 | 熔断计数持久化 | ✅已实现 | ✅ | 触发熔断时写 `circuit_breaker_count`,目前不写(→ design §8.3) | ✅ 已实现:`_handle_bar` 每 bar update_peak 后调 `_persist_breaker_count`——max_drawdown 触发(计数+1)才落库(未变跳过,避免每 bar 写);达 3 次 status 转 `circuit_broken` |
 | H5 | 次日开盘自动恢复 | ✅ | 🧠 | **(2026-08-07 定:手动)** 停盘后次日不自动 start,用户手动点启动。与 B6 限 1 个 session 一致(避免自动恢复撞上用户已开的新 session);`recover` 重放 live_trades 已能重建持仓,手动 start 即接上。不引入定时任务,运维可控 | ✅ 手动启动 |
@@ -163,7 +163,7 @@
 | I1 | 桥离线暂停下单 | ✅ | 📖 | `_bridge_online=False`,不抛异常继续循环 | — |
 | I2 | 下单时桥离线 | ✅ | 📖 | `_on_bar` 捕获 `BridgeUnavailableError` | — |
 | I3 | Core 崩溃重启 → recover | ✅ | 📖 | 从 live_trades 重放(但不对账,见 D3) | — |
-| I4 | 部分成交跨重启 | ✅已实现 | 🧠 | **(2026-08-07 定:查未完结挂回等回填)**。两种崩溃场景分析:**(A)Core 崩,桥在跑**:Core 内存态丢,桥端订单在券商服务器不受影响;`recover` 重放 `live_trades` 重建持仓。命门窗口 = `passorder` 已发券商、`_persist_trade` 未 commit 就崩 → DB 无记录但券商有真实成交 → 背离。**(B)桥崩(iQuant 重开策略),Core 在跑**:桥内存态全清(`_placed`/`_quote_cache` 纯内存无持久化),Core 心跳发现离线暂停下单(E7 已实现);桥重开新 init 起来,真实订单不丢(券商侧数据,`get_trade_detail_data` 仍能查);行情缺口 E8 已定不补。命门窗口同 A = Core 发 /order、桥已 passorder 发券商、响应返回前崩 → Core 未确认 → 背离。**共同命门**:passorder 已发券商、Core 未落库/未 apply_trade → DB 无记录 vs 券商有成交 → 虚拟持仓背离。**闭合方案(依赖 G1)**:(1)`_persist_trade` 改先写 `LiveOrder(status=submitted)` + commit,再发 passorder → 崩在此窗口后 DB 至少有 submitted 记录;(2)`recover` 重放 live_trades(已成交)+ **查未完结 `status in (submitted,partial)` 挂回引擎待回填队列**;(3)G2 主循环 /deals 轮询回填挂回的单 → G6 据真实成交补记/修正。**I4 只做"查未完结 + 挂回队列"**,不做对账(D3)、不做修正(G6)、不做匹配(G3)。**真机卡点**:挂回的单要和券商侧成交对上,依赖 G3 订单匹配键稳定性(passorder 返回 0,`/deals` m_nOrderID 对不上 MD5)——G3 不稳则 I4 挂回也白搭。**前提**:G1 订单状态机就位(submitted 阶段不 apply_trade、不写 LiveTrade,回填确认才写) | ✅ 规则定 + 已实现(切片5,eb4bc40):`recover` 查未完结(submitted/partial)挂回引擎待回填队列,主循环 `_poll_deals` 按 `m_strOrderRef` 匹配 /deals 补记(G2/G6);前提 G1(先写 submitted)+ G3 匹配键真机定案均已就位 |
+| I4 | 部分成交跨重启 | ✅已实现 | 🧠 | **(2026-08-07 定:查未完结挂回等回填)**。两种崩溃场景分析:**(A)Core 崩,桥在跑**:Core 内存态丢,桥端订单在券商服务器不受影响;`recover` 重放 `live_trades` 重建持仓。命门窗口 = `passorder` 已发券商、`_persist_trade` 未 commit 就崩 → DB 无记录但券商有真实成交 → 背离。**(B)桥崩(QMT 重开策略),Core 在跑**:桥内存态全清(`_placed`/`_quote_cache` 纯内存无持久化),Core 心跳发现离线暂停下单(E7 已实现);桥重开新 init 起来,真实订单不丢(券商侧数据,`get_trade_detail_data` 仍能查);行情缺口 E8 已定不补。命门窗口同 A = Core 发 /order、桥已 passorder 发券商、响应返回前崩 → Core 未确认 → 背离。**共同命门**:passorder 已发券商、Core 未落库/未 apply_trade → DB 无记录 vs 券商有成交 → 虚拟持仓背离。**闭合方案(依赖 G1)**:(1)`_persist_trade` 改先写 `LiveOrder(status=submitted)` + commit,再发 passorder → 崩在此窗口后 DB 至少有 submitted 记录;(2)`recover` 重放 live_trades(已成交)+ **查未完结 `status in (submitted,partial)` 挂回引擎待回填队列**;(3)G2 主循环 /deals 轮询回填挂回的单 → G6 据真实成交补记/修正。**I4 只做"查未完结 + 挂回队列"**,不做对账(D3)、不做修正(G6)、不做匹配(G3)。**真机卡点**:挂回的单要和券商侧成交对上,依赖 G3 订单匹配键稳定性(passorder 返回 0,`/deals` m_nOrderID 对不上 MD5)——G3 不稳则 I4 挂回也白搭。**前提**:G1 订单状态机就位(submitted 阶段不 apply_trade、不写 LiveTrade,回填确认才写) | ✅ 规则定 + 已实现(切片5,eb4bc40):`recover` 查未完结(submitted/partial)挂回引擎待回填队列,主循环 `_poll_deals` 按 `m_strOrderRef` 匹配 /deals 补记(G2/G6);前提 G1(先写 submitted)+ G3 匹配键真机定案均已就位 |
 | I5 | 桥端 `_placed` 缓存跨重启 | ✅ | 🧠 | **(2026-08-07 定:无风险,关闭)** 读码确认:Core 每根 bar 生成新 OrderEvent,`_persist_trade` 写库后订单完成,**不会重发同 order_id**。`_placed`(桥内存 order_id→result)是防同一 bar 内桥回调重入(实盘无此场景)。桥重启后 `_placed` 清空无影响,因 Core 不重发。无需处理 | ✅ 无风险,关闭 I5 |
 
 ---
@@ -199,7 +199,7 @@
 
 | # | 细节 | 依赖 |
 |---|---|---|
-| ✅已改 | `ACCOUNT` 硬编码常量 | ✅ 2026-08-12:iQuant 无读取登录账号 API(`ContextInfo` 仅 `set_account`),账号作常量写进桥文件顶部,换账号改这一行;双桥 `iquant_bridge.py`(仿真 8790)/`iquant_bridge_live.py`(实盘 8791)各自一处;纯 ASCII,`py_compile` 过 |
+| ✅已改 | `ACCOUNT` 硬编码常量 | ✅ 2026-08-12:QMT 无读取登录账号 API(`ContextInfo` 仅 `set_account`),账号作常量写进桥文件顶部,换账号改这一行;双桥 `iquant_bridge.py`(仿真 8790)/`iquant_bridge_live.py`(实盘 8791)各自一处;纯 ASCII,`py_compile` 过 |
 | ✅已改 | `query_deals`/`query_orders`/`query_positions` 字段已补全(`m_strOrderRef`/`m_nCanUseVolume` 等,见 G4/D3/F5 行) | ✅ 2026-08-10 |
 | ✅已改 | `_do_place` 支持 `pr_type`(0 限价/14 对手价)——已恢复硬编码 14(对手价) | ✅ 2026-08-10 |
 | ✅已写 | **桥部署 README + 「实盘交易」模式要求**——`live/bridge/README.md` 部署/账号/TOKEN/白名单配置说明,注明必须以实盘交易模式运行(模拟模式 passorder 不发委托,真机验证) | ✅ 2026-08-10 |
@@ -293,7 +293,7 @@
 
 | 周期 | 数据源 | 去重/长度规则(同启动) |
 |---|---|---|
-| **1d** | **iQuant 桥** `/quote?period=1d`(forming 1d bar OHLCV 快照) | 长度 `_code_period_count[(code,"1d")]`(该股 1d 公式最大 formula_count,兜底 `_period_count`/全局);去重 `_sort_and_cap`(stime 去重 + 截断)——同 `_preheat` |
+| **1d** | **QMT 桥** `/quote?period=1d`(forming 1d bar OHLCV 快照) | 长度 `_code_period_count[(code,"1d")]`(该股 1d 公式最大 formula_count,兜底 `_period_count`/全局);去重 `_sort_and_cap`(stime 去重 + 截断)——同 `_preheat` |
 | **1w/1mon** | **通达信** `TQFormula.compute`(桥端 xtdata 拉不到 1w/1mon,仅此通路) | 走与 `start()` 相同的 `_inject_startup_periods`(count=-1 全量 + 取最新信号);日切 cache miss → 补注入——同启动注入 |
 
 幂等:`_last_daily_bar_date` 当日只驱动一次;1w/1mon 按 `(sid, code, daily_time)` 信号键判 cache miss 补注入。

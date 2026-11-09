@@ -1260,3 +1260,73 @@ def test_create_portfolio_empty_name_rejected(client):
     body = c.post("/api/portfolios", json=_create_payload(name="")).json()
     assert body["code"] == 400
     assert "名称" in body["message"]
+
+
+def test_create_portfolio_numeric_range_rejected(client):
+    """组合数值范围校验：负本金/负佣金/负滑点/0 持仓数/非法基准格式 → 400。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    bad_cases = [
+        {"initial_capital": -1},
+        {"max_holdings": 0},
+        {"min_commission": -5},
+        {"buy_commission_rate": -0.001},
+        {"slippage": -0.01},
+        {"slippage": 0.6},
+        {"benchmark_index": "bad idx"},
+    ]
+    for over in bad_cases:
+        body = c.post("/api/portfolios", json=_create_payload(**over)).json()
+        assert body["code"] == 400, over
+
+    # 合法边界（0 佣金/0 滑点/最小本金）应放行
+    ok = c.post("/api/portfolios", json=_create_payload(
+        initial_capital=1, max_holdings=1, min_commission=0,
+        buy_commission_rate=0, sell_commission_rate=0, stamp_duty_rate=0, slippage=0,
+    )).json()
+    assert ok["code"] == 0
+
+
+def test_create_portfolio_batch_strategy_numeric_rejected(client):
+    """组合批量子策略数值越界 → 400（max_positions=0）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    payload = _create_payload()
+    payload["strategies"][0]["max_positions"] = 0
+    body = c.post("/api/portfolios", json=payload).json()
+    assert body["code"] == 400
+    assert "max_positions" in body["message"]
+
+
+def test_create_strategy_numeric_range_rejected(client):
+    """独立子策略数值范围校验：0/负/超 1 比例 → 400；0=禁用风控合法放行。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db, strategies=[])
+    db.close()
+
+    bad_cases = [
+        {"max_positions": 0},
+        {"single_open_ratio": -0.1},
+        {"single_open_ratio": 1.5},
+        {"stop_loss_ratio": -0.05},
+        {"take_profit_ratio": -0.2},
+        {"trailing_stop_ratio": 1.5},
+        {"add_position_ratio": 2},
+        {"reduce_position_ratio": -1},
+    ]
+    for over in bad_cases:
+        body = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(**over)).json()
+        assert body["code"] == 400, over
+
+    # 0 = 禁用止损/止盈/移动止损（合法）→ 放行
+    ok = c.post(f"/api/portfolios/{pid}/strategies", json=_strategy_payload(
+        stop_loss_ratio=0, take_profit_ratio=0, trailing_stop_ratio=0,
+    )).json()
+    assert ok["code"] == 0

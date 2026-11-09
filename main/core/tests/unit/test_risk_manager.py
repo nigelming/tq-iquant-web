@@ -125,6 +125,56 @@ def test_is_trading_halted_combines_breaker_and_daily_pause():
 
 
 # ===========================================================================
+# daily_loss 分母口径（可选开关，默认关=初始资金，历史行为不变）
+# ===========================================================================
+def test_daily_loss_default_uses_initial_capital():
+    """默认关闭：分母恒为初始资金 → 净值涨到 20 万后，日内亏 6000（仅 3% 净值）仍会触发。"""
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    initial = Decimal("100000")
+    assert pm.daily_loss_on_equity_enabled is False
+
+    pm.update(Decimal("200000"), date(2026, 7, 1), initial)   # 净值翻倍
+    pm.update(Decimal("194000"), date(2026, 7, 2), initial)   # 跨日补算 D1（pnl=0），建立 D2 基准
+    pm.finalize_last_day(initial)                             # D2 日内亏 6000 = 6%×初始资金
+    assert pm.daily_pause_active is True
+
+
+def test_daily_loss_on_equity_uses_prev_close_net_value():
+    """开启：分母 = 上一交易日收盘净值 → 同样亏 6000（3%×20 万）不触发。"""
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    pm.daily_loss_on_equity_enabled = True
+    initial = Decimal("100000")
+
+    pm.update(Decimal("200000"), date(2026, 7, 1), initial)
+    pm.update(Decimal("194000"), date(2026, 7, 2), initial)
+    pm.finalize_last_day(initial)
+    assert pm.daily_pause_active is False
+    assert pm.daily_loss_base(initial) == Decimal("200000")   # 昨收净值口径
+
+
+def test_daily_loss_on_equity_triggers_on_5pct_of_prev_close():
+    """开启：日内亏 12,000 = 6% × 昨收 20 万 ≥ 5% → 触发，且基准取昨收净值。"""
+    pm = _pm(daily_loss_limit=Decimal("0.05"))
+    pm.daily_loss_on_equity_enabled = True
+    initial = Decimal("100000")
+
+    pm.update(Decimal("200000"), date(2026, 7, 1), initial)
+    pm.update(Decimal("188000"), date(2026, 7, 2), initial)
+    pm.finalize_last_day(initial)
+    assert pm.daily_pause_active is True
+    assert pm.daily_loss_trigger_date == date(2026, 7, 2)
+
+
+def test_daily_loss_base_falls_back_to_initial_on_first_day():
+    """首日无昨收净值 → 分母回落初始资金（避免除零/空值）。"""
+    pm = _pm()
+    pm.daily_loss_on_equity_enabled = True
+    initial = Decimal("100000")
+    assert pm.prev_close_value is None
+    assert pm.daily_loss_base(initial) == initial
+
+
+# ===========================================================================
 # 实盘拆分（E5/E6, 2026-08-10 定）：update_peak 每 bar（回撤+熔断+跨日刷新 prev_close），
 # update_daily 14:30 一次（日内亏损）。update = 两者合集，回测向后兼容。
 # ===========================================================================
@@ -151,6 +201,21 @@ def test_update_peak_cross_day_refreshes_prev_close():
     # Day2 后续 bar：不跨日，prev_close 不变
     pm.update_peak(Decimal("102000"), date(2026, 7, 2))
     assert pm.prev_close_value == Decimal("100000")
+
+
+def test_update_peak_allow_peak_update_false_keeps_daily_bookkeeping():
+    """关闭 peak 更新时，跨日 prev_close 与当日末值仍要维护（daily_loss 依赖）。"""
+    pm = _pm()
+    pm.update_peak(Decimal("100000"), date(2026, 7, 1))
+
+    pm.update_peak(
+        Decimal("200000"), date(2026, 7, 2), allow_peak_update=False,
+    )
+
+    assert pm.peak_value == Decimal("100000")
+    assert pm.prev_close_value == Decimal("100000")
+    assert pm._last_bar_total_value == Decimal("200000")
+    assert pm.circuit_breaker_active is False
 
 
 def test_update_daily_uses_prev_close_and_triggers_daily_loss():

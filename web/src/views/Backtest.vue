@@ -4,7 +4,8 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
-  recomputeRobustness, getStockPools, compareBacktestPools,
+  recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  sendUserBlock,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -18,6 +19,7 @@ import type {
   ValidationVerdict,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
+import { deriveBlockCode } from '../utils/blockCode'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
@@ -108,7 +110,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial' })
 const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
@@ -932,6 +934,8 @@ function openForm() {
     volume_limit_enabled: undefined,
     volume_limit_ratio: undefined,
     equity_cap: undefined,
+    daily_close_peak_enabled: false,
+    daily_loss_basis: '',
   }
   showForm.value = true
 }
@@ -940,13 +944,26 @@ async function submit() {
   if (!form.value.portfolio_strategy_id) { alert('请选择组合'); return }
   if (!form.value.name.trim()) { alert('请填写回测名称'); return }
   if (!form.value.start_date || !form.value.end_date) { alert('请选择起止日期'); return }
-  if (form.value.start_date > form.value.end_date) {
-    alert(`开始日期不能晚于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
+  if (form.value.start_date >= form.value.end_date) {
+    alert(`开始日期必须早于结束日期：${form.value.start_date} ~ ${form.value.end_date}`)
     return
   }
   if (form.value.is_oos_gate_enabled && !(form.value.oos_gate_min_ratio >= 0.1 && form.value.oos_gate_min_ratio <= 2)) {
     alert('IS/OOS 门槛比例须在 [0.1, 2]')
     return
+  }
+  // 高级选项 run 级覆盖范围校验（与后端一致，快速失败）
+  if (form.value.slippage_impact_coef !== undefined && form.value.slippage_impact_coef !== '') {
+    const s = Number(form.value.slippage_impact_coef)
+    if (!(s > 0 && s <= 100)) { alert('滑点冲击系数须在 (0,100]%（留空=用组合默认）'); return }
+  }
+  if (form.value.volume_limit_ratio !== undefined && form.value.volume_limit_ratio !== '') {
+    const v = Number(form.value.volume_limit_ratio)
+    if (!(v > 0 && v <= 1)) { alert('成交量占比须在 (0,1]（留空=用组合默认）'); return }
+  }
+  if (form.value.equity_cap !== undefined && form.value.equity_cap !== '') {
+    const e = Number(form.value.equity_cap)
+    if (!(e > 0)) { alert('容量上限必须大于 0（留空=用组合默认）'); return }
   }
   submitting.value = true
   try {
@@ -962,6 +979,10 @@ async function submit() {
       fee_reserve_enabled: form.value.fee_reserve_enabled,
       bond_t0_enabled: form.value.bond_t0_enabled,
       bond_lot_enabled: form.value.bond_lot_enabled,
+      daily_close_peak_enabled: form.value.daily_close_peak_enabled,
+      ...(form.value.daily_loss_basis
+        ? { daily_loss_basis: form.value.daily_loss_basis }
+        : {}),
           ...(form.value.adaptive_slippage_enabled !== undefined
             ? {
                 adaptive_slippage_enabled: form.value.adaptive_slippage_enabled,
@@ -1024,6 +1045,26 @@ async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
   }
 }
 
+// ===== 1.3.1 同步持仓股到通达信自选 =====
+// 口径：详情载荷无最终持仓快照，退而用交易明细涉及的股票代码去重代替（按钮 title 注明）
+const detailStockCodes = computed(() =>
+  Array.from(new Set((detail.value?.trades || []).map((t) => t.stock_code).filter(Boolean))))
+
+async function syncPositionsBlock() {
+  if (!detailStockCodes.value.length) return
+  const name = window.prompt('通达信自选板块名', '创懿回测')
+  if (!name) return
+  try {
+    const r = await sendUserBlock({
+      block_code: deriveBlockCode(name), block_name: name, stock_codes: detailStockCodes.value,
+      mode: 'replace',
+    })
+    alert(`已写入 ${r.count} 只到「${r.block_code}」`)
+  } catch (e) {
+    alert(errMsg(e))
+  }
+}
+
 async function expandCaSection() {
   if (!caCollapsed.value) return
   caCollapsed.value = false
@@ -1053,6 +1094,146 @@ const rbRecomputing = ref(false)
 const rbRecomputeMsg = ref('')
 const rbRecomputeWarn = ref(false)
 const rbRecomputeMsgClass = computed(() => (rbRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
+
+// ===== 持续性检验（阿尔法衰减 vs 风格钟摆）=====
+const persistence = computed(() => detail.value?.persistence ?? null)
+const pStatus = computed(() => persistence.value?.status ?? null)
+const pData = computed(() => {
+  // 重算失败时后端保留上次成功 payload（status=failed + data 仍在），
+  // 因此这里不按 status 过滤，改为「有 data 就展示」，失败提示在模板内单独渲染。
+  const item = persistence.value
+  if (!item || !item.data) return null
+  return item.data
+})
+// 老 payload 可能没有 benchmarks 字段（该字段是后续版本才加入 payload 的），
+// 这里必须双重可选链，否则渲染期直接 TypeError 导致整块白屏。
+const pMainBench = computed(() => pData.value?.benchmarks?.find(b => b.is_main) ?? null)
+const pExcessNote = computed(() => {
+  const d = pData.value
+  const main = pMainBench.value
+  if (!d || !main) return ''
+  const full = (d.years ?? []).filter(y => !y.is_partial)
+  if (full.length < 2) return '有效满年不足 2 年，暂无法给出主基准超额趋势结论'
+  // 判定窗口与后端 decide_verdict 同源：优先取 verdict.window_years（最近 3 个满年，
+  // 不足 3 年回退 2 年），老 payload 无该字段时按最近两个满年展示。
+  const winYears = d.verdict?.window_years?.length
+    ? d.verdict.window_years
+    : full.slice(-2).map(y => y.year)
+  const first = full.find(y => y.year === winYears[0])
+  const last = full.find(y => y.year === winYears[winYears.length - 1])
+  if (!first || !last) return '判定窗口年份缺失，无法对比超额趋势'
+  const code = main.code
+  const eFirst = first.excess?.[code]
+  const eNow = last.excess?.[code]
+  if (eNow == null || eFirst == null) return '主基准在判定窗口内无数据，无法对比超额趋势'
+  const drop = eNow - eFirst
+  const trend = drop < 0 ? '收敛（走低）' : '未收敛（走高/走平）'
+  const benches = d.benchmarks ?? []
+  const beat = benches.filter((b) => { const ex = b.available ? last.excess?.[b.code] : null; return ex != null && ex > 0 }).length
+  const avail = benches.filter((b) => { const ex = b.available ? last.excess?.[b.code] : null; return ex != null }).length
+  return `主基准（${main.name}）为判定口径：判定窗口 ${winYears[0]}–${winYears[winYears.length - 1]}（${winYears.length} 个满年）超额${trend}（${first.year} ${pctSigned(eFirst)} → ${last.year} ${pctSigned(eNow)}，累计 ${(drop * 100).toFixed(2)}pp）；最近满年跑赢 ${beat}/${avail} 只可用宽基 → 收益回落主要随风格/宽基贝塔（市场温度周期），非策略能力衰减。`
+})
+type PSignal = {
+  key: string
+  label: string
+  detail: string
+  status: 'bad' | 'mixed' | 'good' | 'na'
+  word: string
+}
+
+// 判定信号由后端 decide_verdict 统一产出（阈值/口径与 HTML 报告一致），前端只负责呈现。
+// 升级前计算的老记录没有 signals 字段，模板回退为展示 verdict.reasons。
+const pSignals = computed<PSignal[]>(() => (pData.value?.verdict?.signals ?? []) as PSignal[])
+
+const pCollapsed = ref(true)
+const pRecomputing = ref(false)
+const pRecomputeMsg = ref('')
+const pRecomputeWarn = ref(false)
+const pRecomputeMsgClass = computed(() => (pRecomputeWarn.value ? 'ca-msg ca-warn' : 'ca-msg'))
+const persistenceSectionEl = ref<HTMLDivElement | null>(null)
+const pRollingEl = ref<HTMLDivElement | null>(null)
+let pRollingChart: echarts.ECharts | null = null
+
+// 判定基准：默认继承组合基准（payload.benchmarks 里 is_main 的那只）。
+// 成长类策略可切到创业板指等，避免用沪深300 衡量成长策略时把风格贝塔算进超额。
+// 后端 guard 允许的基准集合（组合基准 + 宽基）兜底：老 payload 没有 benchmarks 字段时
+// 仍需给出可选项，否则下拉框会因 options 为空而不显示。
+const P_BENCH_FALLBACK = [
+  { code: '000300.SH', name: '沪深300', is_main: true, available: true },
+  { code: '000688.SH', name: '科创50', is_main: false, available: true },
+  { code: '000852.SH', name: '中证1000', is_main: false, available: true },
+  { code: '000905.SH', name: '中证500', is_main: false, available: true },
+  { code: '000985.CSI', name: '中证全指', is_main: false, available: true },
+  { code: '399006.SZ', name: '创业板指', is_main: false, available: true },
+]
+const pBenchSel = ref('')
+const pBenchOptions = computed(() => {
+  const list = pData.value?.benchmarks ?? []
+  return list.length > 1
+    ? list.filter((b) => b.available || b.code === pBenchSel.value)
+    : P_BENCH_FALLBACK
+})
+watch(
+  () => pData.value,
+  (d) => {
+    if (!d) return
+    const list = d.benchmarks ?? []
+    if (!list.some((b) => b.code === pBenchSel.value)) {
+      pBenchSel.value = (list.find((b) => b.is_main) ?? list[0])?.code || '000300.SH'
+    }
+  },
+  { immediate: true },
+)
+
+function verdictLabel(level: string): string {
+  return { alpha_decay: '疑似阿尔法衰减', style_pendulum: '风格钟摆（市场温度周期）', stable: '稳定', mixed: '信号混合', insufficient: '样本不足' }[level] || level
+}
+
+async function recomputePersistence() {
+  const id = currentRecord.value?.id
+  if (!id || pRecomputing.value) return
+  pRecomputing.value = true
+  pRecomputeMsg.value = ''
+  pRecomputeWarn.value = false
+  try {
+    const res = await recomputePersistenceAnalysis(id, pBenchSel.value || undefined)
+    pRecomputeMsg.value = res.status === 'completed' ? '计算完成' : `计算未完成：${res.error || res.status}`
+    pRecomputeWarn.value = res.status !== 'completed'
+    detail.value = await getBacktestDetail(id, acceptanceProfile.value)
+    persistenceSectionEl.value?.scrollIntoView({ behavior: 'smooth' })
+  } catch (e) {
+    pRecomputeMsg.value = `计算失败：${errMsg(e)}`
+    pRecomputeWarn.value = true
+  } finally {
+    pRecomputing.value = false
+    nextTick(renderPRolling)
+  }
+}
+
+async function togglePSection() {
+  pCollapsed.value = !pCollapsed.value
+  if (!pCollapsed.value) nextTick(renderPRolling)
+}
+
+function renderPRolling() {
+  const el = pRollingEl.value
+  const d = pData.value
+  if (!el || !d?.rolling?.dates?.length) return
+  pRollingChart?.dispose()
+  pRollingChart = echarts.init(el)
+  pRollingChart.setOption({
+    tooltip: { trigger: 'axis', valueFormatter: (v: any) => (v == null ? '-' : (v * 100).toFixed(2) + '%') },
+    legend: { data: ['策略 6M', '策略 12M', '基准 12M'] },
+    grid: { left: 56, right: 24, bottom: 36, top: 40, containLabel: true },
+    xAxis: { type: 'category', data: d.rolling.dates, axisLabel: { color: cssVar('--ink-soft') }, axisLine: { lineStyle: { color: cssVar('--line') } } },
+    yAxis: { type: 'value', axisLabel: { formatter: (v: number) => (v * 100).toFixed(0) + '%', color: cssVar('--ink-soft') }, splitLine: { lineStyle: { color: cssVar('--line') } } },
+    series: [
+      { name: '策略 6M', type: 'line', data: d.rolling.strat_6m, symbol: 'none', lineStyle: { color: cssVar('--blue'), width: 1.2 } },
+      { name: '策略 12M', type: 'line', data: d.rolling.strat_12m, symbol: 'none', lineStyle: { color: cssVar('--red'), width: 2 } },
+      { name: '基准 12M', type: 'line', data: d.rolling.bench_12m, symbol: 'none', lineStyle: { color: cssVar('--gold'), width: 1.4, type: 'dashed' } },
+    ],
+  })
+}
 
 // ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
 const mrCollapsed = ref(true)
@@ -1431,7 +1612,7 @@ const mrNeutralRows = computed(() => {
     { k: '震荡周胜率', v: n.win_rate === null ? '—' : pct1(n.win_rate), raw: 0 },
     { k: '震荡交易日数', v: `${n.n_range_days} 天`, raw: 0 },
     { k: '月均交易次数', v: n.monthly_trades === null ? '—' : num(n.monthly_trades, 1), raw: 0 },
-    { k: '年化换手率', v: n.annual_turnover === null ? '—' : `${num(n.annual_turnover, 2)}x`, raw: 0 },
+    { k: '年化换手率（双边）', v: n.annual_turnover === null ? '—' : `${num(n.annual_turnover, 2)}x`, raw: 0 },
     { k: '成本占盈利平仓毛利比', v: n.cost_gross_ratio === null ? '—' : pct1(n.cost_gross_ratio), raw: 0 },
     { k: '假突破磨损', v: `${n.whipsaw_count} 次（${n.whipsaw_days} 个交易日）`, raw: 0 },
     {
@@ -1755,9 +1936,23 @@ async function onDelete(id: number) {
 function backToList() {
   currentRecord.value = null
   detail.value = null
-  // 销毁图表实例，避免内存泄漏
-  equityChart?.dispose(); equityChart = null
-  drawdownChart?.dispose(); drawdownChart = null
+  // 详情页共 20+ 个图表实例，全部随详情销毁——只 dispose 两个会残留
+  // 其余实例（模块级变量仍持有），反复进出详情会累积泄漏。
+  disposeAllCharts()
+}
+
+// 详情页「样本外验证 未执行 → 立即发起验证」：把当前回测的组合/名称/区间/评估口径
+// 带入回归验证页预填表单（经 sessionStorage 接力，BacktestAnalysis 挂载后消费）。
+function prefillWalkForward() {
+  const r = currentRecord.value
+  if (!r) return
+  sessionStorage.setItem('wf_prefill', JSON.stringify({
+    portfolio_strategy_id: r.portfolio_strategy_id,
+    name: `${r.name}-WF`,
+    start_date: r.start_date ?? '',
+    end_date: r.end_date ?? '',
+    evaluation_profile: r.evaluation_profile || 'absolute',
+  }))
 }
 
 // ===== 格式化 =====
@@ -1801,6 +1996,10 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
   if (!m) return []
   const retVolRatio = m.annual_return != null && m.volatility
     ? m.annual_return / m.volatility : null
+  // 单位敞口上行效率：上行捕获率 ÷ Beta。>1 = 每 1 份市场敞口捕获的涨幅超过
+  // 市场本身（持仓个股平均强于指数，选股贡献）；<1 = 弹性弱于指数。
+  const upPerBeta = m.beta != null && m.beta > 0 && m.up_capture_ratio != null
+    ? m.up_capture_ratio / m.beta : null
   return [
     { label: '总收益', value: pct(m.total_return), cls: valueClass(m.total_return) },
     { label: '年化收益', value: pct(m.annual_return), cls: valueClass(m.annual_return) },
@@ -1831,11 +2030,17 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '信息比率', value: num(m.information_ratio, 2), cls: valueClass(m.information_ratio) },
     { label: '上行捕获率', value: pct1(m.up_capture_ratio), cls: 'text-blue' },
     { label: '下行捕获率', value: pct1(m.down_capture_ratio), cls: 'text-blue' },
+    {
+      label: '单位敞口上行效率',
+      value: upPerBeta == null ? '—' : `${num(upPerBeta, 2)}×`,
+      cls: 'text-blue',
+      hint: '上行捕获率 ÷ Beta：每 1 份市场敞口捕获的上涨幅度倍数。>1 表示持仓个股平均强于指数（超额来自选股）；<1 表示弹性弱于指数',
+    },
     { label: '超额最大回撤', value: pct(m.excess_max_drawdown), cls: valueClass(m.excess_max_drawdown) },
 
     _group('磨损与仓位'),
-    { label: '年化换手率', value: num(m.annual_turnover, 2), cls: 'text-blue' },
-    { label: '交易成本占比', value: pct1(m.total_cost_ratio), cls: 'text-orange' },
+    { label: '年化换手率（双边）', value: m.annual_turnover == null ? '—' : `${num(m.annual_turnover, 2)}×/年`, cls: 'text-blue' },
+    { label: '交易成本/日均净值', value: pct1(m.total_cost_ratio), cls: 'text-orange' },
     { label: '平均仓位利用率', value: pct1(m.avg_position_utilization), cls: 'text-blue' },
     { label: '空仓日占比', value: pct1(m.empty_days_ratio), cls: 'text-orange' },
 
@@ -1905,7 +2110,7 @@ function scoreStrategy(m: BacktestEvaluationItem | null | undefined, sampleYears
   if (ulcer <= 0.05) highlights.push(`Ulcer 指数 ${ulcer.toFixed(2)}，回撤深度极浅`)
 
   // 问题
-  if (costRatio > 0.08) issues.push(`交易成本占比 ${(costRatio * 100).toFixed(1)}%，年化换手 ${(m.annual_turnover ?? 0).toFixed(1)} 次，成本侵蚀明显`)
+  if (costRatio > 0.08) issues.push(`交易成本/日均净值 ${(costRatio * 100).toFixed(1)}%，年化换手 ${(m.annual_turnover ?? 0).toFixed(1)} 次，成本侵蚀明显`)
   if (util < 0.3) issues.push(`仓位利用率 ${(util * 100).toFixed(1)}%，空仓日 ${(emptyDays * 100).toFixed(1)}%，资金闲置较多`)
   if ((m.return_kurtosis ?? 0) > 10) issues.push(`收益峰度 ${(m.return_kurtosis ?? 0).toFixed(1)}，尾部风险大（最差日 ${((m.worst_daily_return ?? 0) * 100).toFixed(2)}%）`)
   if ((m.max_consecutive_profit_days ?? 0) > 500) issues.push(`最长连盈 ${m.max_consecutive_profit_days} 天，交易信号触发频率低`)
@@ -2108,6 +2313,40 @@ function boxplotData(arr: number[]): [number, number, number, number, number] | 
   return [sorted[0], q(0.25), q(0.5), q(0.75), sorted[sorted.length - 1]]
 }
 
+// 箱线图配套统计行：图上常驻标注 / 富 tooltip / 图下统计表共用同一份数据（口径唯一）。
+// 收益先 ×100 转百分点并 round 4 位（与箱线数据同口径）；样本 <5 无法构成箱体，整年剔除。
+interface BoxStatRow {
+  year: number
+  n: number              // 样本数
+  mean: number           // 均值（百分点）
+  min: number
+  q1: number
+  median: number
+  q3: number
+  max: number
+  posRatio: number       // 正值占比 0~1（上涨日/月占比）
+}
+function boxStatRow(year: number, returns: number[]): BoxStatRow | null {
+  const vals = returns.map((r) => Number((r * 100).toFixed(4)))
+  const five = boxplotData(vals)
+  if (!five) return null
+  const mean = Number((vals.reduce((s, v) => s + v, 0) / vals.length).toFixed(4))
+  const posRatio = vals.filter((v) => v > 0).length / vals.length
+  return { year, n: vals.length, mean, min: five[0], q1: five[1], median: five[2], q3: five[3], max: five[4], posRatio }
+}
+const dailyBoxRows = computed<BoxStatRow[]>(() =>
+  (returnsBuckets.value?.yearly ?? [])
+    .map((y) => boxStatRow(y.year, y.daily_returns))
+    .filter((r): r is BoxStatRow => r !== null))
+const monthlyBoxRows = computed<BoxStatRow[]>(() =>
+  (returnsBuckets.value?.yearly ?? [])
+    .map((y) => boxStatRow(y.year, y.monthly_returns))
+    .filter((r): r is BoxStatRow => r !== null))
+// 箱线统计值已是百分点单位：带符号格式化（勿再 ×100，区别于 fmtSignedPct）
+const fmtPp = (v: number): string => (v >= 0 ? '+' : '') + v.toFixed(2) + '%'
+// A 股红涨绿跌：正红负绿
+const signColor = (v: number): string => (v >= 0 ? 'var(--red)' : 'var(--green)')
+
 // ===== 交易明细交互（排序/筛选/分页）=====
 const tradesTable = useTable(
   computed(() => detail.value?.trades ?? []),
@@ -2295,8 +2534,8 @@ const mrStateTable = useTable(
       { key: 'excess', label: '超额', sortable: true, sortValue: (r: any) => r.excessRaw },
       { key: 'win', label: '胜率' },
       { key: 'dd', label: '态内最大回撤' },
-      { key: 'turnover', label: '年化换手' },
-      { key: 'cost', label: '成本占比' },
+      { key: 'turnover', label: '年化换手（双边）' },
+      { key: 'cost', label: '成本/日均净值' },
     ],
   },
 )
@@ -2551,62 +2790,84 @@ function initMonthlyHeatChart() {
   })
 }
 
+// 箱线图 option 构建：箱体（五数）+ 零轴虚线 + 均值菱形◆ + 中位数常驻数值标注。
+// 解决「只有 hover 才能看到数值」：中位数直接标注在图上，均值以 ◆ 常驻显示，
+// 完整五数 + 均值 + 样本数 + 正值占比在图下统计表常驻（与图共用 BoxStatRow，口径唯一）。
+function boxChartOption(rows: BoxStatRow[], yName: string, fill: string, border: string) {
+  const categories = rows.map((r) => String(r.year))
+  return {
+    tooltip: {
+      trigger: 'item',
+      formatter: (p: any) => {
+        const r = rows[p.dataIndex]
+        if (!r) return ''
+        if (p.seriesName === '均值') return `${r.year}年 均值: ${fmtPp(r.mean)}`
+        return `${r.year}年 ${yName.replace('(%)', '')}分布<br/>`
+          + `中位: ${fmtPp(r.median)} · 均值: ${fmtPp(r.mean)}<br/>`
+          + `Q1: ${fmtPp(r.q1)} · Q3: ${fmtPp(r.q3)}<br/>`
+          + `最小: ${fmtPp(r.min)} · 最大: ${fmtPp(r.max)}<br/>`
+          + `样本 ${r.n} 个 · 正值占比 ${(r.posRatio * 100).toFixed(1)}%`
+      },
+    },
+    // 图例仅标注意义不直观的「均值 ◆」；箱体/中位标注不言自明不进图例
+    legend: { show: true, top: 4, right: 8, data: ['均值'], icon: 'diamond' },
+    grid: { left: 60, right: 20, top: 40, bottom: 30 },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value', name: yName },
+    series: [
+      {
+        name: '箱体', type: 'boxplot',
+        data: rows.map((r) => [r.min, r.q1, r.median, r.q3, r.max]),
+        itemStyle: { color: fill, borderColor: border },
+        // 零轴参考线：一眼区分箱体整体偏正/偏负
+        markLine: {
+          silent: true, symbol: 'none', animation: false,
+          lineStyle: { type: 'dashed', color: cssVar('--ink-faint') },
+          label: { show: false },
+          data: [{ yAxis: 0 }],
+        },
+      },
+      {
+        name: '均值', type: 'scatter',
+        data: rows.map((r, i) => [categories[i], r.mean]),
+        symbol: 'diamond', symbolSize: 10,
+        itemStyle: { color: cssVar('--gold') },
+        z: 3,
+      },
+      {
+        // 中位数常驻标注：透明散点仅承载 label，无须 hover
+        name: '中位数标注', type: 'scatter',
+        data: rows.map((r, i) => [categories[i], r.median]),
+        symbol: 'none', silent: true,
+        label: {
+          show: true, position: 'top', distance: 3, fontSize: 10,
+          color: cssVar('--ink'), backgroundColor: cssVar('--card-bg'),
+          padding: [1, 3], borderRadius: 2,
+          formatter: (p: any) => fmtPp(Number(p.value[1])),
+        },
+        tooltip: { show: false },
+        z: 4,
+      },
+    ],
+  }
+}
+
 function initDailyBoxChart() {
   if (!dailyBoxEl.value || !hasReturnsBuckets.value) return
   dailyBoxChart?.dispose()
   dailyBoxChart = echarts.init(dailyBoxEl.value)
-  const { yearly } = returnsBuckets.value!
-  const categories = yearly.map((y) => String(y.year))
-  const boxData = yearly
-    .map((y) => y.daily_returns.map((r) => Number((r * 100).toFixed(4))))
-    .map(boxplotData)
-    .filter(Boolean)
-  if (boxData.length === 0) return
-  setThemed(dailyBoxChart, {
-    tooltip: {
-      trigger: 'item',
-      formatter: (p: any) => {
-        const [min, q1, med, q3, max] = p.value
-        return `${categories[p.dataIndex]}年<br/>最小: ${min.toFixed(4)}%<br/>Q1: ${q1.toFixed(4)}%<br/>中位: ${med.toFixed(4)}%<br/>Q3: ${q3.toFixed(4)}%<br/>最大: ${max.toFixed(4)}%`
-      },
-    },
-    grid: { left: 60, right: 20, top: 40, bottom: 30 },
-    xAxis: { type: 'category', data: categories },
-    yAxis: { type: 'value', name: '日收益率(%)' },
-    series: [{
-      type: 'boxplot', data: boxData,
-      itemStyle: { color: cssVar('--accent-light'), borderColor: cssVar('--blue') },
-    }],
-  })
+  if (dailyBoxRows.value.length === 0) return
+  setThemed(dailyBoxChart, boxChartOption(
+    dailyBoxRows.value, '日收益率(%)', cssVar('--accent-light'), cssVar('--blue')))
 }
 
 function initMonthlyBoxChart() {
   if (!monthlyBoxEl.value || !hasReturnsBuckets.value) return
   monthlyBoxChart?.dispose()
   monthlyBoxChart = echarts.init(monthlyBoxEl.value)
-  const { yearly } = returnsBuckets.value!
-  const categories = yearly.map((y) => String(y.year))
-  const boxData = yearly
-    .map((y) => y.monthly_returns.map((r) => Number((r * 100).toFixed(4))))
-    .map(boxplotData)
-    .filter(Boolean)
-  if (boxData.length === 0) return
-  setThemed(monthlyBoxChart, {
-    tooltip: {
-      trigger: 'item',
-      formatter: (p: any) => {
-        const [min, q1, med, q3, max] = p.value
-        return `${categories[p.dataIndex]}年<br/>最小: ${min.toFixed(4)}%<br/>Q1: ${q1.toFixed(4)}%<br/>中位: ${med.toFixed(4)}%<br/>Q3: ${q3.toFixed(4)}%<br/>最大: ${max.toFixed(4)}%`
-      },
-    },
-    grid: { left: 60, right: 20, top: 40, bottom: 30 },
-    xAxis: { type: 'category', data: categories },
-    yAxis: { type: 'value', name: '月收益率(%)' },
-    series: [{
-      type: 'boxplot', data: boxData,
-      itemStyle: { color: hexToRgba(cssVar('--green'), 0.15), borderColor: cssVar('--green') },
-    }],
-  })
+  if (monthlyBoxRows.value.length === 0) return
+  setThemed(monthlyBoxChart, boxChartOption(
+    monthlyBoxRows.value, '月收益率(%)', hexToRgba(cssVar('--green'), 0.15), cssVar('--green')))
 }
 
 function initAnnualBarChart() {
@@ -2693,6 +2954,7 @@ function disposeAllCharts() {
   stQuadChart?.dispose(); stQuadChart = null
   iaExpChart?.dispose(); iaExpChart = null
   rbHistChart?.dispose(); rbHistChart = null
+  pRollingChart?.dispose(); pRollingChart = null
 }
 
 watch(theme, () => {
@@ -2803,7 +3065,7 @@ watch(theme, () => {
             @click="showAdvanced = !showAdvanced"
             data-field="advanced-toggle"
           >
-            {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量）
+            {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量 / 日内亏损口径）
           </div>
 
           <div v-show="showAdvanced" class="form-group" style="margin-top:6px">
@@ -2832,6 +3094,22 @@ watch(theme, () => {
                   <input type="checkbox" v-model="form.fee_reserve_enabled" data-field="fee_reserve_enabled" />
                   <span class="field-hint">费用预留（买入审批含佣金，避免现金为负）</span>
                 </label>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.daily_close_peak_enabled" data-field="daily_close_peak_enabled" />
+                  <span class="field-hint">日末峰值保护（混合周期时避免周/月粗 bar 的周期末收盘价污染峰值；纯 1d 无影响）</span>
+                </label>
+              </div>
+              <div class="field-row">
+                <span class="field-label">日内亏损口径</span>
+                <select v-model="form.daily_loss_basis" data-field="daily_loss_basis">
+                  <option value="">跟随组合</option>
+                  <option value="equity">昨日收盘净值</option>
+                  <option value="initial">初始资金（旧口径）</option>
+                </select>
+                <span class="field-suffix">run 级覆盖，不改组合配置</span>
               </div>
               <div class="field-row field-span-2">
                 <span class="field-label"></span>
@@ -2914,14 +3192,19 @@ watch(theme, () => {
                 冲击系数留空=用组合默认。</p>
               <p class="guide-step"><b>成交量约束/容量上限（run 级覆盖）</b>：发起回测弹窗的成交量/容量选项可
                 临时覆盖组合配置做 A/B 对比，不改组合。</p>
+              <p class="guide-step"><b>风控规则</b>：信号优先级 风控（止损/止盈/移动止损）&gt; 公式信号；
+                移动止损跟踪持仓最高价回撤≥阈值触发，是核心出场机制（实测贡献约 70% 利润）。</p>
             </div>
           </div>
           <div class="form-group">
             <label class="group-label">三、建议</label>
             <div class="guide-block">
               <p class="guide-note">· 长区间（5 年以上）建议用 dual 复权 + 开启成交量约束/自适应滑点，结果更贴近实盘。</p>
-              <p class="guide-note">· 动态仓位（组合设为动态净资产）务必设容量上限，否则复利后单仓可能不可成交。</p>
+              <p class="guide-note">· 动态仓位务必设容量上限（=实盘可动用资金），否则复利后单仓可达数百万、实盘无法成交。
+                实测：容量 1000 万 + 单仓 10% → 单仓封顶 100 万。</p>
+              <p class="guide-note">· 成交量占比建议 1%~3%（实盘机构≤1-2%），10% 仅适合超大盘股。</p>
               <p class="guide-note">· 回测完成后详情页自动给出「🧪 验证结论」，先看容量/危机防御/样本外再判断结果可信度。</p>
+              <p class="guide-note">· 收益衰减是正常的：加约束后收益下降但更真实；若收益暴跌，检查约束是否过严。</p>
             </div>
           </div>
         </div>
@@ -2948,6 +3231,12 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+      <button @click="syncPositionsBlock" class="btn btn-sm"
+              style="margin-top:8px;display:inline-block;margin-left:6px"
+              :disabled="detailStockCodes.length === 0"
+              title="口径：本次回测交易明细涉及的股票（去重）——详情无最终持仓快照；写入通达信自选板块；覆盖写入板块">
+        🔗 同步持仓股到通达信自选
+      </button>
     </div>
 
     <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->
@@ -2985,8 +3274,12 @@ watch(theme, () => {
               {{ validation.oos.overall_pass ? '样本外通过' : '样本外未通过' }} {{ validation.oos.windows_passed }}
             </span>
             <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">{{ validation.oos.name }}</span>
+            <RouterLink to="/backtest/analysis" class="btn btn-sm" style="margin-left:8px">查看</RouterLink>
           </template>
-          <span v-else style="font-size:12px;color:var(--ink-soft)">未执行（可在「回归验证」面板发起 walk-forward）</span>
+          <span v-else style="font-size:12px;color:var(--ink-soft)">
+            未执行
+            <RouterLink to="/backtest/analysis" class="btn btn-sm btn-primary" style="margin-left:8px" @click="prefillWalkForward">立即发起验证</RouterLink>
+          </span>
         </div>
       </div>
       <!-- 危机防御表 -->
@@ -3031,8 +3324,8 @@ watch(theme, () => {
         <tbody>
           <tr v-for="c in acceptance.checks" :key="c.metric">
             <td>{{ c.label }}</td>
-            <td>{{ c.op }} {{ (c.metric.includes('ratio') || c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
-            <td>{{ c.value === null ? '—' : c.value.toFixed(4) }}</td>
+            <td>{{ c.op }} {{ (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
+            <td>{{ c.value === null ? '—' : (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.value * 100).toFixed(2) + '%' : c.value.toFixed(4) }}</td>
             <td><span class="badge" :class="c.pass === true ? 'badge-green' : c.pass === false ? 'badge-red' : 'badge-gray'">{{ c.pass === true ? '过' : c.pass === false ? '未过' : '—' }}</span></td>
           </tr>
         </tbody>
@@ -3063,7 +3356,7 @@ watch(theme, () => {
     <div ref="crisisAlphaSectionEl" class="ca-section">
       <div class="section-title ca-header" @click="toggleCaSection">
         <span>🌪️ 危机Alpha 专题分析</span>
-        <span class="ca-caret" :class="{ open: !caCollapsed }">▶</span>
+        <span class="ca-caret" :class="{ open: !caCollapsed }" @click.stop="toggleCaSection">▶</span>
       </div>
 
       <template v-if="!caCollapsed">
@@ -3498,7 +3791,7 @@ watch(theme, () => {
     <div ref="marketRegimeSectionEl" class="ca-section mr-section">
       <div class="section-title ca-header" @click="toggleMrSection">
         <span>🚀 机遇Alpha · ⚖️ 中性Alpha 专题分析</span>
-        <span class="ca-caret" :class="{ open: !mrCollapsed }">▶</span>
+        <span class="ca-caret" :class="{ open: !mrCollapsed }" @click.stop="toggleMrSection">▶</span>
       </div>
 
       <template v-if="!mrCollapsed">
@@ -4068,7 +4361,7 @@ watch(theme, () => {
     <div ref="robustnessSectionEl" class="ca-section rb-section">
       <div class="section-title ca-header" @click="toggleRbSection">
         <span>🔬 稳健性检验</span>
-        <span class="ca-caret" :class="{ open: !rbCollapsed }">▶</span>
+        <span class="ca-caret" :class="{ open: !rbCollapsed }" @click.stop="toggleRbSection">▶</span>
       </div>
 
       <template v-if="!rbCollapsed">
@@ -4138,25 +4431,99 @@ watch(theme, () => {
           </table>
         </div>
 
-        <div class="section-title" style="font-size:14px">三、个股已实现净 P&amp;L 集中度</div>
+        <div class="section-title" style="font-size:14px">三、盈利贡献分布（已实现 / 未实现 / 单笔）</div>
         <div class="ca-status" style="margin-bottom:6px">
-          盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
-          ｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}
-          ｜ 总净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+          已实现净利 {{ fmtMoney(rbData.concentration.total_realized_pnl) }}
+          <template v-if="rbData.concentration.gross_profit != null">
+            （毛利 {{ fmtMoney(rbData.concentration.gross_profit) }} − 毛亏 {{ fmtMoney(rbData.concentration.gross_loss) }}）
+          </template>
+          <template v-if="rbData.concentration.unrealized">
+            ｜ 未实现 <span :class="valueClass(rbData.concentration.unrealized.total_pnl)">{{ fmtMoney(rbData.concentration.unrealized.total_pnl) }}</span>
+          </template>
+          ｜ 盈利个股 {{ rbData.concentration.profitable_stocks }} / {{ rbData.concentration.total_stocks }}
+          <template v-if="rbData.concentration.top20_share_gross != null">
+            ｜ 前20只占毛利 {{ pct(rbData.concentration.top20_share_gross) }} ／ 占净利 {{ pct(rbData.concentration.top20_share) }}
+          </template>
+          <template v-else>｜ 前20只占总净利 {{ pct(rbData.concentration.top20_share) }}</template>
         </div>
         <div class="table-container">
           <table>
-            <thead><tr><th>#</th><th>代码</th><th>净 P&amp;L</th><th>占比</th></tr></thead>
+            <thead><tr><th>#</th><th>代码</th><th>已实现净 P&amp;L</th><th>占毛利</th><th>占净利</th></tr></thead>
             <tbody>
               <tr v-for="(t, i) in rbData.concentration.top" :key="t.code">
                 <td>{{ i + 1 }}</td>
                 <td>{{ t.code }}</td>
                 <td :class="valueClass(t.pnl)">{{ fmtMoney(t.pnl) }}</td>
-                <td>{{ pct(t.share) }}</td>
+                <td>{{ pct(t.share_gross ?? t.share) }}</td>
+                <td>{{ pct(t.share_net ?? t.share) }}</td>
               </tr>
             </tbody>
           </table>
         </div>
+
+        <template v-if="rbData.concentration.unrealized?.rows?.length">
+          <div class="ca-status" style="margin:8px 0 6px">
+            期末未平仓（未实现盈亏单列，不计入已实现净利）：{{ rbData.concentration.unrealized.rows.length }} 只
+            ｜ 成本 {{ fmtMoney(rbData.concentration.unrealized.cost) }}
+            ｜ 市值 {{ fmtMoney(rbData.concentration.unrealized.market_value) }}
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>代码</th><th>持股数</th><th>成本</th><th>市值</th><th>浮动盈亏</th><th>占已实现净利</th></tr></thead>
+              <tbody>
+                <tr v-for="u in rbData.concentration.unrealized.rows" :key="u.code">
+                  <td>{{ u.code }}</td>
+                  <td>{{ fmtQty(u.quantity) }}</td>
+                  <td>{{ fmtMoney(u.cost) }}</td>
+                  <td>{{ fmtMoney(u.market_value) }}</td>
+                  <td :class="valueClass(u.pnl)">{{ fmtMoney(u.pnl) }}</td>
+                  <td>{{ pct(u.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <template v-if="rbData.concentration.lots">
+          <div class="section-title" style="font-size:14px">单笔贡献分布（FIFO 平仓批次）</div>
+          <div class="ca-status" style="margin-bottom:6px">
+            平仓批次 {{ rbData.concentration.lots.count }} 笔（盈利 {{ rbData.concentration.lots.winners }} 笔）
+            <template v-if="rbData.concentration.lots.hhi != null">
+              ｜ 盈利集中度 HHI {{ rbData.concentration.lots.hhi }}
+              ｜ 等效独立盈利来源 ≈ {{ rbData.concentration.lots.effective_sources }} 笔
+            </template>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>累计笔数</th><th>占批次</th><th>累计盈利</th><th>占毛利</th><th>占净利</th></tr></thead>
+              <tbody>
+                <tr v-for="k in rbData.concentration.lots.cumulative" :key="k.n">
+                  <td>前 {{ k.n }} 笔</td>
+                  <td>{{ pct(k.pct_of_lots) }}</td>
+                  <td>{{ fmtMoney(k.pnl) }}</td>
+                  <td>{{ pct(k.share_gross) }}</td>
+                  <td>{{ pct(k.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-container" style="margin-top:8px">
+            <table>
+              <thead><tr><th>#</th><th>代码</th><th>买入 → 卖出</th><th>股数</th><th>盈亏</th><th>占毛利</th><th>占净利</th></tr></thead>
+              <tbody>
+                <tr v-for="l in rbData.concentration.lots.top" :key="`${l.rank}-${l.code}-${l.sell_date}`">
+                  <td>{{ l.rank }}</td>
+                  <td>{{ l.code }}</td>
+                  <td>{{ (l.buy_date || '').slice(0, 10) }} → {{ (l.sell_date || '').slice(0, 10) }}</td>
+                  <td>{{ fmtQty(l.quantity) }}</td>
+                  <td :class="valueClass(l.pnl)">{{ fmtMoney(l.pnl) }}</td>
+                  <td>{{ pct(l.share_gross) }}</td>
+                  <td>{{ pct(l.share_net) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
 
         <div class="section-title" style="font-size:14px">四、样本内 / 样本外对比（默认 75/25 自动切分）</div>
         <template v-if="rbData.oos">
@@ -4193,6 +4560,139 @@ watch(theme, () => {
           <div class="empty-state"><p>区间不足 2 年，无法切分样本内/样本外。</p></div>
         </div>
       </template>
+      </template>
+    </div>
+
+    <!-- 持续性检验（阿尔法衰减 vs 风格钟摆） -->
+    <div ref="persistenceSectionEl" class="ca-section rb-section">
+      <div class="section-title ca-header" @click="togglePSection">
+        <span>🔬 持续性检验</span>
+        <span class="ca-caret" :class="{ open: !pCollapsed }" @click.stop="togglePSection">▶</span>
+      </div>
+      <template v-if="!pCollapsed">
+        <div v-if="pStatus === null" class="card" style="padding:12px">
+          <p style="color:var(--ink-soft);margin:0 0 8px">
+            本次回测尚未计算持续性检验（分年度超额/风险/交易结构 + 滚动年化，判定阿尔法衰减 vs 风格钟摆）。
+          </p>
+          <button class="btn btn-sm btn-primary" :disabled="pRecomputing" @click="recomputePersistence">
+            {{ pRecomputing ? '计算中…' : '重新计算' }}
+          </button>
+          <span v-if="pRecomputeMsg" :class="pRecomputeMsgClass">{{ pRecomputeMsg }}</span>
+        </div>
+
+        <div v-else-if="pStatus === 'failed' && !pData" class="card" style="padding:12px">
+          <p style="color:var(--red);margin:0 0 8px">持续性检验失败：{{ persistence?.error || '未知原因' }}</p>
+          <button class="btn btn-sm btn-primary" :disabled="pRecomputing" @click="recomputePersistence">
+            {{ pRecomputing ? '计算中…' : '重新计算' }}
+          </button>
+          <span v-if="pRecomputeMsg" :class="pRecomputeMsgClass">{{ pRecomputeMsg }}</span>
+        </div>
+
+        <template v-else-if="pData">
+          <p v-if="pStatus === 'failed'" class="ca-note" style="color:var(--red)">
+            本次重算失败（{{ persistence?.error || '未知原因' }}），下方为上次成功结果；可稍后重试。
+          </p>
+          <div class="p-verdict" :class="'lv-' + pData.verdict.level">
+            <div class="p-verdict-head">
+              <span class="p-verdict-badge">{{ verdictLabel(pData.verdict.level) }}</span>
+              <span class="p-verdict-title">{{ pData.verdict.summary }}</span>
+            </div>
+            <div v-if="pSignals.length" class="p-signals">
+              <div v-for="s in pSignals" :key="s.key" class="p-signal" :class="'st-' + s.status">
+                <span class="p-signal-dot"></span>
+                <span class="p-signal-label">{{ s.label }}</span>
+                <span class="p-signal-detail">{{ s.detail }}</span>
+                <span class="p-signal-word">{{ s.word }}</span>
+              </div>
+            </div>
+            <ul v-else-if="pData.verdict.reasons?.length" class="p-reasons">
+              <li v-for="r in pData.verdict.reasons" :key="r">{{ r }}</li>
+            </ul>
+            <div class="p-verdict-caveat">{{ pData.verdict.caveat }}</div>
+            <div class="p-verdict-foot">
+              <span v-if="pData.verdict.window_years?.length">
+                判定窗口 {{ pData.verdict.window_years[0] }}–{{ pData.verdict.window_years[pData.verdict.window_years.length - 1] }}（{{ pData.verdict.window_years.length }} 个满年）
+              </span>
+              <label class="p-bench-pick">
+                判定基准
+                <select v-model="pBenchSel" :disabled="pRecomputing" @change="recomputePersistence">
+                  <option v-for="b in pBenchOptions" :key="b.code" :value="b.code">
+                    {{ b.name }}（{{ b.code }}）
+                  </option>
+                </select>
+              </label>
+              <span v-if="persistence?.computed_at">
+                计算于 {{ persistence?.computed_at?.replace('T', ' ').slice(0, 19) }}
+              </span>
+              <span v-if="persistence?.skipped_benchmarks?.length" class="p-warn">
+                无数据跳过：{{ persistence?.skipped_benchmarks.join('、') }}
+              </span>
+              <button class="btn btn-sm" :disabled="pRecomputing" @click="recomputePersistence">
+                {{ pRecomputing ? '计算中…' : '重新计算' }}
+              </button>
+              <span v-if="pRecomputeMsg" :class="pRecomputeWarn ? 'p-msg p-msg-warn' : 'p-msg'">{{ pRecomputeMsg }}</span>
+            </div>
+          </div>
+
+          <div class="section-title" style="font-size:13px">分年度指标矩阵（* 未满 200 交易日，不参与判定）</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>年份</th><th>交易日</th><th>收益</th><th>最大回撤</th><th>夏普</th><th>卡玛</th>
+                <th>胜率</th><th>盈亏比</th><th>换手×（双边）</th><th>成本/日均净值</th><th>仓位利用率</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="y in (pData.years ?? [])" :key="y.year">
+                  <td>{{ y.year }}<span v-if="y.is_partial" class="badge badge-gray" style="margin-left:4px">*</span></td>
+                  <td>{{ y.trading_days ?? '-' }}</td>
+                  <td :class="valueClass(y.nav_return)">{{ pctSigned(y.nav_return) }}</td>
+                  <td>{{ pct1(y.max_drawdown) }}</td>
+                  <td>{{ num(y.sharpe, 2) }}</td>
+                  <td>{{ num(y.calmar, 2) }}</td>
+                  <td>{{ y.win_rate == null ? '-' : pct1(y.win_rate) }}</td>
+                  <td>{{ num(y.profit_factor, 2) }}</td>
+                  <td>{{ y.turnover == null ? '-' : num(y.turnover, 2) + '×' }}</td>
+                  <td>{{ pct1(y.cost_ratio) }}</td>
+                  <td>{{ y.avg_position_utilization == null ? '-' : pct1(y.avg_position_utilization) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ca-note" style="margin-top:6px;color:var(--ink-soft)">
+            仓位利用率 = 持仓市值/总净值（年均）。逐年走低 = 敞口上限（持仓数×单仓上限）随净值膨胀收紧，
+            绝对收益的规模摊薄主要来自这里；低利用率同时是回撤保护的来源。
+          </p>
+
+          <div class="section-title" style="font-size:13px">分年度超额收益（vs 组合基准 + 宽基）</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>年份</th>
+                <th v-for="b in (pData.benchmarks ?? [])" :key="b.code">
+                  <span :class="b.is_main ? 'p-main-label' : ''">{{ b.name }}</span><span v-if="b.is_main" class="badge badge-blue" style="margin-left:4px">主</span>
+                  <span v-if="!b.available" class="badge badge-gray" style="margin-left:4px">无数据</span>
+                </th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="y in (pData.years ?? [])" :key="y.year">
+                  <td>{{ y.year }}</td>
+                  <td v-for="b in (pData.benchmarks ?? [])" :key="b.code"
+                      :class="[...(y.excess?.[b.code] == null ? [] : [valueClass(y.excess?.[b.code])]), b.is_main ? 'p-main-cell' : '']">
+                    {{ y.excess?.[b.code] == null ? '-' : pctSigned(y.excess?.[b.code]) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="pExcessNote" class="ca-note" style="margin-top:8px;color:var(--ink-soft)">{{ pExcessNote }}</p>
+
+          <div class="section-title" style="font-size:13px">滚动年化收益（策略 6M/12M vs 基准 12M）</div>
+          <div class="chart-box"><div ref="pRollingEl" class="ca-chart" style="height:340px"></div></div>
+          <p class="ca-note" style="margin-top:6px;color:var(--ink-soft)">
+            解读：策略 12M 与基准 12M <b>同步回落</b> → 风格钟摆（收益随风格贝塔）；策略 12M <b>单独下坠而基准平稳</b> → 疑似阿尔法衰减；
+            策略 6M 波动大于 12M 属正常（短窗口对单段行情更敏感），连续下行段才是关注点。
+          </p>
+        </template>
       </template>
     </div>
 
@@ -4284,14 +4784,60 @@ watch(theme, () => {
         <div ref="monthlyHeatEl" class="chart-container" style="min-height:240px"></div>
       </div>
 
-      <div class="section-title" style="font-size:14px">年度日收益箱线图</div>
+      <div class="section-title" style="font-size:14px">
+        年度日收益箱线图
+        <span class="title-hint">箱体=中间50%交易日（Q1~Q3），箱内横线=中位数（图上常驻数值），上下须=最小/最大，◆=均值 · 中位&gt;0 则该年多数交易日盈利，箱体越窄日收益越稳定；样本&lt;5 的年份不绘制</span>
+      </div>
       <div class="chart-box">
         <div ref="dailyBoxEl" class="chart-container" style="min-height:260px"></div>
       </div>
+      <div class="table-container box-stat-wrap">
+        <table class="box-stat-table">
+          <thead>
+            <tr><th>年份</th><th class="num">样本数</th><th class="num">均值</th><th class="num">中位数</th><th class="num">Q1</th><th class="num">Q3</th><th class="num">最小</th><th class="num">最大</th><th class="num">正值占比</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in dailyBoxRows" :key="r.year">
+              <td>{{ r.year }}</td>
+              <td class="num">{{ r.n }}</td>
+              <td class="num" :style="{ color: signColor(r.mean) }">{{ fmtPp(r.mean) }}</td>
+              <td class="num" :style="{ color: signColor(r.median) }">{{ fmtPp(r.median) }}</td>
+              <td class="num">{{ fmtPp(r.q1) }}</td>
+              <td class="num">{{ fmtPp(r.q3) }}</td>
+              <td class="num" :style="{ color: signColor(r.min) }">{{ fmtPp(r.min) }}</td>
+              <td class="num" :style="{ color: signColor(r.max) }">{{ fmtPp(r.max) }}</td>
+              <td class="num">{{ fmtPct(r.posRatio, 1) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
-      <div class="section-title" style="font-size:14px">各年月收益箱线图</div>
+      <div class="section-title" style="font-size:14px">
+        各年月收益箱线图
+        <span class="title-hint">读法同上；月样本每年 ≤12 个，箱体形状参考意义弱于日收益，重点看中位数与均值是否持续为正</span>
+      </div>
       <div class="chart-box">
         <div ref="monthlyBoxEl" class="chart-container" style="min-height:260px"></div>
+      </div>
+      <div class="table-container box-stat-wrap">
+        <table class="box-stat-table">
+          <thead>
+            <tr><th>年份</th><th class="num">样本数</th><th class="num">均值</th><th class="num">中位数</th><th class="num">Q1</th><th class="num">Q3</th><th class="num">最小</th><th class="num">最大</th><th class="num">正值占比</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in monthlyBoxRows" :key="r.year">
+              <td>{{ r.year }}</td>
+              <td class="num">{{ r.n }}</td>
+              <td class="num" :style="{ color: signColor(r.mean) }">{{ fmtPp(r.mean) }}</td>
+              <td class="num" :style="{ color: signColor(r.median) }">{{ fmtPp(r.median) }}</td>
+              <td class="num">{{ fmtPp(r.q1) }}</td>
+              <td class="num">{{ fmtPp(r.q3) }}</td>
+              <td class="num" :style="{ color: signColor(r.min) }">{{ fmtPp(r.min) }}</td>
+              <td class="num" :style="{ color: signColor(r.max) }">{{ fmtPp(r.max) }}</td>
+              <td class="num">{{ fmtPct(r.posRatio, 1) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="section-title" style="font-size:14px">各年年收益柱状图</div>
@@ -4764,6 +5310,27 @@ watch(theme, () => {
   padding: 16px;
   overflow-x: auto;
 }
+/* 箱线图配套统计表：紧贴图表下方（chart-box margin-bottom 8px → 负间距视觉成组） */
+.box-stat-wrap { margin: -2px 0 8px; padding: 10px 16px; }
+.box-stat-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.box-stat-table th {
+  padding: 6px 10px;
+  text-align: left;
+  color: var(--ink-faint);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: .08em;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.box-stat-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.box-stat-table tbody tr:last-child td { border-bottom: none; }
+.box-stat-table .num { text-align: right; font-family: var(--font-mono); }
 .trade-table {
   width: 100%;
   border-collapse: collapse;
@@ -4869,46 +5436,131 @@ watch(theme, () => {
   color: var(--ink-soft);
   transition: transform .2s ease;
   margin-left: 8px;
+  /* 箭头本身是独立点击热区：字形只有 ~11px，命中区过小会让用户以为"点箭头没反应"；
+     position/z-index 保证它在任何滚动/图表元素之上可被命中。 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
 }
+.ca-caret:hover { color: var(--accent); }
 .ca-caret.open { transform: rotate(90deg); }
+/* 摘要横幅：浅色卡 + 蓝色左边条，与持续性检验判定卡同族。原深黑横幅（#0b0b0b）
+   在浅色主题下对比突兀、12px/85% 透明度让关键数字发糊，废弃深色方案后
+   按钮/状态/告警直接沿用全局 .btn/.ca-status/.ca-msg/.ca-warn 主题色。 */
 .ca-banner {
-  background: #0b0b0b;
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
   border-radius: 12px;
-  padding: 18px 24px;
-  color: #f2efeb;
-  margin-bottom: 6px;
+  padding: 16px 20px;
+  color: var(--ink);
+  margin-bottom: 10px;
 }
-[data-theme="dark"] .ca-banner {
-  background: #05070a;
-  color: #ece7df;
+/* 持续性检验判定卡：浅底 + 分信号着色。判定色与涨跌红绿解耦（全站涨跌=正红负绿），
+   语义四级：蓝=良性（稳定/风格钟摆：非策略衰减）、金=关注（信号混合）、
+   红=恶化（疑似衰减）、灰=样本不足；信号词 st-good/st-mixed/st-bad 同口径。 */
+.p-verdict {
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--ink-faint);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 10px;
 }
-/* 反色强调块内的按钮/文字须用固定浅色（--ink/--card-bg 随主题翻转会导致
-   浅色模式下按钮文字与深底同色而不可见） */
-.ca-banner .btn {
-  color: #f2efeb;
-  border-color: rgba(242,239,235,.45);
+.p-verdict.lv-alpha_decay { border-left-color: var(--red); }
+.p-verdict.lv-style_pendulum { border-left-color: var(--accent); }
+.p-verdict.lv-mixed { border-left-color: var(--gold); }
+.p-verdict.lv-stable { border-left-color: var(--accent); }
+.p-verdict.lv-insufficient { border-left-color: var(--ink-faint); }
+.p-verdict-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.p-verdict-badge {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
   background: transparent;
+  white-space: nowrap;
 }
-.ca-banner .btn:hover {
-  background: #f2efeb;
-  color: #0b0b0b;
+.lv-alpha_decay .p-verdict-badge { color: var(--red); border-color: var(--red); background: var(--red-wash); }
+.lv-style_pendulum .p-verdict-badge { color: var(--accent); border-color: var(--accent); background: var(--accent-light); }
+.lv-mixed .p-verdict-badge { color: var(--gold); border-color: var(--gold); background: var(--gold-wash); }
+.lv-stable .p-verdict-badge { color: var(--accent); border-color: var(--accent); background: var(--accent-light); }
+.p-verdict-title { font-size: 13px; font-weight: 500; color: var(--ink-soft); }
+.p-signals { display: grid; gap: 6px; margin-top: 12px; }
+.p-signal {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(127,127,127,.07);
+  font-size: 12.5px;
 }
-[data-theme="dark"] .ca-banner .btn {
-  color: #ece7df;
-  border-color: rgba(236,231,223,.45);
+.p-signal-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); flex: none; }
+.p-signal-label { font-weight: 700; color: var(--ink); min-width: 88px; }
+.p-signal-detail {
+  flex: 1;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
 }
-[data-theme="dark"] .ca-banner .btn:hover {
-  background: #ece7df;
-  color: #0b0b0b;
+.p-signal-word {
+  font-weight: 700;
+  padding: 1px 10px;
+  border-radius: 999px;
+  background: rgba(127,127,127,.1);
+  color: var(--ink-soft);
+  white-space: nowrap;
 }
-/* .ca-status/.ca-msg 默认用 --ink-soft/--ink（随主题为深色），在深色 banner 上
-   不可见 → banner 作用域内固定浅色 */
-.ca-banner .ca-status { color: rgba(242,239,235,.72); }
-.ca-banner .ca-msg { color: #f2efeb; }
-.ca-banner .ca-warn { color: #e06550; }
-[data-theme="dark"] .ca-banner .ca-status { color: rgba(236,231,223,.72); }
-[data-theme="dark"] .ca-banner .ca-msg { color: #ece7df; }
-[data-theme="dark"] .ca-banner .ca-warn { color: #e06550; }
+.p-signal.st-bad .p-signal-dot { background: var(--red); }
+.p-signal.st-bad .p-signal-word { color: var(--red); background: var(--red-wash); }
+.p-signal.st-mixed .p-signal-dot { background: var(--gold); }
+.p-signal.st-mixed .p-signal-word { color: var(--gold); background: var(--gold-wash); }
+.p-signal.st-good .p-signal-dot { background: var(--accent); }
+.p-signal.st-good .p-signal-word { color: var(--accent); background: var(--accent-light); }
+.p-reasons { margin: 10px 0 0 18px; font-size: 12.5px; color: var(--ink-soft); line-height: 1.6; }
+.p-verdict-caveat { margin-top: 10px; font-size: 12px; color: var(--ink-faint); line-height: 1.6; }
+.p-verdict-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.p-verdict-foot .p-warn { color: var(--gold); }
+.p-verdict-foot .p-msg { color: var(--ink-soft); }
+.p-verdict-foot .p-msg-warn { color: var(--red); }
+.p-bench-pick { display: inline-flex; align-items: center; gap: 6px; }
+.p-bench-pick select {
+  height: 24px;
+  padding: 0 6px;
+  font-size: 12px;
+  border: 1px solid var(--line, #dcdcdc);
+  border-radius: 4px;
+  /* --surface 未定义于主题变量：浅色回退 #fff 尚可，深色主题下白底配浅色 --ink
+     文字会看不清；改用 --card-bg（深色主题随主题变深，与 --ink 对比正确）。 */
+  background: var(--card-bg, #fff);
+  color: var(--ink);
+}
+.p-bench-pick select:disabled { opacity: .6; }
+@media (max-width: 720px) {
+  .p-signal { flex-wrap: wrap; }
+  .p-signal-detail { flex-basis: 100%; }
+}
+/* 分年度超额矩阵：主基准列高亮（判定口径） */
+.p-main-label { font-weight: 700; }
+.p-main-cell { background: var(--accent-light); font-weight: 600; }
 .ca-banner .t { font-size: 20px; font-weight: 800; }
 .ca-banner .d { font-size: 12px; opacity: .85; margin-top: 6px; }
 .score-card {

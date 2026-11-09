@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { readFileSync } from 'node:fs'
 import { useTheme } from '../composables/useTheme'
+import { deriveBlockCode } from '../utils/blockCode'
 
 const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
   const CSS_VARS: Record<string, string> = {
@@ -53,8 +54,10 @@ vi.mock('../api', () => ({
   recomputeCrisisAlpha: vi.fn(),
   recomputeMarketRegime: vi.fn(),
   recomputeRobustness: vi.fn(),
+  recomputePersistenceAnalysis: vi.fn(),
   getStockPools: vi.fn(),
   compareBacktestPools: vi.fn(),
+  sendUserBlock: vi.fn(),
 }))
 
 // echarts 在 jsdom 下无真实 canvas，init 会失败 → mock 成最小桩
@@ -75,7 +78,8 @@ import Backtest from '../views/Backtest.vue'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
-  getStockPools, compareBacktestPools,
+  recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  sendUserBlock,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -306,6 +310,71 @@ describe('Backtest.vue — 发起回测', () => {
     vi.unstubAllGlobals()
   })
 
+  it('高级选项勾选日末峰值保护 → 提交参数带 daily_close_peak_enabled=true', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 103 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('PEAK_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    const checkbox = w.find('input[data-field="daily_close_peak_enabled"]')
+    expect((checkbox.element as HTMLInputElement).checked).toBe(false)
+    await checkbox.setValue(true)
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (runBacktest as any).mock.calls[0][0]
+    expect(arg.daily_close_peak_enabled).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('高级选项日内亏损口径默认跟随组合 → 不发送 daily_loss_basis 字段', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 104 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('DL_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    const sel = w.find('select[data-field="daily_loss_basis"]')
+    expect((sel.element as HTMLSelectElement).value).toBe('')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    // 空串=跟随组合（后端回落组合默认 equity）
+    expect((runBacktest as any).mock.calls[0][0]).not.toHaveProperty('daily_loss_basis')
+    vi.unstubAllGlobals()
+  })
+
+  it('高级选项选择初始资金口径 → 提交参数带 daily_loss_basis=initial', async () => {
+    ;(runBacktest as any).mockResolvedValue({ record_id: 105 })
+    vi.stubGlobal('alert', () => {})
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[placeholder*="回测"]').setValue('DL_BT2')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    await w.find('select[data-field="daily_loss_basis"]').setValue('initial')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect((runBacktest as any).mock.calls[0][0].daily_loss_basis).toBe('initial')
+    vi.unstubAllGlobals()
+  })
+
   it('高级选项勾选可转债 T+0 + 10 张取整 → 提交参数带 bond_t0/bond_lot=true', async () => {
     ;(runBacktest as any).mockResolvedValue({ record_id: 102 })
     vi.stubGlobal('alert', () => {})
@@ -402,6 +471,45 @@ describe('Backtest.vue — 发起回测', () => {
 
     expect(alertMock).toHaveBeenCalled()
     expect(runBacktest).not.toHaveBeenCalled()  // 前端拦截，不发请求
+    vi.unstubAllGlobals()
+  })
+
+  it('开始日期等于结束日期 → 前端拦截（与后端严格 start<end 对齐）', async () => {
+    ;(runBacktest as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[placeholder*="回测"]').setValue('EQ_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-08-01')
+    await dateInputs[1].setValue('2026-08-01')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock).toHaveBeenCalled()
+    expect(runBacktest).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('高级选项滑点冲击系数越界 → 前端拦截，不调 runBacktest', async () => {
+    ;(runBacktest as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[placeholder*="回测"]').setValue('OVR_BT')
+    const dateInputs = w.findAll('input[type="date"]')
+    await dateInputs[0].setValue('2026-07-01')
+    await dateInputs[1].setValue('2026-07-31')
+    await w.find('[data-field="advanced-toggle"]').trigger('click')
+    await w.find('input[data-field="adaptive_slippage_enabled"]').setValue(true)
+    await w.find('input[data-field="slippage_impact_coef"]').setValue('150')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect(alertMock.mock.calls[0][0]).toContain('滑点冲击系数')
+    expect(runBacktest).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
 
@@ -885,6 +993,130 @@ describe('Backtest.vue — 图表数值精度', () => {
   })
 })
 
+// --- 箱线图展示增强：零轴 / 均值◆ / 中位常驻标注 / 图下统计表 ---
+describe('Backtest.vue — 箱线图展示增强', () => {
+  // 2026 日收益 [1, -0.5, 0.3, 2, -1]（pp）：min -1 / Q1 -0.5 / 中位 0.3 / Q3 1 / max 2
+  // mean = 1.8/5 = 0.36；正值占比 3/5 = 60%
+  const mockDetailBox = {
+    ...mockDetail,
+    returns_buckets: {
+      monthly_matrix: {
+        years: [2025, 2026],
+        months: ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
+        matrix: [
+          [0.5, -0.2, 1.0, 0.3, 0.8, null, null, null, null, null, null, null],
+          [null, null, null, null, null, null, null, 0.5, -0.2, 1.0, 0.3, 0.8],
+        ],
+        text: [
+          ['+0.50%','-0.20%','+1.00%','+0.30%','+0.80%','','','','','','',''],
+          ['','','','','','','','+0.50%','-0.20%','+1.00%','+0.30%','+0.80%'],
+        ],
+      },
+      yearly: [
+        // 2025 日收益仅 3 个点（<5 无法构成箱体）→ 整年剔除，验证不错位
+        { year: 2025, daily_returns: [0.01, 0.02, -0.01], monthly_returns: [0.005, -0.002, 0.01, 0.003, 0.008], annual_return: 0.02 },
+        { year: 2026, daily_returns: [0.01, -0.005, 0.003, 0.02, -0.01], monthly_returns: [0.005, -0.002, 0.01, 0.003, 0.008], annual_return: 0.02 },
+      ],
+    },
+  }
+
+  async function mountBoxDetail() {
+    ;(getBacktestDetail as any).mockResolvedValue(mockDetailBox)
+    const { init } = await import('echarts')
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const options = (init as any).mock.results.map((r: any) => r.value.setOption.mock.calls[0][0])
+    return { w, options }
+  }
+
+  it('日收益箱线含零轴虚线 markLine', async () => {
+    const { options } = await mountBoxDetail()
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    expect(box).toBeTruthy()
+    const ml = box.series[0].markLine
+    expect(ml).toBeTruthy()
+    expect(ml.data[0].yAxis).toBe(0)
+    expect(ml.lineStyle.type).toBe('dashed')
+  })
+
+  it('均值◆ scatter 常驻系列，数值为年均值（pp）', async () => {
+    const { options } = await mountBoxDetail()
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    const mean = box.series.find((s: any) => s.name === '均值')
+    expect(mean).toBeTruthy()
+    expect(mean.type).toBe('scatter')
+    expect(mean.symbol).toBe('diamond')
+    // 2025 被剔除后仅剩 2026：data = [['2026', 0.36]]
+    expect(mean.data).toEqual([['2026', 0.36]])
+    // 图例含「均值」便于识别 ◆
+    expect(box.legend.data).toContain('均值')
+  })
+
+  it('中位数常驻标注：透明散点承载 label，无需 hover', async () => {
+    const { options } = await mountBoxDetail()
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    const med = box.series.find((s: any) => s.name === '中位数标注')
+    expect(med).toBeTruthy()
+    expect(med.symbol).toBe('none')
+    expect(med.label.show).toBe(true)
+    expect(med.data).toEqual([['2026', 0.3]])
+  })
+
+  it('tooltip 富文案：含均值/五数/样本数/正值占比', async () => {
+    const { options } = await mountBoxDetail()
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    const tip = box.tooltip.formatter({ dataIndex: 0, seriesName: '箱体' })
+    expect(tip).toContain('2026年')
+    expect(tip).toContain('中位: +0.30%')
+    expect(tip).toContain('均值: +0.36%')
+    expect(tip).toContain('Q1: -0.50%')
+    expect(tip).toContain('Q3: +1.00%')
+    expect(tip).toContain('最小: -1.00%')
+    expect(tip).toContain('最大: +2.00%')
+    expect(tip).toContain('样本 5 个')
+    expect(tip).toContain('正值占比 60.0%')
+  })
+
+  it('样本<5 的年份剔除后箱体与年份轴不错位', async () => {
+    const { options } = await mountBoxDetail()
+    const box = options.find((o: any) => o.yAxis?.name === '日收益率(%)')
+    expect(box.xAxis.data).toEqual(['2026'])
+    expect(box.series[0].data).toEqual([[-1, -0.5, 0.3, 1, 2]])
+  })
+
+  it('图下常驻统计表：五数+均值+样本数+正值占比免 hover 可见', async () => {
+    const { w } = await mountBoxDetail()
+    const tables = w.findAll('.box-stat-table')
+    expect(tables.length).toBe(2)  // 日收益表 + 月收益表
+    const daily = tables[0]
+    const text = daily.text()
+    expect(text).toContain('样本数')
+    expect(text).toContain('中位数')
+    expect(text).toContain('正值占比')
+    // 2025 日收益 <5 样本被剔除 → 日收益表仅 2026 一行
+    const rows = daily.findAll('tbody tr')
+    expect(rows.length).toBe(1)
+    expect(text).toContain('+0.36%')  // 均值
+    expect(text).toContain('+0.30%')  // 中位数
+    expect(text).toContain('-0.50%')  // Q1
+    expect(text).toContain('+1.00%')  // Q3
+    expect(text).toContain('-1.00%')  // 最小
+    expect(text).toContain('+2.00%')  // 最大
+    expect(text).toContain('60.0%')   // 正值占比
+    // 月收益表两年均有 5 个样本 → 两行
+    expect(tables[1].findAll('tbody tr').length).toBe(2)
+  })
+
+  it('日收益/月收益箱线图标题附读法提示', async () => {
+    const { w } = await mountBoxDetail()
+    const text = w.text()
+    expect(text).toContain('箱体=中间50%交易日')
+    expect(text).toContain('◆=均值')
+  })
+})
+
 // --- 回测报告 — 策略对比/摘要卡红涨绿跌 ---
 describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
   it('P3 夏普口径 tooltip：夏普比率行 title 标注日频/√252/无风险利率 2%/CAGR', async () => {
@@ -978,10 +1210,11 @@ describe('Backtest.vue — 策略对比/摘要卡红涨绿跌', () => {
     expect(rowValue('信息比率')).toBe('0.56')
     expect(rowValue('上行捕获率')).toBe('92.0%')
     expect(rowValue('下行捕获率')).toBe('71.0%')
+    expect(rowValue('单位敞口上行效率')).toBe('1.08×')   // 0.92 / 0.85
     expect(rowValue('超额最大回撤')).toBe('-3.20%')
     // 磨损与仓位
-    expect(rowValue('年化换手率')).toBe('3.25')
-    expect(rowValue('交易成本占比')).toBe('0.2%')
+    expect(rowValue('年化换手率（双边）')).toBe('3.25×/年')
+    expect(rowValue('交易成本/日均净值')).toBe('0.2%')
     expect(rowValue('平均仓位利用率')).toBe('64.0%')
     expect(rowValue('空仓日占比')).toBe('10.0%')
     // 结构：无持仓明细（positions_json 老记录）→ null 显 —
@@ -1481,11 +1714,63 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     const text = w.text()
     expect(text).toContain('年度收益与年内最大回撤')
     expect(text).toContain('3年滚动窗口')
-    expect(text).toContain('个股已实现净')
+    expect(text).toContain('盈利贡献分布（已实现 / 未实现 / 单笔）')
     expect(text).toContain('样本内 / 样本外对比')
     expect(text).toContain('000408.SZ')
     expect(text).toContain('断点年份：2023')
     expect(text).toContain('13/13')
+  })
+
+  it('盈利贡献分布：未实现单列 + 单笔贡献表', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      robustness: {
+        status: 'completed',
+        data: {
+          total_return: 11.2514, benchmark_return: 0.5, years_positive: '1/1',
+          annual: [], rolling_3y: [],
+          concentration: {
+            total_realized_pnl: 2244555, gross_profit: 2870112, gross_loss: 625556,
+            top: [{ code: '002328.SZ', pnl: 149477, share: 0.0667,
+                    share_gross: 0.0521, share_net: 0.0667 }],
+            top20_share: 0.8078, top20_share_gross: 0.5742,
+            unrealized: {
+              total_pnl: 5845.01, cost: 200404.99, market_value: 206250,
+              rows: [{ code: '002230.SZ', quantity: 5500, cost: 200404.99,
+                       market_value: 206250, pnl: 5845.01, share_net: 0.0026 }],
+            },
+            profitable_stocks: 77, total_stocks: 111,
+            lots: {
+              count: 314, winners: 177,
+              top: [{ rank: 1, code: '002843.SZ', buy_date: '2026-02-10',
+                      sell_date: '2026-03-03', quantity: 10900, pnl: 115144,
+                      share_gross: 0.0401, share_net: 0.0513 }],
+              cumulative: [{ n: 5, pct_of_lots: 0.0159, pnl: 495833,
+                             share_gross: 0.1728, share_net: 0.2209 }],
+              hhi: 0.0145, effective_sources: 68.9,
+            },
+          },
+          oos: null,
+        },
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rbHeader = w.findAll('.ca-header').find((h) => h.text().includes('稳健性检验'))!
+    await rbHeader.trigger('click')
+    await flushPromises()
+    const text = w.text()
+    expect(text).toContain('已实现净利')
+    expect(text).toContain('毛利')
+    expect(text).toContain('未实现')
+    expect(text).toContain('002230.SZ')          // 未平仓单列
+    expect(text).toContain('单笔贡献分布（FIFO 平仓批次）')
+    expect(text).toContain('前 5 笔')
+    expect(text).toContain('002843.SZ')
+    expect(text).toContain('等效独立盈利来源')
+    expect(text).toContain('68.9')
   })
 
   it('robustness 为 null：显示未计算提示', async () => {
@@ -2527,5 +2812,200 @@ describe('Backtest.vue — 门状态与采纳验收', () => {
     await flushPromises()
     const calls = (getBacktestDetail as any).mock.calls
     expect(calls.some((c: any[]) => c[1] === 'relative')).toBe(true)
+  })
+})
+
+describe('Backtest.vue — 持续性检验 section', () => {
+  it('区块渲染判定横幅与分年度表', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      persistence: {
+        status: 'completed',
+        data: {
+          status: 'completed', error: null,
+          years: [
+            { year: 2024, is_partial: false, nav_return: 0.6, max_drawdown: 0.08, sharpe: 2.5, calmar: 7.0, win_rate: 0.6, profit_factor: 1.9, turnover: 2.0, cost_ratio: 0.001, avg_position_utilization: 0.633, excess: { '000300.SH': 0.3 }, bench_returns: {} },
+            { year: 2025, is_partial: false, nav_return: 0.3, max_drawdown: 0.2, sharpe: 1.0, calmar: 1.5, win_rate: 0.45, profit_factor: 1.2, turnover: 3.5, cost_ratio: 0.002, avg_position_utilization: 0.356, excess: { '000300.SH': 0.05 }, bench_returns: {} },
+          ],
+          rolling: { dates: ['2024-06-01'], strat_6m: [0.12], strat_12m: [0.08], bench_12m: [0.06] },
+          benchmarks: [{ code: '000300.SH', name: '沪深300', is_main: true, available: true }],
+          verdict: {
+            level: 'alpha_decay', reasons: ['超额收敛', '风险恶化', '结构退化'], summary: '疑似阿尔法衰减', caveat: '结论供参考',
+            signals: [
+              { key: 'excess', label: '超额 vs 沪深300', detail: '2024 +30.00% → 2025 +5.00%', status: 'bad', word: '收敛' },
+              { key: 'risk', label: '风险指标', detail: '夏普 2.50→1.00 · 卡玛 7.00→1.50 · 回撤 8.0%→20.0%', status: 'bad', word: '恶化' },
+              { key: 'struct', label: '交易结构', detail: '胜率 60.0%→45.0% · 盈亏比 1.90→1.20 · 换手 2.00→3.50×', status: 'bad', word: '退化' },
+            ],
+            window_years: [2024, 2025],
+          },
+        },
+      },
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    const viewBtn = w.findAll('button').filter(b => b.text().includes('查看'))[0]
+    await viewBtn.trigger('click')
+    await flushPromises()
+    const pHeader = w.findAll('.section-title').find(h => h.text().includes('持续性检验'))
+    await pHeader!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('疑似阿尔法衰减')
+    // 判定卡改为三行信号，带近两年实际数值与状态色语义
+    expect(w.text()).toContain('超额 vs 沪深300')
+    expect(w.text()).toContain('夏普 2.50→1.00')
+    expect(w.text()).toContain('收敛')
+    expect(w.text()).toContain('恶化')
+    expect(w.text()).toContain('退化')
+    expect(w.findAll('.p-signal.st-bad').length).toBe(3)
+    expect(w.text()).toContain('分年度超额收益')
+    expect(w.text()).toContain('沪深300')
+    // 分年度指标矩阵：仓位利用率列（容量衰减视角）
+    expect(w.text()).toContain('仓位利用率')
+    expect(w.text()).toContain('63.3%')
+    expect(w.text()).toContain('35.6%')
+    expect(w.text()).toContain('敞口上限（持仓数×单仓上限）')
+
+    // 箭头本身必须是可点热区（历史 bug：只有点标题文字才能折叠/展开）
+    const pCaret = pHeader!.find('.ca-caret')
+    await pCaret.trigger('click')
+    await flushPromises()
+    expect(w.find('.p-verdict').exists()).toBe(false)
+    await pCaret.trigger('click')
+    await flushPromises()
+    expect(w.find('.p-verdict').exists()).toBe(true)
+  })
+
+  it('判定基准选择器：默认主基准，切换后带 benchmark_code 重算', async () => {
+    const payload = {
+      status: 'completed',
+      data: {
+        status: 'completed', error: null,
+        years: [
+          { year: 2024, is_partial: false, trading_days: 242, nav_return: 0.6, max_drawdown: 0.08, sharpe: 2.5, calmar: 7.0, win_rate: 0.6, profit_factor: 1.9, turnover: 2.0, cost_ratio: 0.001, excess: { '000300.SH': 0.3, '399006.SZ': 0.2 }, bench_returns: {} },
+          { year: 2025, is_partial: false, trading_days: 243, nav_return: 0.3, max_drawdown: 0.2, sharpe: 1.0, calmar: 1.5, win_rate: 0.45, profit_factor: 1.2, turnover: 3.5, cost_ratio: 0.002, excess: { '000300.SH': 0.05, '399006.SZ': 0.01 }, bench_returns: {} },
+        ],
+        rolling: { dates: ['2024-06-01'], strat_6m: [0.12], strat_12m: [0.08], bench_12m: [0.06] },
+        benchmarks: [
+          { code: '000300.SH', name: '沪深300', is_main: true, available: true },
+          { code: '399006.SZ', name: '创业板指', is_main: false, available: true },
+        ],
+        verdict: {
+          level: 'mixed', reasons: [], summary: '信号混合', caveat: '结论供参考',
+          signals: [], window_years: [2024, 2025],
+        },
+      },
+    }
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, persistence: payload })
+    ;(recomputePersistenceAnalysis as any).mockResolvedValue({ status: 'completed', error: null })
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, persistence: payload })
+
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').filter(b => b.text().includes('查看'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('.section-title').find(h => h.text().includes('持续性检验'))!.trigger('click')
+    await flushPromises()
+
+    const sel = w.find('.p-bench-pick select')
+    expect(sel.exists()).toBe(true)
+    expect((sel.element as HTMLSelectElement).value).toBe('000300.SH')
+    expect(w.text()).toContain('创业板指')
+
+    await sel.setValue('399006.SZ')
+    await flushPromises()
+    expect((recomputePersistenceAnalysis as any).mock.calls[0][0]).toBe(1)
+    expect((recomputePersistenceAnalysis as any).mock.calls[0][1]).toBe('399006.SZ')
+  })
+
+  it('老 payload 无 benchmarks 字段时仍渲染基准下拉（兜底 6 只宽基）', async () => {
+    const payload = {
+      status: 'completed',
+      data: {
+        status: 'completed', error: null, years: [], rolling: null,
+        verdict: { level: 'insufficient', reasons: [], summary: '样本不足', caveat: '', signals: [], window_years: [] },
+      },
+    }
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, persistence: payload })
+
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').filter(b => b.text().includes('查看'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('.section-title').find(h => h.text().includes('持续性检验'))!.trigger('click')
+    await flushPromises()
+
+    const sel = w.find('.p-bench-pick select')
+    expect(sel.exists()).toBe(true)
+    expect(sel.findAll('option').length).toBe(6)
+    expect((sel.element as HTMLSelectElement).value).toBe('000300.SH')
+  })
+})
+
+describe('Backtest.vue — 年化换手显示口径', () => {
+  it('整体表现指标：年化换手显示 ×/年 单位（避免被误读为百分比）', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({
+      ...mockDetail,
+      evaluations: { ...mockDetail.evaluations, annual_turnover: 34.73 },
+      strategy_evaluations: [{ strategy_id: 1, strategy_name: '唯一策略', total_return: 0.05 }],
+    })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    const rows = w.findAll('.portfolio-card .metric-row')
+    const rowValue = (label: string) =>
+      rows.find(r => r.find('.metric-label').text() === label)!.find('span:last-child').text()
+    expect(rowValue('年化换手率（双边）')).toBe('34.73×/年')
+  })
+})
+
+describe('Backtest.vue — 详情页同步自选（1.3.1）', () => {
+  it('详情页头部有[同步持仓股到通达信自选]按钮，prompt 确认后调 sendUserBlock（codes 来自交易明细去重）', async () => {
+    ;(sendUserBlock as any).mockResolvedValue({ block_code: '创懿回测', count: 1 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('prompt', vi.fn(() => '创懿回测'))
+    vi.stubGlobal('alert', alertMock)
+    // mockDetail.trades 两条都是 000001.SZ → 去重后 1 只
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))
+    expect(btn).toBeTruthy()
+    await btn!.trigger('click')
+    await flushPromises()
+
+    expect(prompt).toHaveBeenCalledWith('通达信自选板块名', '创懿回测')
+    expect(sendUserBlock).toHaveBeenCalledWith({
+      block_code: deriveBlockCode('创懿回测'), block_name: '创懿回测', stock_codes: ['000001.SZ'], mode: 'replace',
+    })
+    expect(alertMock).toHaveBeenCalledWith(expect.stringContaining('已写入 1 只'))
+    vi.unstubAllGlobals()
+  })
+
+  it('prompt 取消 → 不调用 sendUserBlock', async () => {
+    vi.stubGlobal('prompt', () => null)
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    await w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))!.trigger('click')
+    await flushPromises()
+
+    expect(sendUserBlock).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('交易明细为空 → 按钮禁用', async () => {
+    ;(getBacktestDetail as any).mockResolvedValueOnce({ ...mockDetail, trades: [] })
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+
+    const btn = w.findAll('button').find(b => b.text().includes('同步持仓股到通达信自选'))!
+    expect((btn.element as HTMLButtonElement).disabled).toBe(true)
   })
 })

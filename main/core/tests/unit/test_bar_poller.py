@@ -12,13 +12,19 @@
   {"ok": True, "data": {code: [bar, ...]}}
 每 bar = DataFrame reset_index().to_dict("records")。
 """
-from datetime import datetime
+from datetime import datetime, time
 from decimal import Decimal
 
 import httpx
 import pytest
 
-from core.engine.bar_poller import BarPoller, parse_bar_time
+from core.engine.bar_poller import (
+    DEFAULT_QUOTE_POLL_PAUSE,
+    DEFAULT_QUOTE_POLL_RESUME,
+    BarPoller,
+    QuotePollingWindow,
+    parse_bar_time,
+)
 from core.engine.event import BarEvent
 from core.engine.http_bridge_dispatcher import BridgeUnavailableError
 
@@ -134,6 +140,26 @@ def test_parse_bar_time_stime_still_preferred_over_index():
     """stime 仍优先于 index(两者都存在时用 stime)。"""
     bar = {"stime": "20260805100800", "index": "20260805100900"}
     assert parse_bar_time(bar) == datetime(2026, 8, 5, 10, 8, 0)
+
+
+def test_parse_bar_time_stime_8digit_daily_bar():
+    """日线 bar 的 stime 是 8 位日期 "20261106" → 当日 00:00（回归：曾解析成 1970）。"""
+    assert parse_bar_time({"stime": "20261106"}) == datetime(2026, 11, 6, 0, 0, 0)
+
+
+def test_parse_bar_time_numeric_8digit_not_treated_as_epoch():
+    """数值型 8 位日期不得当 epoch 秒（20261106 → 1970-08-23 的真机 bug）。"""
+    assert parse_bar_time({"time": 20261106}) == datetime(2026, 11, 6, 0, 0, 0)
+
+
+def test_parse_bar_time_out_of_range_year_warns_and_returns_none(caplog):
+    """年份不在 [2000, 2100] → WARN 带原始值并返回 None，绝不静默按 1970 处理。"""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert parse_bar_time({"stime": "19700823"}) is None
+    assert any("out of range" in r.getMessage() and "19700823" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_parse_bar_time_invalid_returns_none():
@@ -462,3 +488,292 @@ def test_empty_quote_no_trigger():
     assert result == []
     # 空数据不建立基线
     assert poller._initialized is False
+
+
+# ---------------- TQ 1.3.1 批量行情路径 ----------------
+class BatchDispatcher:
+    """支持批量行情的假 dispatcher(TdxTqDispatcher 同形状)。
+
+    batches:每次 query_quotes_batch 依次弹出的返回值(Exception 元素 → 抛出模拟故障);
+    per_code:回退路径下每 code 的 query_quote 响应队列(同 _QuoteRecorder 语义)。
+    """
+
+    supports_batch_quote = True
+
+    def __init__(self, batches=None, per_code=None):
+        self._batches = list(batches or [])
+        self._per_code = {c: list(seq) for c, seq in (per_code or {}).items()}
+        self.batch_calls = []
+        self.quote_calls = []
+
+    def query_quotes_batch(self, codes, period="1m", count=10):
+        self.batch_calls.append(list(codes))
+        item = self._batches.pop(0) if self._batches else {}
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def query_quote(self, code, period="1m", count=10):
+        self.quote_calls.append(code)
+        seq = self._per_code.get(code) or []
+        return seq.pop(0) if seq else []
+
+
+def test_batch_path_triggers_same_as_per_code():
+    """批量命中:每轮一次批量拉取,多股合并触发行为与逐只路径一致。"""
+    base = {
+        "600000.SH": [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+        "000001.SZ": [_bar("20260805100800", 18.40), _bar("20260805100900", 18.50)],
+    }
+    nxt = {
+        "600000.SH": [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+                      _bar("20260805101000", 9.40)],
+        "000001.SZ": [_bar("20260805100800", 18.40), _bar("20260805100900", 18.50),
+                      _bar("20260805101000", 18.60)],
+    }
+    disp = BatchDispatcher(batches=[base, nxt])
+    poller = BarPoller(disp, ["600000.SH", "000001.SZ"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                       # 基线
+    result = poller.poll()              # 两股的 10:09 均完成 → 合并触发
+
+    # 每轮恰好一次批量调用,零逐只调用
+    assert disp.batch_calls == [["600000.SH", "000001.SZ"], ["600000.SH", "000001.SZ"]]
+    assert disp.quote_calls == []
+    assert len(result) == 1
+    assert result[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert set(result[0].stocks.keys()) == {"600000.SH", "000001.SZ"}
+    assert result[0].stocks["600000.SH"]["close"] == Decimal("9.32")
+    assert result[0].stocks["000001.SZ"]["close"] == Decimal("18.50")
+    # bars_by_code 透传与逐只路径一致
+    assert set(result[0].bars_by_code.keys()) == {"600000.SH", "000001.SZ"}
+
+
+def test_batch_empty_result_falls_back_to_per_code():
+    """批量返回空({})→ 回退逐只路径,触发行为与逐只完全一致。"""
+    disp = BatchDispatcher(
+        batches=[{}, {}],
+        per_code={"600000.SH": [
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+             _bar("20260805101000", 9.40)],
+        ]})
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()
+    result = poller.poll()
+
+    assert disp.quote_calls == ["600000.SH", "600000.SH"]
+    assert len(result) == 1
+    assert result[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert result[0].stocks["600000.SH"]["close"] == Decimal("9.32")
+
+
+def test_batch_exception_falls_back_and_warns_once(caplog):
+    """批量抛异常 → 回退逐只;回退 warning 只记一次(防刷屏)。"""
+    import logging
+    disp = BatchDispatcher(
+        batches=[RuntimeError("batch boom"), RuntimeError("batch boom")],
+        per_code={"600000.SH": [
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+            [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+             _bar("20260805101000", 9.40)],
+        ]})
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    with caplog.at_level(logging.WARNING, logger="core.engine.bar_poller"):
+        poller.poll()
+        poller.poll()
+
+    assert len(fired) == 1
+    assert fired[0].bar_time == datetime(2026, 8, 5, 10, 9, 0)
+    assert disp.quote_calls == ["600000.SH", "600000.SH"]
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warns) == 1
+
+
+# ---------------- 显式闭合数据源（快照合成） ----------------
+class ClosedBarDispatcher(BatchDispatcher):
+    """声明「返回的每一根都已是闭合 bar」的假数据源（SnapshotQuoteDispatcher 同形）。"""
+
+    bars_explicitly_completed = True
+
+
+def test_explicit_closed_source_triggers_latest_bar_immediately():
+    """数据源声明全闭合时，最新一根闭合 bar 本轮立即触发（不再等下一根）。"""
+    base = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32)]}
+    nxt = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+        _bar("20260805101000", 9.40)]}
+    disp = ClosedBarDispatcher(batches=[base, nxt])
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                        # 基线：last_completed=10:09，不触发
+    assert fired == []
+    result = poller.poll()               # 10:10 已闭合 → 本轮立即触发
+
+    assert len(result) == 1
+    # bar_time 语义不变：仍为区间终点（10:10:00），不是区间起点
+    assert result[0].bar_time == datetime(2026, 8, 5, 10, 10, 0)
+    assert result[0].stocks["600000.SH"]["close"] == Decimal("9.40")
+
+
+def test_explicit_closed_source_no_duplicate_when_window_repeats():
+    """同一闭合 bar 在后续轮次重复返回 → 不重复触发（(周期, bar_time) 幂等）。"""
+    base = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32)]}
+    nxt = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+        _bar("20260805101000", 9.40)]}
+    disp = ClosedBarDispatcher(batches=[base, nxt, nxt, nxt])
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                        # 基线
+    poller.poll()                        # 10:10 触发一次
+    poller.poll()                        # 窗口重复，不触发
+    poller.poll()                        # 窗口重复，不触发
+
+    assert [b.bar_time for b in fired] == [datetime(2026, 8, 5, 10, 10, 0)]
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 10, 0)
+
+
+def test_explicit_closed_source_empty_round_does_not_trigger_or_advance():
+    """某轮取不到数据（空/批量异常回退空）→ 不触发、水位不变，下一轮正常。"""
+    base = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32)]}
+    nxt = {"600000.SH": [
+        _bar("20260805100800", 9.31), _bar("20260805100900", 9.32),
+        _bar("20260805101000", 9.40)]}
+    disp = ClosedBarDispatcher(batches=[base, {}, nxt])
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.poll()                        # 基线
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 9, 0)
+
+    poller.poll()                        # 空轮次：无 bar → 不触发、水位不变
+    assert fired == []
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 9, 0)
+
+    poller.poll()                        # 恢复：10:10 正常触发
+    assert [b.bar_time for b in fired] == [datetime(2026, 8, 5, 10, 10, 0)]
+
+
+# ---------------- 行情轮询窗口(收盘后停拉行情) ----------------
+def test_quote_polling_window_defaults_when_config_missing():
+    """缺键/None → 安全默认 09:15–15:05(左闭右开):收盘后停轮询。"""
+    w = QuotePollingWindow.from_config(None)
+    assert w.enabled is True
+    assert w.resume_time == DEFAULT_QUOTE_POLL_RESUME == time(9, 15)
+    assert w.pause_time == DEFAULT_QUOTE_POLL_PAUSE == time(15, 5)
+    assert w.is_open(datetime(2026, 8, 5, 9, 14, 59)) is False
+    assert w.is_open(datetime(2026, 8, 5, 9, 15)) is True
+    assert w.is_open(datetime(2026, 8, 5, 15, 4, 59)) is True
+    assert w.is_open(datetime(2026, 8, 5, 15, 5)) is False
+    assert w.is_open(datetime(2026, 8, 5, 23, 0)) is False
+
+
+def test_quote_polling_window_can_be_disabled():
+    """enabled=false → 永远开放(旧行为:全天轮询)。"""
+    w = QuotePollingWindow.from_config({"enabled": False})
+    assert w.is_open(datetime(2026, 8, 8, 3, 0)) is True
+
+
+def test_quote_polling_window_parses_times_and_falls_back():
+    """兼容 '0915' / '15:05' 写法;非法值回落安全默认。"""
+    w = QuotePollingWindow.from_config({"resume_time": "0915", "pause_time": "15:06"})
+    assert w.resume_time == time(9, 15)
+    assert w.pause_time == time(15, 6)
+    bad = QuotePollingWindow.from_config({"resume_time": "abc", "pause_time": ""})
+    assert bad.resume_time == DEFAULT_QUOTE_POLL_RESUME
+    assert bad.pause_time == DEFAULT_QUOTE_POLL_PAUSE
+
+
+def test_quote_polling_next_resume_skips_weekend():
+    """暂停日志的"下次恢复"提示:周五收盘后 → 下一交易日(周一)09:15。"""
+    w = QuotePollingWindow.from_config(None)
+    nxt = w.next_resume_at(
+        datetime(2026, 8, 7, 15, 6), lambda d: d.weekday() < 5)
+    assert nxt == datetime(2026, 8, 10, 9, 15)
+
+
+class _SeqDispatcher:
+    """按顺序返回固定 bar 窗口的最小 dispatcher(无批量能力)。"""
+
+    def __init__(self, bars_by_code):
+        self.bars_by_code = bars_by_code
+        self.calls = 0
+
+    def query_quote(self, code, period="1m", count=10, **kwargs):
+        self.calls += 1
+        return list(self.bars_by_code.get(code) or [])
+
+
+def test_resume_guard_baselines_new_code_and_drops_overnight_bars():
+    """暂停→恢复:无水位新代码只建基线;挂水位代码的隔夜 bar 不触发。"""
+    # 昨日尾盘:14:58 / 14:59 / 15:00(最新一根按相对变化规则算进行中)
+    yday = [
+        _bar("20260804145800", 9.1),
+        _bar("20260804145900", 9.2),
+        _bar("20260804150000", 9.3),
+    ]
+    disp = _SeqDispatcher({"600000.SH": yday, "000001.SZ": yday})
+    poller = BarPoller(disp, ["600000.SH", "000001.SZ"], period="1m", count=10)
+    poller._initialized = True
+    poller._last_completed = {"600000.SH": datetime(2026, 8, 4, 14, 57),
+                              "000001.SZ": None}
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.mark_resume_boundary(datetime(2026, 8, 5).date())
+    poller.poll()   # 恢复首轮:窗口里全是昨日 bar
+    assert fired == []                                        # 隔夜 bar 未当盘中触发
+    assert poller._last_completed["000001.SZ"] == datetime(2026, 8, 4, 14, 59)  # 建基线
+
+    poller.poll()   # 恢复后第二轮:昨日 bar 仍不触发(_resume_day 过滤保留)
+    assert fired == []
+
+    # 今日首根完成(10:00，被 10:01 顶成已完成) → 正常触发
+    today_bars = yday[1:] + [_bar("20260805100000", 9.4), _bar("20260805100100", 9.5)]
+    disp.bars_by_code = {"600000.SH": today_bars, "000001.SZ": today_bars}
+    poller.poll()
+    assert [b.bar_time for b in fired] == [datetime(2026, 8, 5, 10, 0, 0)]
+
+
+def test_resume_guard_survives_empty_first_poll():
+    """恢复首轮拉空（09:15 开盘前 1m 窗口为空）→ 守护保留到首批真实 bar。
+
+    若空轮次就清守护，09:31 首批 bar 到来时「暂停期扩池、无水位」的代码会把整个
+    count 窗口（09:22–09:30）当盘中补触发——旧价格 + 现价成交，正是要防的副作用。
+    """
+    disp = _SeqDispatcher({"600000.SH": []})
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    poller._initialized = True
+    fired = []
+    poller.on_bar = lambda bar: fired.append(bar)
+
+    poller.mark_resume_boundary(datetime(2026, 8, 5).date())
+    poller.poll()                        # 09:15 空窗口：无任何数据
+    assert fired == []
+    assert poller._resume_guard is True  # 空轮次不清守护
+
+    today_bars = [_bar("20260805092200", 9.1), _bar("20260805092300", 9.1),
+                  _bar("20260805093000", 9.2), _bar("20260805093100", 9.2)]
+    disp.bars_by_code = {"600000.SH": today_bars}
+    poller.poll()                        # 09:31 首批真实 bar：新代码只建基线
+    assert fired == []
+    assert poller._last_completed["600000.SH"] == datetime(2026, 8, 5, 9, 30)
+    assert poller._resume_guard is False  # 有数据后守护一次性清除
+

@@ -1,0 +1,2414 @@
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import io
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+from datetime import datetime, date, timedelta
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
+try:
+    from pywinauto import Application, Desktop
+    from pywinauto.keyboard import send_keys
+    from pywinauto import timings
+    import pyperclip
+except Exception:
+    Application = None
+    Desktop = None
+    send_keys = None
+    timings = None
+    pyperclip = None
+
+try:
+    from PIL import ImageGrab
+    from PIL import Image
+except Exception:
+    ImageGrab = None
+    Image = None
+
+# 验证码 OCR：同花顺复制表格会弹「先输入验证码」，必须自动识别才能无人值守。
+# 双引擎（2026-11-04）：
+#   1) ddddocr 专用验证码模型（优先）——通用 Windows OCR 对蓝底干扰线验证码
+#      准确率不足（实证反复识别失败）。历史版本在本机导入即 access violation，
+#      新版（onnxruntime 1.31）冒烟通过；保留环境变量开关
+#      THS_CAPTCHA_DDDDOCR=0 一键回退（C 层崩溃无法 try/except，出问题时用）。
+#   2) Windows 内置 OCR（WinRT，winrt-* 包）多尺度/多阈值/双极性投票兜底。
+#   识别失败样本落盘 data/ths/captcha_debug/（保 20 张）供调参。
+_OCR_ENGINE = None
+_OCR_FAILED = False
+_DD_OCR = None
+_DD_FAILED = False
+
+
+def _get_ddddocr():
+    """ddddocr 懒加载单例；未安装/被环境变量禁用/导入失败 → None。"""
+    global _DD_OCR, _DD_FAILED
+    if _DD_OCR is not None or _DD_FAILED:
+        return _DD_OCR
+    if os.environ.get("THS_CAPTCHA_DDDDOCR", "1") == "0":
+        _DD_FAILED = True
+        return None
+    try:
+        import ddddocr
+        _DD_OCR = ddddocr.DdddOcr(show_ad=False)
+    except Exception:
+        logger.exception("ddddocr 初始化失败，验证码回退 Windows OCR")
+        _DD_FAILED = True
+    return _DD_OCR
+
+from .event import OrderEvent, TradeEvent
+from .execution_engine import OrderDispatcher
+from .http_bridge_dispatcher import BridgeOrderRejected, BridgeUnavailableError
+from .live.timing import now_shanghai
+from .live.win_dialog_scope import UI_AUTO_LOCK, dialog_matches_channel
+from tq_iquant_shared.constants import SignalType, TradeType
+
+logger = logging.getLogger(__name__)
+
+
+class ThsUiDispatcher(OrderDispatcher):
+    """基于同花顺独立交易客户端（xiadan.exe）UI自动化的下单通道。
+
+    参考 OpenCrabTrader 的 ths_xiadan 实现，使用剪贴板 + pywinauto 驱动。
+
+    与 QMT 通道的差异（决定 Core 侧匹配路径）：
+    - 同花顺下单对话框不支持写入 userOrderId/Remark，委托表只能拿到「合同编号」，
+      无法把 Core 的 bridge_order_id 写进柜台。因此 ``supports_remark = False``，
+      OrderStateMachine 改走「代码+方向+数量+插入时间窗」的遗留模糊匹配；
+    - 行情/交易日历不来自同花顺，``query_quote``/``query_calendar`` 直接复用
+      Core 同进程内嵌的 TQ（通达信）模块，与回测取数口径一致；
+    - 委托表的「成交数量/成交均价」是当日累计值，``query_deals`` 据此合成成交行
+      （佣金/印花税在委托表不可见，按 0 记，与实盘首期口径一致）。
+    """
+
+    channel = "ths_ui"
+    #: 柜台不回写备注，Core 不能按 remark 精确认领，只能走 legacy 模糊匹配。
+    supports_remark = False
+    #: 引擎侧文件交接层挂载门控（通道无关）：file_builtin 模式 True（构造时按
+    #: execute_mode 落实例属性），direct 模式 False。LiveEngine 据此挂 FileHandoff。
+    file_handoff_enabled = False
+
+    TAB_BUY = "{F1}"
+    TAB_SELL = "{F2}"
+    TAB_CANCEL = "{F3}"
+    TAB_POSITION = "{F4}"
+    _SWITCH_WAIT = 2.5
+    _COPY_WAIT = 0.6
+    _FOCUS_WAIT = 0.6
+    #: 代码键入后等 THS 异步用最新价覆盖价格框（真机实证 4s）；该等待不碰键鼠，
+    #: 在 UI_AUTO_LOCK 之外执行（单测可置 0 免真睡）。
+    _PRICE_FOLLOW_WAIT = 4.0
+    GUI_LOCK_TIMEOUT = 30.0
+    _GRID_LOCK = threading.RLock()
+    _CODE_RE = re.compile(r"^\d{6}$")
+
+    _POS_FIELDS = {
+        "symbol": ("证券代码", "代码"),
+        "name": ("证券名称", "名称"),
+        "volume": ("股票余额", "持仓数量", "数量"),
+        "available": ("可用余额", "可卖数量", "可用"),
+        "cost": ("成本价", "摊薄成本价", "买入均价"),
+        "price": ("市价", "现价", "最新价"),
+        "market_value": ("市值", "最新市值"),
+    }
+    _ORD_FIELDS = {
+        "time": ("委托时间", "时间", "申报时间"),
+        "symbol": ("证券代码", "代码"),
+        "name": ("证券名称", "名称"),
+        "bs": ("操作", "买卖标志"),
+        "remark": ("备注",),
+        "volume": ("委托数量", "数量"),
+        "filled": ("成交数量", "已成交数量"),
+        "price": ("委托价格", "价格"),
+        "trade_price": ("成交均价", "成交价格"),
+        "cancelled": ("撤消数量", "撤单数量"),
+        "order_id": ("合同编号", "委托编号", "编号"),
+        "market": ("交易市场", "市场"),
+    }
+    _GRID_HEADER_HINTS = ("证券代码", "股票余额", "合同编号", "委托编号", "可用余额", "证券名称")
+    #: F4「查询资金股票」页顶部的资金字段标签 → Core account 字段。
+    _FUND_LABELS = {
+        "资金余额": "balance",
+        "冻结金额": "frozen",
+        "可用金额": "available",
+        "股票市值": "market_value",
+        "总资产": "total_asset",
+    }
+    _NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
+    CONFIRM_BUTTONS = ("确定", "确认")
+    CANCEL_CONFIRM_BUTTONS = ("是(Y)", "是（Y）", "是")
+
+    def __init__(self, window_title: str = "网上股票交易系统5.0", client_exe_path: str = None,
+                 captcha_ocr: bool = False, execute_mode: str = "file_builtin",
+                 execute_interval_seconds: float = 5, work_dir: str = "data/ths",
+                 session_id: int = 0, price_mode: str = "approval", **kwargs):
+        self._window_title = window_title
+        self._client_exe_path = client_exe_path
+        self._captcha_ocr = bool(captcha_ocr)
+        self._app = None
+        self._win = None
+        self._uia_win = None
+        self._connected = False
+        self._last_error = ""
+        # 登录页探测：同花顺登录页与交易主界面共用同一窗口/标题，窗口存在
+        # ≠ 已登录；登出后主窗口仍在，必须靠控件特征区分（2026-11-06 实证）。
+        self._login_probe_at = 0.0
+        self._login_page_cache = False
+        self._price_map: Dict[str, float] = {}
+        # 持仓表短时复用：_read_account_overview 会先 get_positions 再 get_account
+        # （资产页资金字段与持仓同页），两次调用若各自读表要白付一次 ~6-10s 的
+        # GUI+验证码成本。5s 内复用同一份原始行（同一次快照语义一致）。
+        self._pos_rows_at = 0.0
+        self._pos_rows_cache: Optional[list] = None
+        # 委托价格模式：approval=键入审批价（信号价）限价，委托价≠审批价自动撤单
+        # （原行为）；latest=不键价格，让 THS 代码键入后自动跟出最新价（回测继承
+        # 价跨日过期，日线信号次日跳空必不成交的补救），按实际委托价记账。
+        self.ths_price_mode = "latest" if str(price_mode or "") == "latest" else "approval"
+        # ---- 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼现状）----
+        self.execute_mode = "file_builtin" if str(execute_mode or "") == "file_builtin" else "direct"
+        self.file_handoff_enabled = self.execute_mode == "file_builtin"
+        self._execute_interval_seconds = max(float(execute_interval_seconds or 5), 0.01)
+        self._work_dir = str(work_dir or "data/ths")
+        self._session_id = int(session_id or 0)
+        # 批次 A 机制（与 TdxTqDispatcher 同口径）：本进程下单 ref 基线 + 提交时间。
+        # THS 委托表有「委托时间」列，_submit_times 主要供 recover 补记/对账口径统一。
+        self._submit_times: Dict[str, tuple] = {}
+        self._known_refs: set = set()
+        self._claimed_refs: set = set()
+        # file 模式执行器记账：order_id -> {"error","ts","entry"}（诊断 + 引擎
+        # execution_receipts 消费源——file 拒单即时可见，不必等 180s expire）。
+        self._file_rejects: Dict[str, dict] = {}
+        self._rejects_lock = threading.Lock()
+        self._last_submit_ref = ""
+        self._last_submit_time: tuple = ("", "")
+        self._last_enqueued_order_id: Optional[str] = None
+        # 遮挡校验诊断：最近一次点击点最上层的非 THS 窗口句柄（错误文案用）
+        self._last_occluder_hwnd = 0
+        self._handoff = None
+        self._executor_thread: Optional[threading.Thread] = None
+        self._executor_stop = threading.Event()
+        self._executor_lock = threading.Lock()
+        if self.execute_mode == "file_builtin":
+            from .live.file_handoff import FileHandoff
+            self._handoff = FileHandoff(self._work_dir, self._session_id)
+
+    @staticmethod
+    def _get_ocr_engine():
+        """延迟创建 Windows 内置 OCR 引擎（用户配置语言，缺失时退 zh/en）。"""
+        global _OCR_ENGINE, _OCR_FAILED
+        if _OCR_ENGINE is not None or _OCR_FAILED:
+            return _OCR_ENGINE
+        try:
+            from winrt.windows.media.ocr import OcrEngine
+            engine = OcrEngine.try_create_from_user_profile_languages()
+            if engine is None:
+                from winrt.windows.globalization import Language
+                for tag in ("zh-Hans-CN", "en-US"):
+                    engine = OcrEngine.try_create_from_language(Language(tag))
+                    if engine is not None:
+                        break
+            _OCR_ENGINE = engine
+        except Exception:
+            _OCR_ENGINE = None
+            _OCR_FAILED = True
+        return _OCR_ENGINE
+
+    @staticmethod
+    def _run_coro(coro):
+        """同步上下文执行 WinRT 协程（已在事件循环内时改到独立线程）。"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+
+    def _recognize_image(self, engine, img) -> str:
+        """把 PIL 图片落临时 PNG，交给 Windows OCR 识别（内存流实测识别为空）。"""
+        from winrt.windows.graphics.imaging import BitmapDecoder
+        from winrt.windows.storage import FileAccessMode, StorageFile
+
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            img.save(path, "PNG")
+
+            async def _go():
+                f = await StorageFile.get_file_from_path_async(path)
+                stream = await f.open_async(FileAccessMode.READ)
+                decoder = await BitmapDecoder.create_async(stream)
+                bitmap = await decoder.get_software_bitmap_async()
+                result = await engine.recognize_async(bitmap)
+                return str(result.text or "")
+
+            return self._run_coro(_go())
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _ocr_words(self, img) -> list:
+        """整图 OCR，返回 [(text, x, y)] 词级坐标（窗口内偏移由调用方换算）。
+
+        Windows OCR（与验证码流水线同引擎）。用于撤单页委托行的视觉定位——
+        xiadan 网格为自绘控件，WM_GETTEXT/ValuePattern 均不可读，唯 OCR 可见。
+        """
+        from winrt.windows.graphics.imaging import BitmapDecoder
+        from winrt.windows.storage import FileAccessMode, StorageFile
+        import tempfile
+        import os as _os
+
+        engine = self._get_ocr_engine()
+        if engine is None:
+            raise BridgeUnavailableError("ths ui OCR unavailable")
+        fd, path = tempfile.mkstemp(suffix=".png")
+        _os.close(fd)
+        try:
+            img.save(path, "PNG")
+
+            async def _go():
+                f = await StorageFile.get_file_from_path_async(path)
+                stream = await f.open_async(FileAccessMode.READ)
+                decoder = await BitmapDecoder.create_async(stream)
+                bitmap = await decoder.get_software_bitmap_async()
+                return await engine.recognize_async(bitmap)
+
+            result = self._run_coro(_go())
+            words = []
+            for line in result.lines:
+                for w in line.words:
+                    box = w.bounding_rect
+                    words.append((w.text, int(box.x), int(box.y)))
+            return words
+        finally:
+            try:
+                _os.remove(path)
+            except OSError:
+                pass
+
+    def _get_ocr_engine_or_raise(self):
+        engine = self._get_ocr_engine()
+        if engine is None:
+            raise BridgeUnavailableError("ths ui OCR unavailable")
+        return engine
+
+    @staticmethod
+    def order_id(order: OrderEvent) -> str:
+        import hashlib
+        key = "%s|%s|%s|%s|%s|%s|%s|%s" % (
+            order.strategy_id, order.portfolio_id, order.stock_code,
+            order.trade_type.value, order.signal_type.value, order.signal_name,
+            order.quantity, order.price,
+        )
+        if order.bar_time is not None:
+            key += "|%s" % order.bar_time.isoformat()
+        return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    @property
+    def last_enqueued_order_id(self) -> Optional[str]:
+        """file 模式最近一次成功入队的指令 order_id（None=未入队/已重置）。
+
+        LiveEngine 据此把 place_order 的 None 返回识别为「已受理入队」，
+        订单保持 submitted 等回填，而不是走 approval failed 拒单。
+        """
+        return self._last_enqueued_order_id
+
+    def heartbeat(self) -> bool:
+        try:
+            if self._connected and self._win is not None and self._win.exists():
+                # 窗口存在 ≠ 已登录：同花顺登出后主窗口仍在（标题也不变），
+                # 周期探测登录页，避免把登录页长期当成在线通道（读回空持仓）。
+                if self._probe_login_page():
+                    self._connected = False
+                    self._last_error = "同花顺客户端已退出登录（停留在登录页）"
+                    return False
+                return True
+            return self.connect()
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if self._handoff is not None:
+            self._executor_stop.set()
+            t = self._executor_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=3)
+            self._executor_thread = None
+        self._app = None
+        self._win = None
+        self._uia_win = None
+        self._connected = False
+
+    def connect(self) -> bool:
+        self._last_error = ""
+        if Application is None:
+            self._connected = False
+            self._last_error = "pywinauto not installed"
+            return False
+        try:
+            if timings is not None:
+                try:
+                    timings.Timings.fast()
+                except Exception:
+                    pass
+            if self._client_exe_path and os.path.exists(self._client_exe_path):
+                try:
+                    self._app = Application(backend="win32").connect(path=self._client_exe_path, timeout=5)
+                except Exception:
+                    self._app = Application(backend="win32").connect(title_re=re.escape(self._window_title))
+            else:
+                self._app = Application(backend="win32").connect(title_re=re.escape(self._window_title))
+            try:
+                self._win = self._app.window(title_re=re.escape(self._window_title))
+                if not self._win.exists():
+                    self._win = self._app.top_window()
+            except Exception:
+                self._win = self._app.top_window() if self._app else None
+            self._connected = self._win is not None and self._win.exists()
+            if self._connected and self._probe_login_page():
+                # 登录页标题与交易主界面相同（都是「网上股票交易系统5.0」），
+                # 仅凭窗口存在会把登录页误判为可用通道（读回空持仓 → 假对账）。
+                self._connected = False
+                self._last_error = "同花顺客户端停留在登录页（未登录实盘账户）"
+                return False
+            if self._connected and self.execute_mode == "file_builtin":
+                self._ensure_executor()
+            return self._connected
+        except Exception as e:
+            self._app = None
+            self._win = None
+            self._uia_win = None
+            self._connected = False
+            self._last_error = str(e)
+            return False
+
+    def _focus(self) -> bool:
+        """把主窗拉到前台（最小化自动恢复）。
+
+        返回是否成功——仅用于可观测性（焦点被 Windows 前台锁拒绝时留证），
+        调用方维持原行为，不因 False 中断。
+        """
+        if self._win is None:
+            return False
+        try:
+            self._win.set_focus()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ths 主窗聚焦失败：%s", e)
+            return False
+        return True
+
+    def _key(self, keys: str) -> None:
+        self._focus()
+        time.sleep(self._FOCUS_WAIT)
+        if self._win is not None:
+            try:
+                self._win.type_keys(keys)
+                return
+            except Exception:
+                pass
+        try:
+            if send_keys is not None:
+                send_keys(keys)
+        except Exception:
+            pass
+
+    # 买入/卖出页字段 control_id（UIA 真机探针实测：代码=1032、价格=1033、
+    # 数量=1034；买卖两页镜像同 id。THS 升级若漂移，失败信息会带未定位字段名）
+    _ORDER_FIELD_IDS = {"code": 1032, "price": 1033, "quantity": 1034}
+
+    def _uia_window(self):
+        """UIA 后端窗口包装（与 win32 同窗）；pywinauto 缺失/失败 → None。"""
+        if Application is None or Desktop is None or self._win is None:
+            return None
+        try:
+            return Desktop(backend="uia").window(handle=self._win.handle)
+        except Exception:
+            return None
+
+    def _detect_login_page(self) -> bool:
+        """UIA 判定当前是否停留在登录页（「登录」按钮 + 「交易密码」输入框）。
+
+        同花顺登录页与交易主界面共用同一窗口和标题，进程/窗口都存在，只能
+        靠控件特征区分。UIA 不可用时返回 False（保持旧行为，不误伤正常通道）。
+        """
+        uia = self._uia_window()
+        if uia is None:
+            return False
+        # 与其他 UI 读表串行化：UIA 调用非线程安全，忙时沿用上次探测结果。
+        if not self._GRID_LOCK.acquire(timeout=1.0):
+            return self._login_page_cache
+        try:
+            has_login_btn = False
+            for e in uia.descendants(control_type="Button"):
+                try:
+                    if (e.window_text() or "").strip() == "登录":
+                        has_login_btn = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not has_login_btn:
+                return False
+            for e in uia.descendants(control_type="Edit"):
+                try:
+                    if "交易密码" in (e.window_text() or ""):
+                        return True
+                except Exception:  # noqa: BLE001
+                    continue
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            try:
+                self._GRID_LOCK.release()
+            except Exception:
+                pass
+
+    def _probe_login_page(self, force: bool = False) -> bool:
+        """登录页探测（默认 10s 节流）：心跳/连接频繁调用，避免每次扫 UIA 树。"""
+        now = time.monotonic()
+        if not force and now - self._login_probe_at < 10.0:
+            return self._login_page_cache
+        self._login_probe_at = now
+        self._login_page_cache = self._detect_login_page()
+        return self._login_page_cache
+
+    def _uia_field(self, uia_win, kind: str):
+        """按 control_id 定位下单页字段（可见页的 Edit），未找到 → None。"""
+        cid = self._ORDER_FIELD_IDS[kind]
+        for e in uia_win.descendants(control_type="Edit"):
+            try:
+                if getattr(e.element_info, "control_id", None) == cid:
+                    return e
+            except Exception:
+                continue
+        return None
+
+    def _click_field(self, field, left_offset: int = None) -> None:
+        """真实鼠标点击字段区域。left_offset：代码框等「输入+下拉按钮」组合
+        必须点输入区左侧——真机校准：代码框左起 8px 落框，中心点会点到下拉
+        按钮（像素差异扫描校准，见 .superpowers/sdd/calibrate_ths_code.py）。
+
+        点击前做遮挡校验（2026-11-06）：被其它窗口覆盖时 pywinauto 的
+        click_input 不会校验落点归属，会点到遮挡窗口并把后续键入发给它——
+        直接抛 BridgeUnavailableError 中止（fail-closed）。
+        """
+        from pywinauto import mouse
+        r = field.rectangle()
+        x = r.left + (left_offset if left_offset is not None else r.width() // 2)
+        y = (r.top + r.bottom) // 2
+        if not self._ensure_topmost(x, y):
+            raise BridgeUnavailableError(
+                "ths 下单页被其它窗口遮挡，已中止点击（落点 %s,%s，"
+                "最上层 hwnd=%s）" % (x, y, self._last_occluder_hwnd))
+        mouse.click(coords=(x, y))
+        time.sleep(0.3)
+
+    def cancel_order(self, order_ref: str, stock_code: str) -> bool:
+        """F3 撤单自动化（几何双击方案，真机实证：双击 (1063,156) 撤单成功、
+        冻结归零、可撤列表清空）。
+
+        流程：撤单页语义固定（读回 pin 在 F3 撤单页）→ 网格读回确认目标在列 →
+        **整窗截图 OCR 定位目标行坐标 → 双击该行**（页面提示「双击或回车即可
+        撤单」；几何启发式 y=top+45+idx*24 真机复跑未命中，OCR 词坐标是唯一
+        可靠落点）→ 复读验证（按行状态判定）。
+
+        复读验证按**行状态**判定（_order_gone_in）：目标行消失或已呈撤单态
+        （撤消数量扣满委托数量 / 状态列含「撤」）→ 已撤。只按「行消失」判定的
+        旧口径受 UIA 页面选择漂移影响——读回可能切到「当日委托」页（保留已撤/
+        已成行）→ gone 恒 False → 撤单明明生效却报失败。
+
+        安全约束：可撤列表含非平台单（order_id ∉ _known_refs）时拒绝执行
+        （双击按行索引定位，列表混入手动委托时索引不可信，防误撤手动委托）。
+        返回 True=目标已不在可撤列表；False=未生效（调用方按重试处理）。
+        """
+        if Application is None or self._win is None:
+            return False
+        # 整个撤单序列必须持 GUI 锁：读可撤列表 → 整窗截图 OCR → 双击 → 复读。
+        # 原实现只在两次嵌套读内部各取一次锁，截图→算坐标→双击这段裸奔；若
+        # deals 池（5s 查成交）或 HTTP 线程（查持仓）在这 1~2s 内切页，双击
+        # 落点会漂移到另一页的另一行，且「只撤本平台单」白名单校验对切页后的
+        # 行失效——最坏会撤掉一笔手工委托。RLock 可重入，内部 _read_orders_once
+        # 的取锁无碍。
+        # 跨引擎互斥（同进程）+ 整段 GUI 锁：读可撤列表 → 截图 OCR → 双击 → 复读。
+        # 两个调度器并行时（tdx/ths），撤单的物理双击必须与对方 UI 自动化串行，
+        # 否则鼠标落点漂移（2026-11-06 补：此前只持 _GRID_LOCK，跨引擎不互斥）。
+        # 锁序恒定：_GRID_LOCK → UI_AUTO_LOCK。
+        if not self._gui_guard():
+            self._last_error = "cancel: UI 忙（等待 GUI 锁超时）"
+            return False
+        try:
+            # 撤单常被引擎在记账锁（book_lock）内调用：UI 互斥只等 10s，
+            # 超时按「未撤、下轮/expire 兜底」，不长时间攥住记账锁。
+            if not self._ui_guard(timeout=10.0):
+                self._last_error = "cancel: UI 互斥等待超时（其它通道 UI 自动化占用中）"
+                return False
+            try:
+                return self._cancel_locked(order_ref, stock_code)
+            finally:
+                self._release_ui_lock()
+        finally:
+            try:
+                self._GRID_LOCK.release()
+            except Exception:
+                pass
+
+    def _cancel_locked(self, order_ref: str, stock_code: str) -> bool:
+        """cancel_order 的持锁主体（调用方已取 _GRID_LOCK）。"""
+        # get_orders(pin_cancel_page=True) 自带「读空重试一次」，直接复用，
+        # 不在持锁路径里重写重试逻辑。
+        rows = self.get_orders(pin_cancel_page=True)
+        if rows is None:
+            # 读表失败 ≠ 真空表：不点、不报成功，等下一轮重试。
+            self._last_error = "cancel: 撤单页读取失败（%s）" % (
+                self._last_error or "未连接/互斥超时/复制为空")
+            return False
+        idx = next((i for i, o in enumerate(rows)
+                    if str(o.get("order_id")) == str(order_ref)), None)
+        if idx is None:
+            # 目标不在可撤列表：已成交收口/已撤
+            self._last_error = "cancel: 目标 %s 不在可撤列表" % order_ref
+            return False
+        unknown = [o for o in rows
+                   if str(o.get("order_id")) not in self._known_refs
+                   and not self._row_terminal(o)]
+        if unknown:
+            self._last_error = (
+                "cancel: 可撤列表含 %d 条非本平台委托，拒绝撤单" % len(unknown))
+            logger.warning("ths cancel_order refuse: %s",
+                           [o.get("order_id") for o in unknown])
+            return False
+
+        # OCR 导航定位（真机实证：OCR 读回 '510300' @ (309,157) → 双击 (339,165)
+        # 撤单成功）——几何启发式 y=top+45+idx*24 在真机复跑中未命中（网格布局
+        # 漂移），OCR 词坐标是唯一可靠落点。
+        from PIL import ImageGrab
+        from pywinauto import mouse
+        wr = self._win.rectangle()
+        words = self._ocr_words(ImageGrab.grab(bbox=(
+            wr.left, wr.top, wr.right, wr.bottom)))
+        code6 = re.sub(r"\D", "", str(stock_code))[:6]
+        # 同一代码在撤单页可能有多笔可撤委托（分批建仓/拆单/多笔挂单）。rows 与
+        # OCR 取自同一张撤单页，行序一致（自上而下）：按目标行在「同代码全部行」
+        # 中的序号取对应代码词；取第一个匹配词会双击到别的委托（撤错单）。
+        same_code_all = [
+            i for i, o in enumerate(rows)
+            if re.sub(r"\D", "", str(o.get("symbol") or ""))[:6] == code6
+        ]
+        same_code_open = [i for i in same_code_all if not self._row_terminal(rows[i])]
+        if idx not in same_code_open:
+            self._last_error = (
+                "cancel: 目标 %s 已终结（已撤/废单），无需撤单" % order_ref)
+            return False
+        row_words = [w for w in words if code6 in w[0]]
+        if not row_words:
+            self._last_error = (
+                "cancel: 撤单页 OCR 未定位到目标行（%s）" % code6)
+            return False
+        if len(row_words) > 1:
+            row_words = sorted(row_words, key=lambda w: (w[2], w[1]))
+        if len(row_words) == 1:
+            if len(same_code_open) > 1:
+                # 同代码仍有多笔可撤行，但 OCR 只识别到一个代码词：无法判断
+                # 目标行位置，宁可不撤也不点错行（下一轮再试/人工介入）。
+                self._last_error = (
+                    "cancel: 同代码可撤行 %d 条但 OCR 仅定位到一个代码词，"
+                    "无法安全定位目标行，已中止" % len(same_code_open))
+                return False
+            pick = row_words[0]
+        else:
+            if len(row_words) != len(same_code_all):
+                # OCR 丢行/页面漂移导致行序对不上：宁可中止也不点错行。
+                self._last_error = (
+                    "cancel: 同代码行 %d 条但 OCR 定位到 %d 个代码词，"
+                    "无法安全定位目标行，已中止"
+                    % (len(same_code_all), len(row_words)))
+                return False
+            pick = row_words[same_code_all.index(idx)]
+        _, tw_x, tw_y = pick
+        dx, dy = wr.left + tw_x + 30, wr.top + tw_y + 8
+        # 双击前遮挡校验：ImageGrab 截的是屏幕像素，被遮挡时 OCR 词可能来自
+        # 遮挡窗口，双击也会落在它上面（2026-11-06 P0）。
+        if not self._ensure_topmost(dx, dy):
+            self._last_error = (
+                "cancel: 撤单页被其它窗口遮挡，已中止双击"
+                "（落点 %s,%s，最上层 hwnd=%s）"
+                % (dx, dy, self._last_occluder_hwnd))
+            return False
+        mouse.double_click(coords=(dx, dy))
+        time.sleep(1.5)
+
+        rows2 = self.get_orders(pin_cancel_page=True)
+        if rows2 is None:
+            # 复读失败不能按「行消失 → 已撤」判成功（会把失败撤单收敛成 canceled，
+            # 真实在途单留在柜台）。返回 False 由下一轮先确认目标是否仍在可撤列表。
+            self._last_error = (
+                "cancel: 撤单后回查失败（%s），无法确认撤单结果"
+                % (self._last_error or "读表失败"))
+            return False
+        gone = self._order_gone_in(rows2, order_ref)
+        if gone:
+            logger.info("ths cancel_order ok: ref=%s", order_ref)
+        else:
+            self._last_error = "cancel: 目标仍在可撤列表（撤单未生效）"
+        return gone
+
+    @staticmethod
+    def _row_terminal(o: dict) -> bool:
+        """该行是否已终结（已撤/废单）——终结行不构成「可能被误撤的手动委托」。
+
+        2026-11-07 真机实证：THS 客户端跨日不重启时「撤单」页仍列昨日 5 笔
+        已撤单（831/774/710/666/583），新单 6999 撤销时被
+        「可撤列表含 5 条非本平台委托」拒绝 → 自动撤单实际失效。终结判定与
+        `_order_gone_in` 同口径（备注含撤/废，或撤消数量+成交数量扣满）。
+        """
+        note = str(o.get("note") or "")
+        if "撤" in note or "废" in note:
+            return True
+        volume = int(o.get("volume") or 0)
+        cancelled = int(o.get("cancelled_volume") or 0)
+        filled = int(o.get("filled_volume") or 0)
+        return volume > 0 and cancelled > 0 and filled + cancelled >= volume
+
+    @staticmethod
+    def _order_gone_in(rows: list, order_ref: str) -> bool:
+        """撤单生效判定（按行状态，页面语义鲁棒）：
+        - 目标行消失 → 已撤（撤单页语义：可撤列表清空）；
+        - 行仍在但已呈撤单态 → 已撤：状态列含「撤」，或撤消数量扣满委托数量
+          （全撤 54：cancelled ≥ volume；部撤 53：filled + cancelled ≥ volume）；
+        - 行仍在且非撤单态 → 未生效（False，调用方按重试处理）。
+        读回可能受 UIA 页面选择漂移切到「当日委托」页（保留已撤/已成行），
+        按行状态判定不受漂移影响。委托表无独立状态列，撤单态由 备注列/撤消数量/
+        成交数量 综合推断（与 _order_status_code 同口径）。
+        """
+        for o in rows:
+            if str(o.get("order_id") or "") != str(order_ref):
+                continue
+            if "撤" in str(o.get("note") or ""):
+                return True
+            volume = int(o.get("volume") or 0)
+            cancelled = int(o.get("cancelled_volume") or 0)
+            filled = int(o.get("filled_volume") or 0)
+            if volume > 0 and cancelled > 0 and filled + cancelled >= volume:
+                return True
+            return False
+        return True  # 行消失
+
+    def kb_send(self, keys: str) -> None:
+        """向当前焦点控件发送键入（SendInput）——不重置窗口焦点。
+
+        与 _key（_focus+窗口 type_keys）的区别：键入序列内多步操作必须保持
+        字段焦点不被重置，同花顺下单页键入必须走本方法。
+        """
+        if send_keys is not None:
+            try:
+                send_keys(keys)
+                return
+            except Exception:
+                pass
+        if self._win is not None:
+            try:
+                self._win.type_keys(keys)
+            except Exception:
+                pass
+
+    def _switch(self, tab: str) -> bool:
+        """功能键切页（F1 买入 / F2 卖出 / F3 撤单 / F4 资金股票）。
+
+        返回是否切到目标页：按完功能键后**轮询** UIA 左侧树选中项校验（
+        `_SWITCH_VERIFY_TIMEOUT` 内每 0.5s 一次），未命中则降级
+        `_select_page`（精确切页），再失败返回 False（调用方决定报错）。
+        UIA 不可用（选中项读到 None）时保持旧行为返回 True，避免无谓阻断。
+
+        2026-11-07 真机实证：固定等 2.5s 后只校验一次，在与本通道读表线程
+        并发抢 UI 时（F3/F1 各一次）页签切换常常晚于 2.5s 才落定——功能键
+        其实已生效，却被判「未命中」并多余降级一次 UIA 切页（多一次点击，
+        加大落点漂移风险）。改为轮询到命中即返回（命中通常 ~1s，比原固定
+        等待更短）。
+        """
+        self._key(tab)
+        prefix = self._TAB_PAGE_PREFIX.get(tab)
+        if not prefix:
+            time.sleep(self._SWITCH_WAIT)
+            return True
+        deadline = time.monotonic() + self._SWITCH_VERIFY_TIMEOUT
+        sel = None
+        waited = 0.0
+        while True:
+            time.sleep(0.5)
+            waited += 0.5
+            sel = self._selected_tree_item()
+            if sel is None or prefix in sel:
+                return True
+            if waited >= self._SWITCH_VERIFY_TIMEOUT or time.monotonic() >= deadline:
+                break
+        logger.warning("ths 功能键切页未命中（tab=%s 当前选中=%s），降级 UIA 切页",
+                       tab, sel)
+        return self._select_page(prefix)
+
+    #: 功能键切页后的选中项校验上限（秒）：命中即返回，超时才降级 UIA 切页。
+    _SWITCH_VERIFY_TIMEOUT = 6.0
+
+    #: 功能键 → 左侧树页签名前缀（切页校验用）
+    _TAB_PAGE_PREFIX = {
+        "{F1}": "买入",
+        "{F2}": "卖出",
+        "{F3}": "撤单",
+        "{F4}": "资金股票",
+    }
+
+    def _selected_tree_item(self) -> Optional[str]:
+        """左侧树当前选中项名称（UIA 不可用/读失败 → None）。"""
+        uia = self._uia_window()
+        if uia is None:
+            return None
+        try:
+            for item in uia.descendants(control_type="TreeItem"):
+                try:
+                    if item.is_selected():
+                        return item.window_text()
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _select_page(self, name: str) -> bool:
+        """用 UIA 左侧树切页（功能键在焦点漂移后不可靠），并聚焦表格。
+
+        F4/F3 仍是兜底；UIA 方式能明确切到「资金股票」「当日委托」，
+        避免 F3「撤单」页可能过滤掉已成交委托。切页后必须点一下表格，
+        否则 Ctrl+A/C 作用在树上，复制不到数据。表格点击前做遮挡校验
+        （被其它窗口覆盖时点到的会是遮挡窗口）。
+        """
+        if Application is None or self._win is None:
+            return False
+        # 2026-11-06 真机实证：`Application(backend="uia").connect(title_re=...)`
+        # 找不到该窗口（同花顺主窗是 Afx 自绘 + 32 位进程），导致切页恒失败、
+        # 每次读委托都退 F3 撤单页（可能漏已成交单）。句柄定位（_uia_window）
+        # 可用，31 个 TreeItem（含「当日委托」「资金股票」）扫描 0.45s。
+        uia = self._uia_window()
+        if uia is None:
+            return False
+        try:
+            for item in uia.descendants(control_type="TreeItem"):
+                try:
+                    text = item.window_text()
+                    # 前缀匹配：「撤单[F3]」「资金股票」等带快捷键后缀
+                    if text != name and not text.startswith(name):
+                        continue
+                    item.select()
+                    time.sleep(self._SWITCH_WAIT)
+                    grids = uia.descendants(class_name="CVirtualGridCtrl")
+                    if grids:
+                        gr = grids[0].rectangle()
+                        gx = (gr.left + gr.right) // 2
+                        gy = (gr.top + gr.bottom) // 2
+                        if not self._ensure_topmost(gx, gy):
+                            self._last_error = (
+                                "切页失败：表格被其它窗口遮挡（%s，最上层 hwnd=%s）"
+                                % (name, self._last_occluder_hwnd))
+                            return False
+                        grids[0].click_input()
+                        time.sleep(0.4)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            self._last_error = "切页失败：UIA 树不可读（%s）" % name
+        return False
+
+    def _gui_guard(self) -> bool:
+        return self._GRID_LOCK.acquire(timeout=self.GUI_LOCK_TIMEOUT)
+
+    #: 等待其它通道 UI 自动化的上限；超时即 fail-closed（不点击、不键入）。
+    UI_LOCK_TIMEOUT = 60.0
+
+    def _ui_guard(self, timeout: float = None) -> bool:
+        """获取跨引擎 UI 互斥锁（锁序恒定 ``_GRID_LOCK`` → ``UI_AUTO_LOCK``）。
+
+        先拿本通道 GUI 锁再拿跨引擎锁：THS 自己的读表线程只在 G 上排队，
+        不会「持 U 等 G」把跨引擎锁攥住饿死 TDX。TDX 只取 U 不取 G，无环。
+
+        注意：UI_AUTO_LOCK 是 threading.RLock，**只在同一后端进程内互斥**；
+        另一个后端进程、独立探针脚本、用户手工操作都不会排队
+        （见 docs/execution-contract.md「同进程互斥」）。
+        """
+        t = self.UI_LOCK_TIMEOUT if timeout is None else timeout
+        return UI_AUTO_LOCK.acquire(timeout=t)
+
+    @staticmethod
+    def _release_ui_lock() -> None:
+        try:
+            UI_AUTO_LOCK.release()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_topmost(self, x: int, y: int) -> bool:
+        """点击前校验落点最上层窗口是否属于同花顺（被遮挡则拉前台复检）。
+
+        与 `TdxSignalConfirmer._ensure_topmost` 同义：最小化 → SW_RESTORE；
+        WindowFromPoint → GetAncestor(GA_ROOT) 与主窗句柄比对；不一致则
+        SetForegroundWindow + 0.25s 复检。仍不一致返回 False，调用方必须
+        中止本次点击（fail-closed，防点击/按键泄漏到前台其它程序）。
+        """
+        if self._win is None:
+            return False
+        try:
+            from ctypes import wintypes
+            u32 = ctypes.WinDLL("user32", use_last_error=True)
+            u32.WindowFromPoint.argtypes = [wintypes.POINT]
+            u32.WindowFromPoint.restype = wintypes.HWND
+            u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            u32.GetAncestor.restype = wintypes.HWND
+            u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            hwnd = int(self._win.handle)
+
+            def _root_at(px: int, py: int) -> int:
+                hit = u32.WindowFromPoint(wintypes.POINT(int(px), int(py)))
+                return int(u32.GetAncestor(wintypes.HWND(hit or hwnd), 2) or 0)
+
+            if u32.IsIconic(wintypes.HWND(hwnd)):
+                u32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+                time.sleep(0.25)
+            if _root_at(x, y) == hwnd:
+                return True
+            u32.SetForegroundWindow(wintypes.HWND(hwnd))
+            time.sleep(0.25)
+            root = _root_at(x, y)
+            if root == hwnd:
+                return True
+            self._last_occluder_hwnd = root
+            logger.warning("ths 点击点 (%s,%s) 被其它窗口遮挡：root=%s ths=%s",
+                           x, y, root, hwnd)
+            return False
+        except Exception:  # noqa: BLE001
+            logger.warning("ths 点击前遮挡校验异常（按被遮挡处理）", exc_info=True)
+            return False
+
+
+    _CLIP_SENTINEL = "__THS_CLIPBOARD_EMPTY__"
+
+    def _copy_grid(self, required=()) -> str:
+        """复制当前表格，自动处理复制验证码。
+
+        同花顺在 Ctrl+C 后弹验证码，此时剪贴板仍是上一次内容；必须等验证码
+        提交、THS 真正完成复制后再读剪贴板。这里每轮先写哨兵值，避免把旧
+        页面的数据误当成本页结果（UIA 切页后尤其容易发生）。
+        """
+        if pyperclip is None:
+            return ""
+        if not self._captcha_ocr:
+            self._last_error = "验证码 OCR 未启用，无法复制同花顺表格"
+            return ""
+        if self._get_ocr_engine() is None:
+            self._last_error = "验证码 OCR 不可用（Windows OCR 未就绪）"
+            return ""
+        for _ in range(3):
+            try:
+                pyperclip.copy(self._CLIP_SENTINEL)
+                marked = str(pyperclip.paste() or "")
+            except Exception:
+                marked = ""
+            if marked != self._CLIP_SENTINEL:
+                # 剪贴板被其它程序占用/写入失败：此时无法区分「旧页数据」与
+                # 「本轮复制结果」，宁可本轮失败（返回空 → 读失败）也不返回陈旧表格。
+                self._last_error = "剪贴板写入失败（被其它程序占用）"
+                time.sleep(0.4)
+                continue
+            self._key("^a")
+            time.sleep(self._COPY_WAIT)
+            self._key("^c")
+            time.sleep(self._COPY_WAIT)
+            try:
+                last = str(pyperclip.paste() or "")
+            except Exception:
+                last = ""
+            # 哨兵保证「非哨兵 = 本次复制真的落盘」：THS 弹验证码时剪贴板仍是
+            # 哨兵，只有解完验证码才会写入表格文本。先判剪贴板可省掉一次桌面
+            # 弹窗枚举（顺带降低与通达信弹窗串扰的概率）。
+            if last == self._CLIP_SENTINEL or not self._looks_like_grid(last):
+                last = ""
+            if last and (not required
+                         or all(k in last[:600] for k in required)):
+                return last
+            dlg = self._find_captcha_dialog()
+            if dlg is None:
+                self._last_error = "表格为空或页签不匹配: %s" % (required,)
+                time.sleep(0.4)
+                continue
+            try:
+                if not self._solve_captcha(dlg):
+                    self._last_error = "验证码弹窗无法自动处理"
+                    continue
+            except Exception:
+                self._last_error = "验证码处理异常"
+                continue
+            time.sleep(self._COPY_WAIT + 0.4)
+            try:
+                last = str(pyperclip.paste() or "")
+            except Exception:
+                last = ""
+            if last == self._CLIP_SENTINEL or not self._looks_like_grid(last):
+                time.sleep(0.4)
+                continue
+            if required and not all(k in last[:600] for k in required):
+                self._last_error = "表格页签不匹配: %s" % (required,)
+                time.sleep(0.4)
+                continue
+            return last
+        return ""
+
+    def _find_captcha_dialog(self):
+        if Desktop is None:
+            return None
+        try:
+            for w in Desktop(backend="win32").windows():
+                try:
+                    # 弹窗归属过滤（双引擎并行）：只认同花顺客户端进程的弹窗
+                    if not dialog_matches_channel(w, "ths"):
+                        continue
+                    texts = [s.window_text() for s in w.descendants(class_name="Static")]
+                    if any("先输入验证码" in t for t in texts):
+                        return w
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _captcha_crop(dlg, edit, dlg_rect):
+        """截取验证码图片（编辑框右侧、与之垂直重叠的无文本 Static）。"""
+        edit_rect = edit.rectangle()
+        for s in dlg.descendants(class_name="Static"):
+            try:
+                if s.window_text():
+                    continue
+                r = s.rectangle()
+                if r.left >= edit_rect.right and not (
+                        r.bottom < edit_rect.top or r.top > edit_rect.bottom):
+                    shot = ImageGrab.grab(
+                        bbox=(dlg_rect.left, dlg_rect.top, dlg_rect.right, dlg_rect.bottom))
+                    return shot.crop((
+                        r.left - dlg_rect.left, r.top - dlg_rect.top,
+                        r.right - dlg_rect.left, r.bottom - dlg_rect.top,
+                    ))
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _dismiss_captcha(dlg) -> bool:
+        """关闭验证码弹窗，避免失败后对话框卡住整个交易界面。"""
+        if dlg is None:
+            return False
+        try:
+            for b in dlg.descendants(class_name="Button"):
+                try:
+                    if "取消" in (b.window_text() or ""):
+                        b.click()
+                        time.sleep(0.4)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            dlg.type_keys("{ESC}")
+            time.sleep(0.4)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _type_edit_keys(edit, code) -> bool:
+        """用真实键盘事件（SendInput）键入验证码。
+
+        2026-11-06 真机实证：该弹窗的 Edit 是自绘控件，`set_edit_text`
+        （WM_SETTEXT）虽不抛异常、但输入框保持空白（截图为证），确定按钮
+        拿不到验证码 → 反复「验证码错误!!」。必须走真实按键。
+        """
+        try:
+            edit.set_focus()
+        except Exception:
+            pass
+        try:
+            edit.type_keys("^a{DELETE}", pause=0.05)
+        except Exception:
+            pass
+        try:
+            for ch in code:
+                edit.type_keys(ch, pause=0.08)
+            return True
+        except Exception:
+            return False
+
+    def _solve_captcha(self, dlg) -> bool:
+        if ImageGrab is None or not self._captcha_ocr:
+            self._dismiss_captcha(dlg)
+            return False
+        if self._get_ocr_engine() is None:
+            self._last_error = "验证码 OCR 不可用（Windows OCR 未就绪）"
+            self._dismiss_captcha(dlg)
+            return False
+        try:
+            # 每次输错后验证码会刷新，必须每轮重新定位弹窗 + 重新截图识别。
+            # 5 次尝试：单次 OCR 识别+键入链路 ~70% 命中时 5 次综合 >99.7%。
+            for _attempt in range(5):
+                # 提交失败后同花顺会重建弹窗，旧句柄的截图会读到过期验证码
+                # （历史「反复同一个错码」根因），故每轮重新查找。
+                dlg = self._find_captcha_dialog()
+                if dlg is None:
+                    return True
+                edits = dlg.descendants(class_name="Edit")
+                if not edits:
+                    self._dismiss_captcha(dlg)
+                    return False
+                edit = edits[0]
+                try:
+                    dlg.set_focus()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                crop = self._captcha_crop(dlg, edit, dlg.rectangle())
+                if crop is None:
+                    self._dismiss_captcha(dlg)
+                    return False
+                code = self._ocr_digits(crop)
+                if not code:
+                    self._last_error = "验证码识别失败"
+                    self._dismiss_captcha(dlg)
+                    return False
+                if not self._type_edit_keys(edit, code):
+                    self._last_error = "验证码输入失败（键盘事件无法送达）"
+                    self._dismiss_captcha(dlg)
+                    return False
+                time.sleep(0.2)
+                clicked = False
+                for b in dlg.descendants(class_name="Button"):
+                    t = b.window_text() or ""
+                    if "确定" in t or "确认" in t:
+                        try:
+                            b.click()
+                            clicked = True
+                        except Exception:
+                            pass
+                        break
+                if not clicked:
+                    try:
+                        edit.type_keys("{ENTER}")
+                    except Exception:
+                        pass
+                time.sleep(1.2)
+                if self._find_captcha_dialog() is None:
+                    return True
+            self._dismiss_captcha(self._find_captcha_dialog())
+            return False
+        except Exception:
+            self._dismiss_captcha(self._find_captcha_dialog())
+            return False
+
+    @staticmethod
+    def _vote_digits(raw_texts) -> str:
+        """4 位验证码投票：只接受恰好 4 位数字的候选。
+
+        THS 验证码恒 4 位——3 位/6 位误读若被截断参投会污染多数票（历史
+        「验证码经常出错」主因）。多数一致（≥2 票）胜出；无多数取首个
+        4 位候选（多尺度多极性里的首个完整读数）；全无效 → 空串。"""
+        from collections import Counter
+        votes = [t for t in raw_texts if len(t) == 4]
+        if not votes:
+            return ""
+        top, n = Counter(votes).most_common(1)[0]
+        if n >= 2:
+            return top
+        return votes[0]
+
+    def _ocr_digits(self, img) -> str:
+        """识别 4 位数字验证码：ddddocr 专用模型优先，WinOCR 多变体投票兜底。
+
+        ddddocr（专用验证码模型）对 4 位数字类准确率显著高于通用 OCR——原图 +
+        2x 放大两票一致直接采信；单票也优先采信（合议时通用 OCR 的系统性误读
+        会污染多数票）。ddddocr 不可用/未产出 → WinOCR 多尺度×多阈值×双极性
+        投票兜底（含 4 位候选过滤，历史「验证码经常出错」主因）。"""
+        if Image is None:
+            return ""
+        raws: list = []
+        dd = _get_ddddocr()
+        if dd is not None:
+            try:
+                big = img.resize(
+                    (img.width * 2, img.height * 2), Image.LANCZOS)
+                for src in (img, big):
+                    try:
+                        buf = io.BytesIO()
+                        src.save(buf, format="PNG")
+                        res = dd.classification(buf.getvalue())
+                        digits = "".join(
+                            ch for ch in str(res or "") if ch.isdigit())
+                        if len(digits) == 4:
+                            raws.append(digits)
+                    except Exception:
+                        continue
+                if raws:
+                    # 专用模型：两票一致或单票均直接采信
+                    return raws[0] if len(set(raws)) == 1 else raws[0]
+            except Exception:
+                pass
+        engine = self._get_ocr_engine()
+        if engine is None:
+            return ""
+        try:
+            for scale in (3, 4, 5, 6):
+                src = img.convert("L")
+                src = src.resize(
+                    (src.width * scale, src.height * scale), Image.LANCZOS)
+                for threshold in (170, 190, 210):
+                    for inv in (False, True):
+                        try:
+                            bw = src.point(
+                                lambda p, t=threshold, i=inv: (
+                                    255 if (p < t) != i else 0)
+                            ).convert("RGB")
+                            text = self._recognize_image(engine, bw)
+                            digits = "".join(
+                                ch for ch in str(text or "") if ch.isdigit())
+                            if digits:
+                                raws.append(digits[:4])
+                        except Exception:
+                            continue
+            return self._vote_digits(raws)
+        except Exception:
+            return ""
+
+    def _dump_captcha_debug(self, img) -> None:
+        """识别失败样本落盘（data/ths/captcha_debug/，保 20 张）供调参。"""
+        try:
+            base = os.path.join(self._work_dir or "data/ths", "captcha_debug")
+            os.makedirs(base, exist_ok=True)
+            name = datetime.now().strftime("captcha_%Y%m%d_%H%M%S_%f") + ".png"
+            img.save(os.path.join(base, name), "PNG")
+            olds = sorted(
+                f for f in os.listdir(base) if f.endswith(".png"))
+            for f in olds[:-20]:
+                try:
+                    os.remove(os.path.join(base, f))
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _looks_like_grid(self, text: str) -> bool:
+        if not text or "\t" not in text:
+            return False
+        head = text[:400]
+        return any(k in head for k in self._GRID_HEADER_HINTS)
+
+    def _snapshot_hwnds(self) -> set:
+        if Desktop is None:
+            return set()
+        out = set()
+        try:
+            for w in Desktop(backend="win32").windows():
+                try:
+                    if w.class_name() == "#32770" and w.is_visible():
+                        out.add(w.handle)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _new_dialog_with_button(self, before: set, keywords):
+        if Desktop is None:
+            return None, None
+        try:
+            for w in Desktop(backend="win32").windows():
+                try:
+                    if w.class_name() != "#32770" or not w.is_visible():
+                        continue
+                    # 弹窗归属过滤（双引擎并行）：不碰通达信客户端的弹窗
+                    if not dialog_matches_channel(w, "ths"):
+                        continue
+                    if w.handle in before:
+                        continue
+                    for b in w.descendants(class_name="Button"):
+                        t = b.window_text() or ""
+                        if any(k in t for k in keywords):
+                            return w, b
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+
+    def _confirm_dialog(self, before: set, keywords) -> bool:
+        dlg, btn = self._new_dialog_with_button(before, keywords)
+        if dlg is None:
+            return True
+        try:
+            btn.click()
+        except Exception:
+            pass
+        time.sleep(1.2)
+        try:
+            if not dlg.is_visible():
+                return True
+        except Exception:
+            return True
+        try:
+            dlg.set_focus()
+            time.sleep(0.4)
+            dlg.type_keys("{ENTER}")
+        except Exception:
+            pass
+        time.sleep(1.0)
+        try:
+            return not dlg.is_visible()
+        except Exception:
+            return True
+
+    def _rows(self, text: str) -> list:
+        out = []
+        for line in str(text or "").splitlines():
+            line = line.rstrip("\r")
+            if not line.strip():
+                continue
+            cells = line.split("\t") if "\t" in line else line.split()
+            out.append([c.strip() for c in cells])
+        return out
+
+    def _header_map(self, rows: list, fields: dict) -> dict:
+        for cells in rows:
+            if not any("证券代码" in c or "代码" in c for c in cells):
+                continue
+            idx = {}
+            for field, names in fields.items():
+                for i, c in enumerate(cells):
+                    if any(n == c or n in c for n in names):
+                        idx[field] = i
+                        break
+            if "symbol" in idx:
+                idx["__header__"] = rows.index(cells)
+                return idx
+        return {}
+
+    def _cell(self, cells: list, idx: dict, field: str) -> str:
+        i = idx.get(field)
+        if i is None or i >= len(cells):
+            return ""
+        return cells[i]
+
+    def _f(self, v: str) -> float:
+        s = str(v or "").strip().replace(",", "").replace("%", "").replace("￥", "")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _i(self, v: str) -> int:
+        try:
+            return int(self._f(v))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _exchange_for(code: str, market: str = "") -> str:
+        """6 位代码 + 「交易市场」列 → SH/SZ/BJ。"""
+        m = str(market or "").upper()
+        if "上海" in m or m in ("SH", "1"):
+            return "SH"
+        if "深圳" in m or m in ("SZ", "2"):
+            return "SZ"
+        if "北京" in m or m in ("BJ", "3"):
+            return "BJ"
+        if code.startswith("92"):
+            return "BJ"  # 北交所新股段（与 tdx/live_service 同口径，优先于 9→SH）
+        if code.startswith("11"):
+            return "SH"  # 沪市可转债 110/113/118（否则落入默认 SZ，T+1 校验 fail-open）
+        if code.startswith(("6", "5", "9")):
+            return "SH"
+        if code.startswith(("4", "8")):
+            return "BJ"
+        return "SZ"
+
+    @staticmethod
+    def _split_time(raw: str):
+        """委托时间文本 → (YYYYMMDD, HHMMSS)。仅时间时按上海当天补日期。
+
+        insert_time 必须是 6 位纯数字：Core ``_parse_insert_utc`` 取前 6 位拼
+        YYYYMMDDHHMMSS，带冒号会解析成 None，导致 legacy 模糊匹配全部落空。
+        """
+        text = str(raw or "").strip()
+        m = re.search(
+            r"(\d{4})[-/]?(\d{2})[-/]?(\d{2})[ T]+(\d{1,2}):?(\d{2}):?(\d{2})",
+            text,
+        )
+        if m:
+            y, mo, d, hh, mm, ss = m.groups()
+            return y + mo + d, "%02d%02d%02d" % (int(hh), int(mm), int(ss))
+        m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", text)
+        if m:
+            hh, mm, ss = m.groups()
+            return now_shanghai().strftime("%Y%m%d"), "%02d%02d%02d" % (
+                int(hh), int(mm), int(ss))
+        m = re.search(r"(\d{6})$", text)
+        if m:
+            return now_shanghai().strftime("%Y%m%d"), m.group(1)
+        return now_shanghai().strftime("%Y%m%d"), ""
+
+    @staticmethod
+    def _order_status_code(note: str, filled: int, volume: int, cancelled: int) -> int:
+        """委托表文本/数量 → QMT m_nOrderStatus 码（Core 状态机口径）。
+
+        56=已成、55=部成（非终态）、54=已撤、53=部撤（终态）、57=废单、50=已报。
+        THS 委托表没有独立状态列，只能综合「备注/撤消数量/成交数量」推断。
+        """
+        text = str(note or "")
+        if "废" in text:
+            return 57
+        if "撤" in text:
+            return 53 if filled > 0 else 54
+        if cancelled > 0:
+            return 53 if filled > 0 else 54
+        if filled > 0:
+            return 56 if (volume <= 0 or filled >= volume) else 55
+        return 50
+
+    def _parse_position_rows(self, text: str) -> list:
+        rows = self._rows(text)
+        idx = self._header_map(rows, self._POS_FIELDS)
+        if not idx:
+            return []
+        out = []
+        for cells in rows[idx["__header__"] + 1:]:
+            code = self._cell(cells, idx, "symbol")
+            if not self._CODE_RE.match(code):
+                continue
+            vol = self._i(self._cell(cells, idx, "volume"))
+            # 有「可用余额」列时严格采用其值（0 表示 T+1 锁定，不能回退成持仓量）；
+            # 仅当该列不存在时才按持仓量放行，与桥离线时的 fail-open 口径一致。
+            if idx.get("available") is not None:
+                avail = self._i(self._cell(cells, idx, "available"))
+            else:
+                avail = vol
+            out.append({
+                "symbol": code,
+                "name": self._cell(cells, idx, "name"),
+                "volume": vol,
+                "available": avail,
+                "cost": self._f(self._cell(cells, idx, "cost")),
+                "price": self._f(self._cell(cells, idx, "price")),
+                "market_value": self._f(self._cell(cells, idx, "market_value")),
+            })
+        return out
+
+    def _parse_orders(self, text: str) -> list:
+        rows = self._rows(text)
+        idx = self._header_map(rows, self._ORD_FIELDS)
+        if not idx:
+            return []
+        out = []
+        for cells in rows[idx["__header__"] + 1:]:
+            code = self._cell(cells, idx, "symbol")
+            if not self._CODE_RE.match(code):
+                continue
+            bs = self._cell(cells, idx, "bs")
+            out.append({
+                "order_id": self._cell(cells, idx, "order_id"),
+                "symbol": code,
+                "name": self._cell(cells, idx, "name"),
+                "direction": "sell" if "卖" in bs else "buy",
+                "price": self._f(self._cell(cells, idx, "price")),
+                "trade_price": self._f(self._cell(cells, idx, "trade_price")),
+                "volume": self._i(self._cell(cells, idx, "volume")),
+                "filled_volume": self._i(self._cell(cells, idx, "filled")),
+                "cancelled_volume": self._i(self._cell(cells, idx, "cancelled")),
+                "market": self._cell(cells, idx, "market"),
+                "note": self._cell(cells, idx, "remark"),
+                "time": self._cell(cells, idx, "time"),
+            })
+        return out
+
+    @staticmethod
+    def _ref_key(ref):
+        """合同号排序键：纯数字按数值，其它按字符串（防混合类型比较异常）。"""
+        s = str(ref or "")
+        return (1, int(s)) if s.isdigit() else (0, s)
+
+    def _find_order(self, code: str, direction: str, volume: int,
+                    since: Optional[str] = None):
+        """下单后回查委托列表，取「最新且不早于本次提交」的一行。
+
+        THS 委托列表排序随用户点列头而变（实证默认新单在最上），不能依赖
+        行序；同代码/方向/数量常有多笔历史单（含已撤）。2026-11-06 实证：
+        行序取首命中会命中旧单 583 → 误判委托价 → 误撤旧单、新单 666 滞留
+        柜台且平台已按拒单处理（重复下单风险）。改为按 (委托时间, 合同号)
+        取最大，并用 since 过滤掉本次提交之前的历史单。
+        """
+        floor = ""
+        if since:
+            try:
+                floor = (datetime.strptime(since, "%Y%m%d%H%M%S")
+                         - timedelta(seconds=120)).strftime("%Y%m%d%H%M%S")
+            except Exception:
+                floor = ""
+        # 跨日残留防火墙（2026-11-07 真机实证）：THS 客户端跨日不重启时
+        # 「当日委托」仍列昨日单，委托表只有 HH:MM:SS（无日期）→ _split_time
+        # 按今天补日期，昨日 17:52 的单会被当成「今天更晚」的新单，盖过本次
+        # 真实新单（6999@17:19:04 未报 被旧单 831@17:52:46 已撤 盖过 → 误判
+        # 委托价 10.56≠9.0 → 去撤已撤的旧单失败 → 真单被拒单且滞留柜台）。
+        # 未来时间戳（超出时钟容差）只可能来自跨日残留，一律排除。
+        ceiling = (now_shanghai() + timedelta(seconds=120)).strftime("%Y%m%d%H%M%S")
+        best = None
+        best_key = None
+        try:
+            for o in (self.get_orders() or []):
+                if o.get("symbol") != code or o.get("direction") != direction:
+                    continue
+                if volume and o.get("volume") != volume:
+                    continue
+                # 真机实证（2026-11-06）：_parse_orders 行只有「time」文本
+                # （17:46:16），insert_date/insert_time 仅 query_orders 的 Core
+                # 契约形状才有——只读这两个键会让 stamp 恒空、since 过滤把
+                # 真实新单全部误杀（774 已提交却被判 order not found）。
+                raw_date = o.get("insert_date")
+                raw_time = o.get("insert_time")
+                if not raw_date or not raw_time:
+                    raw_date, raw_time = self._split_time(o.get("time"))
+                stamp = "%s%s" % (raw_date or "", raw_time or "")
+                if stamp and stamp > ceiling:
+                    logger.warning(
+                        "ths order lookup skip future-stamped row (跨日残留): "
+                        "ref=%s stamp=%s ceiling=%s", o.get("order_id"), stamp, ceiling)
+                    continue
+                if floor and (not stamp or stamp < floor):
+                    continue
+                key = (stamp, self._ref_key(o.get("order_id")))
+                if best_key is None or key > best_key:
+                    best, best_key = o, key
+        except Exception:
+            pass
+        return best
+
+    def _find_order_retry(self, code: str, direction: str, volume: int,
+                          since: Optional[str] = None, attempts: int = 3,
+                          interval: float = 2.0):
+        """下单后回查委托列表（带重试，返回 _find_order 同形结果）。
+
+        2026-11-06 真机实证：提交成功瞬间 THS 委托表尚未刷新出新行，单次回查
+        返回 None → 真实已提交的单被误判 `order not found` 拒单；且 ref 未入
+        _known_refs，随后人工/超时撤单又被 unknown 守卫拒绝（710 滞留柜台）。
+        改为最多 attempts 次、每次间隔 interval 秒重读委托表。
+        """
+        attempts = max(1, int(attempts))
+        for i in range(attempts):
+            found = self._find_order(code, direction, volume, since=since)
+            if found is not None:
+                return found
+            if i + 1 < attempts:
+                logger.warning(
+                    "ths order lookup miss (attempt %d/%d): %s %s %d since=%s",
+                    i + 1, attempts, code, direction, volume, since or "-")
+                time.sleep(interval)
+        return None
+
+    def _read_position_rows(self, max_age: float = 0.0) -> Optional[list]:
+        """持仓表原始读回（UI 列形状：symbol/name/volume/available/cost/price/market_value）。
+
+        get_account/query_positions/get_positions 共用；价格快照同步进 _price_map。
+        返回 None = 读取失败（未连接 / UI 忙 / 表格复制为空），调用方必须与
+        「真空仓 []」区分——否则读失败会被当成 real=0 触发假对账告警。
+        max_age>0 时复用最近一次成功读回（同一快照内的多次调用免重复读表）。
+        """
+        if max_age > 0 and self._pos_rows_cache is not None:
+            if time.monotonic() - self._pos_rows_at <= max_age:
+                return self._pos_rows_cache
+        if not self._connected:
+            if not self.connect():
+                return None
+        # 跨引擎互斥（同进程）：读表含物理键鼠（切页点击 + Ctrl+A/C），必须与
+        # 另一通道的 UI 自动化串行。锁序恒定：_GRID_LOCK → UI_AUTO_LOCK。
+        if not self._gui_guard():
+            self._last_error = "持仓读取失败：UI 忙（等待 GUI 锁超时）"
+            return None
+        try:
+            if not self._ui_guard():
+                self._last_error = "持仓读取失败：UI 互斥等待超时（其它通道 UI 自动化占用中）"
+                return None
+            text = ""
+            sel_ok = False
+            t0 = time.monotonic()
+            try:
+                sel_ok = self._select_page("资金股票")
+                if not sel_ok:
+                    self._switch(self.TAB_POSITION)
+                text = self._copy_grid(required=("证券代码", "股票余额"))
+            finally:
+                self._release_ui_lock()
+        finally:
+            try:
+                self._GRID_LOCK.release()
+            except Exception:
+                pass
+        elapsed = time.monotonic() - t0
+        if elapsed > 10.0:
+            logger.warning("ths positions read slow: %.1fs (uia_switch=%s)",
+                           elapsed, sel_ok)
+        if not text:
+            self._last_error = "持仓读取失败：表格复制为空（验证码/切页/客户端异常）"
+            return None
+        rows = self._parse_position_rows(text)
+        self._price_map = {r["symbol"]: r["price"] for r in rows if r.get("price", 0) > 0}
+        self._pos_rows_at = time.monotonic()
+        self._pos_rows_cache = rows
+        self._last_error = ""
+        return rows
+
+    def get_orders(self, pin_cancel_page: bool = False) -> Optional[list]:
+        """委托表读回（剪贴板+OCR 流水线）。空结果重试一次——真机偶发
+        整表读空（剪贴板竞态），二次读取可恢复。
+
+        返回 None 表示**读失败**（未连接/互斥超时/复制为空），与「真空表 []」
+        严格区分：调用方若把读失败当空表，会把真实在途单当成「已消失」。
+
+        pin_cancel_page=True（撤单流程专用）：读回固定 F3「撤单」页语义——
+        默认读回优先 UIA 切「当日委托」页（含全部委托），会把 UI 漂走，
+        撤单流程的可撤列表索引与撤后验证都需要撤单页。
+        """
+        def _read():
+            if pin_cancel_page:
+                return self._read_orders_once(pin_cancel_page=True)
+            return self._read_orders_once()
+
+        rows = _read()
+        if not rows:
+            time.sleep(1.0)
+            rows = _read()
+        return rows
+
+    def _read_orders_once(self, pin_cancel_page: bool = False) -> Optional[list]:
+        if not self._connected:
+            if not self.connect():
+                return None
+        # 跨引擎互斥（同进程）：读表含切页点击 + Ctrl+A/C 物理键鼠。
+        # 锁序恒定：_GRID_LOCK → UI_AUTO_LOCK。
+        if not self._gui_guard():
+            return None
+        try:
+            if not self._ui_guard():
+                logger.warning("ths orders read skipped: UI 互斥等待超时")
+                return None
+            t0 = time.monotonic()
+            try:
+                # 「当日委托」页含全部当日委托（含已成交/已撤）；F3「撤单」页
+                # 可能只显示可撤单，缺失已成交单会导致 backfill 漏成交。
+                # pin_cancel_page=True 反转该优先级（撤单流程专用，见 get_orders）。
+                if pin_cancel_page:
+                    self._switch(self.TAB_CANCEL)
+                elif not self._select_page("当日委托"):
+                    # UIA 切页失败才退 F3：该页可能过滤掉已成交委托，deals
+                    # 回填会漏成交并把已成交单一直挂成在途（直到超时收割）。
+                    # 降级仍继续读（好过完全无数据），但必须留痕可排查。
+                    logger.warning("同花顺 UIA 切「当日委托」失败，降级 F3 撤单页"
+                                   "（可能缺失已成交委托）")
+                    self._last_error = "切页失败：已降级 F3 撤单页（可能漏已成交单）"
+                    self._switch(self.TAB_CANCEL)
+                text = self._copy_grid(required=("委托时间", "合同编号"))
+            finally:
+                self._release_ui_lock()
+        finally:
+            try:
+                self._GRID_LOCK.release()
+            except Exception:
+                pass
+        elapsed = time.monotonic() - t0
+        if elapsed > 10.0:
+            logger.warning("ths orders read slow: %.1fs (pin_cancel=%s)",
+                           elapsed, pin_cancel_page)
+        if not text:
+            # 读失败（复制为空/验证码未解/切页失败）≠ 真空表：返回 None，
+            # 调用方据此重试或跳过本轮，不得当成「无委托」。
+            logger.warning("ths orders copy empty (read failed, pin_cancel=%s)",
+                           pin_cancel_page)
+            return None
+        return self._parse_orders(text)
+
+    def _read_fund_values(self) -> dict:
+        """读 F4 页静态标签后的数值（标签/数值成对，后出现的面板覆盖前面的）。"""
+        if self._win is None:
+            return {}
+        try:
+            texts = [
+                (s.window_text() or "").strip()
+                for s in self._win.descendants(class_name="Static")
+            ]
+        except Exception:
+            return {}
+        out: dict = {}
+        i = 0
+        while i < len(texts):
+            if texts[i] not in self._FUND_LABELS:
+                i += 1
+                continue
+            # 两种版式：顶部「标签组 + 数值组」按位置一一对应；底部「标签/数值」交替。
+            labels = []
+            j = i
+            while j < len(texts) and texts[j] in self._FUND_LABELS:
+                labels.append(texts[j])
+                j += 1
+            values = []
+            k = j
+            while (k < len(texts) and len(values) < len(labels)
+                   and self._NUM_RE.match(texts[k])):
+                values.append(self._f(texts[k]))
+                k += 1
+            if len(values) == len(labels):
+                for label, value in zip(labels, values):
+                    out[self._FUND_LABELS[label]] = value
+                i = j
+            else:
+                # 组内数值缺失：退化为「下一个数值即本标签值」（交替版式）。
+                for nxt in texts[i + 1:i + 10]:
+                    if self._NUM_RE.match(nxt):
+                        out[self._FUND_LABELS[texts[i]]] = self._f(nxt)
+                        break
+                i += 1
+        return out
+
+    def get_account(self) -> Optional[list]:
+        try:
+            # 与紧随其后的资金字段读取同页，5s 内复用持仓行（快照链路省一次
+            # ~6-10s 的复制验证码成本；资金字段仍每次现读）。
+            positions = self._read_position_rows(max_age=5.0)
+        except Exception:  # noqa: BLE001
+            positions = None
+        if positions is None:
+            # 读失败 ≠ 空仓：不能返回全 0 资产，调用方按「本轮跳过」处理。
+            return None
+        total_mv = sum(float(p.get("market_value") or 0) for p in positions)
+        funds = self._read_fund_values()
+        if not funds:
+            # 资金标签一个都没读到（F4 未就绪/OCR 失败）≠ 零资产：返回 None
+            # 让调用方跳过本轮，绝不退化成「持仓市值 = 总资产」的假数字。
+            self._last_error = "资金字段读取失败（F4 资金标签未识别）"
+            return None
+        available = funds.get("available")
+        total_asset = funds.get("total_asset")
+        if total_asset is None:
+            # 缺总资产列时用「现金 + 市值」补算，但现金部分必须真读到：
+            # 只有市值能读到时补算结果就是市值，属于假数字，宁可返回 None。
+            cash = funds.get("balance")
+            if cash is None:
+                if available is not None or funds.get("frozen") is not None:
+                    cash = (available or 0) + (funds.get("frozen") or 0)
+            if cash is None:
+                self._last_error = "资金字段读取不完整（缺总资产/资金余额/可用金额）"
+                return None
+            mv = funds.get("market_value")
+            total_asset = (total_mv if mv is None else float(mv)) + cash
+        return [{
+            "available": available,
+            "total_asset": total_asset,
+            "market_value": funds.get("market_value") or total_mv,
+            "balance": funds.get("balance"),
+            "frozen": funds.get("frozen"),
+        }]
+
+    def query_positions(self) -> Optional[list]:
+        try:
+            # 5s 内复用同一份持仓行：引擎 60s 账户快照与 /positions 读回常常
+            # 相邻触发，各自读表要白付一次 6-10s GUI+验证码成本（真机实证
+            # /positions 冷启动 16.6s 含与快照的重复读表）。
+            rows = self._read_position_rows(max_age=5.0)
+        except Exception:  # noqa: BLE001
+            logger.exception("同花顺持仓读取异常")
+            self._last_error = "持仓读取异常"
+            return None
+        if rows is None:
+            return None
+        out = []
+        for r in rows:
+            code = str(r.get("symbol") or "")
+            if not self._CODE_RE.match(code):
+                continue
+            exch = self._exchange_for(code)
+            avail = r.get("available")
+            if avail is None:  # 无可用列才回退持仓量；0 是合法的 T+1 锁定值
+                avail = r.get("volume") or 0
+            out.append({
+                "instrument": code,
+                "exchange": exch,
+                "volume": int(r.get("volume") or 0),
+                "available": int(avail),
+                "cost": float(r.get("cost") or 0),
+                "price": float(r.get("price") or 0),
+                "name": r.get("name") or "",
+            })
+        return out
+
+    def get_positions(self) -> Optional[list]:
+        """通用形状持仓（与 TdxTqDispatcher.get_positions 同形状，供外部持仓分级）。
+
+        UI 原始读回归一：6 位代码按首位推断交易所补后缀；
+        market_value 用 UI 市价 × 余额计算（UI 原始行的市值列不透传）。
+        读取失败返回 None（与真空仓 [] 区分）。
+        """
+        rows = self.query_positions()
+        if rows is None:
+            return None
+        out = []
+        for r in rows:
+            code = str(r.get("instrument") or "")
+            if not self._CODE_RE.match(code):
+                continue
+            vol = int(r.get("volume") or 0)
+            out.append({
+                "symbol": "%s.%s" % (code, self._exchange_for(code)),
+                "volume": vol,
+                "available": int(r.get("available") or 0),
+                "cost": float(r.get("cost") or 0),
+                "market_value": round(float(r.get("price") or 0) * vol, 2),
+            })
+        return out
+
+    def query_account(self) -> Optional[list]:
+        try:
+            acc = self.get_account()
+        except Exception:  # noqa: BLE001
+            return None
+        return acc
+
+    def query_orders(self, order_id: Optional[str] = None) -> list:
+        """委托表 → Core /orders 形状（source=BRIDGE，remark 恒空）。
+
+        THS 委托表没有可回写的 remark，Core 的 remark 精确认领路径必然落空；
+        这里显式返回 remark=""，配合 ``supports_remark=False`` 让状态机走
+        代码+方向+数量+插入时间窗的 legacy 模糊匹配。order_ref=合同编号。
+        """
+        try:
+            orders = self.get_orders()
+        except Exception as e:
+            raise BridgeUnavailableError("同花顺委托表读取失败：%s" % e) from e
+        if orders is None:
+            # 读失败不能返回 []：状态机会把「表里查不到该 ref」当成已撤单，
+            # 从而把真实在途单收敛成 canceled（2026-11-07 排查确认）。
+            raise BridgeUnavailableError(
+                "同花顺委托表读取失败：%s"
+                % (self._last_error or "未连接/互斥超时/复制为空"))
+        out = []
+        for o in orders:
+            ref = str(o.get("order_id") or "").strip()
+            if not ref:
+                continue
+            code = str(o.get("symbol") or "")
+            if not self._CODE_RE.match(code):
+                continue
+            volume = int(o.get("volume") or 0)
+            filled = int(o.get("filled_volume") or 0)
+            cancelled = int(o.get("cancelled_volume") or 0)
+            insert_date, insert_time = self._split_time(o.get("time"))
+            out.append({
+                "source": "BRIDGE",
+                "remark": "",
+                "order_ref": ref,
+                "instrument": code,
+                "exchange": self._exchange_for(code, o.get("market")),
+                "direction": 49 if o.get("direction") == "sell" else 48,
+                "volume": volume,
+                "traded_volume": filled,
+                "filled_volume": filled,
+                "price": float(o.get("price") or 0),
+                "insert_date": insert_date,
+                "insert_time": insert_time,
+                "status": self._order_status_code(
+                    o.get("note") or "", filled, volume, cancelled),
+            })
+        return out
+
+    def query_deals(self, order_id: Optional[str] = None) -> list:
+        """由委托表「成交数量/成交均价」合成成交回报（当日累计值）。
+
+        Core 的 backfill_order 按 order_ref 聚合、用累计量覆盖 filled_quantity，
+        因此这里直接返回累计成交行即可；分批成交在下一次轮询会自然收敛。
+        佣金/印花税不在委托表暴露，按 0 记（与 QMT 桥首期口径一致）。
+        """
+        try:
+            orders = self.get_orders()
+        except Exception as e:
+            raise BridgeUnavailableError("同花顺委托表读取失败：%s" % e) from e
+        if orders is None:
+            # 同上：读失败 ≠ 无成交，必须让调用方跳过本轮而不是收敛成「无成交」。
+            raise BridgeUnavailableError(
+                "同花顺委托表读取失败：%s"
+                % (self._last_error or "未连接/互斥超时/复制为空"))
+        out = []
+        for o in orders:
+            ref = str(o.get("order_id") or "").strip()
+            filled = int(o.get("filled_volume") or 0)
+            if not ref or filled <= 0:
+                continue
+            code = str(o.get("symbol") or "")
+            if not self._CODE_RE.match(code):
+                continue
+            price = float(o.get("trade_price") or 0) or float(o.get("price") or 0)
+            if price <= 0:
+                continue
+            trade_date, trade_time = self._split_time(o.get("time"))
+            out.append({
+                "order_ref": ref,
+                "remark": "",
+                "instrument": code,
+                "exchange": self._exchange_for(code, o.get("market")),
+                "direction": 49 if o.get("direction") == "sell" else 48,
+                "volume": filled,
+                "price": price,
+                "amount": price * filled,
+                "commission": 0,
+                "stamp_duty": 0,
+                "trade_date": trade_date,
+                "trade_time": trade_time,
+            })
+        return out
+
+    def query_calendar(self) -> list:
+        """权威交易日历经 TdxTqDispatcher（get_trading_dates 优先、日线反推兜底），
+        失败 [] 走 fail-open。"""
+        from .tdx_tq_dispatcher import TdxTqDispatcher
+        return TdxTqDispatcher().query_calendar()
+
+    def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
+        """行情复用 Core 同进程内嵌的 TQ（通达信）模块。
+
+        同花顺只负责交易执行，不提供行情；BarPoller 需要 stime/OHLCV 形状。
+        TQ 返回 {field: DataFrame(index=时间, columns=[code])}，这里转成 bar dict。
+        """
+        text = str(code or "").strip()
+        code6 = re.sub(r"\D", "", text)[:6]
+        if len(code6) != 6:
+            return []
+        tq_code = text if "." in text else "%s.%s" % (
+            code6, self._exchange_for(code6))
+        try:
+            from core.tq.data import TQData
+            raw = TQData().get_history_raw(
+                [tq_code], [period], count=max(int(count or 10), 2))
+        except Exception as e:
+            self._last_error = "quote unavailable: %s" % e
+            return []
+        block = raw.get(period) or {}
+        close = block.get("Close")
+        if close is None or getattr(close, "empty", True):
+            return []
+        if tq_code not in getattr(close, "columns", []):
+            return []
+
+        def _value(field: str, ts) -> float:
+            frame = block.get(field)
+            if frame is None:
+                return 0.0
+            try:
+                return float(frame.at[ts, tq_code])
+            except Exception:
+                return 0.0
+
+        bars = []
+        for ts in close.index:
+            try:
+                stime = ts.strftime("%Y%m%d%H%M%S")
+            except Exception:
+                digits = re.sub(r"\D", "", str(ts))
+                stime = digits[:14] if len(digits) >= 14 else ""
+            if len(stime) != 14:
+                continue
+            bars.append({
+                "stime": stime,
+                "open": _value("Open", ts),
+                "high": _value("High", ts),
+                "low": _value("Low", ts),
+                "close": _value("Close", ts),
+                "volume": _value("Volume", ts),
+                "amount": _value("Amount", ts),
+            })
+        return bars
+
+    def check_price_limit(self, stock_code: str, direction: str, price) -> Optional[str]:
+        """涨跌停前置校验委托 TdxTqDispatcher（与 query_calendar/query_quote 同模式）。
+
+        引擎按 price_limit_check_enabled 配置门控调用；返回拒绝原因文案，None=通过。
+        """
+        from .tdx_tq_dispatcher import TdxTqDispatcher
+        return TdxTqDispatcher().check_price_limit(stock_code, direction, price)
+
+    # ---------------- 下单（双模式） ----------------
+
+    def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
+        """file_builtin：指令写入交接文件秒回 None（内置执行器异步执行）；
+        direct：同步执行 UI 自动化（现行为）。"""
+        if self.execute_mode == "file_builtin":
+            return self._place_order_via_file(order)
+        # 跨引擎 UI 互斥由 _execute_via_ui 内两段式持锁负责（4s 价格跟随等待
+        # 与回查在锁外），此处不再整段包 UI_AUTO_LOCK。
+        return self._execute_via_ui(order)
+
+    def _place_order_via_file(self, order: OrderEvent) -> Optional[TradeEvent]:
+        """file 模式 place_order：只做参数校验 + 指令入队，秒回 None。
+
+        不做 captcha/OCR 前置拒单——OCR 守卫在 _execute_via_ui（执行器）里判，
+        失败经 mark_done 落 rejected 回执。place_order 返回 None 时 LiveEngine
+        按 last_enqueued_order_id 识别「已入队」，订单保持 submitted 等回填。
+        """
+        code = re.sub(r"\D", "", str(order.stock_code))[:6]
+        if not self._CODE_RE.match(code):
+            raise BridgeOrderRejected(f"invalid code {order.stock_code}")
+        vol = int(order.quantity)
+        price = float(order.price) if order.price is not None else 0.0
+        if vol <= 0 or price <= 0:
+            raise BridgeOrderRejected(f"invalid order vol/price {vol}/{price}")
+        self._last_enqueued_order_id = None
+        oid = self.order_id(order)
+        entry = {
+            "order_id": oid,
+            "stock_code": order.stock_code,
+            "code": code,
+            "direction": order.trade_type.value,
+            "quantity": vol,
+            "price": price,
+            "strategy_id": order.strategy_id,
+            "portfolio_id": order.portfolio_id,
+            "signal_type": order.signal_type.value if order.signal_type else None,
+            "signal_name": order.signal_name,
+            "bar_time": order.bar_time.isoformat() if order.bar_time else None,
+        }
+        self._handoff.append_order(entry)
+        self._last_enqueued_order_id = oid
+        self._ensure_executor()
+        return None
+
+    @staticmethod
+    def _entry_to_order(entry: dict) -> OrderEvent:
+        """orders.jsonl 指令行 → OrderEvent（执行器重建用）。"""
+        raw_bt = entry.get("bar_time")
+        bar_time = None
+        if raw_bt:
+            try:
+                bar_time = datetime.fromisoformat(str(raw_bt))
+            except ValueError:
+                bar_time = None
+        price = entry.get("price")
+        return OrderEvent(
+            strategy_id=int(entry.get("strategy_id") or 0),
+            portfolio_id=int(entry.get("portfolio_id") or 0),
+            stock_code=str(entry.get("stock_code") or ""),
+            trade_type=TradeType(str(entry.get("direction") or "BUY").upper()),
+            signal_type=SignalType(str(entry.get("signal_type") or "OPEN")),
+            quantity=int(entry.get("quantity") or 0),
+            price=Decimal(str(price)) if price is not None else None,
+            bar_time=bar_time,
+            signal_name=str(entry.get("signal_name") or ""),
+        )
+
+    def _ensure_executor(self) -> None:
+        """惰性启动内置执行线程（daemon）：首次 place_order 或 connect 成功时。"""
+        if self.execute_mode != "file_builtin" or self._handoff is None:
+            return
+        with self._executor_lock:
+            t = self._executor_thread
+            if t is not None and t.is_alive():
+                return
+            self._executor_stop.clear()
+            t = threading.Thread(
+                target=self._executor_loop, name="ths-file-executor", daemon=True)
+            self._executor_thread = t
+            t.start()
+
+    def _executor_loop(self) -> None:
+        """内置执行器节拍：每 execute_interval_seconds 消费一轮待执行指令。
+
+        UI 异常不杀线程（_execute_entry 全包）；读文件失败记 warning 下轮再试。
+        """
+        while not self._executor_stop.wait(self._execute_interval_seconds):
+            try:
+                pending = self._handoff.read_pending_orders()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ths file executor read pending failed: %s", e)
+                continue
+            for entry in pending:
+                if self._executor_stop.is_set():
+                    return
+                self._execute_entry(entry)
+
+    def _execute_entry(self, entry: dict) -> None:
+        """执行单条指令：成功 accepted（ref 记 _known_refs/_submit_times，批次 A
+        口径）/失败 rejected（_file_rejects + results 回执），均不抛出。"""
+        order_id = str(entry.get("order_id") or "")
+        try:
+            order = self._entry_to_order(entry)
+            # 跨引擎 UI 互斥由 _execute_via_ui 内两段式持锁负责（4s 价格跟随
+            # 等待与回查在锁外），此处不再整段包 UI_AUTO_LOCK。
+            self._execute_via_ui(order)
+        except (BridgeOrderRejected, BridgeUnavailableError) as e:
+            self._record_file_reject(order_id, entry, e)
+            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            return
+        except Exception as e:  # noqa: BLE001  UI 异常不杀执行线程
+            logger.warning("ths file executor error (order %s): %s", order_id, e)
+            self._record_file_reject(order_id, entry, e)
+            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            return
+
+        ref = str(self._last_submit_ref or "")
+        if ref:
+            self._known_refs.add(ref)
+            if ref not in self._submit_times:
+                self._submit_times[ref] = self._last_submit_time or (
+                    now_shanghai().strftime("%Y%m%d"),
+                    now_shanghai().strftime("%H%M%S"),
+                )
+        # 回执落盘必须在「UI 已报单成功」之后单独兜底：写失败若按执行失败处理，
+        # 会把真实在途单回执成 rejected → 下一根 bar 重下造成重复持仓。
+        self._mark_done_safe(order_id, {"status": "accepted", "ref": ref})
+
+    def _mark_done_safe(self, order_id: str, result: dict) -> None:
+        try:
+            self._handoff.mark_done(order_id, result)
+        except Exception:  # noqa: BLE001
+            logger.warning("ths handoff mark_done failed (order %s, %s)",
+                           order_id, result.get("status"), exc_info=True)
+
+    def _record_file_reject(self, order_id: str, entry: dict, exc: Exception) -> None:
+        """执行失败记账（带原始指令 entry 供引擎形状匹配）。"""
+        with self._rejects_lock:
+            self._file_rejects[str(order_id)] = {
+                "error": str(exc),
+                "ts": now_shanghai().isoformat(timespec="seconds"),
+                "entry": dict(entry or {}),
+            }
+
+    def execution_receipts(self) -> List[dict]:
+        """弹出执行失败回执（file_builtin 模式；单消费者=LiveEngine deals 轮询）。
+
+        引擎在记账锁内消费：按 order_id/entry 形状匹配在途单即时标 rejected
+        （工作台立即可见），不必等 180s expire。direct 模式无执行回执（恒 []）。
+        """
+        if self.execute_mode != "file_builtin":
+            return []
+        with self._rejects_lock:
+            if not self._file_rejects:
+                return []
+            items = list(self._file_rejects.items())
+            self._file_rejects.clear()
+        return [
+            {
+                "order_id": oid,
+                "status": "rejected",
+                "error": str(rec.get("error") or ""),
+                "ts": rec.get("ts"),
+                "entry": dict(rec.get("entry") or {}),
+            }
+            for oid, rec in items
+        ]
+
+    @property
+    def pending_receipt_count(self) -> int:
+        """待引擎消费的执行回执数（file_builtin 模式；direct 恒 0）。
+
+        供 EngineWatchdog 的 ths ``execution_stalled`` 探针判定「results 有新增
+        但引擎长时间没消费」；orders 积压行数与最老行等待秒数由探针直接读
+        orders.jsonl + cursor.json 得出，不在此重复统计。
+        """
+        if self.execute_mode != "file_builtin":
+            return 0
+        with self._rejects_lock:
+            return len(self._file_rejects)
+
+    @classmethod
+    def _clamp_qty(cls, vol: int, auto_qty, code: str, is_buy: bool) -> Optional[int]:
+        """数量钳制（对齐 project2）：min(引擎目标, THS 实时可买/可卖) + 板块整手。
+
+        - auto_qty == 0 → None（THS 按当前价算的可买/可卖为 0：真实资金/持仓
+          不足，拒单——柜台实时约束，零延迟）；
+        - auto_qty is None → 读不到（控件非焦点等）→ 引擎量按板块整手兜底；
+        - auto_qty > 0 → min(vol, auto_qty)，BUY 按板块整手（科创板 200）取整，
+          SELL 不取整手（A 股允许零股卖出）；取整后 ≤0 → None。
+        """
+        from .market_rules import lot_size_for_board
+        lot = lot_size_for_board(code)
+        if auto_qty is not None:
+            try:
+                auto = int(auto_qty)
+            except (TypeError, ValueError):
+                auto = None
+            if auto == 0:
+                return None
+            if auto and auto > 0:
+                vol = min(vol, auto)
+        if is_buy:
+            return (vol // lot) * lot or None
+        return vol
+
+    def _clipboard_copy_float(self) -> Optional[float]:
+        """Ctrl+C 读当前焦点控件内容 → float（THS 跟出价/可买量读取）。"""
+        try:
+            self.kb_send("^c")
+            time.sleep(0.15)
+            text = str(pyperclip.paste() or "").strip().replace(",", "")
+            return float(text)
+        except Exception:
+            return None
+
+    def _clipboard_copy_int(self) -> Optional[int]:
+        val = self._clipboard_copy_float()
+        try:
+            return int(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
+        """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。
+
+        connect 守卫 / 验证码 OCR 守卫 / _gui_guard / F1F2 切页 / **鼠标点击进字段（真机校准偏移）+ kb_send 键入**——代码框
+        「输入区左起 8px」（中心点会点到下拉按钮）、价格/数量中心点击；键入
+        全程 kb_send（_key 的 _focus() 会打掉字段焦点、Timings.fast() 会丢
+        字符，均已规避）。
+        确认框 / _find_order 回查 / 合成 TradeEvent；成交时序由回填负责。
+        跨引擎 UI 互斥为**两段式持锁**：切页+键入代码一段、读价+键入+提交一段，
+        中间 4s 价格跟随等待与末尾回查都在锁外（单次占锁 8–10s）。
+        """
+        self._last_submit_ref = ""
+        self._last_submit_time = ("", "")
+        if not self._connected:
+            if not self.connect():
+                raise BridgeUnavailableError("ths ui not connected")
+        code = re.sub(r"\D", "", str(order.stock_code))[:6]
+        if not self._CODE_RE.match(code):
+            raise BridgeOrderRejected(f"invalid code {order.stock_code}")
+        vol = int(order.quantity)
+        price = float(order.price) if order.price is not None else 0.0
+        if vol <= 0 or price <= 0:
+            raise BridgeOrderRejected(f"invalid order vol/price {vol}/{price}")
+        if not self._captcha_ocr:
+            # 下单后必须复制委托表回查合同编号；THS 复制会弹验证码，
+            # OCR 未启用时宁可拒单，也不能先发单再因查不到而误报失败。
+            raise BridgeUnavailableError(
+                "ths ui captcha_ocr disabled: cannot verify order after submit")
+        if self._get_ocr_engine() is None:
+            raise BridgeUnavailableError(
+                "ths ui OCR unavailable: cannot verify order after submit")
+        if not self._gui_guard():
+            raise BridgeUnavailableError("ths ui busy")
+        submit_stamp = ""
+        confirmed = False
+        try:
+            # Timings.fast()（connect 时启用）把 SendInput 间隔压到 0ms——真机
+            # 实测自绘控件丢键入事件（代码/价格零像素变化、数量偶然成功）。
+            # 键入前恢复默认时序，操作完由下次 connect 再加速。
+            if timings is not None:
+                try:
+                    timings.Timings.defaults()
+                except Exception:
+                    pass
+            # ---- 第一段（持跨引擎 UI 互斥）：切页 + 键入代码 ----
+            # 4s 价格跟随等待与委托表回查都在锁外：单次占锁压到 8–10s，避免
+            # 双引擎并行时长期饥饿 TDX 的 5s 确认预算。_GRID_LOCK 仍整段持有
+            # （本通道读表线程不许在间隙切页，否则落点漂移）。
+            if not self._ui_guard():
+                raise BridgeUnavailableError(
+                    "ths 下单 UI 互斥等待超时（其它通道 UI 自动化占用中）")
+            try:
+                if not self._switch(
+                        self.TAB_BUY if order.trade_type.value == "BUY"
+                        else self.TAB_SELL):
+                    raise BridgeUnavailableError(
+                        "ths 下单页切换失败（功能键与 UIA 均未命中）")
+                # 键入三要素（真机像素差异扫描/焦点探针/整窗 OCR 实证）：
+                # 1) 代码框=「输入区+下拉按钮」组合——点击必须落在输入区**左起 8px**
+                #    （中心点会点到下拉按钮、键入丢失）；价格/数量中心点击即可。
+                # 2) _key 每次先 _focus() 重置主窗口焦点打掉字段焦点、Timings.fast()
+                #    丢字符——键入用 kb_send（SendInput 直发焦点控件）+ defaults 时序。
+                # 3) 字段定位：UIA control_id 代码=1032、价格=1033、数量=1034。
+                uia_win = self._uia_window()
+                if uia_win is None:
+                    raise BridgeUnavailableError("ths UIA backend unavailable")
+                code_f = self._uia_field(uia_win, "code")
+                price_f = self._uia_field(uia_win, "price")
+                vol_f = self._uia_field(uia_win, "quantity")
+                missing = [k for k, f in
+                           (("code", code_f), ("price", price_f), ("quantity", vol_f))
+                           if f is None]
+                if missing:
+                    raise BridgeUnavailableError(
+                        "ths 下单页字段未定位（UIA control_id=%s）: %s"
+                        % (self._ORDER_FIELD_IDS, ",".join(missing)))
+                self._click_field(code_f, left_offset=8)
+                # 自绘字段 ^a 全选不可靠（残留致小数位异常→THS 弹「小数部分应为
+                # 3 位」校验框）——清空改 {END}+连发退格
+                self.kb_send("{END}")
+                self.kb_send("{BACKSPACE}" * 12)
+                self.kb_send(code)
+            finally:
+                self._release_ui_lock()
+            # 真机实证（委托价格 4.415 ≠ 键入 4.153）：代码键入后 THS 异步用
+            # 最新价覆盖价格框——必须等自动填充完成再改价格，否则键入价被覆盖。
+            # 该等待不碰键鼠，放在 UI_AUTO_LOCK 之外让 TDX 有窗口进来。
+            time.sleep(self._PRICE_FOLLOW_WAIT)
+            # ---- 第二段（重新持锁）：重锚代码框 → 读价/钳量 → 键入 → 提交 ----
+            if not self._ui_guard():
+                raise BridgeUnavailableError(
+                    "ths 下单 UI 互斥等待超时（其它通道 UI 自动化占用中）")
+            try:
+                # 释放/重取锁的间隙焦点可能被抢占：先点回代码框输入区再 TAB。
+                self._click_field(code_f, left_offset=8)
+                self.kb_send("{END}")
+                # 数量读回钳制（对齐 project2）：Tab 到价格框读 THS 跟出价（日志），
+                # 再 Tab 到数量框读 THS 实时可买/可卖量 → min(引擎目标, 实时可量)
+                # 按板块整手钳制——柜台实时约束，消除快照资金口径的时效差。
+                auto_price = None
+                auto_qty = None
+                try:
+                    self.kb_send("{TAB}")
+                    time.sleep(0.2)
+                    auto_price = self._clipboard_copy_float()
+                    logger.info(
+                        "ths auto price=%s (engine price=%s)",
+                        auto_price, float(price) if price else None)
+                    self.kb_send("{TAB}")
+                    time.sleep(0.2)
+                    auto_qty = self._clipboard_copy_int()
+                    logger.info(
+                        "ths auto qty=%s (engine target=%d)", auto_qty, vol)
+                except Exception:
+                    auto_qty = None
+                clamped = self._clamp_qty(vol, auto_qty, code,
+                                          order.trade_type.value == "BUY")
+                if clamped is None:
+                    raise BridgeOrderRejected(
+                        "THS 可买/可卖 = 0（真实资金/持仓不足）" if auto_qty == 0
+                        else "THS 数量钳制后不足一手")
+                if clamped != vol:
+                    logger.info(
+                        "ths qty clamped: engine=%d -> final=%d", vol, clamped)
+                vol = clamped
+                if self.ths_price_mode != "latest":
+                    # approval 模式：显式键入审批价（覆盖 THS 自动跟出的最新价）
+                    self._click_field(price_f)
+                    self.kb_send("{END}")
+                    self.kb_send("{BACKSPACE}" * 12)
+                    self.kb_send(str(price))
+                    time.sleep(0.3)
+                # latest 模式：不键价格——THS 已用最新价覆盖价格框（上方等待
+                # 即为此服务），委托以实时最新价报出
+                self._click_field(vol_f)
+                self.kb_send("{END}")
+                self.kb_send("{BACKSPACE}" * 12)
+                self.kb_send(str(vol))
+                time.sleep(0.3)
+                before = self._snapshot_hwnds()
+                # 记录本单提交时刻（同一台机器本地时钟=THS 委托时间），供回查
+                # 过滤历史同码/同向/同量旧单（含已撤单）。
+                submit_stamp = now_shanghai().strftime("%Y%m%d%H%M%S")
+                self.kb_send("{ENTER}")
+                time.sleep(1.5)
+                # 弹窗两轮处理：①确认框 ②迟到的校验弹窗（如「小数部分应为3位，
+                # 是否继续」→ 是(Y)/继续 放行；按钮清单含是(Y)/继续/确定/确认）
+                dlg_buttons = (self.CONFIRM_BUTTONS + self.CANCEL_CONFIRM_BUTTONS
+                               + ("继续",))
+                confirmed = self._confirm_dialog(before, dlg_buttons)
+                time.sleep(1.0)
+                late = self._confirm_dialog(before, dlg_buttons)
+                confirmed = confirmed or late
+            finally:
+                self._release_ui_lock()
+        except BridgeOrderRejected:
+            raise
+        except BridgeUnavailableError:
+            raise
+        except Exception as e:
+            raise BridgeOrderRejected(f"ths ui place order error: {e}")
+        finally:
+            try:
+                self._GRID_LOCK.release()
+            except Exception:
+                pass
+        if not confirmed:
+            # _confirm_dialog 在「没有新增弹窗」时返回 True（客户端免确认设置直接
+            # 报单也走这里），因此走到本分支只可能是弹窗仍在（点击/回车都失败），
+            # 此时委托未提交，直接拒单是正确的；不要回查委托表——那会在模态弹窗
+            # 打开的情况下继续发切页点击/按键。
+            raise BridgeOrderRejected("order confirm dialog not confirmed")
+        found = self._find_order_retry(code, order.trade_type.value.lower(), vol,
+                                       since=submit_stamp or None)
+        if found is None:
+            # 三次回查（间隔 2s）仍未命中：单可能已提交但委托表未刷新，须让人
+            # 工核对柜台——文案带上回查次数，避免被当成普通拒绝忽略。
+            raise BridgeOrderRejected(
+                "order not found in order list after submit"
+                "（已提交但回查 3 次未命中，请核对柜台是否有滞留委托）")
+        ref = str(found.get("order_id") or "")
+        if ref:
+            self._last_submit_ref = ref
+            self._last_submit_time = self._split_time(found.get("time"))
+            # direct 模式唯一入基线处（file 执行器 _execute_entry 另有幂等 add）：
+            # 不入 _known_refs 则 direct 模式 cancel_order 的 unknown 守卫恒拒
+            # → 超时撤单/价格闭环撤单全部失效。
+            self._known_refs.add(ref)
+        # 委托价格校验闭环（真机实证：键入价被 THS 异步填充覆盖 → 委托价 4.415
+        # ≠ 键入 4.153）：柜台委托价格 ≠ 审批价 → 自动撤单 + 拒单（调用方重试），
+        # 防止以非审批价格真实成交。容差 0.001（ETF 3 位小数/股票 2 位均覆盖）。
+        # latest 模式豁免：委托价=实时最新价本就 ≠ 审批价，按实际委托价记账。
+        found_price = float(found.get("price") or 0)
+        if (self.ths_price_mode != "latest" and found_price > 0
+                and abs(found_price - price) > 0.001):
+            if not ref:
+                raise BridgeOrderRejected(
+                    "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖，无合同号可撤）"
+                    % (found_price, price))
+            # 自身 ref 豁免 unknown 守卫（语义正确：该单是本平台下的）——file 模式
+            # _execute_via_ui 返回后才入 _known_refs、direct 模式刚由上方补记前
+            # 未必覆盖（异常路径），撤单前显式补记防守卫误拒 → 错价单残留柜台。
+            self._known_refs.add(ref)
+            canceled = False
+            try:
+                canceled = bool(self.cancel_order(ref, code))
+            except Exception as e:  # noqa: BLE001 — 撤单失败升级文案，不吞拒单
+                logger.warning("ths price-mismatch cancel error: %s (%s)", ref, e)
+            if canceled:
+                raise BridgeOrderRejected(
+                    "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖），已自动撤单"
+                    % (found_price, price))
+            raise BridgeOrderRejected(
+                "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖）；"
+                "自动撤单失败，请人工处理（合同号 %s）" % (found_price, price, ref))
+        # latest 模式按实际委托价记账（≈最新价）；approval 按审批价
+        if self.ths_price_mode == "latest" and found_price > 0:
+            fill_price = Decimal(str(found_price))
+        else:
+            fill_price = order.price if order.price is not None else Decimal(str(price))
+        amount = fill_price * vol
+        return TradeEvent(
+            strategy_id=order.strategy_id,
+            portfolio_id=order.portfolio_id,
+            stock_code=order.stock_code,
+            trade_type=order.trade_type,
+            price=fill_price,
+            quantity=vol,
+            amount=amount,
+            commission=Decimal("0"),
+            stamp_duty=Decimal("0"),
+            trade_time=order.bar_time or datetime.now(),
+            signal_type=order.signal_type,
+            signal_name=order.signal_name,
+        )
+

@@ -1,4 +1,4 @@
-import axios from 'axios'
+﻿import axios from 'axios'
 
 export const api = axios.create({ baseURL: '/api' })
 
@@ -65,6 +65,8 @@ export interface FormulaItem {
   name: string
   content: string
   formula_count: number
+  engine: string  // tq=通达信计算（默认）/ builtin=内置公式子集解释器（仅回测）
+  no_leak_cross?: boolean  // 批次 9a：跨周期引用无泄露开关（默认 false=TDX 语义）
   created_at: string | null
   updated_at: string | null
   signals: FormulaSignalItem[]
@@ -92,6 +94,7 @@ export interface PortfolioItem {
   adaptive_slippage_enabled: boolean  // #4 自适应滑点（回测，默认关）：冲击随订单量占成交量比例上浮
   slippage_impact_coef: number        // 滑点冲击系数（默认 0.10，封顶滑点 10%）
   position_sizing: string             // W2 仓位模型：dynamic（默认）|fixed
+  daily_loss_basis: string            // 日内亏损熔断分母：equity（默认，昨收净值）|initial（初始资金）
   cash_enhance_enabled: boolean       // W2 现金管理增强（预留，默认关）
   cash_enhance_equity_threshold: number | null
   cash_enhance_position_ratio_threshold: number | null
@@ -460,6 +463,7 @@ export interface BacktestDetailItem {
   crisis_alpha: BacktestCrisisAlphaItem | null
   market_regime: BacktestMarketRegimeItem | null
   robustness: BacktestRobustnessItem | null  // 稳健性检验（年度/3年滚动/集中度/样本内外）
+  persistence: PersistenceAnalysis | null  // 持续性检验（阿尔法衰减 vs 风格钟摆）
   acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
 }
 
@@ -490,10 +494,35 @@ export interface BacktestRobustnessItem {
     rolling_3y: { start: string; end: string; cagr: number | null; max_drawdown: number | null }[]
     concentration: {
       total_realized_pnl: number
-      top: { code: string; pnl: number; share: number }[]
-      top20_share: number
+      // 占比字段在毛利/净利 <= 0 时为 null（避免负占比误导）；旧 payload 缺这些键
+      top: { code: string; pnl: number; share: number | null;
+             share_gross?: number | null; share_net?: number | null }[]
+      top20_share: number | null
+      gross_profit?: number
+      gross_loss?: number
+      top20_share_gross?: number | null
+      // 期末未平仓：未实现盈亏单列，不计入已实现净利
+      unrealized?: {
+        total_pnl: number
+        cost: number
+        market_value: number
+        rows: { code: string; quantity: number | null; cost: number;
+                market_value: number; pnl: number; share_net: number | null }[]
+      }
       profitable_stocks: number
       total_stocks: number
+      // 单笔（FIFO 平仓批次）贡献分布
+      lots?: {
+        count: number
+        winners: number
+        top: { rank: number; code: string; buy_date: string | null; sell_date: string | null;
+               quantity: number; pnl: number;
+               share_gross: number | null; share_net: number | null }[]
+        cumulative: { n: number; pct_of_lots: number; pnl: number;
+                      share_gross: number | null; share_net: number | null }[]
+        hhi: number | null
+        effective_sources: number | null
+      }
     }
     oos: {
       split_year: string
@@ -502,6 +531,68 @@ export interface BacktestRobustnessItem {
       caveat?: string  // W5-O2 伪 OOS 明示（固定切分防时段崩塌，不防全样本调参）
     } | null
   } | null
+}
+
+// 持续性检验（阿尔法衰减 vs 风格钟摆）— 对齐 persistence_alpha.compute_persistence
+export interface PersistenceYearRow {
+  year: number
+  is_partial: boolean
+  trading_days?: number
+  nav_return: number | null
+  max_drawdown: number | null
+  sharpe: number | null
+  calmar: number | null
+  win_rate: number | null
+  profit_factor: number | null
+  turnover: number | null
+  cost_ratio: number | null
+  avg_position_utilization?: number | null
+  excess: Record<string, number | null>
+  bench_returns: Record<string, number | null>
+}
+export interface PersistenceRolling {
+  dates: string[]
+  strat_6m: (number | null)[]
+  strat_12m: (number | null)[]
+  bench_12m: (number | null)[]
+}
+export interface PersistenceBenchmarkMeta { code: string; name: string; is_main: boolean; available: boolean }
+export interface PersistenceSignal {
+  key: 'excess' | 'risk' | 'struct'
+  label: string
+  detail: string
+  status: 'bad' | 'mixed' | 'good' | 'na'
+  word: string
+}
+export interface PersistenceVerdict {
+  level: 'alpha_decay' | 'style_pendulum' | 'stable' | 'mixed' | 'insufficient'
+  reasons: string[]
+  summary: string
+  signals?: PersistenceSignal[]
+  window_years?: number[]
+  caveat: string
+}
+export interface PersistenceAnalysis {
+  status: string
+  error?: string | null
+  computed_at?: string | null
+  skipped_benchmarks?: string[]
+  data?: {
+    status: string
+    error: string | null
+    years: PersistenceYearRow[]
+    rolling: PersistenceRolling
+    benchmarks: PersistenceBenchmarkMeta[]
+    verdict: PersistenceVerdict
+  } | null
+}
+export async function recomputePersistenceAnalysis(id: number, benchmarkCode?: string) {
+  const res = await api.post<ApiResponse<PersistenceAnalysis>>(
+    `/backtest/records/${id}/persistence/recompute`,
+    null,
+    { params: benchmarkCode ? { benchmark_code: benchmarkCode } : undefined },
+  )
+  return res.data.data
 }
 
 export interface OosSegment {
@@ -557,6 +648,58 @@ export interface FormulaRequest {
   content: string
   signals: SignalItem[]
   formula_count: number  // 注入历史根数（公式级，默认 200）
+  engine: string  // tq（默认，原行为）/ builtin（内置引擎，仅回测）
+  no_leak_cross: boolean  // 批次 9a：跨周期引用无泄露开关（默认 false=TDX 语义）
+}
+
+// 语法预检（POST /formulas/precheck）— 对齐 tdx_formula.syntax_check 返回
+export interface PrecheckIssue {
+  rule: string  // future | realtime | data | index_only | unknown
+  level: string  // error | warning
+  name: string
+  line: number
+  col: number
+  message: string
+}
+
+export interface PrecheckResult {
+  ok: boolean
+  issues: PrecheckIssue[]
+  errors: string[]
+  outputs: string[]  // `:` 输出线名（供信号配置对照）
+}
+
+export async function precheckFormula(content: string) {
+  const res = await api.post<ApiResponse<PrecheckResult>>('/formulas/precheck', { content })
+  return res.data.data
+}
+
+// ---- 0016 信号标准化向导（POST /formulas/normalize-preview）----
+// 选源公式输出线 + 规则 → 生成新公式源码（`:` 线降级 `:=` + 尾部追加 ±1/±2/0 离散标识线）
+export interface NormalizePlan {
+  line: string
+  rule: 'cross_zero' | 'above_threshold' | 'map_values'
+  params: Record<string, unknown>
+}
+
+export interface NormOutputLine {
+  name: string
+  source_line: string
+  rule: string
+  expr: string
+  meaning: string  // 触发含义（说明 trigger_value 取值）
+}
+
+export interface NormalizePreviewResult {
+  new_content: string
+  output_lines: NormOutputLine[]
+  warnings: string[]
+}
+
+export async function normalizePreview(content: string, plans: NormalizePlan[]) {
+  const res = await api.post<ApiResponse<NormalizePreviewResult>>(
+    '/formulas/normalize-preview', { content, plans })
+  return res.data.data
 }
 
 export async function getFormulaDetail(id: number) {
@@ -617,6 +760,55 @@ export async function importTdxFormula(acCode: string) {
   return res.data.data
 }
 
+// ---- 1.3.1 公式试算（POST /formulas/test-run）：任选股票/周期/bar 数跑一遍公式 ----
+// 单条输出线的统计：n=参与计算 bar 数；ones=值=1 的次数（信号触发次数）；
+// last_values=末 3 根 bar 的输出值（字符串，保留原始精度）
+export interface TestRunLine {
+  n: number
+  ones: number
+  last_values: string[]
+}
+
+// 公式试算结果：按股票代码分组，每股下按输出线名给统计
+export interface TestRunResult {
+  results: Record<string, Record<string, TestRunLine>>
+  warning?: string  // 非致命告警（如个别股票无行情数据），顶部红字提示
+}
+
+export interface TestRunRequest {
+  content?: string         // 公式源码（可选——通达信导入公式平台库不存源码，留空走 formula_id 按名计算）
+  formula_id?: number      // content 为空时必填：平台公式 id（按名调通达信计算，与回测/实盘同路径）
+  stock_codes: string[]    // 股票代码（含后缀格式，如 000001.SZ）最多20 只
+  period: string           // 1m|5m|15m|30m|1h|1d|1w|1mon
+  count?: number           // bar 根数（默认 20）
+  dividend_type?: number   // 复权类型（默认 1=前复权）
+  formula_type?: number    // 公式类型（默认 0=技术指标）
+}
+
+export async function testRunFormula(req: TestRunRequest) {
+  const res = await api.post<ApiResponse<TestRunResult>>('/formulas/test-run', req)
+  return res.data.data
+}
+
+// ---- 1.3.1 通达信用户板块写入（POST /tdx/user-block）：全量替换板块成分股 ----
+export interface UserBlockRequest {
+  block_code: string       // 板块代码：由 block_name 确定性派生的 ASCII 码（utils/blockCode deriveBlockCode），同名同码保证幂等
+  block_name: string       // 板块显示名（用户输入的中文名）
+  stock_codes: string[]    // 成分股代码列表
+  show?: boolean           // 是否在通达信里显示该板块
+  mode?: 'replace' | 'append'  // replace=覆盖写（默认，后端先清空板块再写入）；append=追加（SDK 原生语义）
+}
+
+export interface UserBlockResult {
+  block_code: string
+  count: number  // 实际写入的股票数
+}
+
+export async function sendUserBlock(req: UserBlockRequest) {
+  const res = await api.post<ApiResponse<UserBlockResult>>('/tdx/user-block', req)
+  return res.data.data
+}
+
 export async function getPortfolios() {
   const res = await api.get<ApiResponse<PortfolioItem[]>>('/portfolios')
   return res.data.data
@@ -669,6 +861,7 @@ export interface PortfolioRequest {
   adaptive_slippage_enabled?: boolean  // #4 自适应滑点（默认关）
   slippage_impact_coef?: number  // (0,1]，冲击系数，默认 0.10
   position_sizing?: string  // W2: dynamic（默认）|fixed
+  daily_loss_basis?: string  // 日内亏损分母：equity（默认，昨收净值）|initial（初始资金）
   cash_enhance_enabled?: boolean
   cash_enhance_equity_threshold?: number | null
   cash_enhance_position_ratio_threshold?: number | null
@@ -724,6 +917,16 @@ export interface StrategyDetail {
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
   exposure_cap_enabled: boolean
+  max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
+  requote_enabled: boolean
+  requote_max_attempts: number
+  split_order_enabled: boolean
+  split_order_threshold: number
+  risk_timing: string  // next_day|immediate
+  signal_frequency?: string | null
+  signal_at?: string | null
+  signal_weekday?: number | null
+  signal_data_end?: string | null
 }
 
 export interface StrategyRequest {
@@ -751,6 +954,16 @@ export interface StrategyRequest {
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
   exposure_cap_enabled?: boolean
+  max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
+  requote_enabled?: boolean
+  requote_max_attempts?: number
+  split_order_enabled?: boolean
+  split_order_threshold?: number
+  risk_timing?: string  // next_day|immediate
+  signal_frequency?: string | null
+  signal_at?: string | null
+  signal_weekday?: number | null
+  signal_data_end?: string | null
 }
 
 // 独立子策略 CRUD（两层设计：组合下单独管理子策略）
@@ -796,6 +1009,8 @@ export interface BacktestRequest {
   volume_limit_enabled?: boolean                // 成交量约束 run 级覆盖（undefined=用组合默认）
   volume_limit_ratio?: number                   // (0,1]，run 级覆盖占比（undefined=用组合默认）
   equity_cap?: number                           // 容量上限 run 级覆盖，>0（undefined=用组合默认）
+  daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
+  daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
 }
 
 // C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）
@@ -1380,6 +1595,11 @@ export interface LivePositionItem {
   // 归属（组合策略/子策略）；旧数据/旧接口可能缺省
   portfolio_id?: number | null
   strategy_id?: number | null
+  // 来源：strategy=策略持仓（缺省按 strategy）/ external=账户原有持仓
+  source?: string
+  // 归属：pool=在组合股票池内 / fallback=不在池内、按兜底规则挂到首个组合；
+  // 旧数据/旧接口缺省时按 pool 降级（不显示徽标）
+  attribution?: 'pool' | 'fallback'
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {
@@ -1404,6 +1624,54 @@ export async function getLiveDecisions(sessionId: number) {
   return res.data.data
 }
 
+// ---- 预警信号（alert 模式）：live.session_signals ----
+// 字段对齐 live_service.serialize_signal；alert_status: sent|failed|skipped 等
+export interface LiveSignalItem {
+  id: number
+  portfolio_id: number
+  strategy_id: number
+  stock_code: string
+  period: string
+  bar_time: string | null
+  formula_name: string
+  signal_name: string
+  signal_type: string  // OPEN|ADD|REDUCE|CLOSE|RISK_*
+  trigger_value: number
+  price: string | null
+  execution_mode: string
+  status: string  // new|notified|...
+  alert_status: string | null  // sent|failed|skipped
+  alert_error: string | null
+  tdx_run_id: string | null
+  created_at: string | null
+  alerted_at: string | null
+}
+
+export interface LiveSignalData {
+  items: LiveSignalItem[]
+  total: number
+}
+
+export interface LiveSignalFilters {
+  strategy_id?: number
+  stock_code?: string
+  signal_type?: string
+  execution_mode?: string
+  alert_status?: string
+  start?: string  // ISO 时间
+  end?: string    // ISO 时间
+  limit?: number
+  offset?: number
+}
+
+export async function getLiveSignals(sessionId: number, filters: LiveSignalFilters = {}) {
+  const res = await api.get<ApiResponse<LiveSignalData>>(
+    `/live/sessions/${sessionId}/signals`,
+    { params: filters },
+  )
+  return res.data.data
+}
+
 // ---- #27: 实盘会话 CRUD/启停（LiveSessions.vue 曾原生 axios 直连）----
 // 列表对齐 live.py list_sessions serializer；启停/create 返回 {id, status}
 
@@ -1411,17 +1679,47 @@ export interface LiveSessionItem {
   id: number
   name: string
   mode: string  // simulation|live
+  engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
+  execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
+  engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
+  live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
   portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
+  reconcile_mismatches?: ReconcileMismatch[]  // 最近一次虚拟持仓 vs 桥实际对账差异（未运行 []）
 }
+
+// I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
+export interface ReconcileMismatch {
+  code: string
+  virtual: number
+  real: number
+  diff: number
+  // 本次差异的计算时点（ISO）；旧数据/旧接口可能缺省
+  computed_at?: string
+}
+
+// 实盘交易引擎：iquant(QMT 通道) / tdx(通达信TQ) / ths(同花顺UI自动化)
+export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'goldminer'
+
+// 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
+export type LiveExecutionMode = 'alert' | 'auto'
 
 export interface LiveSessionCreate {
   name: string
   mode: string
+  engine?: LiveEngineKey
+  execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
+  live_capital?: number | null  // 实盘资金基准（账户总资产，元）；空=null=用组合初始资金
+  signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
+}
+
+export async function getLiveSession(sessionId: number) {
+  const res = await api.get<ApiResponse<Record<string, any>>>(`/live/sessions/${sessionId}`)
+  return res.data.data
 }
 
 export async function getLiveSessions() {
@@ -1459,6 +1757,27 @@ export async function recoverLiveBreaker(sessionId: number, portfolioId: number)
 // ---- #27: 系统配置（SystemConfig.vue 曾原生 axios 直连）----
 // 对齐 core/config.py _defaults()；GET 全量返回、PUT 全量覆盖写
 
+export interface ThsUiConfig {
+  enabled: boolean
+  window_title: string
+  client_exe_path: string
+  driver: string
+  captcha_ocr: boolean
+  execute_mode: string             // file_builtin=文件内置执行器 | direct=直接执行
+  execute_interval_seconds: number // 内置执行器轮询指令文件间隔（秒）
+  work_dir: string                 // 交接目录（相对 main/ 解析），实际文件在 {work_dir}/{session_id}/
+  available?: boolean
+}
+
+export interface TqTradeConfig {
+  account: string
+  account_type: string
+  price_mode: string   // my|cage|latest|ztj|dtj
+  client_path: string
+  default_engine: string       // tdx|iquant|ths：新建实盘会话未显式选引擎时使用
+  cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
+}
+
 export interface SystemConfig {
   tdx_path: string
   iquant_path: string
@@ -1468,6 +1787,54 @@ export interface SystemConfig {
     simulation: { base_url: string }
     live: { base_url: string }
   }
+  goldminer: {
+    base_url: string
+    token: string
+    account_id: string
+  }
+  ths_ui: ThsUiConfig
+  tq_trade: TqTradeConfig
+}
+
+export interface LiveChannelEngine {
+  key: LiveEngineKey
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  label: string
+  configured: boolean
+  detail: string
+}
+
+export interface LiveChannelInfo {
+  engine: LiveEngineKey
+  active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  label: string
+  online: boolean | null
+  engine_running?: boolean  // 无运行引擎时为 false（此时 online=null，不做在线判定）
+  engines: LiveChannelEngine[]
+  ths_ui: ThsUiConfig
+  bridge: { simulation: string; live: string }
+  tq_trade?: { available: boolean; account: string; account_type: string; price_mode: string; client_path: string }
+}
+
+export interface ChannelTestResult {
+  ok: boolean
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  error?: string | null
+  window_title?: string
+  positions?: number
+  base_url?: string
+}
+
+export async function getLiveChannel(engine?: LiveEngineKey) {
+  const res = await api.get<ApiResponse<LiveChannelInfo>>('/live/channel', { params: engine ? { engine } : {} })
+  return res.data.data
+}
+
+export async function testLiveChannel(
+  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq', mode = 'simulation',
+) {
+  const res = await api.post<ApiResponse<ChannelTestResult>>('/live/channel/test', { channel, mode })
+  return res.data.data
 }
 
 export interface SystemStatus {

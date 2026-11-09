@@ -1,3 +1,4 @@
+import json
 import logging
 
 import pandas as pd
@@ -93,6 +94,110 @@ class TQData:
                             "name": b.get("BlockName")}
             return None
 
+    # --- TQ 1.3.1 轻量包装（试算/交易日历/涨跌停/自选股/退订/除权/批量） ---
+    # 最薄透传：不包大 try/except，fail-open 由调用方负责；仅 SDK 打印型失败
+    # 或测试契约要求的场景返回安全默认。
+
+    def get_trading_dates(
+        self, market: str = "SH", start: str = "", end: str = "",
+        strict: bool = False,
+    ) -> List[str]:
+        """交易日历，归一化为 ["YYYYMMDD", ...] 字符串列表。
+
+        探针实测（1.3.1）：market 传 'SH'（'SZ'/'1'/'0'/'' 均被 SDK 宽松接受，
+        返回同样结果）。SDK 失败打印并返回 []，异常默认归一为空列表；
+        strict=True 时异常原样 re-raise（REST 层据此区分失败与真空，
+        query_calendar 消费保持默认非 strict 不变）。
+        """
+        try:
+            with get_tdx_lock():
+                raw = get_tq().get_trading_dates(
+                    market=market, start_time=start, end_time=end) or []
+            return [str(d).strip() for d in raw if str(d).strip()]
+        except Exception:
+            if strict:
+                raise
+            return []
+
+    def get_zdt_data(self, stocks: List[str]) -> dict:
+        """涨跌停状态：{code: {ZDTStatusNow/ZDTStatusOri/FirstTimeZT/DT, ...}}。
+
+        仅状态无价格，原样透传 SDK 的 Value，不做价格推断；空列表短路不触 SDK。
+        """
+        if not stocks:
+            return {}
+        with get_tdx_lock():
+            return get_tq().get_zdt_data(list(stocks)) or {}
+
+    def ensure_sector(self, block_code: str, block_name: str) -> dict:
+        """创建自定义板块（已存在时 SDK 端不报错，返回带 ErrorId 的结果）。
+
+        SDK create_sector 返回 JSON 字符串（失败 None），解析为 dict 供调用方判断。
+        """
+        with get_tdx_lock():
+            raw = get_tq().create_sector(block_code=block_code, block_name=block_name)
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return {}
+        return {}
+
+    def delete_sector(self, block_code: str):
+        """删除自定义板块（配合 send_user_block 的追加语义实现覆盖写）。
+
+        薄透传：SDK delete_sector 返回 JSON 字符串或 dict（失败 None），原样
+        返回不解析——结果处理（best-effort 忽略）由调用方负责。
+        """
+        with get_tdx_lock():
+            return get_tq().delete_sector(block_code=block_code)
+
+    def send_user_block(
+        self, block_code: str, stocks: List[str], show: bool = False,
+    ) -> dict:
+        """添加自选股到板块（show=True 时客户端展示该板块）。"""
+        with get_tdx_lock():
+            return get_tq().send_user_block(
+                block_code=block_code, stock_list=list(stocks), show=show) or {}
+
+    def unsubscribe_bars(self, stocks: List[str]) -> None:
+        """退订行情（unsubscribe_hq）。空列表直接返回不触 SDK——SDK 对空列表
+        raise ValueError 并 close 连接，绝不能让它发生。"""
+        if not stocks:
+            return
+        with get_tdx_lock():
+            get_tq().unsubscribe_hq(list(stocks))
+
+    def get_divid_factors(
+        self, stock_code: str, start: str = "", end: str = "",
+    ) -> pd.DataFrame:
+        """除权除息数据；空代码短路返回空 DataFrame（SDK 同样返回空表）。"""
+        if not stock_code:
+            return pd.DataFrame()
+        with get_tdx_lock():
+            df = get_tq().get_divid_factors(stock_code, start_time=start, end_time=end)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    def get_market_snapshot_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量市场快照（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_market_snapshot_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
+
+    def get_stock_info_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量证券基础信息（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_stock_info_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
+
+    def get_more_info_batch(self, stocks: List[str], field_list: List[str]) -> dict:
+        """批量股票更多信息（备用透传，return_df=False 默认 dict）。"""
+        with get_tdx_lock():
+            return get_tq().get_more_info_batch(
+                stock_list=list(stocks), field_list=list(field_list)) or {}
+
     def get_history(
         self, stocks: List[str], periods: List[str],
         start: str = "", end: str = "",
@@ -123,7 +228,9 @@ class TQData:
 
     def get_all_stocks(self, market: str = "5") -> List[str]:
         tq = get_tq()
-        return tq.get_stock_list(market) or []
+        # tqcenter 非线程安全：与回测 worker 其它 SDK 调用同锁串行。
+        with get_tdx_lock():
+            return tq.get_stock_list(market) or []
 
     # --- TDX 底层调用 ---
     def _get_pools(self) -> List[dict]:
@@ -132,6 +239,10 @@ class TQData:
         SDK get_user_sector() 返回 [{"Code","Name"}]（大写首字母）。
         v1 曾用 get_sector_list（系统板块，587 个，非用户板块）且把 dict 当 str → 线上炸。
         """
+        # 调用方（get_stock_pools）已持 get_tdx_lock()。此处不能再取——
+        # _tdx_lock 是非重入 threading.Lock，同线程重入即自死锁（股票池接口整路卡死，
+        # 且锁永不释放会连带阻塞回测/实盘所有 TQ 调用）。私有 _load_history 等
+        # 同口径均假设调用方持锁。
         tq = get_tq()
         sectors = tq.get_user_sector() or []
         return [{"code": s["Code"], "name": s["Name"]} for s in sectors]
@@ -142,8 +253,10 @@ class TQData:
         SDK get_stock_list_in_sector(code, block_type=1, list_type=1) 返回
         [{"Code","Name"}]。必须传板块 Code（如 TQCS），传 Name 返回空。
         """
+        # 同上：调用方（get_pool_stocks）已持锁，此处不可重入取锁。
         tq = get_tq()
-        stocks = tq.get_stock_list_in_sector(pool_code, block_type=1, list_type=1) or []
+        stocks = tq.get_stock_list_in_sector(
+            pool_code, block_type=1, list_type=1) or []
         return [
             {"stock_code": s["Code"], "stock_name": s["Name"]}
             for s in stocks
@@ -178,8 +291,10 @@ class TQData:
                                 series[col] = df[col][code]
                         if series:
                             result[code][period] = pl.DataFrame(series)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 静默丢弃会让回测/试算少一只股票且不可复现——异常必须可见。
+                        logger.warning(
+                            "跳过行情构建失败股票 %s(period=%s)：%s", code, period, e)
         return result
 
     def _load_history_raw(
