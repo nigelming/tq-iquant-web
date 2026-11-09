@@ -1,0 +1,54 @@
+﻿# 创懿基金量化投资平台 —— 首次启动配置模板
+# 安装后首次运行会复制为 <数据根目录>\config.yaml，之后所有修改以该文件为准，
+# 本模板不会被覆盖。界面「系统设置」里也能改这些项。
+database:
+  sqlite_path: data/dev.db
+iquant_bridge:
+  # QMT 通道（股票账户，端口 8790）：simulation 与 live 两个模式位都指向 8790，
+  # 不使用信用账户腿（8791）
+  simulation:
+    base_url: http://127.0.0.1:8790
+  live:
+    base_url: http://127.0.0.1:8790
+goldminer:
+  base_url: http://127.0.0.1:7801
+  # 掘金终端「策略」里生成的 token 与账户 ID（留空则在界面里填写）
+  token: ''
+  account_id: ''
+  # 桥请求超时（秒）：须 ≥30s 且 < 主循环 60s。
+  request_timeout_seconds: 30
+  slow_response_seconds: 15
+  slow_warn_interval_seconds: 300
+# QMT/iQuant 客户端安装路径（留空则在界面里选择）
+iquant_path: ''
+max_concurrent_backtest: 1
+# 通达信安装路径（含 PYPlugins 目录，TQ 模块从这里加载 tqcenter.py）
+tdx_path: ''
+ths_ui:
+  captcha_ocr: true
+  # 同花顺下单程序 xiadan.exe 的完整路径（留空则在界面里选择）
+  client_exe_path: ''
+  driver: clipboard
+  enabled: false
+  execute_interval_seconds: 5
+  execute_mode: file_builtin
+  price_mode: latest
+  window_title: 网上股票交易系统5.0
+  work_dir: data/ths
+live:
+  heartbeat_timeout_seconds: 90
+  execution_stall_seconds: 180
+  bridge_timeout_seconds: 90
+  market_data_stall_seconds: 180
+  # 行情轮询窗口（Asia/Shanghai，左闭右开）：窗口外停 BarPoller 行情拉取。
+  quote_polling:
+    enabled: true
+    resume_time: "09:15"
+    pause_time: "15:05"
+tq_trade:
+  account: ''
+  account_type: stock
+  auto_confirm_dialog: true
+  cancel_unfilled_minutes: 3
+  client_path: ''
+  price_mode: my

@@ -1,0 +1,24 @@
+<!-- 候选 B：Lucide 图标 chart-candlestick（ISC License，可商用）
+     原始：https://github.com/lucide-icons/lucide （lucide-static v1.70.0）
+     修改：加深蓝圆角底、描边改金色以适配桌面图标 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#16405F"/>
+      <stop offset="0.55" stop-color="#0B2440"/>
+      <stop offset="1" stop-color="#07182A"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="214" fill="url(#bg)"/>
+  <g transform="translate(128 128) scale(32)"
+     fill="none" stroke="#F6D98C" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M9 5v4"/>
+    <rect width="4" height="6" x="7" y="9" rx="1"/>
+    <path d="M9 15v2"/>
+    <path d="M17 3v2"/>
+    <rect width="4" height="8" x="15" y="5" rx="1"/>
+    <path d="M17 13v3"/>
+    <path d="M3 3v16a2 2 0 0 0 2 2h16"/>
+  </g>
+</svg>
