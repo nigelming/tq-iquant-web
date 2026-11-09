@@ -6,7 +6,7 @@
 - BUY 审批资金对齐：min(虚拟现金, 真实可用×0.98)（approve_order cash_override）；
 - 提交前价格刷新：order.price 用实时最新价（回测继承价为信号 bar 收盘，跨日过期）。
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -127,6 +127,77 @@ def test_capture_imports_external_position_into_first_strategy():
            if e.get("type") == "alignment_import"] if hasattr(
         engine._event_bus, "drain_all") else []
     assert evs or True  # 事件通道形状以实现为准，导入本身已断言
+
+
+def test_import_deducts_inherited_value_from_virtual_cash():
+    """继承仓市值从起账现金扣除：资金基准=账户总资产，净值不双计。
+
+    实证场景（2026-11-07）：基准 27 万 + 继承市值 5.59 万，若不扣，净值
+    32.59 万 → 20% 单仓 6.52 万而非 5.46 万。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()   # 起账 100000
+    disp = _AcctDispatcher(positions=_real_positions())
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    engine._tick_deals()
+
+    expected = Decimal("100000") - Decimal("54431.0") - Decimal("7893.0")
+    assert port.account.cash == expected
+
+
+def test_import_deduction_is_idempotent():
+    """同一持仓反复采集只扣一次（虚拟已有 quantity>0 → 跳过导入）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=_real_positions())
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+
+    with factory() as db:
+        engine._capture_account_snapshot(db)
+        cash_after_first = port.account.cash
+        engine._capture_account_snapshot(db)
+
+    assert port.account.cash == cash_after_first
+
+
+def test_import_without_value_keeps_cash_untouched():
+    """成本/市值都拿不到（停牌票）→ 不伪造扣款，现金保持不变并打 WARN。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[
+        {"symbol": "600888.SH", "volume": 900, "available": 0},
+    ])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    engine._tick_deals()
+
+    assert port.account.cash == Decimal("100000")
+
+
+def test_mirror_increase_deducts_only_external_delta():
+    """平台自管仓被外部加仓：只按「真实-虚拟」增量市值扣现金。
+
+    平台成交部分已由 apply_trade 扣过现金，重复扣会把现金打穿。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[
+        {"symbol": "600000.SH", "volume": 1000, "available": 1000,
+         "cost": 10.0, "market_value": 10500.0},
+    ])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    ctx = engine.ctx.portfolios[0].strategies[0]
+    pos = Position("600000.SH")
+    pos.buy(600, Decimal("10.0"), datetime(2026, 11, 3, 10, 0))
+    ctx.positions["600000.SH"] = pos
+
+    engine._tick_deals()
+
+    # 外部增量 400 股 ×（10500 / 1000）= 4200
+    assert port.account.cash == Decimal("100000") - Decimal("4200")
 
 
 def test_capture_mirrors_engine_managed_code():
@@ -536,6 +607,121 @@ def test_capture_persists_highest_price_and_import_restores_peak():
     engine2._tick_deals()
     pos2 = engine2.ctx.portfolios[0].strategies[0].positions["002745.SZ"]
     assert pos2.highest_price == Decimal("12.88")   # 峰值已还原
+
+
+def _peak_engine(ports, disp, factory, synth=None):
+    poller = BarPoller(disp, ["002745.SZ"], period="1m", count=10)
+    kw = {"snapshot_synth": synth} if synth is not None else {}
+    return LiveEngine(
+        session_id=1, portfolios=ports, dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        account_snapshot_interval=5.0, **kw,
+    )
+
+
+def _seed_peak_snapshot(factory, disp, code="002745.SZ", peak="12.88"):
+    """先用一个引擎把「上一份快照」落库（含该代码峰值），模拟重启前的最后一次采集。"""
+    from core.engine.live.snapshot_bars import SnapshotBarSynthesizer
+    port, _ = _portfolio_single()
+    synth = SnapshotBarSynthesizer(
+        [code], fetch_snapshot=lambda codes: {}, in_session=lambda dt: True)
+    eng = _peak_engine([port], disp, factory, synth)
+    eng._tick_deals()
+    eng.ctx.portfolios[0].strategies[0].positions[code].update_high(Decimal(peak))
+    eng._last_acct_capture = 0.0
+    eng._tick_deals()
+
+
+def test_capture_restores_peak_for_all_portfolios_holding_same_code():
+    """多组合持同一代码：重启后每个组合都要还原峰值。
+
+    回归：原实现找到第一个匹配持仓就 break → 其余组合 highest_price 停在
+    当前价/买入价 → 移动止损静默失效（等于重启即免疫移动止损）。
+    """
+    factory, _ = _db_factory()
+    disp = _AcctDispatcher(positions=[
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 10.221, "market_value": 54431.0},
+    ])
+    _seed_peak_snapshot(factory, disp)
+
+    buy_at = datetime(2026, 11, 6, 10, 0)   # 早于上一份快照 → 属持续持仓
+    ports = []
+    for pid in (1, 2):
+        port, _ = _portfolio_single()
+        port.portfolio_id = pid
+        pos = Position("002745.SZ")
+        pos.buy(5300, Decimal("10.221"), buy_at)
+        pos.update_high(Decimal("10.5"))
+        port.strategies[0].positions["002745.SZ"] = pos
+        ports.append(port)
+
+    engine = _peak_engine(ports, disp, factory)
+    engine._tick_deals()
+
+    for port in ports:
+        assert port.strategies[0].positions["002745.SZ"].highest_price == Decimal("12.88")
+
+
+def test_capture_does_not_resurrect_peak_after_reopen():
+    """同代码先清仓再重开：上一份快照的旧高点不得还原，也不得续写进新快照。
+
+    否则峰值被钉在上一轮高位 → 下一根 bar drawdown 立即 ≥ 阈值 → 误触全仓卖出。
+    """
+    factory, _ = _db_factory()
+    disp = _AcctDispatcher(positions=[
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 10.221, "market_value": 54431.0},
+    ])
+    _seed_peak_snapshot(factory, disp)
+
+    port, _ = _portfolio_single()
+    pos = Position("002745.SZ")
+    # 本轮建仓晚于上一份快照 → 旧峰值属上一轮持仓
+    pos.buy(5300, Decimal("10.5"), now_shanghai() + timedelta(minutes=1))
+    pos.update_high(Decimal("10.5"))
+    port.strategies[0].positions["002745.SZ"] = pos
+
+    engine = _peak_engine([port], disp, factory)
+    engine._tick_deals()
+
+    assert pos.highest_price == Decimal("10.5")
+    db = factory()
+    latest = (db.query(LiveAccountPositionSnapshot)
+              .filter_by(stock_code="002745.SZ")
+              .order_by(LiveAccountPositionSnapshot.id.desc()).first())
+    db.close()
+    assert Decimal(str(latest.highest_price)) == Decimal("10.5")
+
+
+def test_capture_seeds_peak_and_price_from_cost_for_tdx_row():
+    """tdx 持仓行无现价、market_value 常为 0（会话 5 实证 1888 行峰值全 NULL）：
+    快照仍须写可用峰值基线（成本）与现价，否则重启后移动止损从当根 bar 重算；
+    同时继承仓扣减走 cost×volume 兜底，不得被 0 市值短路。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()          # 起账 100000
+    disp = _AcctDispatcher(positions=[
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 10.221, "market_value": 0},
+    ])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    engine._tick_deals()
+
+    # 扣减：市值 0 → 成本×数量（10.221 × 5300 = 54171.3）
+    assert port.account.cash == Decimal("100000") - Decimal("54171.3")
+    # 内存峰值以成本起算（重启前后一致，不再是 0）
+    pos = engine.ctx.portfolios[0].strategies[0].positions["002745.SZ"]
+    assert pos.highest_price == Decimal("10.221")
+    # 落库：峰值/现价均非 NULL
+    db = factory()
+    row = (db.query(LiveAccountPositionSnapshot)
+           .filter_by(stock_code="002745.SZ")
+           .order_by(LiveAccountPositionSnapshot.id.desc()).first())
+    db.close()
+    assert Decimal(str(row.highest_price)) == Decimal("10.221")
+    assert Decimal(str(row.current_price)) == Decimal("10.221")
 
 
 # ---- 实盘成交量约束（对齐回测 #2 volume_cap）----

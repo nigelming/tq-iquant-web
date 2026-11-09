@@ -139,8 +139,8 @@ results.jsonl，在途单停留 submitted 直到超时——即时消费让工�
 - **at-most-once 消费**：`read_pending_orders` 读后游标立即推进到文件尾（先推进
   再执行）——执行前崩溃的单不会重复执行，由引擎 180s expire 兜底标 rejected；
 - **断点续读**：执行器重启后从 `orders_offset` 继续读，不重放历史指令；
-- **幂等 done 表**：游标损坏重置从 0 重扫时，`done` 表里的 order_id 跳过——
-  已执行单不会因重扫而重复执行（真钱安全的关键不变量）。
+- **幂等 done 表**：orders.jsonl 被外部截断/轮转导致 offset 回退重扫时，`done`
+  表里的 order_id 跳过——已执行单不会因重扫而重复执行（真钱安全的关键不变量）。
 
 ## 5. 原子性与损坏容错
 
@@ -149,7 +149,8 @@ results.jsonl，在途单停留 submitted 直到超时——即时消费让工�
 - **cursor.json 原子写**：tmp 文件 + `os.replace`——崩溃不留半截游标（半截游标
   会导致 done 表丢失 → 已执行单被重扫重执行，真钱风险）；
 - **坏行跳过**：orders.jsonl 中 JSON 解析失败的行跳过并 warning（不中断消费，
-  行仍占游标位）；cursor.json 损坏/缺失从 0 起（靠 done 表保幂等）；
+  行仍占游标位）；cursor.json 损坏/缺失时 done 表一并丢失，offset 初始化到当前
+  文件尾——历史指令不重放（at-most-once 不降级为重复下单）；
 - **目录缺失**：读容错返回空（不抛异常），`FileHandoff` 构造时重建目录。
 
 ## 6. 执行器实现要求清单

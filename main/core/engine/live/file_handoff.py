@@ -15,8 +15,9 @@
   见 docs/execution-contract.md：新增字段可选、改名/删除须升版）；
 - 所有写均为「逐行 append + flush + 实例级线程锁」，每行带 seq/ts(上海时间)/session_id；
 - read_pending_orders 按游标消费（读后游标推进到文件尾），done 表里的 order_id 跳过
-  ——游标损坏重置从 0 重扫时靠 done 表保证幂等（已执行单不会重复执行）；
-- JSON 解析失败的行跳过并 warning（不中断消费）；cursor.json 损坏/缺失从 0 起。
+  ——订单文件被外部截断/轮转导致游标回退时靠 done 表保证幂等（已执行单不会重复执行）；
+- JSON 解析失败的行跳过并 warning（不中断消费）；cursor.json 损坏/缺失时 done 表
+  一并丢失，故 offset 初始化到当前文件尾（历史指令不重放，at-most-once 不降级）。
 """
 
 import json
@@ -192,7 +193,16 @@ class FileHandoff:
             if not isinstance(data, dict):
                 raise ValueError("cursor not a dict")
         except (OSError, ValueError):
-            data = {}
+            # cursor.json 缺失/损坏：done 表一并丢失，若从 0 重扫会把历史
+            # orders 全部重放（at-most-once 降级为重复下单）。故把 offset
+            # 初始化到当前文件尾——只执行此后新增的指令。正常重启（游标
+            # 可读）不走这里，行为完全不变。
+            offset = self._count_lines(self.orders_path)
+            if offset > 0:
+                logger.warning(
+                    "file handoff cursor missing/corrupt, skip %d historical order(s)",
+                    offset)
+            return {"orders_offset": offset, "done": {}}
         try:
             offset = max(int(data.get("orders_offset") or 0), 0)
         except (TypeError, ValueError):

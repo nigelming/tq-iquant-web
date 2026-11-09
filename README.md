@@ -1,18 +1,20 @@
 # 创懿私募基金量化投资平台
 
-连接通达信(TDX)回测数据与 QMT 通道实盘交易的单用户量化系统。无鉴权，所有接口直接可访问。
+连接通达信(TDX)回测数据与多通道实盘交易（通达信 TQ / 同花顺 / 掘金量化 / QMT）的单用户量化系统。无鉴权，所有接口直接可访问。
 
 ## 架构
 
 ```
-Core (main/, Python 3.13) ──HTTP──→ QMT 桥策略 (live/bridge/, QMT 客户端内 Python 3.6)
-  └─ 同进程嵌入 TQ 模块（通达信，直接函数调用 + polars DataFrame）
+Core (main/, Python 3.13) ──HTTP──→ 掘金桥 goldminer_bridge.py（掘金终端内，127.0.0.1:7801）
+                          ──HTTP──→ QMT 生产桥 iquant_bridge.py（QMT 客户端内 Python 3.6.8，127.0.0.1:8790 / STOCK，QMT 仿真账户/仿真资金）
+  ├─ 同进程嵌入 TQ 模块（通达信，直接函数调用 + polars DataFrame；回测 / tdx 引擎 / 预警取数）
+  └─ 同花顺 UI 自动化（xiadan.exe，键鼠 + 文件交接）
 Web 前端 (web/, Vue 3 + Vite) ←HTTP/SSE→ Core (FastAPI)
 shared/ — tq_iquant_shared 包，被 main 和 live 共同引用（须兼容 Python 3.7）
 ```
 
 - **`main/`** — FastAPI Core + 嵌入式 TQ 模块。事件驱动引擎（polars 核心），`uv` 管理依赖。
-- **`live/`** — QMT 客户端内运行的桥策略（HTTP 桥 `127.0.0.1:8790`，端点 `/ping`/`/order`/`/positions`/`/account`/`/orders`/`/deals`/`/quote`）。QMT 自带 Python 3.6.8，桥代码须兼容 3.6（纯标准库，无 f-string）。
+- **`live/`** — 终端内运行的桥策略（HTTP 桥）：`goldminer_bridge.py` 跑在掘金终端；`iquant_bridge.py`（127.0.0.1:8790 / STOCK，生产通道；账户为 QMT 仿真账户、仿真资金）跑在 QMT 客户端（自带 Python 3.6.8，须纯标准库、无 f-string）；`iquant_bridge_live.py`（8791 / CREDIT）仓库保留但非生产、未启用。切真实资金须改桥文件 `ACCOUNT` / `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证。桥只能由对应终端点「运行」启动，禁止 `uv run` / 平台 venv 启动（尤其掘金桥）。
 - **`shared/`** — `tq_iquant_shared` 包，通过 `[tool.uv.sources]` 路径依赖引入。
 - **`web/`** — Vue 3 + Vite + TypeScript 前端，白色侧边栏 + 顶栏布局。
 

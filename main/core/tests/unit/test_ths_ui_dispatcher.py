@@ -1101,6 +1101,56 @@ def test_account_reuses_recent_position_rows(monkeypatch):
     assert first[0]["total_asset"] == 5000.0
 
 
+def test_account_fund_read_failure_returns_none(monkeypatch):
+    """持仓可读但 F4 资金标签一个都没识别到 → None（不得退化成
+    「总资产 = 持仓市值」的假数字），并记录 _last_error。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values", lambda: {})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    assert d.get_account() is None
+    assert "资金" in d.last_error
+
+
+def test_account_without_cash_fields_returns_none(monkeypatch):
+    """只读到市值、无任何现金字段 → None（用市值补算总资产即假数字）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values", lambda: {"market_value": 55915.0})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    assert d.get_account() is None
+    assert "资金" in d.last_error
+
+
+def test_account_partial_fund_computes_total_from_cash(monkeypatch):
+    """有资金余额但缺总资产列 → 用「资金余额 + 市值」补算（正常口径）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values",
+                        lambda: {"balance": 10000.0, "available": 9000.0})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    acc = d.get_account()
+    assert acc[0]["total_asset"] == 10000.0 + 55915.0
+
+
 def _order_row_dict(ref, time_hm="173429", price=20.0, volume=100,
                     direction="buy", status=50):
     """_parse_orders 的真实行形状：只有 time 文本（无 insert_date/insert_time）。"""

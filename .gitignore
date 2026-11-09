@@ -8,6 +8,10 @@ __pycache__/
 dist/
 build/
 .nuitka-cache/
+.build/
+# 图标构建中间产物（矢量源与 app.ico 入库，渲染结果不入库）
+packaging/icon/master_1024.png
+packaging/icon/preview_*.png
 
 # Node
 node_modules/

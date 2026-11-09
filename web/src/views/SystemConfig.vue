@@ -5,7 +5,7 @@ import PageHeader from '../components/PageHeader.vue'
 
 // 与 core/config.py _defaults() 对齐：回测字段 tdx_path、QMT 字段 iquant_path、
 // max_concurrent_backtest(回测并发上限)、database.sqlite_path(数据库路径)、
-// iquant_bridge.simulation/live.base_url(双桥地址：仿真8790/实盘8791，按 session 模式选桥)
+// iquant_bridge.simulation/live.base_url(两个模式位当前都指 8790；该账户为 QMT 仿真账户/仿真资金，8791 信用腿未启用)
 // SystemConfig 接口定义见 api/index.ts（对齐 config.py _defaults()）
 const DEFAULTS: SystemConfig = {
   tdx_path: '',
@@ -171,7 +171,8 @@ function testTdx() { return testChannel('tdx_tq') }
             <h3 class="cfg-h">掘金量化桥（goldminer）</h3>
             <p class="cfg-desc">
               桥策略（goldminer_bridge.py）跑在掘金终端内，本地 HTTP 服务供平台下单/查询。
-              令牌与账户 ID 须与掘金终端登录的仿真账户一致；修改后重启后端生效。
+              下方 Token / 账户 ID 仅用于核对展示，<b>不会</b>传给桥；真正生效的是桥文件顶部的
+              TOKEN / ACCOUNT / STRATEGY_ID 常量。保存后新建会话生效，运行中的会话需停止再启动。
             </p>
             <div class="field">
               <label>桥服务地址</label>
@@ -190,13 +191,15 @@ function testTdx() { return testChannel('tdx_tq') }
           <section v-show="activeGroup === 'ths'">
             <h3 class="cfg-h">同花顺 UI 下单通道</h3>
             <p class="cfg-desc">
-              启用后，实盘 session 改由同花顺独立交易客户端（xiadan.exe）执行下单：投资平台生成信号，
-              同花顺只负责成交。关闭时实盘会话在「新建实盘」中另选引擎（通达信 TQ / 掘金量化 / 同花顺）。需保存后测试。
+              同花顺通道是每会话可选引擎：在「新建实盘」选择同花顺便由独立交易客户端（xiadan.exe）
+              执行下单，投资平台只生成信号。此开关仅影响 engine 为空的历史会话在 default_engine
+              未配置/非法时的回退判定（启用→ths，否则→iquant），<b>不会</b>强制切换或禁用已有会话；
+              切换引擎需停止再启动会话。
             </p>
             <div class="field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
                 <input v-model="config.ths_ui.enabled" type="checkbox" style="width:auto" />
-                启用同花顺独立交易通道（全局生效，切换后需重启运行中的 session）
+                启用同花顺通道回退（仅影响 engine 为空的历史会话，不代表启用/禁用该引擎）
               </label>
             </div>
             <div class="field">
@@ -225,7 +228,8 @@ function testTdx() { return testChannel('tdx_tq') }
               </select>
               <p class="cfg-hint">
                 file_builtin：place_order 写入指令文件秒回，内置执行器按轮询间隔执行键鼠自动化；
-                成交/持仓仍走 UI 读回回填。THS 撤单未自动化，超时在途单走 expire rejected。
+                成交/持仓仍走 UI 读回回填。撤单已自动化（F3 撤单页双击委托行）；
+                读后游标即推进（at-most-once），执行前崩溃的单不重复执行，超时走 expire rejected。
               </p>
             </div>
             <div class="field">
@@ -260,7 +264,8 @@ function testTdx() { return testChannel('tdx_tq') }
             <p class="cfg-desc">
               走通达信客户端内置的 TQ 交易接口（tqcenter），与回测取数同一条连接。
               前置条件：通达信客户端已启动并登录资金账号，PYPlugins 下存在 tqcenter.py。
-              下单需在客户端关闭「下单确认」，否则会被判定为半自动模式拒单。
+              下单确认面板默认自动处置（config.tq_trade.auto_confirm_dialog，默认 true）；
+              若关闭该自动处置，则需在客户端关闭「下单确认」，否则会被判定为半自动模式拒单。
             </p>
             <div class="field">
               <label>资金账号</label>
@@ -290,7 +295,7 @@ function testTdx() { return testChannel('tdx_tq') }
                 <option value="goldminer">掘金量化 HTTP 桥（goldminer）</option>
                 <option value="ths">同花顺 UI 自动化（ths）</option>
               </select>
-              <p class="cfg-hint">新建实盘会话未显式选引擎时使用</p>
+              <p class="cfg-hint">engine 为空的历史会话/旧 qmt(miniQMT) 会话回退使用；未配置或非法时回退 ths_ui.enabled 且依赖可用→ths，否则 iquant</p>
             </div>
             <div class="field">
               <label>超时撤单(分钟)</label>

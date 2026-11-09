@@ -3,7 +3,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from core.config import is_frozen_app, load_config
+from core.config import app_root, is_frozen_app, load_config, use_app_root
 
 # 锚定到 main/ 目录（本文件位于 main/core/db.py），让 sqlite_path 无论
 # 从哪个 cwd 启动都解析到同一绝对路径，消除对进程工作目录的依赖。
@@ -11,17 +11,14 @@ _MAIN_DIR = Path(__file__).resolve().parent.parent
 
 
 def _db_path() -> Path:
-    """数据库路径：优先 config.yaml，fallback 到 exe 同级目录。"""
+    """数据库路径：优先 config.yaml，fallback 到应用根目录（可写）。"""
     cfg = load_config()
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     p = Path(sqlite_path)
     if not p.is_absolute():
-        # Nuitka 不设置 sys.frozen，统一走 is_frozen_app（exe 目录锚定）。
-        if is_frozen_app():
-            exe_dir = Path(sys.argv[0]).resolve().parent
-        else:
-            exe_dir = Path(__file__).resolve().parent.parent
-        p = exe_dir / p
+        # 打包版锚到 app_root()：安装目录不可写时自动落到 %LOCALAPPDATA%，
+        # 避免 SQLite 在只读目录下建库失败。
+        p = (app_root() if use_app_root() else _MAIN_DIR) / p
     return p
 
 
@@ -74,7 +71,13 @@ def init_db():
         sys.path.insert(0, str(_MAIN_DIR))
 
     cfg = Config()
-    cfg.set_main_option("script_location", str(_MAIN_DIR / "alembic"))
+    script_dir = _MAIN_DIR / "alembic"
+    if is_frozen_app():
+        # 打包版：迁移脚本随安装目录分发（不是数据目录），优先取 exe 同级 alembic/
+        packaged = Path(sys.argv[0]).resolve().parent / "alembic"
+        if (packaged / "env.py").exists():
+            script_dir = packaged
+    cfg.set_main_option("script_location", str(script_dir))
     command.upgrade(cfg, "head")
 
 

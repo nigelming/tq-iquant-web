@@ -569,10 +569,15 @@ class ThsUiDispatcher(OrderDispatcher):
         # get_orders(pin_cancel_page=True) 自带「读空重试一次」，直接复用，
         # 不在持锁路径里重写重试逻辑。
         rows = self.get_orders(pin_cancel_page=True)
+        if rows is None:
+            # 读表失败 ≠ 真空表：不点、不报成功，等下一轮重试。
+            self._last_error = "cancel: 撤单页读取失败（%s）" % (
+                self._last_error or "未连接/互斥超时/复制为空")
+            return False
         idx = next((i for i, o in enumerate(rows)
                     if str(o.get("order_id")) == str(order_ref)), None)
         if idx is None:
-            # 目标不在可撤列表：已成交收口/已撤/委托表读回失败
+            # 目标不在可撤列表：已成交收口/已撤
             self._last_error = "cancel: 目标 %s 不在可撤列表" % order_ref
             return False
         unknown = [o for o in rows
@@ -594,12 +599,44 @@ class ThsUiDispatcher(OrderDispatcher):
         words = self._ocr_words(ImageGrab.grab(bbox=(
             wr.left, wr.top, wr.right, wr.bottom)))
         code6 = re.sub(r"\D", "", str(stock_code))[:6]
+        # 同一代码在撤单页可能有多笔可撤委托（分批建仓/拆单/多笔挂单）。rows 与
+        # OCR 取自同一张撤单页，行序一致（自上而下）：按目标行在「同代码全部行」
+        # 中的序号取对应代码词；取第一个匹配词会双击到别的委托（撤错单）。
+        same_code_all = [
+            i for i, o in enumerate(rows)
+            if re.sub(r"\D", "", str(o.get("symbol") or ""))[:6] == code6
+        ]
+        same_code_open = [i for i in same_code_all if not self._row_terminal(rows[i])]
+        if idx not in same_code_open:
+            self._last_error = (
+                "cancel: 目标 %s 已终结（已撤/废单），无需撤单" % order_ref)
+            return False
         row_words = [w for w in words if code6 in w[0]]
         if not row_words:
             self._last_error = (
                 "cancel: 撤单页 OCR 未定位到目标行（%s）" % code6)
             return False
-        _, tw_x, tw_y = row_words[0]
+        if len(row_words) > 1:
+            row_words = sorted(row_words, key=lambda w: (w[2], w[1]))
+        if len(row_words) == 1:
+            if len(same_code_open) > 1:
+                # 同代码仍有多笔可撤行，但 OCR 只识别到一个代码词：无法判断
+                # 目标行位置，宁可不撤也不点错行（下一轮再试/人工介入）。
+                self._last_error = (
+                    "cancel: 同代码可撤行 %d 条但 OCR 仅定位到一个代码词，"
+                    "无法安全定位目标行，已中止" % len(same_code_open))
+                return False
+            pick = row_words[0]
+        else:
+            if len(row_words) != len(same_code_all):
+                # OCR 丢行/页面漂移导致行序对不上：宁可中止也不点错行。
+                self._last_error = (
+                    "cancel: 同代码行 %d 条但 OCR 定位到 %d 个代码词，"
+                    "无法安全定位目标行，已中止"
+                    % (len(same_code_all), len(row_words)))
+                return False
+            pick = row_words[same_code_all.index(idx)]
+        _, tw_x, tw_y = pick
         dx, dy = wr.left + tw_x + 30, wr.top + tw_y + 8
         # 双击前遮挡校验：ImageGrab 截的是屏幕像素，被遮挡时 OCR 词可能来自
         # 遮挡窗口，双击也会落在它上面（2026-11-06 P0）。
@@ -613,6 +650,13 @@ class ThsUiDispatcher(OrderDispatcher):
         time.sleep(1.5)
 
         rows2 = self.get_orders(pin_cancel_page=True)
+        if rows2 is None:
+            # 复读失败不能按「行消失 → 已撤」判成功（会把失败撤单收敛成 canceled，
+            # 真实在途单留在柜台）。返回 False 由下一轮先确认目标是否仍在可撤列表。
+            self._last_error = (
+                "cancel: 撤单后回查失败（%s），无法确认撤单结果"
+                % (self._last_error or "读表失败"))
+            return False
         gone = self._order_gone_in(rows2, order_ref)
         if gone:
             logger.info("ths cancel_order ok: ref=%s", order_ref)
@@ -1431,7 +1475,7 @@ class ThsUiDispatcher(OrderDispatcher):
         best = None
         best_key = None
         try:
-            for o in self.get_orders():
+            for o in (self.get_orders() or []):
                 if o.get("symbol") != code or o.get("direction") != direction:
                     continue
                 if volume and o.get("volume") != volume:
@@ -1533,9 +1577,12 @@ class ThsUiDispatcher(OrderDispatcher):
         self._last_error = ""
         return rows
 
-    def get_orders(self, pin_cancel_page: bool = False) -> list:
+    def get_orders(self, pin_cancel_page: bool = False) -> Optional[list]:
         """委托表读回（剪贴板+OCR 流水线）。空结果重试一次——真机偶发
-        整表读空（剪贴板竞态），二次读取可恢复；连续空视为真无委托。
+        整表读空（剪贴板竞态），二次读取可恢复。
+
+        返回 None 表示**读失败**（未连接/互斥超时/复制为空），与「真空表 []」
+        严格区分：调用方若把读失败当空表，会把真实在途单当成「已消失」。
 
         pin_cancel_page=True（撤单流程专用）：读回固定 F3「撤单」页语义——
         默认读回优先 UIA 切「当日委托」页（含全部委托），会把 UI 漂走，
@@ -1552,18 +1599,18 @@ class ThsUiDispatcher(OrderDispatcher):
             rows = _read()
         return rows
 
-    def _read_orders_once(self, pin_cancel_page: bool = False) -> list:
+    def _read_orders_once(self, pin_cancel_page: bool = False) -> Optional[list]:
         if not self._connected:
             if not self.connect():
-                return []
+                return None
         # 跨引擎互斥（同进程）：读表含切页点击 + Ctrl+A/C 物理键鼠。
         # 锁序恒定：_GRID_LOCK → UI_AUTO_LOCK。
         if not self._gui_guard():
-            return []
+            return None
         try:
             if not self._ui_guard():
                 logger.warning("ths orders read skipped: UI 互斥等待超时")
-                return []
+                return None
             t0 = time.monotonic()
             try:
                 # 「当日委托」页含全部当日委托（含已成交/已撤）；F3「撤单」页
@@ -1592,11 +1639,11 @@ class ThsUiDispatcher(OrderDispatcher):
             logger.warning("ths orders read slow: %.1fs (pin_cancel=%s)",
                            elapsed, pin_cancel_page)
         if not text:
-            # 读失败（复制为空/验证码未解/切页失败）≠ 真空表：留下证据，
-            # 调用方据「返回空」重试。
+            # 读失败（复制为空/验证码未解/切页失败）≠ 真空表：返回 None，
+            # 调用方据此重试或跳过本轮，不得当成「无委托」。
             logger.warning("ths orders copy empty (read failed, pin_cancel=%s)",
                            pin_cancel_page)
-            return []
+            return None
         return self._parse_orders(text)
 
     def _read_fund_values(self) -> dict:
@@ -1653,10 +1700,25 @@ class ThsUiDispatcher(OrderDispatcher):
             return None
         total_mv = sum(float(p.get("market_value") or 0) for p in positions)
         funds = self._read_fund_values()
+        if not funds:
+            # 资金标签一个都没读到（F4 未就绪/OCR 失败）≠ 零资产：返回 None
+            # 让调用方跳过本轮，绝不退化成「持仓市值 = 总资产」的假数字。
+            self._last_error = "资金字段读取失败（F4 资金标签未识别）"
+            return None
         available = funds.get("available")
         total_asset = funds.get("total_asset")
         if total_asset is None:
-            total_asset = total_mv + (available or 0) + (funds.get("frozen") or 0)
+            # 缺总资产列时用「现金 + 市值」补算，但现金部分必须真读到：
+            # 只有市值能读到时补算结果就是市值，属于假数字，宁可返回 None。
+            cash = funds.get("balance")
+            if cash is None:
+                if available is not None or funds.get("frozen") is not None:
+                    cash = (available or 0) + (funds.get("frozen") or 0)
+            if cash is None:
+                self._last_error = "资金字段读取不完整（缺总资产/资金余额/可用金额）"
+                return None
+            mv = funds.get("market_value")
+            total_asset = (total_mv if mv is None else float(mv)) + cash
         return [{
             "available": available,
             "total_asset": total_asset,
@@ -1738,8 +1800,14 @@ class ThsUiDispatcher(OrderDispatcher):
         """
         try:
             orders = self.get_orders()
-        except Exception:
-            return []
+        except Exception as e:
+            raise BridgeUnavailableError("同花顺委托表读取失败：%s" % e) from e
+        if orders is None:
+            # 读失败不能返回 []：状态机会把「表里查不到该 ref」当成已撤单，
+            # 从而把真实在途单收敛成 canceled（2026-11-07 排查确认）。
+            raise BridgeUnavailableError(
+                "同花顺委托表读取失败：%s"
+                % (self._last_error or "未连接/互斥超时/复制为空"))
         out = []
         for o in orders:
             ref = str(o.get("order_id") or "").strip()
@@ -1779,8 +1847,13 @@ class ThsUiDispatcher(OrderDispatcher):
         """
         try:
             orders = self.get_orders()
-        except Exception:
-            return []
+        except Exception as e:
+            raise BridgeUnavailableError("同花顺委托表读取失败：%s" % e) from e
+        if orders is None:
+            # 同上：读失败 ≠ 无成交，必须让调用方跳过本轮而不是收敛成「无成交」。
+            raise BridgeUnavailableError(
+                "同花顺委托表读取失败：%s"
+                % (self._last_error or "未连接/互斥超时/复制为空"))
         out = []
         for o in orders:
             ref = str(o.get("order_id") or "").strip()
@@ -1986,28 +2059,34 @@ class ThsUiDispatcher(OrderDispatcher):
             # 跨引擎 UI 互斥由 _execute_via_ui 内两段式持锁负责（4s 价格跟随
             # 等待与回查在锁外），此处不再整段包 UI_AUTO_LOCK。
             self._execute_via_ui(order)
-            ref = str(self._last_submit_ref or "")
-            if ref:
-                self._known_refs.add(ref)
-                if ref not in self._submit_times:
-                    self._submit_times[ref] = self._last_submit_time or (
-                        now_shanghai().strftime("%Y%m%d"),
-                        now_shanghai().strftime("%H%M%S"),
-                    )
-            self._handoff.mark_done(order_id, {"status": "accepted", "ref": ref})
         except (BridgeOrderRejected, BridgeUnavailableError) as e:
             self._record_file_reject(order_id, entry, e)
-            try:
-                self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
-            except Exception:  # noqa: BLE001
-                logger.warning("ths handoff mark_done failed", exc_info=True)
+            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            return
         except Exception as e:  # noqa: BLE001  UI 异常不杀执行线程
             logger.warning("ths file executor error (order %s): %s", order_id, e)
             self._record_file_reject(order_id, entry, e)
-            try:
-                self._handoff.mark_done(order_id, {"status": "rejected", "error": str(e)})
-            except Exception:  # noqa: BLE001
-                logger.warning("ths handoff mark_done failed", exc_info=True)
+            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            return
+
+        ref = str(self._last_submit_ref or "")
+        if ref:
+            self._known_refs.add(ref)
+            if ref not in self._submit_times:
+                self._submit_times[ref] = self._last_submit_time or (
+                    now_shanghai().strftime("%Y%m%d"),
+                    now_shanghai().strftime("%H%M%S"),
+                )
+        # 回执落盘必须在「UI 已报单成功」之后单独兜底：写失败若按执行失败处理，
+        # 会把真实在途单回执成 rejected → 下一根 bar 重下造成重复持仓。
+        self._mark_done_safe(order_id, {"status": "accepted", "ref": ref})
+
+    def _mark_done_safe(self, order_id: str, result: dict) -> None:
+        try:
+            self._handoff.mark_done(order_id, result)
+        except Exception:  # noqa: BLE001
+            logger.warning("ths handoff mark_done failed (order %s, %s)",
+                           order_id, result.get("status"), exc_info=True)
 
     def _record_file_reject(self, order_id: str, entry: dict, exc: Exception) -> None:
         """执行失败记账（带原始指令 entry 供引擎形状匹配）。"""
@@ -2264,6 +2343,10 @@ class ThsUiDispatcher(OrderDispatcher):
             except Exception:
                 pass
         if not confirmed:
+            # _confirm_dialog 在「没有新增弹窗」时返回 True（客户端免确认设置直接
+            # 报单也走这里），因此走到本分支只可能是弹窗仍在（点击/回车都失败），
+            # 此时委托未提交，直接拒单是正确的；不要回查委托表——那会在模态弹窗
+            # 打开的情况下继续发切页点击/按键。
             raise BridgeOrderRejected("order confirm dialog not confirmed")
         found = self._find_order_retry(code, order.trade_type.value.lower(), vol,
                                        since=submit_stamp or None)

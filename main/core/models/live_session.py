@@ -15,8 +15,9 @@ class LiveSession(Base):
     # 保持升级前行为不变；新建会话一律显式写入。
     # 历史 qmt 会话（通道已移除）由 session_engine 白名单回退到默认引擎。
     engine = Column(String(10), nullable=True)
-    # 实盘资金基准：None=各组合用自身 initial_capital；设置=会话内所有组合以该值
-    # 起账（资金占比/单仓/敞口等比率配置等比缩放），多组合各自独立记账。
+    # 实盘资金基准（账户总资产口径，元）：None=各组合用自身 initial_capital；
+    # 设置=会话内所有组合以该值起账（资金占比/单仓/敞口等比率配置等比缩放），
+    # 多组合各自独立记账。启动后继承持仓的市值会从起账现金中扣除（避免与基准双计）。
     live_capital = Column(Numeric(18, 2), nullable=True)
     # 执行模式：alert（半自动，只预警不下单）/ auto（现有自动交易）。
     # 迁移前历史会话写 auto；新建会话由 live_service 显式写 alert。

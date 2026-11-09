@@ -68,7 +68,7 @@ def _mk_captcha_env(monkeypatch, ocr_code="1234"):
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     edit = SimpleNamespace(
         click=lambda: None,
-        type_keys=lambda k: edit.keys.append(k),
+        type_keys=lambda k, **kw: edit.keys.append(k),
         set_edit_text=lambda t: edit.sets.append(t),
         keys=[], sets=[],
     )
@@ -84,24 +84,30 @@ def _mk_captcha_env(monkeypatch, ocr_code="1234"):
 
     monkeypatch.setattr(d, "_captcha_crop", lambda dlg_, edit_, rect: crop)
     monkeypatch.setattr(d, "_ocr_digits", lambda img: ocr_code)
-    monkeypatch.setattr(d, "_find_captcha_dialog", lambda: None)  # 提交即消失
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    state = {"n": 0}
+
+    def _find():
+        state["n"] += 1
+        return dlg if state["n"] == 1 else None  # 提交后弹窗消失
+    monkeypatch.setattr(d, "_find_captcha_dialog", _find)
     monkeypatch.setattr(
         "core.engine.ths_ui_dispatcher.ImageGrab",
         SimpleNamespace(grab=lambda bbox=None: crop))
     return d, edit, dlg, ok_btn
 
 
-def test_solve_captcha_uses_set_edit_text_no_caret_a(monkeypatch):
-    """清空+写入必须走 set_edit_text（WM_SETTEXT）；type_keys 不得出现 ^a
-    （THS 验证码 Edit 不响应 Ctrl+A——字面 "a" 漏入首位，恒 5 位被拒）。"""
+def test_solve_captcha_uses_sendinput_not_set_edit_text(monkeypatch):
+    """清空+写入必须走真实键盘事件（SendInput）；WM_SETTEXT 对自绘 Edit 无效。"""
     d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
     assert d._solve_captcha(dlg) is True
-    assert edit.sets == ["1234"]
-    assert edit.keys == [] or all("^a" not in k for k in edit.keys)
+    assert edit.sets == []
+    assert edit.keys[0] == "^a{DELETE}"
+    assert "".join(edit.keys[1:]) == "1234"
 
 
-def test_solve_captcha_retry_uses_set_edit_text(monkeypatch):
-    """首错后验证码刷新 → 重试同样走 set_edit_text，不出 ^a。"""
+def test_solve_captcha_retry_uses_sendinput(monkeypatch):
+    """首错后验证码刷新 → 重试同样走真实键盘事件，不使用 set_edit_text。"""
     d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
     state = {"n": 0}
 
@@ -110,8 +116,8 @@ def test_solve_captcha_retry_uses_set_edit_text(monkeypatch):
         return dlg if state["n"] == 1 else None   # 第一次提交后仍在 → 重试
     monkeypatch.setattr(d, "_find_captcha_dialog", _find)
     assert d._solve_captcha(dlg) is True
-    assert edit.sets == ["1234", "1234"]
-    assert all("^a" not in k for k in edit.keys)
+    assert edit.sets == []
+    assert "".join(edit.keys) == "^a{DELETE}1234"
 
 
 # ---- TDX「下单确认」弹窗自动点击（无人值守）----

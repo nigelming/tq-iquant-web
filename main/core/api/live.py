@@ -106,7 +106,8 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     if execution_mode not in ("alert", "auto"):
         return err(400, "execution_mode 非法，仅支持 alert(半自动) / auto(全自动)")
     data["execution_mode"] = execution_mode
-    # 会话级实盘资金基准：None=各组合用自身 initial_capital；提供时须 >0。
+    # 会话级实盘资金基准（账户总资产口径）：None=各组合用自身 initial_capital；
+    # 提供时须 >0。继承持仓的市值由引擎从起账现金扣除，避免重复计入。
     live_capital = data.get("live_capital")
     if live_capital is not None:
         try:
@@ -230,24 +231,30 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
 
 @router.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int, db: Session = Depends(get_db)):
-    """停止会话。幂等：已停止的会话重复调用仍返回 200（此前返回 404）。"""
-    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
-    if not session:
-        return err(404, "资源不存在")
-    if session_id not in _ENGINES and session.status != "running":
+    """停止会话。幂等：已停止的会话重复调用仍返回 200（此前返回 404）。
+
+    与 start 共用 _START_LOCK：start 的建引擎/心跳在 threadpool 里是秒级的，
+    若不排队，stop 会在「引擎尚未注册、DB 仍是 stopped」的窗口里直接返回 ok，
+    随后 start 完成注册并把引擎跑起来——用户的停止被静默丢弃。
+    """
+    async with _START_LOCK:
+        session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+        if not session:
+            return err(404, "资源不存在")
+        if session_id not in _ENGINES and session.status != "running":
+            return ok({"id": session_id, "status": "stopped"})
+        engine = svc.stop_session(db, session_id, _ENGINES)
+        # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
+        # 避免用户立刻 start 后新旧引擎并存各下一笔委托。
+        if engine is not None:
+            if hasattr(engine, "_running"):
+                engine._running = False
+            # I-5：同步置拒单闸——在途 tick 的 _handle_bar 入口即刻不再发新单
+            # （不等 engine.stop() 协程被调度）。
+            if hasattr(engine, "_stop_requested"):
+                engine._stop_requested = True
+            asyncio.create_task(engine.stop())
         return ok({"id": session_id, "status": "stopped"})
-    engine = svc.stop_session(db, session_id, _ENGINES)
-    # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
-    # 避免用户立刻 start 后新旧引擎并存各下一笔委托。
-    if engine is not None:
-        if hasattr(engine, "_running"):
-            engine._running = False
-        # I-5：同步置拒单闸——在途 tick 的 _handle_bar 入口即刻不再发新单
-        # （不等 engine.stop() 协程被调度）。
-        if hasattr(engine, "_stop_requested"):
-            engine._stop_requested = True
-        asyncio.create_task(engine.stop())
-    return ok({"id": session_id, "status": "stopped"})
 
 
 @router.post("/sessions/{session_id}/portfolios/{portfolio_id}/recover")

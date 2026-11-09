@@ -951,7 +951,7 @@ onMounted(loadPortfolios)
                 轮动动量窗口=看多少根 bar 的涨幅。</p>
               <p class="guide-step"><b>市场状态闸（B5）</b>：基准周线 bull 态时用 trend_* 覆盖移动止损/最大持仓，
                 其余状态回落原参数。</p>
-              <p class="guide-step"><b>敞口上限</b>：仅回测——BUY 审批卡策略总持仓市值 ≤ 资金占比 × 组合初始资金。</p>
+              <p class="guide-step"><b>敞口上限</b>：回测/实盘均生效——BUY 审批卡策略总持仓市值 ≤ 资金占比 × 组合初始资金。</p>
             </div>
           </div>
           <div class="form-group">

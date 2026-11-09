@@ -344,6 +344,12 @@ class TdxTqDispatcher(OrderDispatcher):
     def get_positions(self) -> list:
         self._ensure()
         rows = self._query("query_stock_positions", [])
+        if self._last_error:
+            # 查询失败（未登录/ErrorId）不能返回空列表：账户快照与对账导入会把
+            # 空表当成「真实零持仓」，既写坏快照又制造假对账差异。抛给调用方
+            # 跳过本轮（引擎已按 BridgeUnavailableError 处理）。
+            raise BridgeUnavailableError(
+                "通达信持仓查询失败：%s" % self._last_error)
         out = []
         for r in rows if isinstance(rows, list) else []:
             vol = _num(r, _POS_VOL_KEYS, 0) or 0
@@ -446,7 +452,13 @@ class TdxTqDispatcher(OrderDispatcher):
         fabricated 候选，防同形态遗留单/手工单被新单误绑。
         """
         out = []
-        for o in self.get_orders():
+        orders = self.get_orders()
+        if self._last_error:
+            # 读失败时不能返回 []：状态机把「表里查不到该 ref」判为已撤单，
+            # 会把真实在途单收敛成 canceled。
+            raise BridgeUnavailableError(
+                "通达信委托查询失败：%s" % self._last_error)
+        for o in orders:
             ref = str(o.get("order_id") or "").strip()
             code = re.sub(r"\D", "", str(o.get("symbol") or ""))[:6]
             if not ref or len(code) != 6:
@@ -477,7 +489,12 @@ class TdxTqDispatcher(OrderDispatcher):
         因此直接返回累计成交行即可；佣金/印花税不在委托表暴露，按 0 记。
         """
         out = []
-        for o in self.get_orders():
+        orders = self.get_orders()
+        if self._last_error:
+            # 读失败 ≠ 无成交：抛出让调用方跳过本轮，避免误判为「已全部无成交」。
+            raise BridgeUnavailableError(
+                "通达信委托查询失败：%s" % self._last_error)
+        for o in orders:
             ref = str(o.get("order_id") or "").strip()
             filled = int(o.get("filled_volume") or 0)
             code = re.sub(r"\D", "", str(o.get("symbol") or ""))[:6]

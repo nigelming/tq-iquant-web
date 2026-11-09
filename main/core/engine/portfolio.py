@@ -634,6 +634,17 @@ class Portfolio:
             # max_add_count 加仓次数上限始终生效（第一道闸）；资金审批/熔断在执行层兜底。
             if pos is None or pos.quantity == 0:
                 return []
+            # 成本未知（继承仓桥侧未给 cost 且市值不可用 → avg_cost=0）：ADD 不能走。
+            # ① threshold 分支要除以 avg_cost，会抛 Decimal DivisionByZero，冒泡到
+            #    live_engine._on_bar 的 per-portfolio 兜底 → 该组合本 bar 全部策略
+            #    （含止损/止盈/移动止损）被整体跳过，信号存续时每根 bar 复现；
+            # ② 即便 threshold=-1 跳过回撤判断，加仓也会把 0 成本摊进加权均价，
+            #    之后止损/止盈基准失真。保守：记事件、不加仓。
+            if pos.avg_cost <= 0:
+                self._rec("add_cost_unknown", "signal_gate", "block", ctx, sig, bar,
+                          message="ADD 跳过：持仓成本未知（avg_cost=0），"
+                                  "无法判断回撤且加仓会污染加权成本")
+                return []
             if ctx.add_position_threshold != Decimal("-1"):
                 drop = (pos.avg_cost - close) / pos.avg_cost
                 if drop < ctx.add_position_threshold:

@@ -14,6 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.main import app
+from core.config import load_config
 from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
@@ -874,16 +875,32 @@ def test_query_positions_uses_engine_when_running(client, mock_bridge):
 
 # ---- 双桥：_bridge_config 返回双址；_build_engine 按 session.mode 选桥 ----
 
+def _configured_bridge_urls():
+    """按 config.yaml 的 iquant_bridge 段取双桥址（缺省回退与 live_service 一致）。
+
+    不硬编码 8790/8791：live 腿可能指向普通账户（8790）或信用账户（8791），
+    用例必须跟随配置，而不是要求配置迎合用例。
+    """
+    cfg = load_config()
+    br = cfg.get("iquant_bridge", {}) if isinstance(cfg, dict) else {}
+    br = br if isinstance(br, dict) else {}
+    sim = br.get("simulation", {}) if isinstance(br.get("simulation"), dict) else {}
+    liv = br.get("live", {}) if isinstance(br.get("live"), dict) else {}
+    return (sim.get("base_url") or "http://127.0.0.1:8790",
+            liv.get("base_url") or "http://127.0.0.1:8791")
+
+
 def test_bridge_config_returns_dual_urls():
-    """_bridge_config() 返回 simulation/live 两个 base_url（对齐 config.yaml 双桥结构）。"""
+    """_bridge_config() 返回 simulation/live 两个 base_url（跟随 config.yaml 双桥结构）。"""
+    expected_sim, expected_live = _configured_bridge_urls()
     br = live_api._bridge_config()
-    assert br["simulation"] == "http://127.0.0.1:8790"
-    assert br["live"] == "http://127.0.0.1:8791"
+    assert br["simulation"] == expected_sim
+    assert br["live"] == expected_live
 
 
 def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
-    """_build_engine(mode) 按 mode 选桥址：simulation→8790，live→8791，
-    未知 mode 兜底仿真桥(8790，防误传走到真实资金桥)。
+    """_build_engine(mode) 按 mode 选桥址：simulation→仿真桥，live→实盘桥，
+    未知 mode 兜底仿真桥（防误传走到真实资金桥）。
 
     simulation/live 用真实创建对应 mode 的 session；unknown mode 不会被
     create_session 接受（白名单），故用 simulation session 直接调 _build_engine
@@ -894,6 +911,7 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
     ps_id = _seed(db)
     db.close()
 
+    sim_url, live_url = _configured_bridge_urls()
     captured = {}
 
     real_cls = live_api.HttpBridgeDispatcher
@@ -911,8 +929,7 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
 
     # simulation / live：创建对应 mode 的 session 后直接调 _build_engine
     # （显式钉 engine=goldminer：HTTP 桥通道，消除对本地 default_engine 的隐性依赖）
-    for mode, expected in [("simulation", "http://127.0.0.1:8790"),
-                           ("live", "http://127.0.0.1:8791")]:
+    for mode, expected in [("simulation", sim_url), ("live", live_url)]:
         sid = _create_session(c, portfolio_ids=(ps_id,), mode=mode, engine="goldminer")
         db2 = Session()
         try:
@@ -929,7 +946,7 @@ def test_build_engine_picks_bridge_by_mode(client, monkeypatch):
         live_api._build_engine(sim_sid, db3, "unknown")
     finally:
         db3.close()
-    assert captured["base_url"] == "http://127.0.0.1:8790", "unknown mode 应兜底仿真桥，实际 %s" % captured["base_url"]
+    assert captured["base_url"] == sim_url, "unknown mode 应兜底仿真桥，实际 %s" % captured["base_url"]
 
 
 def test_start_session_routes_engine_to_bridge(client, monkeypatch):

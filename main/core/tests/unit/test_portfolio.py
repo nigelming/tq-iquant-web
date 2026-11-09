@@ -412,6 +412,29 @@ def test_add_signal_threshold_minus_one_adds_on_extreme_rise():
     assert orders[0].trade_type == TradeType.BUY
 
 
+def test_add_signal_with_unknown_cost_skipped_without_crash():
+    """继承仓成本未知（avg_cost=0）时 ADD 不得除零。
+
+    触发：桥/柜台未给 cost（live_engine._position_cost 回退 Decimal("0")）→
+    持仓成本未知。原实现 (avg_cost-close)/avg_cost 抛 Decimal DivisionByZero，
+    冒泡到 LiveEngine._on_bar 的 per-portfolio 兜底 → 该组合本 bar 全部策略
+    （含止损/止盈/移动止损）被整体跳过，信号存续时每根 bar 复现。
+    """
+    port, ctx = _strategy_with_params(
+        "000001.SZ",
+        [{"signal_name": "add_sig", "signal_type": SignalType.ADD, "trigger_value": 1}],
+        add_position_ratio=Decimal("0.05"),
+    )
+    pos = Position("000001.SZ")
+    pos.mirror_bridge(1000, 1000, Decimal("0"), datetime(2026, 7, 29).date())
+    assert pos.avg_cost == Decimal("0")
+    ctx.positions["000001.SZ"] = pos
+
+    bar = _bar("000001.SZ", "9.4", datetime(2026, 7, 30, 15, 0))
+    cache = {(1, "000001.SZ", bar.bar_time): [{"name": "add_sig", "value": 1}]}
+    assert port.on_bar(bar, signal_cache=cache) == []
+
+
 def test_add_signal_threshold_minus_one_still_respects_max_count():
     """threshold=-1 时 drop 失效，但 max_add_count 加仓次数上限仍生效。
     add_count=2 == max_add_count=2 → 即便跌够（现价 9.0 跌 10%）也不出单。"""

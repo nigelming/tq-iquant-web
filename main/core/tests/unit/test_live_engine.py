@@ -558,6 +558,51 @@ def test_recover_rebuilds_positions_from_trades():
     assert port.account.cash == Decimal("100000") - Decimal("930")
 
 
+def test_recover_skips_external_trade_replay():
+    """补记单（order_type=external）只留痕不记账：重启重放不得改虚拟现金。
+
+    会话运行期 record_external_deals 刻意不 apply（持仓由桥快照镜面覆盖，
+    资金基准已含该资产）。若 recover 全量重放，外部卖出会被 Position.sell
+    截断为 0 持仓却照加卖出所得 → 虚拟现金虚增（净值/单仓金额被放大）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="sell", order_type="external", price=Decimal("9.5"), quantity=100,
+        filled_quantity=100, filled_price=Decimal("9.5"), status="filled",
+        bar_time=datetime(2026, 8, 5, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type="sell", price=Decimal("9.5"), quantity=100,
+        amount=Decimal("950"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 8, 5, 10, 0),
+    ))
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert stock not in ctx.positions
+    assert port.account.cash == Decimal("100000")
+
+
 # ---------------- LiveT1Checker ----------------
 def test_live_t1_checker_full_quantity_without_bridge_map():
     """F5：桥可用表未取到（空表）→ 全量放行（券商端 T+1 兜底，不误伤正常卖出）。"""
@@ -3391,6 +3436,70 @@ def test_recover_restores_risk_state_even_with_zero_trigger_count():
     engine.recover(db)
     db.close()
     assert rm.peak_value == Decimal("900000")
+
+
+def test_recover_keeps_breaker_when_triggered_today():
+    """当日触发 max_drawdown 后重启 → 熔断态保持（次日恢复语义，不得静默解除）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = now_shanghai().date()
+    engine._breaker.persist_risk_state(port)
+
+    rm.circuit_breaker_active = False
+    rm.breaker_trigger_date = None
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert rm.circuit_breaker_active is True
+    assert rm.is_trading_halted() is True
+
+
+def test_recover_clears_breaker_when_trigger_date_passed():
+    """触发日早于今天 → 重启时按次日恢复解除熔断（与盘中跨日恢复一致）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = now_shanghai().date() - timedelta(days=1)
+    engine._breaker.persist_risk_state(port)
+
+    rm.circuit_breaker_active = False
+    rm.breaker_trigger_date = None
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert rm.circuit_breaker_active is False
+
+
+def test_restore_risk_state_ignores_money_fields_from_v1_payload():
+    """旧口径（无 schema 键）的 peak/prev_close 不还原：继承仓市值未扣现金前
+    写下的峰值偏高，沿用会把升级后的正常净值误判成回撤 → 启动即误触熔断。"""
+    from types import SimpleNamespace
+    from core.engine.live.breaker import BreakerService
+
+    rm = SimpleNamespace(
+        peak_value=Decimal("0"),
+        prev_close_value=None,
+        daily_pause_active=False,
+        circuit_breaker_active=False,
+        breaker_trigger_date=None,
+        daily_loss_trigger_date=None,
+    )
+    raw = json.dumps({
+        "peak_value": "1200000",
+        "prev_close_value": "1180000",
+        "daily_pause_active": True,
+        "breaker_trigger_date": "2026-10-23",
+    })
+    assert BreakerService._restore_risk_state(rm, raw) is True
+    assert rm.peak_value == Decimal("0")          # 金额类不还原
+    assert rm.prev_close_value is None
+    assert rm.daily_pause_active is True          # 日期/开关类仍还原
+    assert rm.breaker_trigger_date == date(2026, 10, 23)
 
 
 def test_restore_risk_state_bad_date_does_not_partially_apply():

@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pyperclip>=1.11.0",
     "pytdx>=1.72",
+    "pywebview>=6.2.1",
     "pywinauto>=0.6.9",
     "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.51",

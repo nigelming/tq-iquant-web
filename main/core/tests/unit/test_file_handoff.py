@@ -85,15 +85,47 @@ def test_corrupt_jsonl_lines_skipped(tmp_path):
     assert h.read_pending_orders() == []
 
 
-def test_corrupt_cursor_resets_from_zero(tmp_path):
+def test_corrupt_cursor_skips_history_instead_of_replaying(tmp_path):
+    """cursor.json 损坏 → done 表一并丢失：offset 初始化到文件尾，历史指令
+    不重放（at-most-once 不降级为重复下单），此后新增的指令照常执行。"""
     h = FileHandoff(str(tmp_path), 5)
     h.append_order({"order_id": "k1"})
     with open(h.cursor_path, "w", encoding="utf-8") as f:
         f.write("garbage")
     h2 = FileHandoff(str(tmp_path), 5)
-    assert h2.cursor["orders_offset"] == 0
+    assert h2.cursor["orders_offset"] == 1
     assert h2.cursor["done"] == {}
-    assert len(h2.read_pending_orders()) == 1
+    assert h2.read_pending_orders() == []
+
+    h2.append_order({"order_id": "k2"})
+    assert [p["order_id"] for p in h2.read_pending_orders()] == ["k2"]
+
+
+def test_missing_cursor_skips_history_instead_of_replaying(tmp_path):
+    """cursor.json 被删除 → 同上：历史指令不重放，只执行此后新增的指令。"""
+    h = FileHandoff(str(tmp_path), 6)
+    h.append_order({"order_id": "m1"})
+    h.append_order({"order_id": "m2"})
+    h.read_pending_orders()          # 先落一份游标，再模拟游标文件丢失
+    os.remove(h.cursor_path)
+
+    h2 = FileHandoff(str(tmp_path), 6)
+    assert h2.cursor["orders_offset"] == 2
+    assert h2.read_pending_orders() == []
+
+    h2.append_order({"order_id": "m3"})
+    assert [p["order_id"] for p in h2.read_pending_orders()] == ["m3"]
+
+
+def test_normal_restart_keeps_cursor_semantics(tmp_path):
+    """正常重启（cursor.json 可读）行为不变：未消费指令仍会返回。"""
+    h = FileHandoff(str(tmp_path), 7)
+    h.append_order({"order_id": "n1"})
+    h.read_pending_orders()
+    h.append_order({"order_id": "n2"})   # 写入后、消费前进程退出
+
+    h2 = FileHandoff(str(tmp_path), 7)
+    assert [p["order_id"] for p in h2.read_pending_orders()] == ["n2"]
 
 
 def test_write_signal_and_risk(tmp_path):

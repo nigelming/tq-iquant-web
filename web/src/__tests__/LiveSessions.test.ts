@@ -1356,8 +1356,8 @@ describe('LiveSessions.vue 多会话并行监控（M1）', () => {
     const w = mount(LiveSessions)
     await flushPromises()
 
-    expect(w.text()).toContain('支持多会话并行')
-    expect(w.text()).toContain('同花顺通道同时仅一个会话')
+    expect(w.text()).toContain('支持跨引擎多会话并行')
+    expect(w.text()).toContain('同一引擎同时仅一个会话')
     expect(w.text()).toContain('复制交易')
     w.unmount()
   })

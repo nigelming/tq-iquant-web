@@ -21,10 +21,99 @@ def is_frozen_app() -> bool:
     return hasattr(sys, "frozen") or Path(sys.argv[0]).suffix.lower() == ".exe"
 
 
+def _install_dir() -> Path:
+    return Path(sys.argv[0]).resolve().parent
+
+
+def use_app_root() -> bool:
+    """相对路径（data/dev.db、data/ths）是否锚定到 app_root()。
+
+    打包版恒为 True；源码运行时默认锚 main/（历史行为），
+    仅当显式设置 TQ_APP_ROOT（冒烟测试/便携）时改锚该目录。
+    """
+    return is_frozen_app() or bool(os.environ.get("TQ_APP_ROOT"))
+
+
+def _is_writable_dir(path: Path) -> bool:
+    """实际写探测（创建目录 + 写删临时文件），比 os.access 可靠。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+_APP_ROOT: Optional[Path] = None
+
+
+def app_root() -> Path:
+    """应用可写根目录：data/、logs/、config.yaml 都落在这里。
+
+    优先级：
+    1. 环境变量 TQ_APP_ROOT（冒烟测试/便携场景显式指定）
+    2. 打包版：exe 同级目录（安装目录对当前用户可写时）
+    3. 打包版回落：%LOCALAPPDATA%\\创懿基金量化投资平台
+       （装到 Program Files 或 D:\\ 根目录且普通用户无写权限时，
+       绝不把 SQLite/配置写到只读目录）
+    4. 源码运行：仓库根目录（main/ 的上一级）
+    """
+    global _APP_ROOT
+    if _APP_ROOT is not None:
+        return _APP_ROOT
+
+    env = os.environ.get("TQ_APP_ROOT")
+    if env:
+        _APP_ROOT = Path(env).expanduser().resolve()
+    elif is_frozen_app():
+        base = _install_dir()
+        if _is_writable_dir(base / "data"):
+            _APP_ROOT = base
+        else:
+            local = os.environ.get("LOCALAPPDATA") or str(Path.home())
+            fallback = Path(local) / "创懿基金量化投资平台"
+            _is_writable_dir(fallback / "data")
+            _APP_ROOT = fallback
+    else:
+        _APP_ROOT = Path(__file__).resolve().parent.parent.parent
+    return _APP_ROOT
+
+
 def _default_config_path() -> Path:
-    if is_frozen_app():
-        return Path(sys.argv[0]).resolve().parent / "config.yaml"
+    if use_app_root():
+        return app_root() / "config.yaml"
     return Path(__file__).resolve().parent.parent.parent / "config.yaml"
+
+
+def ensure_config() -> Path:
+    """首次启动生成 config.yaml（从打包附带的模板复制，模板只读不覆盖用户配置）。"""
+    path = _default_config_path()
+    if path.exists():
+        return path
+    template = None
+    candidates = []
+    if is_frozen_app():
+        candidates.append(_install_dir() / "config.template.yaml")
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "config.template.yaml")
+    candidates.append(
+        Path(__file__).resolve().parent.parent.parent / "packaging" / "config.template.yaml"
+    )
+    for c in candidates:
+        if c.exists():
+            template = c
+            break
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _CONFIG_WRITE_LOCK:
+        if template is not None:
+            path.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            path.write_text(
+                yaml.dump(_defaults(), default_flow_style=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+    return path
 
 
 def get_config_path() -> Path:

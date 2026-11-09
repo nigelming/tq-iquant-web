@@ -1683,7 +1683,7 @@ export interface LiveSessionItem {
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
   engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
-  live_capital?: number | null  // 会话级实盘资金基准（元）；null=各组合用自身 initial_capital
+  live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
@@ -1713,7 +1713,7 @@ export interface LiveSessionCreate {
   engine?: LiveEngineKey
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
-  live_capital?: number | null  // 实盘资金基准（元）；空=null=用组合初始资金
+  live_capital?: number | null  // 实盘资金基准（账户总资产，元）；空=null=用组合初始资金
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
 }
 

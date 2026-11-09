@@ -80,9 +80,9 @@ ENGINES: Dict[int, LiveEngine] = {}
 # ---------------------------------------------------------------------------
 
 def iquant_config() -> dict:
-    """读 QMT 通道双桥配置（config.iquant_bridge 段）。
+    """读 QMT 通道桥配置（config.iquant_bridge 段）。
 
-    simulation（仿真/虚拟资金，8790）/ live（实盘/真实资金，8791）各一个
+    simulation / live 两个模式位当前都指向 8790 的 QMT 仿真账户（410038214257 / STOCK，账户内为仿真资金），各一个
     base_url；桥绑 loopback、无鉴权。超时/慢告警阈值与掘金桥同构配置，
     缺省回退（本机 loopback 桥默认 10s / 5s / 300s），不写死在调用点。
     """
@@ -107,9 +107,9 @@ def iquant_config() -> dict:
 
 
 def bridge_config() -> dict:
-    """读双桥地址：simulation(仿真/虚拟资金)/live(实盘/真实资金) 各一个 base_url。
+    """读桥地址：simulation/live 两个模式位当前都指向 8790 的 QMT 仿真账户。
 
-    session.mode = simulation|live 决定走哪个桥（账号差异，见 live/bridge/README.md）。
+    8791 信用腿（CREDIT）保留但非生产、未启用，见 live/bridge/README.md。
     模拟/实盘（信号 vs 真实下单）不由 Core 控制，由 QMT 客户端启动按钮决定。
     """
     q = iquant_config()
@@ -544,7 +544,13 @@ def test_channel(channel: str = "ths_ui", mode: str = "simulation") -> dict:
             if not dispatcher.heartbeat():
                 return {"ok": False, "channel": "tdx_tq",
                         "error": dispatcher.last_error or "通达信交易未就绪"}
-            rows = dispatcher.query_positions()
+            try:
+                rows = dispatcher.query_positions()
+            except Exception as e:
+                # 持仓查询失败会抛 BridgeUnavailableError（读失败≠零持仓）；
+                # 探测接口必须转成 ok=False，不能漏成 500。
+                return {"ok": False, "channel": "tdx_tq",
+                        "error": str(e) or "通达信持仓读取失败"}
             if dispatcher.last_error:
                 return {"ok": False, "channel": "tdx_tq", "error": dispatcher.last_error}
             return {"ok": True, "channel": "tdx_tq",
@@ -779,8 +785,9 @@ def build_engine(
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
-    # 会话级实盘资金基准：非 None 时所有组合以该值起账（比率配置等比缩放）；
-    # None=各组合用自身 initial_capital（现行为）。
+    # 会话级实盘资金基准（账户总资产口径）：非 None 时所有组合以该值起账
+    # （比率配置等比缩放）；None=各组合用自身 initial_capital（现行为）。
+    # 继承持仓的市值由 LiveEngine 从起账现金中扣除，避免与基准重复计入。
     session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     live_capital = getattr(session_row, "live_capital", None)
     # 外部信号注入（0011）：参数优先；未传回退 session.signal_file_path（会话级配置）
@@ -1300,13 +1307,18 @@ def start_session(
         )
 
     execution_mode = getattr(session, "execution_mode", None) or "auto"
-    engine = build_engine(
-        session_id, db, mode,
-        db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
-        engine=session_engine(session),
-        execution_mode=execution_mode,
-        signal_file_path=getattr(session, "signal_file_path", None),
-    )
+    try:
+        engine = build_engine(
+            session_id, db, mode,
+            db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
+            engine=session_engine(session),
+            execution_mode=execution_mode,
+            signal_file_path=getattr(session, "signal_file_path", None),
+        )
+    except RuntimeError as e:
+        # make_dispatcher 对未知引擎键/依赖缺失（pywinauto 等）/路径账号未配置
+        # 统一抛 RuntimeError；这里必须转成 503 可操作提示，不能漏成 500。
+        return None, session, (503, str(e) or "交易通道未就绪")
     # 启动前探测通道在线：客户端未起/未登录直接拒绝，不建引擎、不置 running，
     # 避免「一点就成功、通道离线却无告警」。heartbeat() 本地 loopback 瞬时失败，
     # 不阻塞事件循环。
@@ -1646,27 +1658,38 @@ def engine_external_positions(engine: LiveEngine) -> List[dict]:
     virtual_codes = {r["stock_code"] for r in engine_virtual_positions(engine)}
     now = time.monotonic()
     real = None
+    cached_rows = None
     cache = getattr(engine, "_external_pos_cache", None)
     if cache is not None:
         try:
             ts, rows = cache
-            if now - ts < _EXTERNAL_POS_TTL_SECONDS:
-                real = rows
+            if isinstance(rows, list):
+                cached_rows = rows
+            if cached_rows is not None and now - ts < _EXTERNAL_POS_TTL_SECONDS:
+                real = cached_rows
         except Exception:
             real = None
     if real is None:
         try:
             fn = getattr(dispatcher, "get_positions", None)
-            real = fn() if callable(fn) else []
+            fresh = fn() if callable(fn) else []
         except Exception:
+            # 读失败（如 TdxTqDispatcher 的 BridgeUnavailableError）不是「零持仓」：
+            # 不刷新缓存、沿用上次成功结果，避免瞬时失败把外部持仓闪成空。
             logger.warning("外部持仓读回失败（dispatcher.get_positions）", exc_info=True)
-            real = []
-        if not isinstance(real, list):
-            real = []
-        try:
-            engine._external_pos_cache = (now, real)
-        except Exception:
-            pass
+            real = cached_rows or []
+        else:
+            if isinstance(fresh, list):
+                real = fresh
+                try:
+                    engine._external_pos_cache = (now, real)
+                except Exception:
+                    pass
+            else:
+                # None（ThsUiDispatcher 读表失败契约）同样不是真空仓：
+                # 不得写成空缓存，否则 60s TTL 内外部持仓会一直闪空。
+                logger.warning("外部持仓读回失败（dispatcher.get_positions 返回 None）")
+                real = cached_rows or []
     out = []
     for r in real:
         if not isinstance(r, dict):
@@ -1812,7 +1835,9 @@ def serialize_signal(s: LiveSignal) -> dict:
         "alert_error": s.alert_error,
         "tdx_run_id": s.tdx_run_id,
         "created_at": _iso_utc(s.created_at),
-        "alerted_at": _iso_utc(s.alerted_at),
+        # alerted_at 由 SignalMonitor 用 now_shanghai() 写入（非 server_default），
+        # 按上海时区标注；标成 UTC 会让外部消费方偏移 8 小时。
+        "alerted_at": _iso_cst(s.alerted_at),
     }
 
 

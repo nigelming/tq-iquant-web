@@ -179,6 +179,26 @@ def _position_cost(row, volume: int) -> Decimal:
     return cost if cost > 0 else Decimal("0")
 
 
+def _position_market_value(row, volume: int, cost: Decimal) -> Decimal:
+    """真实持仓行市值：market_value 优先，缺失时按 cost×volume 估算，都无 → 0。
+
+    用于「继承仓位计入起账资金基准」的扣减。资金基准（live_capital / 组合回测
+    initial_capital）是**账户总资产**口径：继承仓位本来就是该资产的一部分，
+    只镜像数量而不扣虚拟现金，会让净值 = 基准现金 + 继承市值 → 双计
+    （2026-11-07 实证：基准 27 万 + 继承市值 5.59 万 → 净值 32.59 万，
+    20% 单仓 6.52 万而非 5.46 万）。
+    """
+    try:
+        mv = Decimal(str(row.get("market_value") or 0))
+    except Exception:  # noqa: BLE001
+        mv = Decimal("0")
+    if mv > 0:
+        return mv
+    if cost and cost > 0 and volume > 0:
+        return cost * Decimal(int(volume))
+    return Decimal("0")
+
+
 # 深交所收盘时点（上海 15:00）。收盘后禁止新下单——报不进交易所，会成待报单
 # 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
 # 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
@@ -480,6 +500,9 @@ class LiveEngine:
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
         self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_online = True
+        # 继承仓位市值扣减虚拟现金后若现金为负（资金基准填得小于继承市值），
+        # 只告警一次，避免 60s 快照节拍刷屏。
+        self._neg_cash_warned = False
         # 存活监控信号（进程内 watchdog 读）：主循环每轮起始刷新心跳；start 记录
         # 启动时刻用于预热宽限。仅两个赋值，不增加任何 TQ/桥调用。
         self._started_at: Optional[datetime] = None
@@ -1569,6 +1592,9 @@ class LiveEngine:
             for p in (last_snap.positions or []):
                 if p.highest_price is not None:
                     prev_peaks[p.stock_code] = Decimal(str(p.highest_price))
+        # 本轮判定为「旧持仓残留峰值」的代码（先清仓再重开）：不还原、不写快照、
+        # 也不交给导入路径（否则重启后会反复复活旧高点）
+        stale_peak_codes: set = set()
         # 全部策略 ctx 的峰值查找表（虚拟账本当前值）
         ctx_peaks: Dict[str, Decimal] = {}
         for port in self.ctx.portfolios:
@@ -1591,6 +1617,22 @@ class LiveEngine:
             code = _position_code(r)
             prev_hp = prev_peaks.get(code)
             cur_hp = ctx_peaks.get(code)
+            holders = []
+            for port in self.ctx.portfolios:
+                for ctx in (getattr(port, "strategies", None) or []):
+                    p = (getattr(ctx, "positions", None) or {}).get(code)
+                    if p is not None and p.quantity > 0:
+                        holders.append(p)
+            # 上一份快照的峰值只对「快照之前就存在」的持仓有效：若该代码当前
+            # 全部持仓都是快照之后新开的（同代码先清仓再重开），旧峰值属于上
+            # 一轮持仓——既不还原到持仓，也不写进新快照（否则会跨重启反复复活，
+            # 把峰值钉在旧高位 → drawdown 立即 ≥ 阈值 → 误触全仓卖出）。
+            # holders 为空（重启后尚未导入虚拟账本）→ 仍信旧峰值，由导入路径还原。
+            snap_at = getattr(last_snap, "captured_at", None)
+            if holders and prev_hp is not None and snap_at is not None:
+                if not any(h.buy_time is None or h.buy_time <= snap_at for h in holders):
+                    prev_hp = None
+                    stale_peak_codes.add(code)
             effective_hp = max(
                 (h for h in (prev_hp, cur_hp) if h is not None),
                 default=None,
@@ -1601,25 +1643,61 @@ class LiveEngine:
             avail_qty = _finite_or_none(r.get("available"))
             cost = _finite_or_none(r.get("cost"))
             mv = _finite_or_none(r.get("market_value"))
+            # 峰值兜底（2026-11-07）：既无历史快照峰值、也无内存峰值（继承仓在
+            # 行情轮询窗口外启动 / 该票无 bar → update_high(close) 从未执行）时，
+            # 用柜台成本作起点。否则该列永远 NULL（tdx 会话 5 实证 1888 行全空）→
+            # 重启后移动止损从当根 bar 收盘重新起算。取舍见导入路径注释。
+            seed_hp = Decimal(str(cost)) if (cost is not None and cost > 0) else None
+            effective_hp = max(
+                (h for h in (effective_hp, seed_hp) if h is not None),
+                default=None,
+            )
+            # 现价：优先组合最近已知价（与 total_value 估值同源），其次通道行内
+            # 价格字段，最后回落成本。此前该列从未被赋值（全表 5701 行为 NULL），
+            # 既无法区分「收盘后无现价」与「通道未提供价格」，也让快照不可读。
+            cur_px = None
+            for port in self.ctx.portfolios:
+                px = (getattr(port, "_price_snapshot", None) or {}).get(code)
+                if px is not None and px > 0:
+                    cur_px = px
+                    break
+            if cur_px is None:
+                for key in ("price", "current_price", "last_price", "now", "Price"):
+                    v = _finite_or_none(r.get(key))
+                    try:
+                        if v is not None and float(v) > 0:
+                            cur_px = Decimal(str(v))
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            if cur_px is None and cost is not None and cost > 0:
+                cur_px = Decimal(str(cost))
             snap.positions.append(LiveAccountPositionSnapshot(
                 stock_code=code,
                 quantity=int(volume or 0),
                 available_quantity=int(avail_qty) if avail_qty is not None else None,
                 cost_price=Decimal(str(cost)) if cost is not None else None,
+                current_price=cur_px,
                 market_value=Decimal(str(mv)) if mv is not None else None,
                 highest_price=effective_hp,
             ))
-            # 账本峰值低于历史记录（重启丢峰）→ 还原（只升不降语义安全）
-            pos = None
-            for port in self.ctx.portfolios:
-                for ctx in (getattr(port, "strategies", None) or []):
-                    p = (getattr(ctx, "positions", None) or {}).get(code)
-                    if p is not None and p.quantity > 0:
-                        pos = p
-                        break
-            if pos is not None and effective_hp and effective_hp > (pos.highest_price or Decimal("0")):
-                pos.update_high(effective_hp)
+            # 账本峰值低于历史记录（重启丢峰）→ 还原（只升不降语义安全）。
+            # 两个口径修正（2026-11-07）：
+            # ① 必须覆盖**所有**持有该代码的策略/组合——此前只还原第一个匹配持仓
+            #    （break），多组合同代码时其余组合重启后峰值从当前价重新起算，
+            #    移动止损静默失效（等于重启即免疫移动止损）；
+            # ② 本轮持仓建仓时间晚于上一份快照 → 该快照峰值属于上一轮持仓
+            #    （同代码先清仓再重开），不得复活旧高点。
+            if effective_hp:
+                for p in holders:
+                    if (snap_at is not None and p.buy_time is not None
+                            and p.buy_time > snap_at):
+                        continue
+                    if effective_hp > (p.highest_price or Decimal("0")):
+                        p.update_high(effective_hp)
         db.add(snap)
+        for _c in stale_peak_codes:
+            prev_peaks.pop(_c, None)
         avail = _finite_or_none(asset.get("available"))
         if avail is not None:
             try:
@@ -1708,6 +1786,30 @@ class LiveEngine:
         port, strategy_ctx = target
         return port.portfolio_id, strategy_ctx.strategy_id
 
+    def _deduct_inherited_value(self, port, value: Decimal, source: str) -> None:
+        """继承仓位的市值从虚拟现金中扣除（资金基准 = 账户总资产口径）。
+
+        会话起账资金基准（live_capital / 组合回测 initial_capital）表示账户总资产；
+        继承/外部增仓的市值本就包含在该基准里。若只把数量镜像进虚拟账本而不扣现金，
+        净值会被重复计入这部分市值 → 单仓金额、敞口上限、回撤分母等比放大。
+
+        只在「真实数量 > 虚拟数量」的新增部分调用：平台自管买入/成交回填已经由
+        apply_trade 扣过现金，不会重复扣。
+
+        调用点需已持有 _book_lock（mirror 在锁内调用；import 路径单独加锁）。
+        """
+        if value <= 0:
+            return
+        port.account.deduct_cash(value)
+        if port.account.cash < 0 and not self._neg_cash_warned:
+            self._neg_cash_warned = True
+            logger.warning(
+                "inherited positions value %s exceeds cash baseline for portfolio %s "
+                "(cash %s < 0, source=%s, session %s): 实盘资金基准应按"
+                "「账户总资产（可用资金 + 持仓市值）」填写",
+                value, port.portfolio_id, port.account.cash, source,
+                self.session_id)
+
     def _mirror_bridge_positions(self, db: Session, positions: list, now) -> int:
         """以桥 /positions 镜面覆盖虚拟账本的数量/可卖/成本（覆盖不累加）。
 
@@ -1719,6 +1821,8 @@ class LiveEngine:
           的持仓变动由成交回填负责，此时覆盖会与在途成交方向打架；
         - 桥没有对应行（已清仓）不强行清零：交给本地成交记录与对账收口，
           避免桥瞬时漏行把真实持仓抹掉；
+        - 真实数量 > 虚拟数量（继承仓/外部手工增仓）的新增部分，按真实市值
+          从虚拟现金扣除——资金基准是「账户总资产」口径，不扣会与基准双计；
         - 幂等：同一快照反复调用结果相同；只有实际变化才发 position 事件，
           避免 60s 节拍把同一持仓刷屏。
         """
@@ -1738,7 +1842,10 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 cost = Decimal("0")
             avail = _finite_or_none(r.get("available"))
-            real[code] = (max(0, vol), avail, cost)
+            real[code] = (
+                max(0, vol), avail, cost,
+                _position_market_value(r, vol, cost),
+            )
         if not real:
             return 0
         inflight = {
@@ -1750,7 +1857,7 @@ class LiveEngine:
         query_date = now.date() if hasattr(now, "date") else now
         changed = 0
         with self._book_lock:
-            for code, (vol, avail, cost) in real.items():
+            for code, (vol, avail, cost, mv_total) in real.items():
                 if code in inflight:
                     continue
                 holders = []
@@ -1776,6 +1883,14 @@ class LiveEngine:
                     sell = min(avail_alloc[i], qty)
                     before_qty, before_cost = pos.quantity, pos.avg_cost
                     pos.mirror_bridge(qty, sell, cost, query_date)
+                    # 真实数量超出虚拟账本的部分 = 继承仓/外部手工增仓，其市值
+                    # 已包含在资金基准（账户总资产）里 → 扣等额虚拟现金，避免双计
+                    if vol > 0 and mv_total > 0 and qty > before_qty:
+                        self._deduct_inherited_value(
+                            port,
+                            mv_total / Decimal(vol) * Decimal(qty - before_qty),
+                            "mirror",
+                        )
                     if pos.quantity == before_qty and pos.avg_cost == before_cost:
                         continue
                     changed += 1
@@ -1804,9 +1919,12 @@ class LiveEngine:
         """真实持仓中虚拟账本缺失的代码 → 导入为对齐仓（挂主策略，纳入风控）。
 
         幂等：虚拟已有（quantity>0）→ 跳过；在途 BUY 覆盖的代码跳过
-        （成交回填后自然进虚拟账本，重复导入会双计）。"""
+        （成交回填后自然进虚拟账本，重复导入会双计）。
+        导入仓的市值同时从虚拟现金扣除——资金基准是「账户总资产」口径，
+        继承仓已包含在基准里，不扣会与基准重复计入（净值虚高 → 单仓放大）。"""
         imported = 0
         imported_shares = 0
+        deducted_value = Decimal("0")
         skipped_zero = 0
         no_code = 0
         out_of_pool = []  # [(code, volume)]：不在任何组合股票池
@@ -1875,12 +1993,26 @@ class LiveEngine:
                 avail = None
             pos.mirror_bridge(vol, avail, cost,
                               now.date() if hasattr(now, "date") else now)
+            # 继承仓市值从起账现金扣除：资金基准（live_capital / 回测初始资金）
+            # 是「账户总资产」口径，继承仓本就包含在该基准里，不扣会双计
+            inherited = _position_market_value(r, vol, cost)
+            if inherited > 0:
+                with self._book_lock:
+                    self._deduct_inherited_value(port, inherited, "import")
+                deducted_value += inherited
             # 峰值恢复：上次快照记录的历史最高价 > 成本 → 还原（移动止损基准
-            # 跨重启不丢；无记录 → 留 0，首 bar update_high(close) 初始化，
-            # 不会拿成本价当峰值误触移动止损）
+            # 跨重启不丢）。无历史记录时**用柜台成本兜底**（2026-11-07）：
+            # 继承仓若在行情轮询窗口外启动/该票无 bar，`update_high(close)` 从未
+            # 执行，峰值恒为 0 → 快照该列永远 NULL → 重启后移动止损从当根 bar
+            # 收盘重新起算（= 重启即免疫）。用成本而非现价作起点：成本是已知的
+            # 真实入场基准，从成本起算严格紧于从现价起算，且不依赖行情；代价是
+            # 「已从真实历史高点回撤、但仍在成本×(1-阈值) 上方」的继承仓不会
+            # 因历史高点触发（历史高点不可得，属可接受取舍）。
             prev_hp = (prev_peaks or {}).get(code)
             if prev_hp and prev_hp > 0:
                 pos.update_high(prev_hp)
+            elif cost > 0:
+                pos.update_high(cost)
             ctx.positions[code] = pos
             imported += 1
             imported_shares += vol
@@ -1924,8 +2056,9 @@ class LiveEngine:
         # 导入成功：可辨识的汇总日志（排障时一眼确认账本是否真写入）
         if imported:
             logger.info(
-                "import legacy positions: %d codes, total %d shares (session %s)",
-                imported, imported_shares, self.session_id)
+                "import legacy positions: %d codes, total %d shares, "
+                "inherited market value %s deducted from virtual cash (session %s)",
+                imported, imported_shares, deducted_value, self.session_id)
         if no_code:
             if not self._no_code_rows_reported:
                 logger.warning(
@@ -2873,27 +3006,38 @@ class LiveEngine:
         if self._maybe_split_order(db, portfolio, order, ctx, period):
             return
         # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
-        # 放行的 deferred 单：删除 B-1 时落库的 deferred 旧行（防同一逻辑单双行；
-        # 行 id 随单挂在 _deferred_row_id，重启恢复重建的单无此标记）
-        _dr = getattr(order, "_deferred_row_id", None)
-        if _dr:
-            db.query(LiveOrder).filter(LiveOrder.id == _dr).delete()
-            order._deferred_row_id = None
-        live_order = self._persist_order_submitted(db, order)
-        self._pending_orders[live_order.id] = live_order
-        # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
-        self._emit("order", {
-            "portfolio_id": portfolio.portfolio_id,
-            "order_id": live_order.id,
-            "strategy_id": live_order.strategy_id,
-            "stock_code": live_order.stock_code,
-            "trade_type": (live_order.trade_type or "").upper(),
-            "status": "submitted",
-            "quantity": live_order.quantity,
-            "price": float(live_order.price) if live_order.price is not None else None,
-            "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-        })
-        db.commit()
+        # 记账锁的范围必须把写库语句一起包住：若本线程先 flush（持有 sqlite 写锁）
+        # 再去等 _book_lock，而 deals 池正持 _book_lock 做 commit，就会互相等待
+        # 到 sqlite busy timeout（~5s）并丢掉一轮成交回填。故先取锁再落库。
+        # 在途表增删与 deals 池的 sync_pending_orders（按 DB 查询整表替换）串行化：
+        # dict 写入与 commit 必须同锁——否则 DB 查询先于 commit 的整表替换会把本单
+        # 丢掉，该 bar 的 inflight_opens 占位失效（max_positions 漏计 → 超开一仓），
+        # 且 _tick_split_children 遍历期间并发增删会抛
+        # "dictionary changed size during iteration"（整轮回填作废）。
+        # _book_lock 为 RLock，_requote_* 在锁内二次进入安全；锁序仍为
+        # _book_lock → get_tdx_lock，无反向获取。
+        with self._book_lock:
+            # 放行的 deferred 单：删除 B-1 时落库的 deferred 旧行（防同一逻辑单双行；
+            # 行 id 随单挂在 _deferred_row_id，重启恢复重建的单无此标记）
+            _dr = getattr(order, "_deferred_row_id", None)
+            if _dr:
+                db.query(LiveOrder).filter(LiveOrder.id == _dr).delete()
+                order._deferred_row_id = None
+            live_order = self._persist_order_submitted(db, order)
+            self._pending_orders[live_order.id] = live_order
+            # B5：订单状态推送（submitted——真实成交回报由 _poll_deals 回填后推 filled）
+            self._emit("order", {
+                "portfolio_id": portfolio.portfolio_id,
+                "order_id": live_order.id,
+                "strategy_id": live_order.strategy_id,
+                "stock_code": live_order.stock_code,
+                "trade_type": (live_order.trade_type or "").upper(),
+                "status": "submitted",
+                "quantity": live_order.quantity,
+                "price": float(live_order.price) if live_order.price is not None else None,
+                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+            })
+            db.commit()
         # THS file_builtin 入队标记：place_order 秒回 None 但指令已写入
         # 交接文件时非 None（=本单确定性 order_id）。其它通道恒 None。
         enqueued_oid: Optional[str] = None
@@ -2939,18 +3083,19 @@ class LiveEngine:
                 "bridge_unavailable", "reject", portfolio, order,
                 message="桥离线（dispatcher 不可达）",
             )
-            self._pending_orders.pop(live_order.id, None)
-            self._emit("order", {
-                "portfolio_id": portfolio.portfolio_id,
-                "order_id": live_order.id,
-                "status": "rejected",
-                "stock_code": live_order.stock_code,
-                "trade_type": (live_order.trade_type or "").upper(),
-                "quantity": live_order.quantity,
-                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                "error_message": live_order.error_message,
-            })
-            db.commit()
+            with self._book_lock:
+                self._pending_orders.pop(live_order.id, None)
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "status": "rejected",
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "quantity": live_order.quantity,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                    "error_message": live_order.error_message,
+                })
+                db.commit()
             return
         except BridgeOrderRejected as e:
             # 桥业务拒单（白名单/限额/重复）→ rejected，回显桥侧真实原因
@@ -2961,18 +3106,19 @@ class LiveEngine:
                 "bridge_rejected", "reject", portfolio, order,
                 message="桥业务拒单: %s" % str(e),
             )
-            self._pending_orders.pop(live_order.id, None)
-            self._emit("order", {
-                "portfolio_id": portfolio.portfolio_id,
-                "order_id": live_order.id,
-                "status": "rejected",
-                "stock_code": live_order.stock_code,
-                "trade_type": (live_order.trade_type or "").upper(),
-                "quantity": live_order.quantity,
-                "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                "error_message": live_order.error_message,
-            })
-            db.commit()
+            with self._book_lock:
+                self._pending_orders.pop(live_order.id, None)
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "status": "rejected",
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "quantity": live_order.quantity,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                    "error_message": live_order.error_message,
+                })
+                db.commit()
             return
         if trade is None:
             # TDX：柜台已受理（ErrorId=0）但委托表暂未见该单——**保持 submitted**，
@@ -3043,18 +3189,19 @@ class LiveEngine:
                     "approval_failed", "reject", portfolio, order,
                     message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
                 )
-                self._pending_orders.pop(live_order.id, None)
-                self._emit("order", {
-                    "portfolio_id": portfolio.portfolio_id,
-                    "order_id": live_order.id,
-                    "status": "rejected",
-                    "stock_code": live_order.stock_code,
-                    "trade_type": (live_order.trade_type or "").upper(),
-                    "quantity": live_order.quantity,
-                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
-                    "error_message": live_order.error_message,
-                })
-                db.commit()
+                with self._book_lock:
+                    self._pending_orders.pop(live_order.id, None)
+                    self._emit("order", {
+                        "portfolio_id": portfolio.portfolio_id,
+                        "order_id": live_order.id,
+                        "status": "rejected",
+                        "stock_code": live_order.stock_code,
+                        "trade_type": (live_order.trade_type or "").upper(),
+                        "quantity": live_order.quantity,
+                        "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                        "error_message": live_order.error_message,
+                    })
+                    db.commit()
                 return
         # ③ 桥受理成功：回写幂等 order_id，尝试同步定位 OrderRef（失败下轮回填再找）
         live_order.bridge_order_id = self._dispatcher.order_id(order)
@@ -3646,12 +3793,21 @@ class LiveEngine:
         # 预取关联 LiveOrder 的 signal_type（LiveTrade 无 signal_type 列）
         order_ids = {t.live_order_id for t in trades if t.live_order_id is not None}
         sig_type_by_order: Dict[int, Optional[str]] = {}
+        order_type_by_order: Dict[int, str] = {}
         if order_ids:
             for lo in db.query(LiveOrder).filter(LiveOrder.id.in_(order_ids)).all():
                 sig_type_by_order[lo.id] = lo.signal_type
+                order_type_by_order[lo.id] = lo.order_type or ""
         for tr in trades:
             port = ports_by_id.get(tr.portfolio_strategy_id)
             if port is None:
+                continue
+            # 补记单（对账发现的陌生/人工成交，order_type=external）只留痕、不记账：
+            # 会话运行期 record_external_deals 就刻意不 apply（持仓由桥快照镜面覆盖）。
+            # 重启重放必须同口径——否则外部卖出会被 Position.sell 截断为 0 持仓却照加
+            # 卖出所得 → 虚拟现金虚增（净值/单仓金额被放大，虽仍受真实可用资金兜底）。
+            # 外部仓位重启后统一走「快照导入/镜面」作为继承仓按市值扣减，口径自洽。
+            if order_type_by_order.get(tr.live_order_id) == "external":
                 continue
             ctx = port.find_strategy(tr.strategy_id)
             if ctx is None:
