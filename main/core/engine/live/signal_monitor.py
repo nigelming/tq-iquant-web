@@ -135,6 +135,12 @@ class SignalMonitor:
             db.commit()
             if not rows:
                 return True
+            # 执行审计（每天 grep [signal-schedule] 核对 14:20 是否落库）。
+            logger.info(
+                "[signal-schedule] persist session=%s n=%d codes=%s mode=%s",
+                self.session_id, len(rows),
+                ",".join(r.stock_code for r in rows), self.execution_mode,
+            )
             if not self.send_warn_enabled:
                 # send_warn 关闭（0017 hermes 信号模式）：信号只落库 + 发 SSE，
                 # status 停留 new、alert_status 空。必须返回 True——返回 False

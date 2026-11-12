@@ -1,3 +1,4 @@
+import logging
 from datetime import date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ class FakeMarketData:
 
 def _ctx(strategy):
     port = SimpleNamespace(portfolio_id=1, strategies=[strategy])
-    return SimpleNamespace(portfolios=[port], code_period_count={})
+    return SimpleNamespace(session_id=7, portfolios=[port], code_period_count={})
 
 
 def _strategy(**kw):
@@ -203,7 +204,8 @@ def _exec_ctx(strategy, bars):
         query_quote=lambda code, period="1m", count=10: list(bars)
     )
     port = SimpleNamespace(portfolio_id=1, strategies=[strategy])
-    return SimpleNamespace(portfolios=[port], code_period_count={}, dispatcher=disp)
+    return SimpleNamespace(session_id=7, portfolios=[port],
+                           code_period_count={}, dispatcher=disp)
 
 
 _BARS = [
@@ -277,3 +279,63 @@ def test_execute_compute_uses_window_end_price_not_forming_bar():
     assert bar.stocks["000001.SZ"]["close"] == Decimal("12.34")
     assert md._tq_formula.calls
     assert md._tq_formula.calls[0][1]["end_time"] == "20261023"
+
+
+# ---------------- 14:20 执行审计日志（[signal-schedule]，每天 grep 核对） ----------------
+
+def test_due_fire_logs_signal_schedule(caplog):
+    """调度触发时落一条 [signal-schedule] fire INFO（session/频率/策略数）。"""
+    days = [date(2026, 10, 26)]
+    s = _scheduler(days, _strategy(signal_frequency="1d", signal_at="14:20",
+                                   signal_data_end="current"))
+    with caplog.at_level(logging.INFO,
+                         logger="core.engine.live.signal_scheduler"):
+        batches = s.due(datetime(2026, 10, 26, 14, 20))
+    assert batches
+    rec = [r for r in caplog.records if "[signal-schedule] fire" in r.getMessage()]
+    assert rec, "调度触发应有 [signal-schedule] fire 日志"
+    msg = rec[0].getMessage()
+    assert "session=7" in msg
+    assert "portfolio=1" in msg
+    assert "freq=1d" in msg
+    assert "strategies=1" in msg
+
+
+def test_due_skip_logs_signal_schedule(caplog):
+    """超补算窗口被跳过时落 [signal-schedule] skip INFO（14:20 是否执行的核对项）。"""
+    days = [date(2026, 10, 23), date(2026, 10, 26)]
+    s = _scheduler(days, _strategy())
+    with caplog.at_level(logging.INFO,
+                         logger="core.engine.live.signal_scheduler"):
+        assert s.due(datetime(2026, 10, 26, 9, 31)) == []
+    rec = [r for r in caplog.records if "[signal-schedule] skip" in r.getMessage()]
+    assert rec, "超窗跳过应有 [signal-schedule] skip 日志"
+    assert "strategies=1" in rec[0].getMessage()
+
+
+def test_execute_logs_signal_schedule(caplog):
+    """批次执行完成落 [signal-schedule] execute INFO（模式/公式/耗时/代码数）。"""
+    strategy = _strategy(signal_frequency="1d", signal_at="14:30",
+                         signal_data_end="completed")
+    md = ExecuteMarketData()
+    sched = SignalScheduler(
+        _exec_ctx(strategy, _BARS), md,
+        lambda: FakeCalendar([date(2026, 10, 23), date(2026, 10, 26)]),
+        {1: "momentum"}, {"momentum": 200}, {1: 10}, FakeMonitor(), FakeAlert(),
+    )
+    batch = DueBatch(
+        portfolio=_exec_ctx(strategy, _BARS).portfolios[0],
+        strategies=[strategy], frequency="1d", period="1d", mode="inject",
+        bar_time=datetime(2026, 10, 26, 14, 30),
+        data_end_date=date(2026, 10, 23),
+    )
+    with caplog.at_level(logging.INFO,
+                         logger="core.engine.live.signal_scheduler"):
+        sched.execute(batch)
+    rec = [r for r in caplog.records
+           if "[signal-schedule] execute" in r.getMessage()]
+    assert rec, "批次执行完成应有 [signal-schedule] execute 日志"
+    msg = rec[0].getMessage()
+    assert "session=7" in msg
+    assert "mode=inject" in msg
+    assert "codes=1" in msg

@@ -1,4 +1,5 @@
 """实盘信号频率调度：何时算、数据截至哪天。"""
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Callable, Dict, List, Optional
@@ -9,6 +10,8 @@ from ..live.timing import now_shanghai
 from ...services.signal_schedule import (
     effective_signal_data_end, effective_signal_frequency, parse_signal_at,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,8 +76,24 @@ class SignalScheduler:
                 if now > due_dt + timedelta(minutes=self.catch_up_minutes):
                     self._fired.add(fired_key)
                     skipped += len(strategies)
+                    # 执行审计（每天 grep [signal-schedule] 核对 14:20 是否跑过）：
+                    # 超窗跳过是「当天没算信号」的最常见静默原因，必须留痕。
+                    logger.info(
+                        "[signal-schedule] skip session=%s portfolio=%s "
+                        "freq=%s at=%s strategies=%d due=%s reason=catchup",
+                        getattr(self.ctx, "session_id", None),
+                        portfolio.portfolio_id, freq, at, len(strategies), due_dt,
+                    )
                     continue
                 self._fired.add(fired_key)
+                logger.info(
+                    "[signal-schedule] fire session=%s portfolio=%s freq=%s "
+                    "period=%s at=%s strategies=%d bar_time=%s mode=%s",
+                    getattr(self.ctx, "session_id", None),
+                    portfolio.portfolio_id, freq, period, at,
+                    len(strategies), bar_time,
+                    "inject" if freq == "1d" else "compute",
+                )
                 batches.append(DueBatch(
                     portfolio=portfolio, strategies=strategies, frequency=freq,
                     period=period,
@@ -145,10 +164,18 @@ class SignalScheduler:
         return d - timedelta(days=1)
 
     def execute(self, batch: DueBatch) -> None:
+        started = self.clock()
         if batch.mode == "inject":
-            self._execute_inject(batch)
+            codes = self._execute_inject(batch)
         else:
-            self._execute_compute(batch)
+            codes = self._execute_compute(batch)
+        logger.info(
+            "[signal-schedule] execute session=%s portfolio=%s mode=%s "
+            "strategies=%d codes=%d elapsed_ms=%d",
+            getattr(self.ctx, "session_id", None), batch.portfolio.portfolio_id,
+            batch.mode, len(batch.strategies), codes,
+            round((self.clock() - started).total_seconds() * 1000),
+        )
 
     def _codes(self):
         return list(self.market_data._bar_poller.stock_codes)
@@ -157,7 +184,7 @@ class SignalScheduler:
         bars = self.ctx.dispatcher.query_quote(code, period=period, count=count)
         return self.market_data._sort_and_cap(bars or [], count)
 
-    def _execute_inject(self, batch: DueBatch) -> None:
+    def _execute_inject(self, batch: DueBatch) -> int:
         bars_by_code = {}
         stocks = {}
         current = effective_signal_data_end(
@@ -188,7 +215,7 @@ class SignalScheduler:
             # 排序由 _quote→_sort_and_cap 保证，末根即目标 bar。
             stocks[code] = to_ohlcv(bars[-1])
         if not stocks:
-            return
+            return 0
         bar = BarEvent(stocks=stocks, bar_time=batch.bar_time,
                        period=batch.period, bars_by_code=bars_by_code)
         self.market_data.fill_signal_cache(
@@ -199,9 +226,11 @@ class SignalScheduler:
                 batch.portfolio, bar, self.market_data.signal_cache,
                 strategies=batch.strategies, frequency=batch.frequency,
             )
+        return len(stocks)
 
-    def _execute_compute(self, batch: DueBatch) -> None:
+    def _execute_compute(self, batch: DueBatch) -> int:
         end_time = batch.data_end_date.strftime("%Y%m%d")
+        evaluated = 0
         for st in batch.strategies:
             formula_name = self._formula_by_strategy.get(st.strategy_id)
             if not formula_name:
@@ -245,6 +274,7 @@ class SignalScheduler:
                     ] = outputs
             if not stocks:
                 continue
+            evaluated += len(stocks)
             bar = BarEvent(stocks=stocks, bar_time=batch.bar_time,
                            period=batch.period)
             if self.monitor is not None:
@@ -252,6 +282,7 @@ class SignalScheduler:
                     batch.portfolio, bar, self.market_data.signal_cache,
                     strategies=[st], frequency=batch.frequency,
                 )
+        return evaluated
 
     def _report_error(self, batch, st, formula_name, message):
         text = "公式失败 %s/%s: %s" % (formula_name, st.strategy_id, message)

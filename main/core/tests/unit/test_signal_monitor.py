@@ -217,3 +217,31 @@ def test_monitor_success_keeps_last_value():
     db = Session()
     assert db.query(LiveSignal).count() == 1
     db.close()
+
+
+def test_persist_logs_signal_schedule(caplog):
+    """落库成功时落 [signal-schedule] persist INFO（14:20 信号是否写库的核对项）。"""
+    import logging
+
+    Session, _ = _factory()
+    _seed(Session)
+    mon = SignalMonitor(
+        1, Session, FakeAlert(), lambda t, p: None, "hermes",
+        send_warn_enabled=False,
+        clock=lambda: datetime(2026, 10, 26, 14, 30),
+    )
+    cache = {(1, "000001.SZ", datetime(2026, 10, 26, 14, 30)): [
+        {"name": "buy", "value": 1},
+    ]}
+    with caplog.at_level(logging.INFO,
+                         logger="core.engine.live.signal_monitor"):
+        mon.evaluate(_ctx(), _bar(), cache,
+                     strategies=_ctx().strategies, frequency="1d")
+    rec = [r for r in caplog.records
+           if "[signal-schedule] persist" in r.getMessage()]
+    assert rec, "信号落库应有 [signal-schedule] persist 日志"
+    msg = rec[0].getMessage()
+    assert "session=1" in msg
+    assert "n=1" in msg
+    assert "000001.SZ" in msg
+    assert "mode=hermes" in msg
