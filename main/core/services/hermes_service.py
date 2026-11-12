@@ -2,6 +2,10 @@
 
 另一台电脑的 hermes 程序经 GET /api/hermes/signals 拉取当日信号 JSON，
 由用户在 hermes 侧终端手动执行买卖——本系统不下单、不接收回传。
+
+0018：默认只返回 hermes 模式 session 的信号（execution_mode="hermes"，
+session 级标记「经 hermes 人工执行」）；include_all=1 时返回全部 session
+（含 alert/auto）——auto 会话的信号混入会让 hermes 端误下单，故默认过滤。
 """
 from datetime import date as date_cls, datetime, timedelta
 from typing import Optional
@@ -17,7 +21,7 @@ def daily_signals(
     db: Session, day: Optional[date_cls] = None,
     portfolio_id: Optional[int] = None, strategy_id: Optional[int] = None,
     signal_type: Optional[str] = None, status: Optional[str] = None,
-    limit: int = 500, offset: int = 0,
+    limit: int = 500, offset: int = 0, include_all: bool = False,
 ) -> dict:
     day = day or now_shanghai().date()
     start = datetime(day.year, day.month, day.day)
@@ -25,6 +29,8 @@ def daily_signals(
     q = (db.query(LiveSignal, LiveSession)
          .join(LiveSession, LiveSignal.live_session_id == LiveSession.id)
          .filter(LiveSignal.bar_time >= start, LiveSignal.bar_time < end))
+    if not include_all:
+        q = q.filter(LiveSession.execution_mode == "hermes")
     if portfolio_id is not None:
         q = q.filter(LiveSignal.portfolio_strategy_id == portfolio_id)
     if strategy_id is not None:

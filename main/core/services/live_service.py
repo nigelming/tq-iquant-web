@@ -38,6 +38,7 @@ from core.models import (
     LiveSignal, LiveAccountSnapshot,
 )
 from core.engine.portfolio_builder import assemble_portfolio
+from core.engine.live.modes import is_signal_only
 try:
     from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 except Exception:
@@ -702,11 +703,11 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
     auto（P0 兼容）: 只查 TQ engine + 频率规则，不做 TQ 试算/告警探测，
     避免历史自动会话因客户端未就绪而无法启动。
     """
-    if execution_mode not in ("alert", "auto"):
-        return (400, "execution_mode 必须为 alert/auto")
+    if execution_mode not in ("alert", "auto", "hermes"):
+        return (400, "execution_mode 必须为 alert/auto/hermes")
     for pid, st in _session_strategies(db, session_id):
         if st.formula_id is None:
-            if execution_mode == "alert":
+            if is_signal_only(execution_mode):
                 return (503, "策略 %s 未绑定公式" % st.name)
             continue
         f = db.query(Formula).filter_by(id=st.formula_id).first()
@@ -725,7 +726,7 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
         if execution_mode == "auto" and freq != st.period:
             return (503, "全自动 P0 仅支持 signal_frequency == period；"
                          "请改用 alert 或等待 P2（策略 %s）" % st.name)
-    if execution_mode == "alert":
+    if is_signal_only(execution_mode):
         if _send_warn_enabled():
             err = _preflight_tq_alert()
             if err:
@@ -756,15 +757,15 @@ def build_engine(
     engine=None → 沿用旧行为（ths_ui.enabled → 同花顺，否则 QMT 桥）；
     engine=tdx → 通达信 TQ。
 
-    execution_mode=alert 时固定使用 AlertDataDispatcher（TQ 行情、禁止下单），
-    优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
+    execution_mode=alert/hermes（0018）时固定使用 AlertDataDispatcher（TQ 行情、
+    禁止下单），优先于 dispatcher_cls/engine 选择；auto 保持既有下单通道行为。
 
     外部信号注入（0011）：signal_file_path 参数非空 → LiveEngine 建
     ExternalSignalFileSource（通达信条件预警文件时间窗口增量读取）；None 时回退读
     session.signal_file_path（会话级配置，start_session/api 组装路径无需显式传），
     两者皆空 → 不启用，行为不变。
     """
-    if execution_mode == "alert":
+    if is_signal_only(execution_mode):
         dispatcher = AlertDataDispatcher()
     elif dispatcher_cls is None:
         dispatcher = make_dispatcher(engine or default_engine(), mode, session_id)
@@ -938,9 +939,10 @@ def build_engine(
             _snap_interval = 5.0
     except Exception:
         _snap_interval = 5.0
-    # 引擎标识（快照表落库用）：alert 模式固定；auto 按会话解析（None → 全局默认）
-    if execution_mode == "alert":
-        _engine_key = "alert"
+    # 引擎标识（快照表落库用）：signal-only 模式用模式名本身（alert/hermes）；
+    # auto 按会话解析（None → 全局默认）
+    if is_signal_only(execution_mode):
+        _engine_key = execution_mode
     else:
         _engine_key = engine or default_engine()
     # 交易日历多源回退链：主源=当前通道 query_calendar；非掘金会话再挂掘金桥
@@ -1071,8 +1073,8 @@ def recover_stale_running_live_sessions(
 
 
 def create_session(db: Session, data: dict, mode: str) -> dict:
-    """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
-    execution_mode = data.get("execution_mode") or "alert"
+    """创建 session。新会话默认 hermes（0018，人工拉取信号执行）；老会话由迁移保持 auto。"""
+    execution_mode = data.get("execution_mode") or "hermes"
     # 外部信号注入（0011）：空串/纯空白 → None（不启用）；非空原样存储（API 层同规则）
     signal_file_path = data.get("signal_file_path")
     if signal_file_path is not None:
@@ -1380,8 +1382,8 @@ def start_session(
     preflight_err = preflight_signal_config(db, session_id, execution_mode)
     if preflight_err is not None:
         return None, session, preflight_err
-    if execution_mode != "alert":
-        # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）
+    if not is_signal_only(execution_mode):
+        # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert/hermes 无下单/成交）
         engine.recover(db)
     return engine, session, None
 

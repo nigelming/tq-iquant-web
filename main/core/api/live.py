@@ -102,9 +102,10 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         return err(400, "engine 非法，仅支持 %s" % " / ".join(svc.ENGINES_META))
     data["name"] = name
     data["engine"] = engine
-    execution_mode = str(data.get("execution_mode") or "alert")
-    if execution_mode not in ("alert", "auto"):
-        return err(400, "execution_mode 非法，仅支持 alert(半自动) / auto(全自动)")
+    execution_mode = str(data.get("execution_mode") or "hermes")
+    if execution_mode not in ("alert", "auto", "hermes"):
+        return err(400, "execution_mode 非法，仅支持 hermes(人工执行) / "
+                        "alert(半自动) / auto(全自动)")
     data["execution_mode"] = execution_mode
     # 会话级实盘资金基准（账户总资产口径）：None=各组合用自身 initial_capital；
     # 提供时须 >0。继承持仓的市值由引擎从起账现金扣除，避免重复计入。

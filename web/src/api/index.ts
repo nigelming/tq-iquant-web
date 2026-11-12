@@ -1704,8 +1704,9 @@ export interface ReconcileMismatch {
 // 实盘交易引擎：iquant(QMT 通道) / tdx(通达信TQ) / ths(同花顺UI自动化)
 export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'goldminer'
 
-// 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
-export type LiveExecutionMode = 'alert' | 'auto'
+// 执行模式：alert(预警,TQ 行情+send_warn,不下单) / hermes(人工执行,信号经
+// /api/hermes/signals 拉取后手动下单,不下单,0018) / auto(全自动,走所选引擎下单)
+export type LiveExecutionMode = 'alert' | 'auto' | 'hermes'
 
 export interface LiveSessionCreate {
   name: string

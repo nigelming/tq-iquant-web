@@ -41,10 +41,14 @@ def client():
 
 
 def _seed(Session):
+    # 0018：session 1/2 为 hermes 模式（接口默认只返回 hermes）；session 3 为
+    # alert 模式，其信号默认被过滤、include_all=1 才返回。
     db = Session()
     db.add(LiveSession(id=1, name="alpha", mode="simulation", status="running",
-                       engine="tdx", execution_mode="alert"))
+                       engine="tdx", execution_mode="hermes"))
     db.add(LiveSession(id=2, name="beta", mode="simulation", status="stopped",
+                       engine="tdx", execution_mode="hermes"))
+    db.add(LiveSession(id=3, name="gamma", mode="simulation", status="stopped",
                        engine="tdx", execution_mode="alert"))
     pool = StockPool(code="P", name="p")
     db.add(pool)
@@ -63,7 +67,7 @@ def _seed(Session):
         stock_code="000001.SZ", period="1d",
         bar_time=datetime(2026, 10, 26, 14, 20),
         formula_name="momentum", signal_name="buy", signal_type="OPEN",
-        trigger_value=1, price=Decimal("12.34"), execution_mode="alert",
+        trigger_value=1, price=Decimal("12.34"), execution_mode="hermes",
         status="new",
     ))
     db.add(LiveSignal(
@@ -71,7 +75,15 @@ def _seed(Session):
         stock_code="600000.SH", period="1d",
         bar_time=datetime(2026, 10, 26, 14, 20),
         formula_name="momentum", signal_name="sell", signal_type="CLOSE",
-        trigger_value=1, price=Decimal("8.90"), execution_mode="alert",
+        trigger_value=1, price=Decimal("8.90"), execution_mode="hermes",
+        status="new",
+    ))
+    db.add(LiveSignal(
+        live_session_id=3, portfolio_strategy_id=1, strategy_id=1,
+        stock_code="000300.SH", period="1d",
+        bar_time=datetime(2026, 10, 26, 14, 20),
+        formula_name="momentum", signal_name="buy", signal_type="OPEN",
+        trigger_value=1, price=Decimal("4.10"), execution_mode="alert",
         status="new",
     ))
     db.add(LiveSignal(
@@ -79,7 +91,7 @@ def _seed(Session):
         stock_code="000001.SZ", period="1d",
         bar_time=datetime(2026, 10, 23, 14, 20),
         formula_name="momentum", signal_name="buy", signal_type="OPEN",
-        trigger_value=1, price=Decimal("12.10"), execution_mode="alert",
+        trigger_value=1, price=Decimal("12.10"), execution_mode="hermes",
         status="alerted",
     ))
     db.commit()
@@ -161,3 +173,45 @@ def test_signals_invalid_date_400(client):
     c, _ = client
     body = c.get("/api/hermes/signals?date=2026/10/26").json()
     assert body["code"] == 400
+
+
+# ---------------- 0018：session 级 hermes 模式过滤 ----------------
+
+def test_signals_default_excludes_non_hermes_sessions(client):
+    """默认只返回 hermes 模式 session 的信号（alert/auto 不混入）。"""
+    c, Session = client
+    _seed(Session)
+    body = c.get("/api/hermes/signals?date=2026-10-26").json()
+    codes = {i["stock_code"] for i in body["data"]["items"]}
+    assert codes == {"000001.SZ", "600000.SH"}  # 000300.SH（alert session）不在
+
+
+def test_signals_include_all_returns_every_session(client):
+    """include_all=1 时返回全部 session（含 alert/auto）的信号。"""
+    c, Session = client
+    _seed(Session)
+    body = c.get("/api/hermes/signals?date=2026-10-26&include_all=1").json()
+    codes = {i["stock_code"] for i in body["data"]["items"]}
+    assert codes == {"000001.SZ", "600000.SH", "000300.SH"}
+
+
+def test_create_session_api_accepts_hermes_mode(client):
+    """API 入口校验（0018）：execution_mode=hermes 可建，缺省默认 hermes，非法值 400。"""
+    c, Session = client
+    body = c.post("/api/live/sessions", json={
+        "name": "h1", "mode": "live", "execution_mode": "hermes",
+    }).json()
+    assert body["code"] == 0, body
+    assert body["data"]["execution_mode"] == "hermes"
+
+    body = c.post("/api/live/sessions", json={
+        "name": "h2", "mode": "live",
+    }).json()
+    assert body["code"] == 0, body
+    assert body["data"]["execution_mode"] == "hermes"  # 缺省默认 hermes
+
+    body = c.post("/api/live/sessions", json={
+        "name": "h3", "mode": "live", "execution_mode": "bogus",
+    }).json()
+    assert body["code"] == 400
+    assert "hermes" in body["message"]

@@ -813,8 +813,9 @@ describe('LiveSessions.vue 执行通道条', () => {
 })
 
 describe('LiveSessions.vue 执行模式 + 预警信号', () => {
-  it('会话列表按 execution_mode 显示「预警/自动」，引擎列显示通道名', async () => {
+  it('会话列表按 execution_mode 显示「Hermes/预警/自动」，引擎列显示通道名', async () => {
     ;(getLiveSessions as any).mockResolvedValue([
+      { id: 10, name: 'Hermes盘', mode: 'live', status: 'stopped', engine: 'tdx', execution_mode: 'hermes', started_at: null, stopped_at: null, portfolio_ids: [] },
       { id: 11, name: '预警盘', mode: 'live', status: 'stopped', engine: 'iquant', execution_mode: 'alert', started_at: null, stopped_at: null, portfolio_ids: [] },
       { id: 12, name: '自动盘', mode: 'live', status: 'stopped', engine: 'tdx', execution_mode: 'auto', started_at: null, stopped_at: null, portfolio_ids: [] },
     ])
@@ -822,15 +823,17 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     await flushPromises()
 
     const rows = w.findAll('tbody tr')
-    expect(rows.length).toBe(2)
-    expect(rows[0].text()).toContain('预警')
-    expect(rows[0].text()).toContain('QMT 通道')
-    expect(rows[1].text()).toContain('自动')
-    expect(rows[1].text()).toContain('通达信')
+    expect(rows.length).toBe(3)
+    expect(rows[0].text()).toContain('Hermes')
+    expect(rows[0].text()).toContain('通达信')
+    expect(rows[1].text()).toContain('预警')
+    expect(rows[1].text()).toContain('QMT 通道')
+    expect(rows[2].text()).toContain('自动')
+    expect(rows[2].text()).toContain('通达信')
     w.unmount()
   })
 
-  it('新建表单默认 alert，引擎 select 始终可见（决定信号计算数据源）；提交带 execution_mode', async () => {
+  it('新建表单默认 hermes（0018），引擎 select 始终可见（决定信号计算数据源）；提交带 execution_mode', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue([
       { id: 1, name: '稳健组合', strategies: [] },
@@ -841,11 +844,11 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
     await flushPromises()
 
-    // 默认 alert：执行模式 select
-    const execSelect = w.findAll('select').find((s) => s.html().includes('预警（半自动'))
+    // 默认 hermes：执行模式 select
+    const execSelect = w.findAll('select').find((s) => s.html().includes('Hermes（人工执行'))
     expect(execSelect).toBeTruthy()
-    expect((execSelect!.element as HTMLSelectElement).value).toBe('alert')
-    // alert 模式下引擎 select 也渲染（决定信号计算数据源）
+    expect((execSelect!.element as HTMLSelectElement).value).toBe('hermes')
+    // hermes 模式下引擎 select 也渲染（决定信号计算数据源）
     expect(w.findAll('select').some((s) => s.html().includes('QMT 通道'))).toBe(true)
 
     // 切到 auto：引擎 select 仍在

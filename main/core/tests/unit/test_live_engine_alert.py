@@ -67,12 +67,12 @@ class FakeScheduler:
         return None
 
 
-def _engine(monitor=None, scheduler=None):
+def _engine(monitor=None, scheduler=None, mode="alert"):
     disp = FakeDispatcher()
     eng = LiveEngine(
         session_id=1, portfolios=[], dispatcher=disp,
         bar_poller=FakePoller(), db_session_factory=lambda: None,
-        execution_mode="alert", signal_monitor=monitor,
+        execution_mode=mode, signal_monitor=monitor,
         signal_scheduler=scheduler or FakeScheduler(),
     )
     return eng, disp
@@ -108,6 +108,27 @@ def test_handle_alert_bar_fills_and_notifies_without_orders(monkeypatch):
     eng._handle_alert_bar(port, bar)
     assert called == {"fill": 1, "on_bar": 0}
     assert mon.calls
+
+
+# ---------------- 0018：hermes 模式（行为同 alert：只算信号不下单） ----------------
+def test_hermes_mode_uses_alert_tick_path():
+    """hermes 模式 tick 走 _tick_alert：不拉持仓/委托/成交，调度器照常节拍。"""
+    mon = FakeMonitor()
+    sched = FakeScheduler()
+    eng, disp = _engine(mon, sched, mode="hermes")
+    eng._tick_alert(datetime(2026, 10, 26, 9, 30))
+    assert "positions" not in disp.calls
+    assert "orders" not in disp.calls
+    assert "deals" not in disp.calls
+    assert sched.calls == 1
+
+
+def test_hermes_mode_bar_handler_is_alert_handler():
+    """hermes 模式 MarketDataService 装配的 bar 回调是 _handle_alert_bar（不进下单链路）。"""
+    eng, _ = _engine(mode="hermes")
+    assert eng.market_data._on_bar == eng._handle_alert_bar
+    eng2, _ = _engine(mode="alert")
+    assert eng2.market_data._on_bar == eng2._handle_alert_bar
 
 
 # ---------------- TQ 1.3.1：stop() 释放 dispatcher 资源 ----------------

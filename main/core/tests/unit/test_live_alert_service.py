@@ -67,10 +67,10 @@ def _seed(db, execution_mode="alert"):
     db.commit()
 
 
-def test_create_session_defaults_to_alert():
+def test_create_session_defaults_to_hermes():
     db = _db()
     row = live_service.create_session(db, {"name": "s", "engine": "tdx"}, "simulation")
-    assert row["execution_mode"] == "alert"
+    assert row["execution_mode"] == "hermes"
 
 
 def test_preflight_rejects_builtin():
@@ -136,6 +136,77 @@ def test_send_warn_enabled_reads_config(monkeypatch):
     assert live_service._send_warn_enabled() is True
     monkeypatch.setattr(live_service, "load_config", lambda: {})
     assert live_service._send_warn_enabled() is False
+
+
+# ---------------- 0018：session 级 hermes 模式 ----------------
+
+def test_preflight_accepts_hermes_and_skips_probe(monkeypatch):
+    """hermes 模式：preflight 同 alert（公式试算保留，send_warn 探测按开关跳过）。"""
+    db = _db()
+    _seed(db)
+    monkeypatch.setattr(live_service, "_send_warn_enabled", lambda: False)
+
+    def _no_probe():
+        raise AssertionError("_preflight_tq_alert must be skipped")
+
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", _no_probe)
+    monkeypatch.setattr(live_service, "_smoke_formula_outputs",
+                        lambda *a, **kw: None)
+    assert live_service.preflight_signal_config(db, 1, "hermes") is None
+
+
+def test_preflight_rejects_unknown_mode():
+    db = _db()
+    _seed(db)
+    status, msg = live_service.preflight_signal_config(db, 1, "bogus")
+    assert status == 400
+    assert "alert/auto/hermes" in msg
+
+
+def test_start_session_hermes_uses_alert_dispatcher(monkeypatch):
+    """hermes 模式启动：AlertDataDispatcher（不下单），execution_mode 保持 hermes。"""
+    factory = _factory()
+    db = factory()
+    _seed(db, execution_mode="hermes")
+
+    class FakeDispatcher:
+        channel = "alert"
+        supports_remark = False
+        supports_batch_quote = True
+
+        def __init__(self, **kwargs):
+            self.last_error = ""
+
+        def heartbeat(self):
+            return True
+
+        def query_calendar(self):
+            return []
+
+        def query_quote(self, code, period="1m", count=10):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(live_service, "AlertDataDispatcher", FakeDispatcher)
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", lambda: None)
+    monkeypatch.setattr(live_service, "_smoke_formula_outputs",
+                        lambda *a, **kw: None)
+    engine, session, error = live_service.start_session(
+        db, 1, {}, "simulation", db_session_factory=factory)
+    assert error is None
+    assert engine.execution_mode == "hermes"
+    assert engine.dispatcher.channel == "alert"
+    db.close()
+
+
+def test_create_session_accepts_hermes_mode():
+    db = _db()
+    row = live_service.create_session(
+        db, {"name": "h", "engine": "tdx", "execution_mode": "hermes"},
+        "simulation")
+    assert row["execution_mode"] == "hermes"
 
 
 def test_start_session_rejects_empty_stock_pool_alert():

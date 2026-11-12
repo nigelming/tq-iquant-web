@@ -32,7 +32,8 @@ const formulas = ref<FormulaItem[]>([])  // 公式列表（formula_id → name �
 const showCreate = ref(false)
 // M2 实盘配置指南弹窗
 const showGuide = ref(false)
-// 默认与后端 create_session 对齐：新会话默认 alert（半自动预警，仅 TQ 行情+send_warn，不下单）
+// 默认与后端 create_session 对齐：新会话默认 hermes（0018 人工执行，仅 TQ 行情，不下单，
+// 信号经另一台电脑 GET /api/hermes/signals 拉取后手动下单）
 // 组合策略多选时标注公式名称——外部信号注入需按公式名建立一一对应关系
 function portfolioFormulas(pid: number): string {
   const p = portfolios.value.find(x => x.id === pid)
@@ -49,7 +50,7 @@ function portfolioFormulas(pid: number): string {
 const form = ref({
   name: '', mode: 'simulation',
   engine: 'tdx' as LiveEngineKey,
-  execution_mode: 'alert' as LiveExecutionMode,
+  execution_mode: 'hermes' as LiveExecutionMode,
   portfolio_ids: [] as number[],
   // 实盘资金基准（元）：null=用组合初始资金；number input v-model 空输入为 ''，提交前归一化
   live_capital: null as number | string | null,
@@ -72,13 +73,14 @@ function engineLabel(key?: string): string {
   return channel.value?.engines?.find((e) => e.key === key)?.label || ENGINE_LABEL[key] || key
 }
 
-// 执行模式中文名（alert=预警/auto=自动）；老数据缺省视作 auto
-const EXECUTION_MODE_LABEL: Record<string, string> = { alert: '预警', auto: '自动' }
+// 执行模式中文名（alert=预警/hermes=人工/auto=自动）；老数据缺省视作 auto
+const EXECUTION_MODE_LABEL: Record<string, string> = { alert: '预警', hermes: 'Hermes', auto: '自动' }
 function executionModeLabel(m?: string): string {
   return EXECUTION_MODE_LABEL[m || 'auto'] || m || '自动'
 }
+// signal-only 模式（alert/hermes，0018）：只算信号不下单，引擎列固定走通达信 TQ 行情
 function isAlert(s: LiveSessionItem): boolean {
-  return (s.execution_mode || 'auto') === 'alert'
+  return s.execution_mode === 'alert' || s.execution_mode === 'hermes'
 }
 
 // 通道条前缀：有运行中会话=运行中通道（跟随该会话引擎）；否则=默认引擎（default_engine）
@@ -504,7 +506,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'hermes', portfolio_ids: [], live_capital: null, signal_file_path: '' }
   showCreate.value = true
 }
 
@@ -516,7 +518,7 @@ async function create() {
   try {
     await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'hermes', portfolio_ids: [], live_capital: null, signal_file_path: '' }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -641,11 +643,11 @@ onUnmounted(closeEventStreams)
           </td>
           <td>
             <span class="badge" :class="isAlert(s) ? 'badge-blue' : 'badge-purple'"
-              :title="isAlert(s) ? '半自动预警：仅 TQ 行情 + send_warn 推送预警，不下单' : '全自动：按交易引擎下单'"
+              :title="s.execution_mode === 'hermes' ? 'Hermes 人工执行：仅 TQ 行情算信号，另一台电脑经 /api/hermes/signals 拉取后手动下单' : (isAlert(s) ? '半自动预警：仅 TQ 行情 + send_warn 推送预警，不下单' : '全自动：按交易引擎下单')"
             >{{ executionModeLabel(s.execution_mode) }}</span>
           </td>
           <td>
-            <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：固定走通达信 TQ 行情计算信号，不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
+            <span class="badge badge-gray" :title="isAlert(s) ? '预警/Hermes 模式：固定走通达信 TQ 行情计算信号，不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
           </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td>
@@ -957,7 +959,8 @@ onUnmounted(closeEventStreams)
       <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
       <label>执行模式</label>
       <select v-model="form.execution_mode">
-        <option value="alert">预警（半自动，仅 TQ 行情 + send_warn 推送，不下单）</option>
+        <option value="hermes">Hermes（人工执行：仅 TQ 行情算信号，另一台电脑拉取后手动下单，不下单）</option>
+        <option value="alert">预警（半自动，仅 TQ 行情 + send_warn 推送（受系统配置开关控制），不下单）</option>
         <option value="auto">自动（按交易引擎下单）</option>
       </select>
       <label>交易引擎（决定信号计算的数据源）</label>
@@ -969,8 +972,11 @@ onUnmounted(closeEventStreams)
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         模式只对 QMT 通道选桥：simulation / live 两个模式位当前都指向 8790（410038214257，STOCK；
         该账户是 QMT 仿真账户、账户内为仿真资金）。8791 信用账户桥位保留但未启用。其它引擎的账户由通道自身决定，模式不改变下单账户。
-        <span v-if="form.execution_mode === 'alert'">
-          预警模式：固定走通达信 TQ 行情计算信号（与所选引擎无关）并通过 send_warn 推送，不下单。
+        <span v-if="form.execution_mode === 'hermes'">
+          Hermes 模式：固定走通达信 TQ 行情计算信号（与所选引擎无关），不下单；信号落库后经另一台电脑 GET /api/hermes/signals 拉取，由人工在终端下单。
+        </span>
+        <span v-else-if="form.execution_mode === 'alert'">
+          预警模式：固定走通达信 TQ 行情计算信号（与所选引擎无关），不下单；send_warn 推送受系统配置 live.alert_send_warn_enabled 控制（默认关，信号仅落库）。
         </span>
         <span v-else>
           自动模式：下单由所选引擎执行——通达信 TQ 直连客户端（确认面板可自动处置）；同花顺走 UI 自动化（file_builtin 文件交接）；掘金量化桥/QMT 桥须在对应终端内运行桥策略。引擎未就绪时启动直接 503 报错，不会静默换通道。
@@ -1111,8 +1117,10 @@ onUnmounted(closeEventStreams)
         <div class="form-group">
           <label class="group-label">六、执行模式</label>
           <div class="guide-block">
-            <p class="guide-step"><b>预警（alert）</b>：固定走通达信 TQ 行情计算信号 + send_warn 推送 + 落库，
-              不下单——半自动（此时所选引擎只用于记录，不参与取数）。</p>
+            <p class="guide-step"><b>Hermes（hermes，新建默认）</b>：固定走通达信 TQ 行情计算信号 + 落库，
+              不下单——另一台电脑经 GET /api/hermes/signals 拉取当日信号，人工在终端下单（0018）。</p>
+            <p class="guide-step"><b>预警（alert）</b>：同 Hermes 只算信号不下单，另加 send_warn 推送
+              （受 live.alert_send_warn_enabled 控制，默认关）。</p>
             <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行；同花顺 file_builtin 下
               指令/回执落在 {ths_ui.work_dir}/{session_id}/（signals/risk/orders/results + cursor.json）。</p>
             <p class="guide-note">· THS 自动模式已真机验证（下单→成交→撤单全链路）；首次实盘建议小单先行；

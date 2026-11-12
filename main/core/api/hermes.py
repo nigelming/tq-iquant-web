@@ -31,8 +31,11 @@ def signals(
     status: Optional[str] = None,
     limit: int = 500,
     offset: int = 0,
+    include_all: bool = False,
     db: Session = Depends(get_db),
 ):
+    """include_all 缺省 false：只返回 hermes 模式 session 的信号（0018）；
+    true 时返回全部 session（含 alert/auto），供排查/审计用。"""
     day = None
     if date:
         try:
@@ -42,4 +45,5 @@ def signals(
     return ok(hermes_service.daily_signals(
         db, day, portfolio_id=portfolio_id, strategy_id=strategy_id,
         signal_type=signal_type, status=status, limit=limit, offset=offset,
+        include_all=include_all,
     ))

@@ -48,6 +48,7 @@ from .bar_poller import BarPoller, QuotePollingWindow
 # TradingCalendar 为 live 专属（仅实盘引擎及其协作者使用，回测不依赖），
 # 0010 后续迁入 live 子包；旧路径 core.engine.trading_calendar 保留 re-export shim。
 from .live.calendar import TradingCalendar
+from .live.modes import is_signal_only
 from .live.snapshot_bars import SnapshotBarSynthesizer
 # 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
 # re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
@@ -413,7 +414,7 @@ class LiveEngine:
             bar_poller,
             on_bar=(
                 self._handle_alert_bar
-                if execution_mode == "alert" else self._handle_bar
+                if is_signal_only(execution_mode) else self._handle_bar
             ),
             set_available_map=self._t1_checker.set_available_map,
             tq_formula=tq_formula,
@@ -422,7 +423,7 @@ class LiveEngine:
             formula_count_by_name=formula_count_by_name,
         )
         self._signal_scheduler = signal_scheduler
-        if (enable_signal_monitor and execution_mode == "alert"
+        if (enable_signal_monitor and is_signal_only(execution_mode)
                 and signal_scheduler is None):
             from .live.signal_scheduler import SignalScheduler
             self._signal_scheduler = SignalScheduler(
@@ -811,7 +812,7 @@ class LiveEngine:
         self._task = asyncio.create_task(self._loop())
         self._task.add_done_callback(functools.partial(self._on_loop_done, "main"))
         # G5：独立 /deals 回填轮询（5s 节拍，不随主循环 60s 拉 bar 一起）
-        if self.execution_mode != "alert":
+        if not is_signal_only(self.execution_mode):
             self._deals_task = asyncio.create_task(self._deals_loop())
             self._deals_task.add_done_callback(functools.partial(self._on_loop_done, "deals"))
 
@@ -874,7 +875,7 @@ class LiveEngine:
         起来前完成（否则首个 bar 触发时缓存未就绪）；单 (code,period) 失败不阻断，
         运行期自愈。
         """
-        if self.execution_mode != "alert":
+        if not is_signal_only(self.execution_mode):
             self._inject_startup_periods(
                 datetime.combine(now_shanghai().date(), datetime.min.time())
             )
@@ -1144,7 +1145,7 @@ class LiveEngine:
         now = now_shanghai()
         self._last_tick_at = now  # 存活心跳（进程内 watchdog 读）
         try:
-            if self.execution_mode == "alert":
+            if is_signal_only(self.execution_mode):
                 self._tick_alert(now)
                 return
             # E8：心跳前的在线状态，用于离线→在线转场时重建基线
@@ -2455,7 +2456,7 @@ class LiveEngine:
         bars_by_code = getattr(bar, "bars_by_code", None) or None
         handler = (
             self._handle_alert_bar
-            if self.execution_mode == "alert" else self._handle_bar
+            if is_signal_only(self.execution_mode) else self._handle_bar
         )
         for portfolio in self.portfolios:
             try:
