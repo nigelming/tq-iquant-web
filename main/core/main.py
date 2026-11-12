@@ -12,6 +12,7 @@ from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
 from core.api.tdx import router as tdx_router
+from core.api.hermes import router as hermes_router
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
@@ -79,6 +80,7 @@ app.include_router(live_router)
 app.include_router(system_router)
 app.include_router(status_router)
 app.include_router(tdx_router)
+app.include_router(hermes_router)
 
 
 @app.exception_handler(Exception)

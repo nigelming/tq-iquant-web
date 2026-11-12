@@ -111,6 +111,39 @@ def test_monitor_persists_and_alerts(monkeypatch):
     db.close()
 
 
+def test_monitor_send_warn_disabled_keeps_new_status():
+    """send_warn 关闭（live.alert_send_warn_enabled=False）：只落库+发 SSE，
+    不调 send_warn；status=new、alert_status 空；水位保留（同电平不重触发）。"""
+    Session, _ = _factory()
+    _seed(Session)
+    alert = FakeAlert()
+    events = []
+    mon = SignalMonitor(
+        1, Session, alert, lambda t, p: events.append((t, p)),
+        "alert", clock=lambda: datetime(2026, 10, 26, 14, 30),
+        send_warn_enabled=False,
+    )
+    cache = {(1, "000001.SZ", datetime(2026, 10, 26, 14, 30)): [
+        {"name": "buy", "value": 1},
+    ]}
+    ctx = _ctx()
+    mon.evaluate(ctx, _bar(), cache, strategies=ctx.strategies, frequency="1d")
+    db = Session()
+    row = db.query(LiveSignal).one()
+    assert row.status == "new"
+    assert row.alert_status is None
+    assert row.alerted_at is None
+    assert alert.items == []
+    assert events and events[0][0] == "signal"
+    db.close()
+    # 返回 True → 水位保留：同电平第二轮不重复落库
+    assert mon._last_value[(1, "000001.SZ", "buy")] == 1
+    mon.evaluate(ctx, _bar(), cache, strategies=ctx.strategies, frequency="1d")
+    db = Session()
+    assert db.query(LiveSignal).count() == 1
+    db.close()
+
+
 def test_monitor_level_edge_and_dedup():
     Session, _ = _factory()
     _seed(Session)

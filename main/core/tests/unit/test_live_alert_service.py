@@ -115,6 +115,29 @@ def test_preflight_alert_returns_503_when_formula_smoke_raises(monkeypatch):
     assert "试算失败" in msg
 
 
+def test_preflight_alert_skips_tq_alert_probe_when_send_warn_disabled(monkeypatch):
+    """send_warn 关闭 → alert 启动不再探测 send_warn 可用性（公式试算仍保留）。"""
+    db = _db()
+    _seed(db)
+    monkeypatch.setattr(live_service, "_send_warn_enabled", lambda: False)
+
+    def _no_probe():
+        raise AssertionError("_preflight_tq_alert must be skipped")
+
+    monkeypatch.setattr(live_service, "_preflight_tq_alert", _no_probe)
+    monkeypatch.setattr(live_service, "_smoke_formula_outputs",
+                        lambda *a, **kw: None)
+    assert live_service.preflight_signal_config(db, 1, "alert") is None
+
+
+def test_send_warn_enabled_reads_config(monkeypatch):
+    monkeypatch.setattr(live_service, "load_config",
+                        lambda: {"live": {"alert_send_warn_enabled": True}})
+    assert live_service._send_warn_enabled() is True
+    monkeypatch.setattr(live_service, "load_config", lambda: {})
+    assert live_service._send_warn_enabled() is False
+
+
 def test_start_session_rejects_empty_stock_pool_alert():
     factory = _factory()
     db = factory()

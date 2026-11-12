@@ -191,6 +191,9 @@ def _defaults() -> dict:
                 "resume_time": "09:15",
                 "pause_time": "15:05",
             },
+            # alert 信号是否推通达信 send_warn 预警（0017）：默认关——信号只落库
+            # + SSE + hermes 接口拉取；config.yaml 设 true 恢复推送。
+            "alert_send_warn_enabled": False,
         },
         "tq_trade": {
             "account": "",

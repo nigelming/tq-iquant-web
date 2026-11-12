@@ -9,7 +9,7 @@ _RANK = {
     "1m": 0, "5m": 1, "15m": 2, "30m": 3, "1h": 4,
     "1d": 5, "1w": 6, "1mon": 7,
 }
-_DEFAULT_AT = {"1d": "14:30", "1w": "09:00", "1mon": "09:00"}
+_DEFAULT_AT = {"1d": "14:20", "1w": "09:00", "1mon": "09:00"}
 
 
 def default_signal_at(frequency: str) -> str:
@@ -34,7 +34,7 @@ def parse_signal_at(value: Optional[str], frequency: str) -> time:
         hh, mm = raw.split(":")
         return time(int(hh), int(mm))
     except (TypeError, ValueError):
-        return time(14, 30)
+        return time(14, 20)
 
 
 def validate_signal_config(

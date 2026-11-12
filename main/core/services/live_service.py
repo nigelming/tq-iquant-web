@@ -638,6 +638,16 @@ def _session_strategies(db: Session, session_id: int):
     return rows
 
 
+def _send_warn_enabled() -> bool:
+    """live.alert_send_warn_enabled（0017）：alert 信号是否推通达信 send_warn。
+
+    缺省 False（hermes 信号模式：只落库 + SSE + 接口拉取）；config.yaml 设
+    true 恢复推送（同时恢复启动前的 send_warn 可用性探测）。
+    """
+    return bool((load_config().get("live") or {}).get(
+        "alert_send_warn_enabled", False))
+
+
 def _preflight_tq_alert():
     msg = TQAlert().preflight()
     return (503, msg) if msg else None
@@ -716,9 +726,10 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
             return (503, "全自动 P0 仅支持 signal_frequency == period；"
                          "请改用 alert 或等待 P2（策略 %s）" % st.name)
     if execution_mode == "alert":
-        err = _preflight_tq_alert()
-        if err:
-            return err
+        if _send_warn_enabled():
+            err = _preflight_tq_alert()
+            if err:
+                return err
         err = _smoke_formula_outputs(db, session_id)
         if err:
             return err
@@ -958,6 +969,7 @@ def build_engine(
         signal_file_path=signal_file_path,
         formula_id_by_strategy=strategy_formula,
         enable_signal_monitor=True,
+        send_warn_enabled=_send_warn_enabled(),
         snapshot_synth=snapshot_synth,
         engine_key=_engine_key,
         account_snapshot_interval=_snap_interval,

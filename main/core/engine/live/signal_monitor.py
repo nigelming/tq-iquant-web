@@ -17,6 +17,7 @@ class SignalMonitor:
         self, session_id: int, db_session_factory: Callable[[], Session],
         alert, emit: Callable[[str, dict], None], execution_mode: str,
         clock: Callable[[], datetime] = now_shanghai,
+        send_warn_enabled: bool = True,
     ):
         self.session_id = session_id
         self._db = db_session_factory
@@ -24,6 +25,9 @@ class SignalMonitor:
         self._emit = emit
         self.execution_mode = execution_mode
         self.clock = clock
+        # send_warn 开关（live.alert_send_warn_enabled，0017）：False=信号只落库
+        # +发 SSE，不推通达信预警。组件默认 True 保留历史行为，装配层注入配置值。
+        self.send_warn_enabled = send_warn_enabled
         self._last_value: Dict[tuple, int] = {}
         self._load_last_states()
 
@@ -131,6 +135,14 @@ class SignalMonitor:
             db.commit()
             if not rows:
                 return True
+            if not self.send_warn_enabled:
+                # send_warn 关闭（0017 hermes 信号模式）：信号只落库 + 发 SSE，
+                # status 停留 new、alert_status 空。必须返回 True——返回 False
+                # 会恢复推送前水位，导致同电平信号每轮重复进入候选（虽有 DB
+                # 幂等兜底，但徒增无效循环）。
+                for r in rows:
+                    self._emit_signal(r)
+                return True
             items = [
                 WarnItem(
                     stock_code=r.stock_code,
@@ -161,21 +173,7 @@ class SignalMonitor:
                     )[:500]
             db.commit()
             for r in rows:
-                self._emit("signal", {
-                    "signal_id": r.id,
-                    "session_id": self.session_id,
-                    "portfolio_id": r.portfolio_strategy_id,
-                    "strategy_id": r.strategy_id,
-                    "stock_code": r.stock_code,
-                    "signal_name": r.signal_name,
-                    "signal_type": r.signal_type,
-                    "bar_time": r.bar_time.isoformat(),
-                    "price": str(r.price) if r.price is not None else None,
-                    "execution_mode": r.execution_mode,
-                    "alert_status": r.alert_status,
-                    "alert_error": r.alert_error,
-                    "tdx_run_id": r.tdx_run_id,
-                })
+                self._emit_signal(r)
             return bool(result.get("ok"))
         except Exception:
             db.rollback()
@@ -183,6 +181,23 @@ class SignalMonitor:
             return False
         finally:
             db.close()
+
+    def _emit_signal(self, r) -> None:
+        self._emit("signal", {
+            "signal_id": r.id,
+            "session_id": self.session_id,
+            "portfolio_id": r.portfolio_strategy_id,
+            "strategy_id": r.strategy_id,
+            "stock_code": r.stock_code,
+            "signal_name": r.signal_name,
+            "signal_type": r.signal_type,
+            "bar_time": r.bar_time.isoformat(),
+            "price": str(r.price) if r.price is not None else None,
+            "execution_mode": r.execution_mode,
+            "alert_status": r.alert_status,
+            "alert_error": r.alert_error,
+            "tdx_run_id": r.tdx_run_id,
+        })
 
     def report_runtime_error(self, portfolio, strategy, formula_name: str,
                              message: str) -> None:

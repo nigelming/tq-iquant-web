@@ -92,7 +92,9 @@ switch ($Action) {
             $err = Join-Path $backend_dir "server.err.log"
             $stdin = Join-Path $backend_dir "stdin.empty"
             if (-not (Test-Path $stdin)) { New-Item -ItemType File -Path $stdin -Force | Out-Null }
-            Start-Process -WindowStyle Hidden -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 127.0.0.1 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
+            # 0.0.0.0（0017 hermes）：另一台电脑经局域网拉 /api/hermes/signals，
+            # 无鉴权为既定决策（单用户局域网工具）；Windows 防火墙首次放行一次。
+            Start-Process -WindowStyle Hidden -FilePath "uv" -ArgumentList "run uvicorn core.main:app --host 0.0.0.0 --port $backend_port" -WorkingDirectory $backend_dir -RedirectStandardInput $stdin -RedirectStandardOutput $log -RedirectStandardError $err
             Write-Host "  waiting for backend API (usually 10-30s; first run of the day slower) ..." -ForegroundColor DarkGray
             if (Wait-BackendReady -TimeoutSec 120) {
                 Write-Host "  backend ready" -ForegroundColor Green

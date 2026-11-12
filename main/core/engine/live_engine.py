@@ -245,6 +245,10 @@ class LiveEngine:
         signal_scheduler=None,
         formula_id_by_strategy: Optional[Dict[int, int]] = None,
         enable_signal_monitor: bool = False,
+        # send_warn 开关（live.alert_send_warn_enabled，0017）：仅影响
+        # enable_signal_monitor 自动构造 SignalMonitor 的注入；显式传入
+        # signal_monitor 时由调用方自行控制。
+        send_warn_enabled: bool = True,
         # 外部信号注入（0011）：通达信条件预警文件路径。None=不启用；非空=建
         # ExternalSignalFileSource，_tick_main 每轮增量读取并经 _handle_bar 全套注入。
         signal_file_path: Optional[str] = None,
@@ -314,7 +318,7 @@ class LiveEngine:
             self._tq_alert = TQAlert()
             self._signal_monitor = SignalMonitor(
                 session_id, db_session_factory, self._tq_alert, self._emit,
-                execution_mode,
+                execution_mode, send_warn_enabled=send_warn_enabled,
             )
         # 外部信号注入源（0011）：signal_file_path 非空时启用——定时增量读取同花顺
         # 条件预警文件，公式名匹配策略后合成 bar 注入 signal_cache，经 _handle_bar

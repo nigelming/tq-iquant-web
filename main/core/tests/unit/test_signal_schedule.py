@@ -12,7 +12,7 @@ def test_effective_and_defaults():
     assert effective_signal_data_end("1w", None) == "completed"
     assert effective_signal_data_end("1d", None) == "current"
     assert parse_signal_at(None, "1w") == time(9, 0)
-    assert parse_signal_at(None, "1d") == time(14, 30)
+    assert parse_signal_at(None, "1d") == time(14, 20)
 
 
 def test_frequency_cannot_be_finer_than_period():
